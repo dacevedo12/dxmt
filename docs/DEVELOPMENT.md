@@ -116,6 +116,9 @@ The following environment variables can be used for **debugging** purposes.
 - `DXMT_LOG_PATH=/some/directory` Changes path where log files are stored. Set to `none` to disable log file creation entirely, without disabling logging.
 - `DXMT_SHADER_CACHE=0`: Disables the internal shader cache.
 - `DXMT_SHADER_CACHE_PATH=/some/absolute/darwin/directory`: Path to internal shader cache files. Default to `$(getconf DARWIN_USER_CACHE_DIR)/dxmt/<executable name with extension>`.
+- `DXMT_DUMP_PATH=/some/directory`: Changes path where shader and pipeline dump files are stored. Falls back to `DXMT_LOG_PATH` when unset.
+- `DXMT_DUMP_PIPELINES=0|problem|all`: Controls pipeline dumping. `problem` dumps known problematic pipelines, currently including mesh pipelines with rasterization enabled and no pixel shader; `all` dumps every graphics pipeline.
+- `DXMT_DUMP_PIPELINE_KEY=hex-key`: Restricts pipeline dumping to one logged pipeline key. This key is intended for the current process only and is not stable across runs.
 
 
 ### Logs

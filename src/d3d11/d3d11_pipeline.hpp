@@ -6,6 +6,12 @@
 #include "d3d11_shader.hpp"
 #include "d3d11_state_object.hpp"
 #include "util_hash.hpp"
+#include "util_env.hpp"
+#include <cstdint>
+#include <fstream>
+#include <functional>
+#include <sstream>
+#include <string>
 
 struct MTL_GRAPHICS_PIPELINE_DESC {
   ManagedShader VertexShader;
@@ -139,6 +145,131 @@ template <> struct equal_to<MTL_GRAPHICS_PIPELINE_DESC> {
 } // namespace std
 
 namespace dxmt {
+
+inline std::string
+DebugShaderName(ManagedShader shader) {
+  if (!shader)
+    return "null";
+
+  std::stringstream stream;
+  stream << "0x" << std::hex << reinterpret_cast<std::uintptr_t>(shader)
+         << "/" << shader->sha1().string();
+  return stream.str();
+}
+
+inline std::string
+DebugPipelineKey(const MTL_GRAPHICS_PIPELINE_DESC &desc) {
+  std::stringstream stream;
+  stream << std::hex << std::hash<MTL_GRAPHICS_PIPELINE_DESC>{}(desc);
+  return stream.str();
+}
+
+inline std::string
+DebugPipelineDesc(const char *kind, const MTL_GRAPHICS_PIPELINE_DESC &desc) {
+  std::stringstream stream;
+  stream << kind << " key=0x" << DebugPipelineKey(desc) << std::dec
+         << " VS=" << DebugShaderName(desc.VertexShader)
+         << " HS=" << DebugShaderName(desc.HullShader)
+         << " DS=" << DebugShaderName(desc.DomainShader)
+         << " GS=" << DebugShaderName(desc.GeometryShader)
+         << " PS=" << DebugShaderName(desc.PixelShader)
+         << " IL=0x" << std::hex << reinterpret_cast<std::uintptr_t>(desc.InputLayout)
+         << " SO=0x" << reinterpret_cast<std::uintptr_t>(desc.SOLayout)
+         << std::dec
+         << " raster=" << desc.RasterizationEnabled
+         << " rt_count=" << desc.NumColorAttachments
+         << " depth=" << desc.DepthStencilFormat
+         << " topology=" << desc.TopologyClass
+         << " sample_count=" << unsigned(desc.SampleCount)
+         << " sample_mask=0x" << std::hex << desc.SampleMask << std::dec
+         << " gs_passthrough=0x" << std::hex << desc.GSPassthrough << std::dec
+         << " gs_strip=" << desc.GSStripTopology
+         << " index_format=" << desc.IndexBufferFormat
+         << " rt_formats=[";
+
+  for (unsigned i = 0; i < desc.NumColorAttachments && i < 8; i++) {
+    if (i)
+      stream << ",";
+    stream << desc.ColorAttachmentFormats[i];
+  }
+
+  stream << "]";
+  return stream.str();
+}
+
+inline std::string
+DebugPipelineDumpDirectory() {
+  std::string path = env::getEnvVar("DXMT_DUMP_PATH");
+  if (path.empty())
+    path = env::getEnvVar("DXMT_LOG_PATH");
+  if (path.empty() || path == "none")
+    path = ".";
+  env::createDirectory(path);
+  if (!path.empty() && path.back() != '/' && path.back() != '\\')
+    path += '/';
+  return path;
+}
+
+inline bool
+DebugShouldDumpPipeline(const MTL_GRAPHICS_PIPELINE_DESC &desc, bool problem) {
+  std::string mode = env::getEnvVar("DXMT_DUMP_PIPELINES");
+  if (mode == "0" || mode == "none" || mode == "false")
+    return false;
+  if (mode == "all")
+    return true;
+
+  std::string key = env::getEnvVar("DXMT_DUMP_PIPELINE_KEY");
+  if (!key.empty()) {
+    if (key.starts_with("0x") || key.starts_with("0X"))
+      key = key.substr(2);
+    return key == DebugPipelineKey(desc);
+  }
+
+  return problem || mode == "1" || mode == "problem";
+}
+
+inline void
+DebugDumpShader(const char *stage, ManagedShader shader) {
+  if (!shader)
+    return;
+  WARN("DXMT diagnostic: dumping ", stage, " shader ", shader->sha1().string());
+  shader->dump();
+}
+
+inline void
+DebugDumpPipeline(const char *kind, const MTL_GRAPHICS_PIPELINE_DESC &desc,
+                  const char *reason, bool problem) {
+  if (!DebugShouldDumpPipeline(desc, problem))
+    return;
+
+  std::string key = DebugPipelineKey(desc);
+  std::string path = DebugPipelineDumpDirectory() + env::getExeBaseName() +
+                     "_pipeline_" + kind + "_0x" + key + ".txt";
+
+  std::ofstream dump(path, std::ios::out | std::ios::trunc);
+  if (dump) {
+    dump << "reason=" << reason << "\n";
+    dump << DebugPipelineDesc(kind, desc) << "\n";
+  }
+
+  DebugDumpShader("VS", desc.VertexShader);
+  DebugDumpShader("HS", desc.HullShader);
+  DebugDumpShader("DS", desc.DomainShader);
+  DebugDumpShader("GS", desc.GeometryShader);
+  DebugDumpShader("PS", desc.PixelShader);
+
+  WARN("DXMT diagnostic: pipeline dumped to ", path);
+}
+
+inline void
+WarnMissingMeshFragmentFunction(const char *kind, const MTL_GRAPHICS_PIPELINE_DESC &desc) {
+  if (desc.RasterizationEnabled && !desc.PixelShader) {
+    WARN("DXMT diagnostic: ", kind,
+         " mesh pipeline has rasterization enabled but no pixel shader: ",
+         DebugPipelineDesc(kind, desc));
+    DebugDumpPipeline(kind, desc, "mesh pipeline has rasterization enabled but no pixel shader", true);
+  }
+}
 
 class MTLCompiledGraphicsPipeline : public ThreadpoolWork {
 public:

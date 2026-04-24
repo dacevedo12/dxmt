@@ -4659,6 +4659,10 @@ public:
 
     MTL_GRAPHICS_PIPELINE_DESC pipelineDesc;
     InitializeGraphicsPipelineDesc<IndexedDraw>(pipelineDesc);
+    DEBUG("DXMT diagnostic: finalize tessellation pipeline: ",
+          DebugPipelineDesc("tessellation", pipelineDesc));
+    DebugDumpPipeline("tessellation", pipelineDesc, "finalize tessellation pipeline", false);
+    WarnMissingMeshFragmentFunction("tessellation", pipelineDesc);
 
     if (FAILED(device->CreateTessellationMeshPipeline(&pipelineDesc, &pipeline))) {
       return DrawCallStatus::Invalid;
@@ -4711,6 +4715,10 @@ public:
 
     MTL_GRAPHICS_PIPELINE_DESC pipelineDesc;
     InitializeGraphicsPipelineDesc<IndexedDraw>(pipelineDesc);
+    DEBUG("DXMT diagnostic: finalize geometry pipeline: ",
+          DebugPipelineDesc("geometry", pipelineDesc));
+    DebugDumpPipeline("geometry", pipelineDesc, "finalize geometry pipeline", false);
+    WarnMissingMeshFragmentFunction("geometry", pipelineDesc);
     device->CreateGeometryPipeline(&pipelineDesc, &pipeline);
     EmitST([pso = std::move(pipeline)](ArgumentEncodingContext& enc) {
       auto render_encoder = enc.currentRenderEncoder();
@@ -4768,6 +4776,9 @@ public:
 
     MTL_GRAPHICS_PIPELINE_DESC pipelineDesc;
     InitializeGraphicsPipelineDesc<IndexedDraw>(pipelineDesc);
+    DEBUG("DXMT diagnostic: finalize graphics pipeline: ",
+          DebugPipelineDesc("graphics", pipelineDesc));
+    DebugDumpPipeline("graphics", pipelineDesc, "finalize graphics pipeline", false);
 
     device->CreateGraphicsPipeline(&pipelineDesc, &pipeline);
     EmitST([pso = std::move(pipeline)](ArgumentEncodingContext& enc) {

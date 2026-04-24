@@ -15,7 +15,8 @@ public:
         depth_stencil_format(pDesc->DepthStencilFormat), device_(pDevice),
         pBlendState(pDesc->BlendState),
         RasterizationEnabled(pDesc->RasterizationEnabled),
-        SampleCount(pDesc->SampleCount) {
+        SampleCount(pDesc->SampleCount),
+        debug_desc_(DebugPipelineDesc("geometry", *pDesc)) {
     uint32_t unorm_output_reg_mask = 0;
     for (unsigned i = 0; i < num_rtvs; i++) {
       rtv_formats[i] = pDesc->ColorAttachmentFormats[i];
@@ -49,6 +50,8 @@ public:
 
   ThreadpoolWork *RunThreadpoolWork() {
 
+    DEBUG("DXMT diagnostic: compile geometry mesh PSO: ", debug_desc_);
+
     WMT::Reference<WMT::Error> err;
     MTL_COMPILED_SHADER vs, gs, ps;
 
@@ -74,6 +77,9 @@ public:
         ERR("Failed to create mesh PSO: Invalid pixel shader.");
         return this;
       }
+    } else if (RasterizationEnabled) {
+      WARN("DXMT diagnostic: geometry mesh PSO has rasterization enabled but no pixel shader: ",
+           debug_desc_);
     }
 
     WMTMeshRenderPipelineInfo info;
@@ -138,6 +144,7 @@ private:
   WMT::Reference<WMT::RenderPipelineState> state_mesh_;
   bool RasterizationEnabled;
   UINT SampleCount;
+  std::string debug_desc_;
 
   CompiledShader *VertexShader;
   CompiledShader *PixelShader;
