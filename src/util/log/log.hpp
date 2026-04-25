@@ -76,6 +76,8 @@ private:
 
 #define DEBUG(...) Logger::debug(str::format(__VA_ARGS__))
 
+#define INFO(...) Logger::info(str::format(__VA_ARGS__))
+
 #define WARN(...) Logger::warn(str::format(__VA_ARGS__))
 
 #define ERR(...) Logger::err(str::format(__VA_ARGS__))

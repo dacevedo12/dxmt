@@ -86,21 +86,7 @@ public:
   }
 
   void
-  encode(WMT::CommandBuffer cmdbuf, ArgumentEncodingContext &enc) {
-    enc.$$setEncodingContext(
-      chunk_id,
-      frame_
-    );
-    auto& statistics = enc.currentFrameStatistics();
-    auto t0 = clock::now();
-    list_enc.execute(enc);
-    attached_cmdbuf = cmdbuf;
-    auto t1 = clock::now();
-    readback = enc.flushCommands(cmdbuf, chunk_id, chunk_event_id);
-    auto t2 = clock::now();
-    statistics.encode_prepare_interval += (t1 - t0);
-    statistics.encode_flush_interval += (t2 - t1);
-  };
+  encode(WMT::CommandBuffer cmdbuf, ArgumentEncodingContext &enc);
 
   uint64_t chunk_id;
   uint64_t chunk_event_id;
@@ -237,19 +223,7 @@ public:
   }
 
   void
-  PresentBoundary() {
-    statistics.compute(frame_count);
-    frame_count++;
-    statistics.at(frame_count).reset();
-    // After present N-th frame (N starts from 1), wait for (N - max_latency)-th frame to finish rendering 
-    if (likely(frame_count > max_latency_)) {
-      auto t0 = clock::now();
-      frame_latency_fence_.wait(frame_count - max_latency_);
-      auto t1 = clock::now();
-      statistics.at(frame_count).present_latency_interval += (t1 - t0);
-    }
-    statistics.at(frame_count).latency = max_latency_;
-  }
+  PresentBoundary();
 
   uint32_t GetMaxLatency() { return max_latency_; }
 

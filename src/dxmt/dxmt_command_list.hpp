@@ -1,8 +1,19 @@
 #pragma once
+#include <chrono>
 #include <concepts>
 #include <functional>
 
 namespace dxmt {
+
+using CommandListClock = std::chrono::high_resolution_clock;
+
+struct CommandListExecutionProfile {
+  unsigned command_count = 0;
+  unsigned slow_command_count = 0;
+  unsigned max_command_index = 0;
+  CommandListClock::duration max_command_duration {};
+  const char *max_command_name = nullptr;
+};
 
 template <typename F, typename context>
 concept CommandWithContext = requires(F f, context &ctx) {
@@ -13,6 +24,7 @@ namespace impl {
 template <typename context> class CommandBase {
 public:
   virtual void invoke(context &) = 0;
+  virtual const char *name() const noexcept = 0;
   virtual ~CommandBase() noexcept {};
   CommandBase<context> *next = nullptr;
 };
@@ -23,6 +35,10 @@ public:
   invoke(context &ctx) final {
     std::invoke(func, ctx);
   };
+  const char *
+  name() const noexcept final {
+    return __PRETTY_FUNCTION__;
+  }
   ~LambdaCommand() noexcept final = default;
   LambdaCommand(F &&ff) : CommandBase<context>(), func(std::forward<F>(ff)) {}
   LambdaCommand(const LambdaCommand &copy) = delete;
@@ -35,6 +51,7 @@ private:
 template <typename context> class EmptyCommand final : public CommandBase<context> {
 public:
   void invoke(context &ctx) final{/* nop */};
+  const char *name() const noexcept final { return "EmptyCommand"; };
   ~EmptyCommand() noexcept = default;
 };
 
@@ -112,13 +129,29 @@ public:
     list.list_end = nullptr;
   }
 
-  void
-  execute(Context &context) {
-    impl::CommandBase<Context> *cur = &empty;
+  CommandListExecutionProfile
+  execute(Context &context, bool profile = false) {
+    CommandListExecutionProfile result;
+    impl::CommandBase<Context> *cur = empty.next;
     while (cur) {
-      cur->invoke(context);
+      if (profile) {
+        auto t0 = CommandListClock::now();
+        cur->invoke(context);
+        auto elapsed = CommandListClock::now() - t0;
+        if (elapsed > result.max_command_duration) {
+          result.max_command_duration = elapsed;
+          result.max_command_index = result.command_count;
+          result.max_command_name = cur->name();
+        }
+        if (std::chrono::duration<double, std::milli>(elapsed).count() > 1.0)
+          result.slow_command_count++;
+      } else {
+        cur->invoke(context);
+      }
+      result.command_count++;
       cur = cur->next;
     }
+    return result;
   };
 };
 

@@ -34,6 +34,20 @@ constexpr size_t kSwapchainLatency = 1;
 
 namespace dxmt {
 
+static bool
+DiagSwapchainEnabled() {
+  static bool enabled = [] {
+    auto value = env::getEnvVar("DXMT_DIAG_SWAPCHAIN");
+    return value == "1" || value == "true" || value == "yes" || value == "trace";
+  }();
+  return enabled;
+}
+
+static double
+DiagMillis(clock::duration duration) {
+  return duration.count() / 1000000.0;
+}
+
 WMTPixelFormat ConvertSwapChainFormat(DXGI_FORMAT format) {
   switch (format) {
   case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:
@@ -131,6 +145,12 @@ public:
       monitor_(wsi::getWindowMonitor(hWnd)),
       hud(WMT::DeveloperHUDProperties::instance()) {
 
+    if (DiagSwapchainEnabled()) {
+      INFO("DXGI: CreateSwapChain hwnd=", reinterpret_cast<uintptr_t>(hWnd), " size=", desc_.Width, "x", desc_.Height,
+           " format=", desc_.Format, " buffers=", desc_.BufferCount, " flags=", desc_.Flags,
+           " swapEffect=", desc_.SwapEffect, " sampleCount=", desc_.SampleDesc.Count);
+    }
+
     native_view_ = WMT::CreateMetalViewFromHWND((intptr_t)hWnd, pDevice->GetMTLDevice(), layer_weak_);
 
     if (!native_view_) {
@@ -173,6 +193,10 @@ public:
         current_mode.refreshRate.numerator != 0) {
       init_refresh_rate_ = (double)current_mode.refreshRate.numerator /
                            (double)current_mode.refreshRate.denominator;
+    }
+    if (DiagSwapchainEnabled()) {
+      INFO("DXGI: Initial present timing refreshRate=", init_refresh_rate_,
+           " preferredMaxFrameRate=", preferred_max_frame_rate);
     }
 
     handle_alt_tab_ = Config::getInstance().getOption<bool>("dxgi.handleAltTab", false);
@@ -262,6 +286,11 @@ public:
   HRESULT
   STDMETHODCALLTYPE
   SetFullscreenState(BOOL Fullscreen, IDXGIOutput *pTarget) final {
+    if (DiagSwapchainEnabled()) {
+      INFO("DXGI: SetFullscreenState requested=", Fullscreen, " currentWindowed=", fullscreen_desc_.Windowed,
+           " target=", reinterpret_cast<uintptr_t>(pTarget));
+    }
+
     Com<IDXGIOutput1> target;
 
     if (pTarget) {
@@ -286,6 +315,13 @@ public:
   };
 
   HRESULT EnterFullscreenMode(IDXGIOutput1* pTarget) {
+    auto diag_t0 = clock::now();
+    if (DiagSwapchainEnabled()) {
+      INFO("DXGI: EnterFullscreenMode begin hwnd=", reinterpret_cast<uintptr_t>(hWnd),
+           " target=", reinterpret_cast<uintptr_t>(pTarget),
+           " swapchainSize=", desc_.Width, "x", desc_.Height, " flags=", desc_.Flags);
+    }
+
     ModeSetGuard::ModeSetInProgress modeset_inprogress(modeset_guard_);
     if (modeset_inprogress)
       return DXGI_STATUS_MODE_CHANGE_IN_PROGRESS;
@@ -336,11 +372,22 @@ public:
       return DXGI_ERROR_NOT_CURRENTLY_AVAILABLE;
     }
 
+    if (DiagSwapchainEnabled()) {
+      INFO("DXGI: EnterFullscreenMode end monitor=", reinterpret_cast<uintptr_t>(monitor_), " modeSwitch=", modeSwitch,
+           " elapsedMs=", DiagMillis(clock::now() - diag_t0));
+    }
+
     return S_OK;
   }
   
   
   HRESULT LeaveFullscreenMode() {
+    auto diag_t0 = clock::now();
+    if (DiagSwapchainEnabled()) {
+      INFO("DXGI: LeaveFullscreenMode begin hwnd=", reinterpret_cast<uintptr_t>(hWnd),
+           " monitor=", reinterpret_cast<uintptr_t>(monitor_));
+    }
+
     ModeSetGuard::ModeSetInProgress modeset_inprogress(modeset_guard_);
     if (modeset_inprogress)
       return DXGI_STATUS_MODE_CHANGE_IN_PROGRESS;
@@ -365,6 +412,11 @@ public:
     
     presenter->changeGammaRamp(nullptr);
 
+    if (DiagSwapchainEnabled()) {
+      INFO("DXGI: LeaveFullscreenMode end monitor=", reinterpret_cast<uintptr_t>(monitor_),
+           " elapsedMs=", DiagMillis(clock::now() - diag_t0));
+    }
+
     return S_OK;
   }
 
@@ -385,6 +437,13 @@ public:
 
     if (preferred_mode.Format == DXGI_FORMAT_UNKNOWN)
       preferred_mode.Format = desc_.Format;
+
+    if (DiagSwapchainEnabled()) {
+      INFO("DXGI: ChangeDisplayMode begin preferred=", preferred_mode.Width, "x", preferred_mode.Height,
+           "@", preferred_mode.RefreshRate.Numerator, "/", preferred_mode.RefreshRate.Denominator,
+           " format=", preferred_mode.Format, " allowModeSwitch=",
+           (desc_.Flags & DXGI_SWAP_CHAIN_FLAG_ALLOW_MODE_SWITCH) != 0u);
+    }
 
     HRESULT hr = pOutput->FindClosestMatchingMode1(&preferred_mode, &selected_mode, nullptr);
 
@@ -418,6 +477,11 @@ public:
 
     *pDisplayMode = selected_mode;
     init_refresh_rate_ = double(selected_mode.RefreshRate.Numerator) / double(selected_mode.RefreshRate.Denominator);
+    if (DiagSwapchainEnabled()) {
+      INFO("DXGI: ChangeDisplayMode end selected=", selected_mode.Width, "x", selected_mode.Height,
+           "@", selected_mode.RefreshRate.Numerator, "/", selected_mode.RefreshRate.Denominator,
+           " format=", selected_mode.Format, " refreshRate=", init_refresh_rate_);
+    }
     return S_OK;
   }
 
@@ -476,6 +540,16 @@ public:
   STDMETHODCALLTYPE
   ResizeBuffers(UINT BufferCount, UINT Width, UINT Height, DXGI_FORMAT Format,
                 UINT flags) final {
+    auto diag_t0 = clock::now();
+    auto old_width = desc_.Width;
+    auto old_height = desc_.Height;
+    auto old_format = desc_.Format;
+    if (DiagSwapchainEnabled()) {
+      INFO("DXGI: ResizeBuffers begin requested=", Width, "x", Height, " bufferCount=", BufferCount,
+           " format=", Format, " flags=", flags, " old=", old_width, "x", old_height,
+           " oldFormat=", old_format, " windowed=", fullscreen_desc_.Windowed);
+    }
+
     /* BufferCount ignored */
     if (Width == 0 || Height == 0) {
       wsi::getWindowSize(hWnd, &desc_.Width, &desc_.Height);
@@ -504,8 +578,11 @@ public:
     backbuffer_ = nullptr;
     if (FAILED(dxmt::CreateDeviceTexture2D(
             device_, &backbuffer_desc_, nullptr, reinterpret_cast<ID3D11Texture2D1 **>(&backbuffer_)
-        )))
+        ))) {
+      ERR("DXGI: ResizeBuffers: failed to create backbuffer ", backbuffer_desc_.Width, "x",
+          backbuffer_desc_.Height, " format=", backbuffer_desc_.Format);
       return E_FAIL;
+    }
     // CreateDeviceTexture2D returns public reference, change to private one here
     backbuffer_->AddRefPrivate();
     backbuffer_->Release();
@@ -531,6 +608,12 @@ public:
       D3D11_ASSERT(metalfx_scaler && "otherwise metalfx failed to initialize");
     }
 
+    if (DiagSwapchainEnabled()) {
+      INFO("DXGI: ResizeBuffers end final=", desc_.Width, "x", desc_.Height,
+           " backbuffer=", backbuffer_desc_.Width, "x", backbuffer_desc_.Height,
+           " format=", desc_.Format, " elapsedMs=", DiagMillis(clock::now() - diag_t0));
+    }
+
     return S_OK;
   };
 
@@ -542,6 +625,12 @@ public:
 
     if (!wsi::isWindow(hWnd))
       return DXGI_ERROR_INVALID_CALL;
+
+    if (DiagSwapchainEnabled()) {
+      INFO("DXGI: ResizeTarget requested=", pDesc->Width, "x", pDesc->Height, "@",
+           pDesc->RefreshRate.Numerator, "/", pDesc->RefreshRate.Denominator,
+           " format=", pDesc->Format, " windowed=", fullscreen_desc_.Windowed);
+    }
 
     std::unique_lock<dxmt::mutex> lock(mutex_);
 
@@ -570,6 +659,12 @@ public:
       wsi::updateFullscreenWindow(monitor_, hWnd, false);
     }
 
+    if (DiagSwapchainEnabled()) {
+      INFO("DXGI: ResizeTarget end selected=", newDisplayMode.Width, "x", newDisplayMode.Height,
+           "@", newDisplayMode.RefreshRate.Numerator, "/", newDisplayMode.RefreshRate.Denominator,
+           " windowed=", fullscreen_desc_.Windowed);
+    }
+
     return S_OK;
   };
 
@@ -579,11 +674,22 @@ public:
                               ? DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709
                               : colorspace_,
                           LayerSupportEDR());
-    if (presenter->changeLayerProperties(
+    bool invalidated = presenter->changeLayerProperties(
             ConvertSwapChainFormat(desc_.Format), target_color_space, desc_.Width * scale_factor,
             desc_.Height * scale_factor, desc_.SampleDesc.Count
-        ))
+        );
+    if (DiagSwapchainEnabled()) {
+      INFO("DXGI: ApplyLayerProps drawable=", desc_.Width * scale_factor, "x", desc_.Height * scale_factor,
+           " format=", desc_.Format, " sampleCount=", desc_.SampleDesc.Count,
+           " invalidated=", invalidated);
+    }
+    if (invalidated) {
+      auto diag_t0 = clock::now();
       device_context_->WaitUntilGPUIdle();
+      if (DiagSwapchainEnabled()) {
+        INFO("DXGI: ApplyLayerProps GPU idle wait elapsedMs=", DiagMillis(clock::now() - diag_t0));
+      }
+    }
   };
 
   HRESULT GetOutputFromMonitor(
@@ -731,6 +837,16 @@ public:
   STDMETHODCALLTYPE
   Present1(UINT SyncInterval, UINT PresentFlags,
            const DXGI_PRESENT_PARAMETERS *pPresentParameters) final {
+    auto present_entry = clock::now();
+    double present_interval_ms = 0.0;
+    bool present_interval_valid = false;
+    if (last_present_entry_valid_) {
+      present_interval_ms = DiagMillis(present_entry - last_present_entry_);
+      present_interval_valid = true;
+    }
+    last_present_entry_ = present_entry;
+    last_present_entry_valid_ = true;
+
     if (SyncInterval > 4)
       return DXGI_ERROR_INVALID_CALL;
 
@@ -750,19 +866,33 @@ public:
     if (should_exit_fs)
       SetFullscreenState(FALSE, nullptr);
 
+    auto lock_t0 = clock::now();
     std::unique_lock<d3d11_device_mutex> lock(device_->mutex);
+    auto lock_elapsed = clock::now() - lock_t0;
 
+    auto prepare_t0 = clock::now();
     device_context_->PrepareFlush();
+    auto prepare_elapsed = clock::now() - prepare_t0;
     if (hr == DXGI_STATUS_OCCLUDED) {
       // flush commands without presenting
+      auto commit_t0 = clock::now();
       device_context_->Commit();
+      auto commit_elapsed = clock::now() - commit_t0;
+      auto present_total_elapsed = clock::now() - present_entry;
+      if (DiagSwapchainEnabled() || DiagMillis(present_total_elapsed) > 16.0 ||
+          (present_interval_valid && present_interval_ms > 16.0)) {
+        INFO("DXGI: Present1 occluded frame=", presentation_count_, " intervalMs=",
+             present_interval_valid ? present_interval_ms : 0.0,
+             " totalMs=", DiagMillis(present_total_elapsed),
+             " lockMs=", DiagMillis(lock_elapsed), " prepareMs=", DiagMillis(prepare_elapsed),
+             " commitMs=", DiagMillis(commit_elapsed), " hr=", hr);
+      }
       return hr;
     }
 
+    double present_rate = preferred_max_frame_rate ? preferred_max_frame_rate : init_refresh_rate_;
     double vsync_duration =
-        std::max(SyncInterval * 1.0 /
-                     (preferred_max_frame_rate ? preferred_max_frame_rate
-                                               : init_refresh_rate_),
+        std::max(SyncInterval * 1.0 / present_rate,
                  preferred_max_frame_rate ? 1.0 / preferred_max_frame_rate : 0);
 
     auto &cmd_queue = device_->GetDXMTDevice().queue();
@@ -772,6 +902,7 @@ public:
       auto output = static_cast<MTLDXGIOutput *>(target_.ptr());
       presenter->changeGammaRamp(output->GetGammaRamp());
     }
+    auto enqueue_t0 = clock::now();
     if constexpr (EnableMetalFX) {
       chunk->emitcc([
         this, vsync_duration, backbuffer = backbuffer_->texture(),
@@ -801,11 +932,42 @@ public:
         this->UpdateStatistics(ctx.queue().statistics, ctx.currentFrameId());
       });
     }
+    auto enqueue_elapsed = clock::now() - enqueue_t0;
+    auto commit_t0 = clock::now();
     device_context_->Commit();
+    auto commit_elapsed = clock::now() - commit_t0;
 
     lock.unlock(); // since PresentBoundary() will and should only stall current thread
 
+    auto diag_t0 = clock::now();
     cmd_queue.PresentBoundary();
+    auto diag_elapsed = clock::now() - diag_t0;
+    auto present_total_elapsed = clock::now() - present_entry;
+    bool present_slow =
+        DiagMillis(present_total_elapsed) > 16.0 ||
+        (present_interval_valid && present_interval_ms > 16.0) ||
+        DiagMillis(lock_elapsed) > 4.0 ||
+        DiagMillis(prepare_elapsed) > 4.0 ||
+        DiagMillis(enqueue_elapsed) > 4.0 ||
+        DiagMillis(commit_elapsed) > 4.0 ||
+        DiagMillis(diag_elapsed) > 4.0;
+    if (DiagSwapchainEnabled() || DiagMillis(diag_elapsed) > 250.0) {
+      static std::atomic<uint64_t> present_boundary_diag_count = 0;
+      auto index = present_boundary_diag_count.fetch_add(1, std::memory_order_relaxed);
+      if (index < 64 || (index % 120) == 0 || DiagMillis(diag_elapsed) > 250.0 || present_slow) {
+        INFO("DXGI: PresentBoundary frame=", presentation_count_, " syncInterval=", SyncInterval,
+           " flags=", PresentFlags, " elapsedMs=", DiagMillis(diag_elapsed),
+           " vsyncDurationMs=", vsync_duration * 1000.0, " presentRate=", present_rate,
+           " preferredMaxFrameRate=", preferred_max_frame_rate,
+           " swapchain=", desc_.Width, "x", desc_.Height, " windowed=", fullscreen_desc_.Windowed);
+        INFO("DXGI: Present1 timing frame=", presentation_count_,
+             " intervalMs=", present_interval_valid ? present_interval_ms : 0.0,
+             " totalMs=", DiagMillis(present_total_elapsed),
+             " lockMs=", DiagMillis(lock_elapsed), " prepareMs=", DiagMillis(prepare_elapsed),
+             " enqueueMs=", DiagMillis(enqueue_elapsed), " commitMs=", DiagMillis(commit_elapsed),
+             " boundaryMs=", DiagMillis(diag_elapsed), " slow=", present_slow);
+      }
+    }
 
     return hr;
   };
@@ -1079,6 +1241,8 @@ private:
   dxmt::mutex mutex_;
 
   bool handle_alt_tab_;
+  clock::time_point last_present_entry_ {};
+  bool last_present_entry_valid_ = false;
 
   std::conditional<EnableMetalFX, Rc<SpatialScaler>, std::monostate>::type metalfx_scaler;
   std::conditional<EnableMetalFX, Com<D3D11ResourceCommon>, std::monostate>::type upscaled_backbuffer_;

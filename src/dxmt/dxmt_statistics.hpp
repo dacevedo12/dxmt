@@ -50,6 +50,12 @@ struct FrameStatistics {
   uint32_t blit_pass_count = 0;
   uint32_t event_stall = 0;
   uint32_t latency = 0;
+  uint32_t shader_binding_upload_count = 0;
+  uint32_t shader_binding_dirty_cbuffer_count = 0;
+  uint32_t shader_binding_dirty_sampler_count = 0;
+  uint32_t shader_binding_dirty_srv_count = 0;
+  uint32_t shader_binding_dirty_uav_count = 0;
+  uint32_t shader_binding_clean_uav_count = 0;
   clock::duration encode_prepare_interval{};
   clock::duration encode_flush_interval{};
   clock::duration drawable_blocking_interval{};
@@ -72,6 +78,12 @@ struct FrameStatistics {
     blit_pass_count = 0;
     event_stall = 0;
     latency = 0;
+    shader_binding_upload_count = 0;
+    shader_binding_dirty_cbuffer_count = 0;
+    shader_binding_dirty_sampler_count = 0;
+    shader_binding_dirty_srv_count = 0;
+    shader_binding_dirty_uav_count = 0;
+    shader_binding_clean_uav_count = 0;
     encode_prepare_interval = {};
     encode_flush_interval = {};
     drawable_blocking_interval = {};
