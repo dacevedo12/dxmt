@@ -338,6 +338,7 @@ DepthStencilBlitContext::copyFromBuffer(
   view_desc.miplevelCount = 1;
   view_desc.firstArraySlice = slice;
   view_desc.arraySize = 1;
+  view_desc.intendedUsage = WMTTextureUsageRenderTarget;
 
   auto view = depth_stencil->createView(view_desc);
 
@@ -428,6 +429,7 @@ DepthStencilBlitContext::copyFromTexture(
   view_desc.miplevelCount = 1;
   view_desc.firstArraySlice = slice;
   view_desc.arraySize = 1;
+  view_desc.intendedUsage = WMTTextureUsageRenderTarget;
   auto depth_view = depth_stencil->createView(view_desc);
 
   view_desc.format = WMTPixelFormatX32_Stencil8;

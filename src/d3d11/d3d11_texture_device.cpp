@@ -20,6 +20,72 @@ private:
   D3DKMT_HANDLE local_kmt_ = 0;
   D3DKMT_HANDLE global_kmt_ = 0;
 
+  static UINT
+  DebugDescHeight(const typename tag_texture::DESC1 &desc) {
+    if constexpr (std::is_same_v<typename tag_texture::DESC1, D3D11_TEXTURE1D_DESC>) {
+      return 1;
+    } else {
+      return desc.Height;
+    }
+  }
+
+  static UINT
+  DebugDescDepth(const typename tag_texture::DESC1 &desc) {
+    if constexpr (std::is_same_v<typename tag_texture::DESC1, D3D11_TEXTURE3D_DESC1>) {
+      return desc.Depth;
+    } else {
+      return 1;
+    }
+  }
+
+  static UINT
+  DebugDescArraySize(const typename tag_texture::DESC1 &desc) {
+    if constexpr (std::is_same_v<typename tag_texture::DESC1, D3D11_TEXTURE3D_DESC1>) {
+      return 1;
+    } else {
+      return desc.ArraySize;
+    }
+  }
+
+  static UINT
+  DebugDescSampleCount(const typename tag_texture::DESC1 &desc) {
+    if constexpr (std::is_same_v<typename tag_texture::DESC1, D3D11_TEXTURE2D_DESC1>) {
+      return desc.SampleDesc.Count;
+    } else {
+      return 1;
+    }
+  }
+
+  static UINT
+  DebugDescSampleQuality(const typename tag_texture::DESC1 &desc) {
+    if constexpr (std::is_same_v<typename tag_texture::DESC1, D3D11_TEXTURE2D_DESC1>) {
+      return desc.SampleDesc.Quality;
+    } else {
+      return 0;
+    }
+  }
+
+  void
+  LogRenderTargetViewFailure(const char *reason, const D3D11_RENDER_TARGET_VIEW_DESC1 &viewDesc) const {
+    WARN(
+        "CreateRenderTargetView: ", reason,
+        " resource=", reinterpret_cast<const void *>(this),
+        " dimension=", uint32_t(tag_texture::dimension),
+        " resource_format=", uint32_t(this->desc.Format),
+        " view_format=", uint32_t(viewDesc.Format),
+        " view_dimension=", uint32_t(viewDesc.ViewDimension),
+        " bind_flags=", this->desc.BindFlags,
+        " metal_usage=", uint32_t(this->texture_->usage()),
+        " usage=", uint32_t(this->desc.Usage),
+        " cpu_access=", this->desc.CPUAccessFlags,
+        " misc_flags=", this->desc.MiscFlags,
+        " size=", this->desc.Width, "x", DebugDescHeight(this->desc), "x", DebugDescDepth(this->desc),
+        " array_size=", DebugDescArraySize(this->desc),
+        " mip_levels=", this->desc.MipLevels,
+        " sample=", DebugDescSampleCount(this->desc), ":", DebugDescSampleQuality(this->desc)
+    );
+  }
+
   using SRVBase =
       TResourceViewBase<tag_shader_resource_view<DeviceTexture<tag_texture>>>;
   class TextureSRV : public SRVBase {
@@ -67,7 +133,9 @@ private:
     ) :
         RTVBase(pDesc, pResource, pDevice) {
       this->texture_ = pResource->texture_.ptr();
-      this->view_id_ = this->texture_->createView(descriptor);
+      auto rtv_descriptor = descriptor;
+      rtv_descriptor.intendedUsage = WMTTextureUsageRenderTarget;
+      this->view_id_ = this->texture_->createView(rtv_descriptor);
       this->format_ = view_format;
       this->pass_desc_ = mtl_rtv_desc;
       this->subset_ = ResourceSubsetState(
@@ -88,7 +156,9 @@ private:
     ) :
         DSVBase(pDesc, pResource, pDevice) {
       this->texture_ = pResource->texture_.ptr();
-      this->view_id_ = this->texture_->createView(descriptor);
+      auto dsv_descriptor = descriptor;
+      dsv_descriptor.intendedUsage = WMTTextureUsageRenderTarget;
+      this->view_id_ = this->texture_->createView(dsv_descriptor);
       this->format_ = view_format;
       this->pass_desc_ = attachment_desc;
       this->renamable_ = pResource->renamable_.ptr();
@@ -147,6 +217,10 @@ public:
                                                     &finalDesc))) {
       return E_INVALIDARG;
     }
+    if (!(this->desc.BindFlags & D3D11_BIND_RENDER_TARGET)) {
+      LogRenderTargetViewFailure("resource missing D3D11_BIND_RENDER_TARGET", finalDesc);
+      return E_INVALIDARG;
+    }
     TextureViewDescriptor descriptor;
     uint32_t arraySize;
     if constexpr (std::is_same_v<typename tag_texture::DESC1, D3D11_TEXTURE3D_DESC1>) {
@@ -159,6 +233,10 @@ public:
             this->m_parent, this->desc.MipLevels, arraySize, this->texture_.ptr(), finalDesc,
             attachment_desc, descriptor
         ))) {
+      return E_FAIL;
+    }
+    if (!(this->texture_->usage() & WMTTextureUsageRenderTarget)) {
+      LogRenderTargetViewFailure("texture usage missing WMTTextureUsageRenderTarget", finalDesc);
       return E_FAIL;
     }
     if (!ppView) {

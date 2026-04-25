@@ -41,6 +41,8 @@ struct BufferResourceHandle {
   uint32_t StructureStride; // 0 if not structured
   Swizzle Swizzle;
   bool GlobalCoherent;
+  bool ThreadgroupMemory;
+  uint32_t ElementCount; // only valid for threadgroup memory
 };
 
 struct AtomicBufferResourceHandle {
@@ -49,6 +51,8 @@ struct AtomicBufferResourceHandle {
   uint32_t StructureStride; // 0 if not structured
   mask_t Mask;
   bool GlobalCoherent;
+  bool ThreadgroupMemory;
+  uint32_t ElementCount; // only valid for threadgroup memory
 };
 
 struct UAVCounterHandle {
@@ -480,6 +484,8 @@ public:
   llvm::Value * CreateGEPInt32WithBoundCheck(BufferResourceHandle &Buffer, llvm::Value* Index);
 
   llvm::Value * CreateGEPInt32WithBoundCheck(AtomicBufferResourceHandle &Buffer, llvm::Value* Index);
+
+  llvm::Value * CreateBufferLoadInt32(BufferResourceHandle &Buffer, llvm::Value *Index, bool Volatile);
 
   [[nodiscard]]
   std::unique_ptr<llvm::IRBuilder<>::FastMathFlagGuard> UseFastMath(bool OptOut);

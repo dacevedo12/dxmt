@@ -5,11 +5,67 @@
 #include "dxmt_format.hpp"
 #include "dxmt_occlusion_query.hpp"
 #include "dxmt_presenter.hpp"
+#include "util_env.hpp"
+#include "util_string.hpp"
 #include "wsi_platform.hpp"
+#include <atomic>
 #include <cstdint>
 #include <cfloat>
+#include <cstdlib>
+#include <cstring>
+#include <string_view>
 
 namespace dxmt {
+
+static bool
+ResolveRenderPassColorAttachment(
+    const char *message, unsigned slot, const TextureViewRef &attachment, WMT::Texture &resolved_texture
+) {
+  if (!attachment)
+    return true;
+
+  auto allocation = attachment->allocation;
+  auto texture = allocation ? allocation->descriptor : nullptr;
+  auto actual_texture = attachment.texture();
+  if (!actual_texture) {
+    WARN(message, " slot=", slot, " view=", uint64_t(attachment->key), " reason=missing Metal texture");
+    return false;
+  }
+
+  auto actual_usage = actual_texture.usage();
+  if (actual_usage & WMTTextureUsageRenderTarget) {
+    resolved_texture = actual_texture;
+    return true;
+  }
+
+  if (!texture) {
+    WARN(
+        message,
+        " slot=", slot,
+        " actual_usage=", uint32_t(actual_usage),
+        " view=", uint64_t(attachment->key),
+        " reason=missing texture descriptor"
+    );
+    return false;
+  }
+
+  auto usage = texture->usage();
+  WARN(
+      message,
+      " slot=", slot,
+      " descriptor_usage=", uint32_t(usage),
+      " actual_usage=", uint32_t(actual_usage),
+      " texture=", reinterpret_cast<const void *>(texture),
+      " view=", uint64_t(attachment->key),
+      " format=", uint32_t(texture->pixelFormat()),
+      " type=", uint32_t(texture->textureType()),
+      " size=", texture->width(), "x", texture->height(), "x", texture->depth(),
+      " array_size=", texture->arrayLength(),
+      " mip_levels=", texture->miplevelCount(),
+      " sample_count=", texture->sampleCount()
+  );
+  return false;
+}
 
 ArgumentEncodingContext::ArgumentEncodingContext(CommandQueue &queue, WMT::Device device, InternalCommandLibrary &lib) :
     emulated_cmd(device, lib, *this),
@@ -203,34 +259,34 @@ ArgumentEncodingContext::encodeConstantBuffers(const MTL_SHADER_REFLECTION *refl
 };
 
 template void ArgumentEncodingContext::encodeShaderResources<PipelineStage::Vertex, PipelineKind::Ordinary>(
-    const MTL_SHADER_REFLECTION *reflection, const MTL_SM50_SHADER_ARGUMENT *arguments, uint64_t argument_buffer_offset
+    const MTL_SHADER_REFLECTION *reflection, const MTL_SM50_SHADER_ARGUMENT *arguments, uint64_t argument_buffer_offset, const std::string &shader_hash, uint64_t demote_msaa_srv_mask_lo, uint64_t demote_msaa_srv_mask_hi
 );
 template void ArgumentEncodingContext::encodeShaderResources<PipelineStage::Pixel, PipelineKind::Ordinary>(
-    const MTL_SHADER_REFLECTION *reflection, const MTL_SM50_SHADER_ARGUMENT *arguments, uint64_t argument_buffer_offset
+    const MTL_SHADER_REFLECTION *reflection, const MTL_SM50_SHADER_ARGUMENT *arguments, uint64_t argument_buffer_offset, const std::string &shader_hash, uint64_t demote_msaa_srv_mask_lo, uint64_t demote_msaa_srv_mask_hi
 );
 template void ArgumentEncodingContext::encodeShaderResources<PipelineStage::Vertex, PipelineKind::Tessellation>(
-    const MTL_SHADER_REFLECTION *reflection, const MTL_SM50_SHADER_ARGUMENT *arguments, uint64_t argument_buffer_offset
+    const MTL_SHADER_REFLECTION *reflection, const MTL_SM50_SHADER_ARGUMENT *arguments, uint64_t argument_buffer_offset, const std::string &shader_hash, uint64_t demote_msaa_srv_mask_lo, uint64_t demote_msaa_srv_mask_hi
 );
 template void ArgumentEncodingContext::encodeShaderResources<PipelineStage::Pixel, PipelineKind::Tessellation>(
-    const MTL_SHADER_REFLECTION *reflection, const MTL_SM50_SHADER_ARGUMENT *arguments, uint64_t argument_buffer_offset
+    const MTL_SHADER_REFLECTION *reflection, const MTL_SM50_SHADER_ARGUMENT *arguments, uint64_t argument_buffer_offset, const std::string &shader_hash, uint64_t demote_msaa_srv_mask_lo, uint64_t demote_msaa_srv_mask_hi
 );
 template void ArgumentEncodingContext::encodeShaderResources<PipelineStage::Hull, PipelineKind::Tessellation>(
-    const MTL_SHADER_REFLECTION *reflection, const MTL_SM50_SHADER_ARGUMENT *arguments, uint64_t argument_buffer_offset
+    const MTL_SHADER_REFLECTION *reflection, const MTL_SM50_SHADER_ARGUMENT *arguments, uint64_t argument_buffer_offset, const std::string &shader_hash, uint64_t demote_msaa_srv_mask_lo, uint64_t demote_msaa_srv_mask_hi
 );
 template void ArgumentEncodingContext::encodeShaderResources<PipelineStage::Domain, PipelineKind::Tessellation>(
-    const MTL_SHADER_REFLECTION *reflection, const MTL_SM50_SHADER_ARGUMENT *arguments, uint64_t argument_buffer_offset
+    const MTL_SHADER_REFLECTION *reflection, const MTL_SM50_SHADER_ARGUMENT *arguments, uint64_t argument_buffer_offset, const std::string &shader_hash, uint64_t demote_msaa_srv_mask_lo, uint64_t demote_msaa_srv_mask_hi
 );
 template void ArgumentEncodingContext::encodeShaderResources<PipelineStage::Compute, PipelineKind::Ordinary>(
-    const MTL_SHADER_REFLECTION *reflection, const MTL_SM50_SHADER_ARGUMENT *arguments, uint64_t argument_buffer_offset
+    const MTL_SHADER_REFLECTION *reflection, const MTL_SM50_SHADER_ARGUMENT *arguments, uint64_t argument_buffer_offset, const std::string &shader_hash, uint64_t demote_msaa_srv_mask_lo, uint64_t demote_msaa_srv_mask_hi
 );
 template void ArgumentEncodingContext::encodeShaderResources<PipelineStage::Vertex, PipelineKind::Geometry>(
-    const MTL_SHADER_REFLECTION *reflection, const MTL_SM50_SHADER_ARGUMENT *arguments, uint64_t argument_buffer_offset
+    const MTL_SHADER_REFLECTION *reflection, const MTL_SM50_SHADER_ARGUMENT *arguments, uint64_t argument_buffer_offset, const std::string &shader_hash, uint64_t demote_msaa_srv_mask_lo, uint64_t demote_msaa_srv_mask_hi
 );
 template void ArgumentEncodingContext::encodeShaderResources<PipelineStage::Geometry, PipelineKind::Geometry>(
-    const MTL_SHADER_REFLECTION *reflection, const MTL_SM50_SHADER_ARGUMENT *arguments, uint64_t argument_buffer_offset
+    const MTL_SHADER_REFLECTION *reflection, const MTL_SM50_SHADER_ARGUMENT *arguments, uint64_t argument_buffer_offset, const std::string &shader_hash, uint64_t demote_msaa_srv_mask_lo, uint64_t demote_msaa_srv_mask_hi
 );
 template void ArgumentEncodingContext::encodeShaderResources<PipelineStage::Pixel, PipelineKind::Geometry>(
-    const MTL_SHADER_REFLECTION *reflection, const MTL_SM50_SHADER_ARGUMENT *arguments, uint64_t argument_buffer_offset
+    const MTL_SHADER_REFLECTION *reflection, const MTL_SM50_SHADER_ARGUMENT *arguments, uint64_t argument_buffer_offset, const std::string &shader_hash, uint64_t demote_msaa_srv_mask_lo, uint64_t demote_msaa_srv_mask_hi
 );
 
 inline uint64_t
@@ -238,18 +294,363 @@ TextureMetadata(uint32_t array_length, float min_lod) {
   return ((uint64_t)array_length << 32) | (uint64_t)std::bit_cast<uint32_t>(min_lod);
 }
 
+static constexpr uint32_t kDummyTextureKindCount = 7;
+static constexpr uint32_t kDummyTextureFormatCount = 4;
+
+enum class DummyTextureKind : uint32_t {
+  Texture2D = 0,
+  Texture2DArray = 1,
+  Texture2DMultisampled = 2,
+  Texture2DMultisampledArray = 3,
+  Texture3D = 4,
+  TextureCube = 5,
+  TextureCubeArray = 6,
+};
+
+enum class DummyTextureFormat : uint32_t {
+  Float = 0,
+  Uint = 1,
+  Sint = 2,
+  Depth = 3,
+};
+
+static DummyTextureKind
+DummyTextureKindForArgument(const MTL_SM50_SHADER_ARGUMENT &arg) {
+  bool is_array = arg.Flags & MTL_SM50_SHADER_ARGUMENT_TEXTURE_ARRAY;
+  if (arg.Flags & MTL_SM50_SHADER_ARGUMENT_TEXTURE_CUBE)
+    return is_array ? DummyTextureKind::TextureCubeArray : DummyTextureKind::TextureCube;
+  if (arg.Flags & MTL_SM50_SHADER_ARGUMENT_TEXTURE_3D)
+    return DummyTextureKind::Texture3D;
+  if (arg.Flags & MTL_SM50_SHADER_ARGUMENT_TEXTURE_MULTISAMPLED)
+    return is_array ? DummyTextureKind::Texture2DMultisampledArray : DummyTextureKind::Texture2DMultisampled;
+  return is_array ? DummyTextureKind::Texture2DArray : DummyTextureKind::Texture2D;
+}
+
+static DummyTextureFormat
+DummyTextureFormatForArgument(const MTL_SM50_SHADER_ARGUMENT &arg) {
+  if (arg.Flags & MTL_SM50_SHADER_ARGUMENT_TEXTURE_DEPTH)
+    return DummyTextureFormat::Depth;
+  if (arg.Flags & MTL_SM50_SHADER_ARGUMENT_TEXTURE_SINT)
+    return DummyTextureFormat::Sint;
+  if (arg.Flags & MTL_SM50_SHADER_ARGUMENT_TEXTURE_UINT)
+    return DummyTextureFormat::Uint;
+  return DummyTextureFormat::Float;
+}
+
+static uint32_t
+DummyTextureIndex(DummyTextureKind kind, DummyTextureFormat format) {
+  return uint32_t(format) * kDummyTextureKindCount + uint32_t(kind);
+}
+
+static WMTPixelFormat
+DummyTexturePixelFormat(DummyTextureFormat format) {
+  switch (format) {
+  case DummyTextureFormat::Uint:
+    return WMTPixelFormatRGBA32Uint;
+  case DummyTextureFormat::Sint:
+    return WMTPixelFormatRGBA32Sint;
+  case DummyTextureFormat::Depth:
+    return WMTPixelFormatDepth32Float;
+  case DummyTextureFormat::Float:
+  default:
+    return WMTPixelFormatRGBA32Float;
+  }
+}
+
+static WMTTextureType
+DummyTextureType(DummyTextureKind kind) {
+  switch (kind) {
+  case DummyTextureKind::Texture2DArray:
+    return WMTTextureType2DArray;
+  case DummyTextureKind::Texture2DMultisampled:
+    return WMTTextureType2DMultisample;
+  case DummyTextureKind::Texture2DMultisampledArray:
+    return WMTTextureType2DMultisampleArray;
+  case DummyTextureKind::Texture3D:
+    return WMTTextureType3D;
+  case DummyTextureKind::TextureCube:
+    return WMTTextureTypeCube;
+  case DummyTextureKind::TextureCubeArray:
+    return WMTTextureTypeCubeArray;
+  case DummyTextureKind::Texture2D:
+  default:
+    return WMTTextureType2D;
+  }
+}
+
+static uint32_t
+DummyTextureArrayLength(DummyTextureKind kind) {
+  switch (kind) {
+  case DummyTextureKind::Texture2DArray:
+  case DummyTextureKind::Texture2DMultisampledArray:
+  case DummyTextureKind::TextureCubeArray:
+    return 1;
+  default:
+    return 1;
+  }
+}
+
+static bool
+DebugEnabledEnv(const char *name) {
+  auto value = env::getEnvVar(name);
+  return value == "1" || value == "true" || value == "yes" || value == "trace";
+}
+
+static bool
+DebugShaderHashSelected(const std::string &shader_hash) {
+  auto filters = env::getEnvVar("DXMT_DIAG_SHADER_HASHES");
+  if (filters.empty() || filters == "all")
+    return true;
+
+  for (auto filter : str::split(filters, ",; ")) {
+    if (filter == "all")
+      return true;
+    if (shader_hash == filter)
+      return true;
+    if (shader_hash.starts_with(filter))
+      return true;
+  }
+
+  return false;
+}
+
+static bool
+DebugShouldLogBinding(const std::string &shader_hash) {
+  return DebugEnabledEnv("DXMT_DIAG_BINDINGS") && DebugShaderHashSelected(shader_hash);
+}
+
+static uint32_t
+DebugBindingLogLimit() {
+  auto value = env::getEnvVar("DXMT_DIAG_BINDING_LIMIT");
+  if (value.empty())
+    return 4096;
+
+  char *end = nullptr;
+  auto parsed = std::strtoul(value.c_str(), &end, 10);
+  if (!end || *end != '\0' || parsed == 0)
+    return 4096;
+
+  return uint32_t(std::min<unsigned long>(parsed, 100000));
+}
+
+static const char *
+DebugPipelineStageName(PipelineStage stage) {
+  switch (stage) {
+  case PipelineStage::Vertex:
+    return "VS";
+  case PipelineStage::Pixel:
+    return "PS";
+  case PipelineStage::Geometry:
+    return "GS";
+  case PipelineStage::Hull:
+    return "HS";
+  case PipelineStage::Domain:
+    return "DS";
+  case PipelineStage::Compute:
+    return "CS";
+  }
+  return "?";
+}
+
+static const char *
+DebugPipelineKindName(PipelineKind kind) {
+  switch (kind) {
+  case PipelineKind::Ordinary:
+    return "ordinary";
+  case PipelineKind::Tessellation:
+    return "tessellation";
+  case PipelineKind::Geometry:
+    return "geometry";
+  }
+  return "?";
+}
+
+static const char *
+DebugTextureTypeName(WMTTextureType type) {
+  switch (type) {
+  case WMTTextureType1D:
+    return "1D";
+  case WMTTextureType1DArray:
+    return "1DArray";
+  case WMTTextureType2D:
+    return "2D";
+  case WMTTextureType2DArray:
+    return "2DArray";
+  case WMTTextureType2DMultisample:
+    return "2DMS";
+  case WMTTextureType2DMultisampleArray:
+    return "2DMSArray";
+  case WMTTextureTypeCube:
+    return "Cube";
+  case WMTTextureTypeCubeArray:
+    return "CubeArray";
+  case WMTTextureType3D:
+    return "3D";
+  case WMTTextureTypeTextureBuffer:
+    return "TextureBuffer";
+  default:
+    return "Unknown";
+  }
+}
+
+static bool
+DebugTextureTypeIsMultisampled(WMTTextureType type) {
+  return type == WMTTextureType2DMultisample || type == WMTTextureType2DMultisampleArray;
+}
+
+template <PipelineStage stage, PipelineKind kind>
+static void
+DebugLogNullShaderBinding(
+    const char *binding_type, const char *expected, const std::string &shader_hash,
+    const MTL_SM50_SHADER_ARGUMENT &arg, bool has_buffer_binding, bool has_texture_binding,
+    bool has_counter_binding, uint64_t encoder_id, const char *action = "zero"
+) {
+  if (!DebugShouldLogBinding(shader_hash))
+    return;
+
+  static std::atomic<uint32_t> log_count = 0;
+  auto index = log_count.fetch_add(1, std::memory_order_relaxed);
+  if (index >= DebugBindingLogLimit())
+    return;
+
+  WARN(
+      "DXMT diagnostic: null shader binding",
+      " stage=", DebugPipelineStageName(stage),
+      " kind=", DebugPipelineKindName(kind),
+      " shader=", shader_hash,
+      " encoder=", encoder_id,
+      " binding=", binding_type,
+      " expected=", expected,
+      " slot=", arg.SM50BindingSlot,
+      " arg_index=", GetArgumentIndex(arg.Type, arg.SM50BindingSlot),
+      " struct_qword=", arg.StructurePtrOffset,
+      " flags=0x", std::hex, arg.Flags, std::dec,
+      " has_buffer=", has_buffer_binding,
+      " has_texture=", has_texture_binding,
+      " has_counter=", has_counter_binding,
+      " action=", action
+  );
+}
+
+template <PipelineStage stage, PipelineKind kind>
+static void
+DebugLogTextureBindingMismatch(
+    const std::string &shader_hash, const MTL_SM50_SHADER_ARGUMENT &arg, Texture *texture, TextureViewKey view_id,
+    uint64_t encoder_id
+) {
+  if (!DebugShouldLogBinding(shader_hash))
+    return;
+
+  auto actual_type = texture->textureType(view_id);
+  bool shader_expects_ms = arg.Flags & MTL_SM50_SHADER_ARGUMENT_TEXTURE_MULTISAMPLED;
+  bool actual_is_ms = DebugTextureTypeIsMultisampled(actual_type);
+  if (shader_expects_ms == actual_is_ms)
+    return;
+
+  static std::atomic<uint32_t> log_count = 0;
+  auto index = log_count.fetch_add(1, std::memory_order_relaxed);
+  if (index >= DebugBindingLogLimit())
+    return;
+
+  WARN(
+      "DXMT diagnostic: texture binding type mismatch",
+      " stage=", DebugPipelineStageName(stage),
+      " kind=", DebugPipelineKindName(kind),
+      " shader=", shader_hash,
+      " encoder=", encoder_id,
+      " binding=SRV",
+      " slot=", arg.SM50BindingSlot,
+      " arg_index=", GetArgumentIndex(arg.Type, arg.SM50BindingSlot),
+      " struct_qword=", arg.StructurePtrOffset,
+      " flags=0x", std::hex, arg.Flags, std::dec,
+      " shader_expects_ms=", shader_expects_ms,
+      " view_is_ms=", actual_is_ms,
+      " view=", uint64_t(view_id),
+      " view_type=", DebugTextureTypeName(actual_type), "(", uint32_t(actual_type), ")",
+      " resource_type=", DebugTextureTypeName(texture->textureType()), "(", uint32_t(texture->textureType()), ")",
+      " sample_count=", texture->sampleCount(),
+      " format=", uint32_t(texture->pixelFormat(view_id)),
+      " size=", texture->width(view_id), "x", texture->height(view_id),
+      " array_size=", texture->arrayLength(view_id),
+      " action=keep_original"
+  );
+}
+
+DummyTextureBinding &
+ArgumentEncodingContext::dummySRVTexture(const MTL_SM50_SHADER_ARGUMENT &arg) {
+  auto kind = DummyTextureKindForArgument(arg);
+  auto format = DummyTextureFormatForArgument(arg);
+  auto &binding = dummy_srv_textures_[DummyTextureIndex(kind, format)];
+  if (binding.texture)
+    return binding;
+
+  WMTTextureInfo info = {};
+  info.type = DummyTextureType(kind);
+  info.pixel_format = DummyTexturePixelFormat(format);
+  info.usage = WMTTextureUsageShaderRead;
+  info.options = WMTResourceStorageModeShared | WMTResourceHazardTrackingModeUntracked;
+  info.width = 1;
+  info.height = 1;
+  info.depth = 1;
+  info.mipmap_level_count = 1;
+  info.sample_count = (kind == DummyTextureKind::Texture2DMultisampled ||
+                       kind == DummyTextureKind::Texture2DMultisampledArray)
+                          ? 2
+                          : 1;
+  info.array_length = DummyTextureArrayLength(kind);
+
+  binding.texture = device_.newTexture(info);
+  binding.gpu_resource_id = info.gpu_resource_id;
+  binding.array_length = info.array_length;
+  if (!binding.texture) {
+    WARN(
+        "DXMT diagnostic: failed to create dummy SRV texture",
+        " type=", uint32_t(info.type),
+        " format=", uint32_t(info.pixel_format),
+        " sample_count=", uint32_t(info.sample_count)
+    );
+    return binding;
+  }
+
+  if (format != DummyTextureFormat::Depth && info.sample_count == 1) {
+    std::array<uint32_t, 4> zero = {};
+    uint32_t slices = info.type == WMTTextureTypeCube ? 6 : info.type == WMTTextureTypeCubeArray ? 6 * info.array_length
+                                                                                                 : info.array_length;
+    for (uint32_t slice = 0; slice < slices; slice++) {
+      binding.texture.replaceRegion({0, 0, 0}, {1, 1, 1}, 0, slice, zero.data(), sizeof(zero), sizeof(zero));
+    }
+  }
+
+  return binding;
+}
+
 template <PipelineStage stage, PipelineKind kind>
 void
 ArgumentEncodingContext::encodeShaderResources(
-    const MTL_SHADER_REFLECTION *reflection, const MTL_SM50_SHADER_ARGUMENT *arguments, uint64_t offset
+    const MTL_SHADER_REFLECTION *reflection, const MTL_SM50_SHADER_ARGUMENT *arguments, uint64_t offset,
+    const std::string &shader_hash, uint64_t demote_msaa_srv_mask_lo, uint64_t demote_msaa_srv_mask_hi
 ) {
   auto BindingCount = reflection->NumArguments;
   uint64_t *encoded_buffer = getMappedArgumentBuffer<uint64_t, stage == PipelineStage::Compute>(offset);
 
   auto &UAVBindingSet = stage == PipelineStage::Compute ? cs_uav_ : om_uav_;
+  auto encoder_id = currentEncoderId();
 
   for (unsigned i = 0; i < BindingCount; i++) {
-    auto &arg = arguments[i];
+    auto arg = arguments[i];
+    if constexpr (stage == PipelineStage::Pixel) {
+      if (arg.Type == SM50BindingType::SRV && arg.SM50BindingSlot < 128) {
+        bool demote_msaa =
+            arg.SM50BindingSlot < 64
+                ? (demote_msaa_srv_mask_lo & (uint64_t(1) << arg.SM50BindingSlot))
+                : (demote_msaa_srv_mask_hi & (uint64_t(1) << (arg.SM50BindingSlot - 64)));
+        if (demote_msaa) {
+          arg.Flags = MTL_SM50_SHADER_ARGUMENT_FLAG(
+              arg.Flags & ~MTL_SM50_SHADER_ARGUMENT_TEXTURE_MULTISAMPLED
+          );
+        }
+      }
+    }
     switch (arg.Type) {
     case SM50BindingType::ConstantBuffer: {
       DXMT_UNREACHABLE
@@ -279,6 +680,9 @@ ArgumentEncodingContext::encodeShaderResources(
           encoded_buffer[arg.StructurePtrOffset + 1] = srv.slice.byteLength;
           makeResident<stage, kind>(srv.buffer.ptr());
         } else {
+          DebugLogNullShaderBinding<stage, kind>(
+              "SRV", "buffer", shader_hash, arg, bool(srv.buffer.ptr()), bool(srv.texture.ptr()), false, encoder_id
+          );
           encoded_buffer[arg.StructurePtrOffset] = 0;
           encoded_buffer[arg.StructurePtrOffset + 1] = 0;
         }
@@ -293,13 +697,25 @@ ArgumentEncodingContext::encodeShaderResources(
         } else if (srv.texture.ptr()) {
           assert(arg.Flags & MTL_SM50_SHADER_ARGUMENT_TEXTURE_MINLOD_CLAMP);
           auto viewIdChecked = srv.texture->checkViewUseArray(srv.viewId, arg.Flags & MTL_SM50_SHADER_ARGUMENT_TEXTURE_ARRAY);
+          DebugLogTextureBindingMismatch<stage, kind>(shader_hash, arg, srv.texture.ptr(), viewIdChecked, encoder_id);
           encoded_buffer[arg.StructurePtrOffset] =
               access<stage>(srv.texture, viewIdChecked, ResourceAccess::Read).gpuResourceID;
           encoded_buffer[arg.StructurePtrOffset + 1] = TextureMetadata(srv.texture->arrayLength(viewIdChecked), 0);
           makeResident<stage, kind>(srv.texture.ptr(), viewIdChecked);
         } else {
-          encoded_buffer[arg.StructurePtrOffset] = 0;
-          encoded_buffer[arg.StructurePtrOffset + 1] = 0;
+          auto &dummy_texture = dummySRVTexture(arg);
+          DebugLogNullShaderBinding<stage, kind>(
+              "SRV", "texture", shader_hash, arg, bool(srv.buffer.ptr()), bool(srv.texture.ptr()), false, encoder_id,
+              dummy_texture.texture ? "dummy_texture" : "zero"
+          );
+          if (dummy_texture.texture) {
+            encoded_buffer[arg.StructurePtrOffset] = dummy_texture.gpu_resource_id;
+            encoded_buffer[arg.StructurePtrOffset + 1] = TextureMetadata(dummy_texture.array_length, 0);
+            makeResident<stage, kind>(dummy_texture.texture, GetResidencyMask<kind>(stage, true, false));
+          } else {
+            encoded_buffer[arg.StructurePtrOffset] = 0;
+            encoded_buffer[arg.StructurePtrOffset + 1] = 0;
+          }
         }
       }
       if (arg.Flags & MTL_SM50_SHADER_ARGUMENT_UAV_COUNTER) {
@@ -319,6 +735,10 @@ ArgumentEncodingContext::encodeShaderResources(
           encoded_buffer[arg.StructurePtrOffset + 1] = uav.slice.byteLength;
           makeResident<stage, kind>(uav.buffer.ptr(), read, write);
         } else {
+          DebugLogNullShaderBinding<stage, kind>(
+              "UAV", "buffer", shader_hash, arg, bool(uav.buffer.ptr()), bool(uav.texture.ptr()), bool(uav.counter.ptr()),
+              encoder_id
+          );
           encoded_buffer[arg.StructurePtrOffset] = 0;
           encoded_buffer[arg.StructurePtrOffset + 1] = 0;
         }
@@ -337,6 +757,10 @@ ArgumentEncodingContext::encodeShaderResources(
           encoded_buffer[arg.StructurePtrOffset + 1] = TextureMetadata(uav.texture->arrayLength(viewIdChecked), 0);
           makeResident<stage, kind>(uav.texture.ptr(), viewIdChecked, read, write);
         } else {
+          DebugLogNullShaderBinding<stage, kind>(
+              "UAV", "texture", shader_hash, arg, bool(uav.buffer.ptr()), bool(uav.texture.ptr()), bool(uav.counter.ptr()),
+              encoder_id
+          );
           encoded_buffer[arg.StructurePtrOffset] = 0;
           encoded_buffer[arg.StructurePtrOffset + 1] = 0;
         }
@@ -347,6 +771,10 @@ ArgumentEncodingContext::encodeShaderResources(
           encoded_buffer[arg.StructurePtrOffset + 2] = counter_alloc->gpuAddress() + offset;
           makeResident<stage, kind>(uav.counter.ptr(), true, true);
         } else {
+          DebugLogNullShaderBinding<stage, kind>(
+              "UAV_COUNTER", "counter", shader_hash, arg, bool(uav.buffer.ptr()), bool(uav.texture.ptr()),
+              bool(uav.counter.ptr()), encoder_id
+          );
           /*
            * potentially cause gpu pagefault, even providing a dummy buffer doesn't improve since the returned
            * counter value is likely to be used as an index to another read/write operation.
@@ -844,13 +1272,22 @@ ArgumentEncodingContext::flushCommands(WMT::CommandBuffer cmdbuf, uint64_t seqId
       auto data = static_cast<RenderEncoderData *>(current);
       WMTRenderPassInfo render_pass_info;
       WMT::InitializeRenderPassInfo(render_pass_info);
+      bool valid_render_pass = true;
       {
         for (unsigned i = 0; i < std::size(render_pass_info.colors); i++) {
           auto &color_data = data->colors[i];
           if (!color_data.attachment)
             continue;
+          WMT::Texture color_texture;
+          if (!ResolveRenderPassColorAttachment(
+                  "RenderPass guard: color attachment missing WMTTextureUsageRenderTarget", i, color_data.attachment,
+                  color_texture
+              )) {
+            valid_render_pass = false;
+            continue;
+          }
           auto &color_info = render_pass_info.colors[i];
-          color_info.texture = color_data.attachment.texture();
+          color_info.texture = color_texture;
           color_info.load_action = color_data.load_action;
           color_info.store_action = color_data.store_action;
           color_info.level = color_data.level;
@@ -892,6 +1329,11 @@ ArgumentEncodingContext::flushCommands(WMT::CommandBuffer cmdbuf, uint64_t seqId
       if (data->use_visibility_result) {
         assert(readbacks.visibility);
         render_pass_info.visibility_buffer = readbacks.visibility->visibility_result_heap;
+      }
+      if (!valid_render_pass) {
+        WARN("RenderPass guard: skipped unsafe render pass encoder=", data->id);
+        data->~RenderEncoderData();
+        break;
       }
       auto gpu_buffer_ = data->allocated_argbuf;
       auto encoder = cmdbuf.renderCommandEncoder(render_pass_info);
@@ -1056,8 +1498,17 @@ ArgumentEncodingContext::flushCommands(WMT::CommandBuffer cmdbuf, uint64_t seqId
           info.render_target_width = data->width;
           info.render_target_height = data->height;
         } else {
+          WMT::Texture color_texture;
+          if (!ResolveRenderPassColorAttachment(
+                  "ClearPass guard: color attachment missing WMTTextureUsageRenderTarget", 0, data->attachment,
+                  color_texture
+              )) {
+            WARN("ClearPass guard: skipped unsafe clear pass encoder=", data->id);
+            data->~ClearEncoderData();
+            break;
+          }
           info.colors[0].clear_color = data->color;
-          info.colors[0].texture = data->attachment.texture();
+          info.colors[0].texture = color_texture;
           info.colors[0].load_action = WMTLoadActionClear;
           info.colors[0].store_action = WMTStoreActionStore;
         }
@@ -1076,7 +1527,16 @@ ArgumentEncodingContext::flushCommands(WMT::CommandBuffer cmdbuf, uint64_t seqId
       {
         WMTRenderPassInfo info;
         WMT::InitializeRenderPassInfo(info);
-        info.colors[0].texture = data->src.texture();
+        WMT::Texture src_texture;
+        if (!ResolveRenderPassColorAttachment(
+                "ResolvePass guard: source attachment missing WMTTextureUsageRenderTarget", 0, data->src,
+                src_texture
+            )) {
+          WARN("ResolvePass guard: skipped unsafe resolve pass encoder=", data->id);
+          data->~ResolveEncoderData();
+          break;
+        }
+        info.colors[0].texture = src_texture;
         info.colors[0].load_action = WMTLoadActionLoad;
         info.colors[0].store_action = WMTStoreActionStoreAndMultisampleResolve;
         info.colors[0].resolve_texture = data->dst.texture();

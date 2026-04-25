@@ -506,7 +506,7 @@ Converter::LoadBuffer(const SrcOperandResource &SrcOp) {
     return {};
 
   return llvm::Optional<BufferResourceHandle>(
-      {res_handle.get(), md.get(), stride, SrcOp.read_swizzle, global_coherent && SupportsMemoryCoherency()}
+      {res_handle.get(), md.get(), stride, SrcOp.read_swizzle, global_coherent && SupportsMemoryCoherency(), false, 0}
   );
 }
 
@@ -527,7 +527,7 @@ Converter::LoadBuffer(const SrcOperandUAV &SrcOp) {
     return {};
 
   return llvm::Optional<BufferResourceHandle>(
-      {res_handle.get(), md.get(), stride, SrcOp.read_swizzle, global_coherent && SupportsMemoryCoherency()}
+      {res_handle.get(), md.get(), stride, SrcOp.read_swizzle, global_coherent && SupportsMemoryCoherency(), false, 0}
   );
 }
 
@@ -548,29 +548,35 @@ Converter::LoadBuffer(const AtomicDstOperandUAV &DstOp) {
     return {};
 
   return llvm::Optional<AtomicBufferResourceHandle>(
-      {res_handle.get(), md.get(), stride, DstOp.mask, global_coherent && SupportsMemoryCoherency()}
+      {res_handle.get(), md.get(), stride, DstOp.mask, global_coherent && SupportsMemoryCoherency(), false, 0}
   );
 }
 
 llvm::Optional<BufferResourceHandle>
 Converter::LoadBuffer(const SrcOperandTGSM &SrcOp) {
   auto [stride, tgsm_h] = res.tgsm_map[SrcOp.id];
+  auto array_type = llvm::cast<llvm::ArrayType>(tgsm_h->getValueType());
 
   llvm::Value *IntPtr = llvm::ConstantExpr::getInBoundsGetElementPtr(tgsm_h->getValueType(), tgsm_h, ir.getInt32(0));
 
   IntPtr = ir.CreatePointerCast(IntPtr, ir.getInt32Ty()->getPointerTo(tgsm_h->getAddressSpace()));
 
-  return llvm::Optional<BufferResourceHandle>({IntPtr, nullptr, stride, SrcOp.read_swizzle, false});
+  return llvm::Optional<BufferResourceHandle>(
+      {IntPtr, nullptr, stride, SrcOp.read_swizzle, false, true, static_cast<uint32_t>(array_type->getNumElements())}
+  );
 }
 llvm::Optional<AtomicBufferResourceHandle>
 Converter::LoadBuffer(const AtomicOperandTGSM &DstOp) {
   auto [stride, tgsm_h] = res.tgsm_map[DstOp.id];
+  auto array_type = llvm::cast<llvm::ArrayType>(tgsm_h->getValueType());
 
   llvm::Value *IntPtr = llvm::ConstantExpr::getInBoundsGetElementPtr(tgsm_h->getValueType(), tgsm_h, ir.getInt32(0));
 
   IntPtr = ir.CreatePointerCast(IntPtr, ir.getInt32Ty()->getPointerTo(tgsm_h->getAddressSpace()));
 
-  return llvm::Optional<AtomicBufferResourceHandle>({IntPtr, nullptr, stride, DstOp.mask, false});
+  return llvm::Optional<AtomicBufferResourceHandle>(
+      {IntPtr, nullptr, stride, DstOp.mask, false, true, static_cast<uint32_t>(array_type->getNumElements())}
+  );
 }
 
 llvm::Optional<UAVCounterHandle>
@@ -2262,17 +2268,13 @@ Converter::operator()(const InstLoadRaw &load) {
   auto Index = ir.CreateLShr(LoadOperand(load.src_byte_offset, kMaskComponentX), 2);
 
   if (auto Comp = ComponentFromScalarMask(Mask, Buf->Swizzle); Comp >= 0) {
-    auto Ptr = CreateGEPInt32WithBoundCheck(Buf.value(), ir.CreateAdd(Index, ir.getInt32(Comp)));
-    auto ValueInt = Buf->GlobalCoherent ? (llvm::Value *)air.CreateDeviceCoherentLoad(ir.getInt32Ty(), Ptr)
-                                        : (llvm::Value *)ir.CreateLoad(ir.getInt32Ty(), Ptr, Volatile);
+    auto ValueInt = CreateBufferLoadInt32(Buf.value(), ir.CreateAdd(Index, ir.getInt32(Comp)), Volatile);
     return StoreOperand(load.dst, MaskSwizzle(ValueInt, Mask));
   }
 
   llvm::Value *ValueVec = llvm::PoisonValue::get(air.getIntTy(4));
   for (auto [DstComp, _] : EnumerateComponents(MemoryAccessMask(Mask, Buf->Swizzle))) {
-    auto Ptr = CreateGEPInt32WithBoundCheck(Buf.value(), ir.CreateAdd(Index, ir.getInt32(DstComp)));
-    auto ValueInt = Buf->GlobalCoherent ? (llvm::Value *)air.CreateDeviceCoherentLoad(ir.getInt32Ty(), Ptr)
-                                        : (llvm::Value *)ir.CreateLoad(ir.getInt32Ty(), Ptr, Volatile);
+    auto ValueInt = CreateBufferLoadInt32(Buf.value(), ir.CreateAdd(Index, ir.getInt32(DstComp)), Volatile);
     ValueVec = ir.CreateInsertElement(ValueVec, ValueInt, DstComp);
   }
   StoreOperand(load.dst, MaskSwizzle(ValueVec, Mask, Buf->Swizzle));
@@ -2294,17 +2296,13 @@ Converter::operator()(const InstLoadStructured &load) {
   auto Index = ir.CreateAdd(IndexStruct, ir.CreateLShr(LoadOperand(load.src_byte_offset, kMaskComponentX), 2));
 
   if (auto Comp = ComponentFromScalarMask(Mask, Buf->Swizzle); Comp >= 0) {
-    auto Ptr = CreateGEPInt32WithBoundCheck(Buf.value(), ir.CreateAdd(Index, ir.getInt32(Comp)));
-    auto ValueInt = Buf->GlobalCoherent ? (llvm::Value *)air.CreateDeviceCoherentLoad(ir.getInt32Ty(), Ptr)
-                                        : (llvm::Value *)ir.CreateLoad(ir.getInt32Ty(), Ptr, Volatile);
+    auto ValueInt = CreateBufferLoadInt32(Buf.value(), ir.CreateAdd(Index, ir.getInt32(Comp)), Volatile);
     return StoreOperand(load.dst, MaskSwizzle(ValueInt, Mask));
   }
 
   llvm::Value *ValueVec = llvm::PoisonValue::get(air.getIntTy(4));
   for (auto [DstComp, _] : EnumerateComponents(MemoryAccessMask(Mask, Buf->Swizzle))) {
-    auto Ptr = CreateGEPInt32WithBoundCheck(Buf.value(), ir.CreateAdd(Index, ir.getInt32(DstComp)));
-    auto ValueInt = Buf->GlobalCoherent ? (llvm::Value *)air.CreateDeviceCoherentLoad(ir.getInt32Ty(), Ptr)
-                                        : (llvm::Value *)ir.CreateLoad(ir.getInt32Ty(), Ptr, Volatile);
+    auto ValueInt = CreateBufferLoadInt32(Buf.value(), ir.CreateAdd(Index, ir.getInt32(DstComp)), Volatile);
     ValueVec = ir.CreateInsertElement(ValueVec, ValueInt, DstComp);
   }
   StoreOperand(load.dst, MaskSwizzle(ValueVec, Mask, Buf->Swizzle));
@@ -2932,6 +2930,27 @@ Converter::CreateGEPInt32WithBoundCheck(AtomicBufferResourceHandle &Buffer, llvm
   return ir.CreateSelect(
       ir.CreateICmpULT(Index, ir.CreateLShr(ByteLength, 2)), Addr, llvm::Constant::getNullValue(Addr->getType())
   );
+}
+
+llvm::Value *
+Converter::CreateBufferLoadInt32(BufferResourceHandle &Buffer, llvm::Value *Index, bool Volatile) {
+  using namespace llvm::air;
+
+  if (!Buffer.ThreadgroupMemory) {
+    auto Ptr = CreateGEPInt32WithBoundCheck(Buffer, Index);
+    return Buffer.GlobalCoherent ? (llvm::Value *)air.CreateDeviceCoherentLoad(ir.getInt32Ty(), Ptr)
+                                 : (llvm::Value *)ir.CreateLoad(ir.getInt32Ty(), Ptr, Volatile);
+  }
+
+  if (!Buffer.ElementCount)
+    return ir.getInt32(0);
+
+  auto InBounds = ir.CreateICmpULT(Index, ir.getInt32(Buffer.ElementCount));
+  auto SafeIndex = ir.CreateSelect(InBounds, Index, ir.getInt32(0));
+  auto Ptr = ir.CreateGEP(ir.getInt32Ty(), Buffer.Pointer, {SafeIndex});
+  auto Value = ir.CreateLoad(ir.getInt32Ty(), Ptr, Volatile);
+
+  return ir.CreateSelect(InBounds, Value, ir.getInt32(0));
 }
 
 std::unique_ptr<llvm::IRBuilder<>::FastMathFlagGuard>

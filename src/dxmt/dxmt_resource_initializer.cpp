@@ -1,11 +1,35 @@
 #include "Metal.hpp"
 #include "dxmt_resource_initializer.hpp"
 #include "dxmt_format.hpp"
+#include "log/log.hpp"
 #include "util_math.hpp"
 #include <cstdint>
 #include <mutex>
 
 namespace dxmt {
+
+static bool
+ValidateInitializerRenderTargetAttachment(const WMTColorAttachmentInfo &attachment) {
+  if (!attachment.texture)
+    return true;
+
+  WMT::Texture texture{attachment.texture};
+  auto actual_usage = texture.usage();
+  if (actual_usage & WMTTextureUsageRenderTarget)
+    return true;
+
+  WARN(
+      "ResourceInitializer guard: color attachment missing WMTTextureUsageRenderTarget",
+      " actual_usage=", uint32_t(actual_usage),
+      " texture=", attachment.texture,
+      " level=", attachment.level,
+      " slice=", attachment.slice,
+      " depth_plane=", attachment.depth_plane,
+      " load_action=", uint32_t(attachment.load_action),
+      " store_action=", uint32_t(attachment.store_action)
+  );
+  return false;
+}
 
 #define ALLOC_BLIT(type, cmd)                                                                                          \
   type *cmd = nullptr;                                                                                                 \
@@ -340,6 +364,10 @@ ResourceInitializer::encode(WMT::CommandBuffer cmdbuf) {
 
   auto clear_pass = clear_render_pass_head.next;
   while (clear_pass) {
+    if (!ValidateInitializerRenderTargetAttachment(clear_pass->info.colors[0])) {
+      clear_pass = clear_pass->next;
+      continue;
+    }
     auto r = cmdbuf.renderCommandEncoder(clear_pass->info);
     r.endEncoding();
     clear_pass = clear_pass->next;

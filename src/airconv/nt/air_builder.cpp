@@ -930,6 +930,10 @@ AIRBuilder::CreateTextureQuery(const Texture &Texture, Value *Handle, Texture::Q
   assert(Texture.kind <= Texture::last_resource_kind);
   auto &TexInfo = TextureInfo[Texture.kind];
 
+  if (Query == Texture::num_samples && !TexInfo.is_ms) {
+    return getInt(1);
+  }
+
   static const char *QUERIES[] = {
       "get_width", "get_height", "get_depth", "get_array_size", "get_num_mip_levels", "get_num_samples",
   };

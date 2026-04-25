@@ -32,6 +32,8 @@ struct MTL_GRAPHICS_PIPELINE_DESC {
   SM50_INDEX_BUFFER_FORMAT IndexBufferFormat;
   uint32_t SampleMask;
   uint32_t GSPassthrough;
+  uint64_t PixelShaderDemoteMsaaSRVMaskLo;
+  uint64_t PixelShaderDemoteMsaaSRVMaskHi;
 };
 
 struct MTL_COMPUTE_PIPELINE_DESC {
@@ -70,6 +72,8 @@ template <> struct hash<MTL_GRAPHICS_PIPELINE_DESC> {
     state.add((size_t)v.GSStripTopology);
     state.add((size_t)v.SampleMask);
     state.add((size_t)v.GSPassthrough);
+    state.add((size_t)v.PixelShaderDemoteMsaaSRVMaskLo);
+    state.add((size_t)v.PixelShaderDemoteMsaaSRVMaskHi);
     state.add((size_t)v.SampleCount);
     state.add((size_t)v.NumColorAttachments);
     for (unsigned i = 0; i < v.NumColorAttachments; i++) {
@@ -139,7 +143,9 @@ template <> struct equal_to<MTL_GRAPHICS_PIPELINE_DESC> {
            (x.SampleCount == y.SampleCount) &&
            (x.IndexBufferFormat == y.IndexBufferFormat) &&
            (x.SampleMask == y.SampleMask) &&
-           (x.GSPassthrough == y.GSPassthrough);
+           (x.GSPassthrough == y.GSPassthrough) &&
+           (x.PixelShaderDemoteMsaaSRVMaskLo == y.PixelShaderDemoteMsaaSRVMaskLo) &&
+           (x.PixelShaderDemoteMsaaSRVMaskHi == y.PixelShaderDemoteMsaaSRVMaskHi);
   }
 };
 } // namespace std
@@ -183,6 +189,8 @@ DebugPipelineDesc(const char *kind, const MTL_GRAPHICS_PIPELINE_DESC &desc) {
          << " sample_count=" << unsigned(desc.SampleCount)
          << " sample_mask=0x" << std::hex << desc.SampleMask << std::dec
          << " gs_passthrough=0x" << std::hex << desc.GSPassthrough << std::dec
+         << " ps_msaa_demote_mask=0x" << std::hex << desc.PixelShaderDemoteMsaaSRVMaskHi
+         << "_" << desc.PixelShaderDemoteMsaaSRVMaskLo << std::dec
          << " gs_strip=" << desc.GSStripTopology
          << " index_format=" << desc.IndexBufferFormat
          << " rt_formats=[";

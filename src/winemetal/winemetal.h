@@ -1508,6 +1508,7 @@ struct wmtcmd_render_dispatch_threads_per_tile {
 WINEMETAL_API void MTLRenderCommandEncoder_encodeCommands(obj_handle_t encoder, const struct wmtcmd_base *cmd_head);
 
 WINEMETAL_API enum WMTPixelFormat MTLTexture_pixelFormat(obj_handle_t texture);
+WINEMETAL_API enum WMTTextureUsage MTLTexture_usage(obj_handle_t texture);
 WINEMETAL_API uint64_t MTLTexture_width(obj_handle_t texture);
 WINEMETAL_API uint64_t MTLTexture_height(obj_handle_t texture);
 WINEMETAL_API uint64_t MTLTexture_depth(obj_handle_t texture);

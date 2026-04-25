@@ -234,6 +234,11 @@ public:
     return MTLTexture_pixelFormat(handle);
   }
 
+  WMTTextureUsage
+  usage() {
+    return MTLTexture_usage(handle);
+  }
+
   uint64_t
   width() {
     return MTLTexture_width(handle);

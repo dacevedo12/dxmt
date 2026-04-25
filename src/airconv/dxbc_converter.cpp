@@ -15,7 +15,6 @@
 #include "llvm/Support/raw_ostream.h"
 #include <bit>
 #include <memory>
-#include <string>
 #include <vector>
 
 #include "metallib_writer.hpp"
@@ -37,6 +36,127 @@ public:
 };
 
 namespace dxmt::dxbc {
+
+static bool
+DemoteSingleSampleMsaaSrv(ShaderInfo &shader_info, uint32_t slot) {
+  using dxmt::shader::common::ResourceType;
+  auto iter = shader_info.srvMap.find(slot);
+  if (iter == shader_info.srvMap.end()) {
+    return false;
+  }
+
+  auto &resource_type = iter->second.resource_type;
+  switch (resource_type) {
+  case ResourceType::Texture2DMultisampled:
+    resource_type = ResourceType::Texture2D;
+    break;
+  case ResourceType::Texture2DMultisampledArray:
+    resource_type = ResourceType::Texture2DArray;
+    break;
+  default:
+    return false;
+  }
+
+  return true;
+}
+
+static void
+DemoteSingleSampleMsaaSrvs(
+  ShaderInfo &shader_info,
+  uint64_t mask_lo,
+  uint64_t mask_hi
+) {
+  for (uint32_t slot = 0; slot < 64; slot++) {
+    if (mask_lo & (uint64_t(1) << slot)) {
+      DemoteSingleSampleMsaaSrv(shader_info, slot);
+    }
+    if (mask_hi & (uint64_t(1) << slot)) {
+      DemoteSingleSampleMsaaSrv(shader_info, slot + 64);
+    }
+  }
+}
+
+static void
+RebuildArgumentBindingTables(ShaderInfo &shader_info) {
+  using namespace dxmt::air;
+  using dxmt::shader::common::ResourceType;
+
+  shader_info.binding_table = {};
+  shader_info.binding_table_cbuffer = {};
+
+  auto &binding_table = shader_info.binding_table;
+  auto &binding_table_cbuffer = shader_info.binding_table_cbuffer;
+
+  for (auto &[range_id, cbv] : shader_info.cbufferMap) {
+    cbv.arg_index = binding_table_cbuffer.DefineBuffer(
+      "cb" + std::to_string(range_id), AddressSpace::constant,
+      MemoryAccess::read, msl_uint4,
+      GetArgumentIndex(SM50BindingType::ConstantBuffer, range_id)
+    );
+  }
+
+  for (auto &[range_id, sampler] : shader_info.samplerMap) {
+    auto attr_index = GetArgumentIndex(SM50BindingType::Sampler, range_id);
+    sampler.arg_index =
+      binding_table.DefineSampler("s" + std::to_string(range_id), attr_index);
+    sampler.arg_cube_index =
+      binding_table.DefineSampler("cube_s" + std::to_string(range_id), attr_index + 1);
+    sampler.arg_metadata_index = binding_table.DefineInteger64(
+      "meta_s" + std::to_string(range_id), attr_index + 2
+    );
+  }
+
+  for (auto &[range_id, srv] : shader_info.srvMap) {
+    auto attr_index = GetArgumentIndex(SM50BindingType::SRV, range_id);
+    if (srv.resource_type != ResourceType::NonApplicable) {
+      auto access = srv.sampled ? MemoryAccess::sample : MemoryAccess::read;
+      auto texture_kind = to_air_resource_type(srv.resource_type, srv.compared);
+      auto scaler_type = to_air_scaler_type(srv.scaler_type);
+      srv.arg_index = binding_table.DefineTexture(
+        "t" + std::to_string(range_id), texture_kind, access, scaler_type,
+        attr_index
+      );
+    } else {
+      srv.arg_index = binding_table.DefineBuffer(
+        "t" + std::to_string(range_id), AddressSpace::device,
+        MemoryAccess::read, msl_uint, attr_index
+      );
+    }
+    srv.arg_metadata_index = binding_table.DefineInteger64(
+      "meta_t" + std::to_string(range_id), attr_index + 1
+    );
+  }
+
+  for (auto &[range_id, uav] : shader_info.uavMap) {
+    auto access =
+      uav.written ? (uav.read ? MemoryAccess::read_write : MemoryAccess::write)
+                  : MemoryAccess::read;
+    auto attr_index = GetArgumentIndex(SM50BindingType::UAV, range_id);
+    if (uav.resource_type != ResourceType::NonApplicable) {
+      auto texture_kind = to_air_resource_type(uav.resource_type);
+      auto scaler_type = to_air_scaler_type(uav.scaler_type);
+      uav.arg_index = binding_table.DefineTexture(
+        "u" + std::to_string(range_id), texture_kind, access, scaler_type,
+        attr_index, uav.rasterizer_order ? std::optional(1) : std::nullopt
+      );
+    } else {
+      uav.arg_index = binding_table.DefineBuffer(
+        "u" + std::to_string(range_id), AddressSpace::device, access, msl_uint,
+        attr_index, uav.rasterizer_order ? std::optional(1) : std::nullopt
+      );
+    }
+    uav.arg_metadata_index = binding_table.DefineInteger64(
+      "meta_u" + std::to_string(range_id), attr_index + 1
+    );
+    if (uav.with_counter) {
+      uav.arg_counter_index = binding_table.DefineBuffer(
+        "counter" + std::to_string(range_id), AddressSpace::device,
+        MemoryAccess::read_write, msl_uint, attr_index + 2,
+        uav.rasterizer_order ? std::optional(1) : std::nullopt
+      );
+    }
+  }
+}
 
 inline dxmt::shader::common::ResourceType
 to_shader_resource_type(microsoft::D3D10_SB_RESOURCE_DIMENSION dim) {
@@ -111,6 +231,43 @@ auto get_item_in_argbuf_binding_table(uint32_t argbuf_index, uint32_t index) {
     );
   });
 };
+
+static void
+add_texture_argument_flags(
+    MTL_SM50_SHADER_ARGUMENT_FLAG &flags, shader::common::ResourceType resource_type,
+    shader::common::ScalerDataType scaler_type, bool compared
+) {
+  switch (resource_type) {
+  case shader::common::ResourceType::Texture2DMultisampled:
+  case shader::common::ResourceType::Texture2DMultisampledArray:
+    flags |= MTL_SM50_SHADER_ARGUMENT_TEXTURE_MULTISAMPLED;
+    break;
+  case shader::common::ResourceType::Texture3D:
+    flags |= MTL_SM50_SHADER_ARGUMENT_TEXTURE_3D;
+    break;
+  case shader::common::ResourceType::TextureCube:
+  case shader::common::ResourceType::TextureCubeArray:
+    flags |= MTL_SM50_SHADER_ARGUMENT_TEXTURE_CUBE;
+    break;
+  default:
+    break;
+  }
+
+  switch (scaler_type) {
+  case shader::common::ScalerDataType::Uint:
+    flags |= MTL_SM50_SHADER_ARGUMENT_TEXTURE_UINT;
+    break;
+  case shader::common::ScalerDataType::Int:
+    flags |= MTL_SM50_SHADER_ARGUMENT_TEXTURE_SINT;
+    break;
+  default:
+    break;
+  }
+
+  if (compared) {
+    flags |= MTL_SM50_SHADER_ARGUMENT_TEXTURE_DEPTH;
+  }
+}
 
 void setup_binding_table(
   const ShaderInfo *shader_info, io_binding_map &resource_map,
@@ -420,12 +577,16 @@ llvm::Error convert_dxbc_pixel_shader(
   bool pso_dual_source_blending = false;
   bool pso_disable_depth_output = false;
   uint32_t pso_unorm_output_reg_mask = 0;
+  uint64_t demote_msaa_srv_mask_lo = 0;
+  uint64_t demote_msaa_srv_mask_hi = 0;
   SM50_SHADER_PSO_PIXEL_SHADER_DATA *pso_data = nullptr;
   if (args_get_data<SM50_SHADER_PSO_PIXEL_SHADER, SM50_SHADER_PSO_PIXEL_SHADER_DATA>(pArgs, &pso_data)) {
     pso_dual_source_blending = pso_data->dual_source_blending;
     pso_disable_depth_output = pso_data->disable_depth_output;
     pso_unorm_output_reg_mask = pso_data->unorm_output_reg_mask;
     pso_sample_mask = pso_data->sample_mask;
+    demote_msaa_srv_mask_lo = pso_data->demote_msaa_srv_mask_lo;
+    demote_msaa_srv_mask_hi = pso_data->demote_msaa_srv_mask_hi;
   }
   SM50_SHADER_METAL_VERSION metal_version = SM50_SHADER_METAL_310;
   SM50_SHADER_FLAG shader_flags = {};
@@ -433,6 +594,13 @@ llvm::Error convert_dxbc_pixel_shader(
   if (args_get_data<SM50_SHADER_COMMON, SM50_SHADER_COMMON_DATA>(pArgs, &sm50_common)) {
     metal_version = sm50_common->metal_version;
     shader_flags = sm50_common->flags;
+  }
+  ShaderInfo shader_info_storage;
+  if (demote_msaa_srv_mask_lo || demote_msaa_srv_mask_hi) {
+    shader_info_storage = *shader_info;
+    DemoteSingleSampleMsaaSrvs(shader_info_storage, demote_msaa_srv_mask_lo, demote_msaa_srv_mask_hi);
+    RebuildArgumentBindingTables(shader_info_storage);
+    shader_info = &shader_info_storage;
   }
 
   IREffect prologue([](auto) { return std::monostate(); });
@@ -1089,7 +1257,6 @@ AIRCONV_API int SM50Initialize(
   }
 
   sm50_shader->bbs = read_control_flow(CodeParser, sm50_shader, inputParser, outputParser);
-
   auto &binding_table = shader_info->binding_table;
   auto &binding_table_cbuffer = shader_info->binding_table_cbuffer;
 
@@ -1165,6 +1332,7 @@ AIRCONV_API int SM50Initialize(
     } else {
       flags |= MTL_SM50_SHADER_ARGUMENT_TEXTURE_MINLOD_CLAMP |
                MTL_SM50_SHADER_ARGUMENT_TEXTURE;
+      add_texture_argument_flags(flags, srv.resource_type, srv.scaler_type, srv.compared);
       switch (srv.resource_type) {
       case ResourceType::Texture1DArray:
       case ResourceType::Texture2DArray:
@@ -1229,6 +1397,7 @@ AIRCONV_API int SM50Initialize(
     } else {
       flags |= MTL_SM50_SHADER_ARGUMENT_TEXTURE_MINLOD_CLAMP |
                MTL_SM50_SHADER_ARGUMENT_TEXTURE;
+      add_texture_argument_flags(flags, uav.resource_type, uav.scaler_type, false);
       switch (uav.resource_type) {
       case ResourceType::Texture1DArray:
       case ResourceType::Texture2DArray:

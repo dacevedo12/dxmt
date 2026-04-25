@@ -1238,6 +1238,13 @@ _MTLTexture_pixelFormat(void *obj) {
 }
 
 static NTSTATUS
+_MTLTexture_usage(void *obj) {
+  struct unixcall_generic_obj_uint64_ret *params = obj;
+  params->ret = [(id<MTLTexture>)params->handle usage];
+  return STATUS_SUCCESS;
+}
+
+static NTSTATUS
 _MTLTexture_width(void *obj) {
   struct unixcall_generic_obj_uint64_ret *params = obj;
   params->ret = [(id<MTLTexture>)params->handle width];
@@ -2981,7 +2988,7 @@ const void *__wine_unix_call_funcs[] = {
     &thunk_SM50FreeError,
     &thunk_SM50CompileGeometryPipelineVertex,
     &thunk_SM50CompileGeometryPipelineGeometry,
-    NULL,
+    &_MTLTexture_usage,
     &thunk_SM50CompileTessellationPipelineHull,
     &thunk_SM50CompileTessellationPipelineDomain,
     &_MTLCommandEncoder_setLabel,
@@ -3117,7 +3124,7 @@ const void *__wine_unix_call_wow64_funcs[] = {
     &thunk_SM50FreeError,
     &thunk32_SM50CompileGeometryPipelineVertex,
     &thunk32_SM50CompileGeometryPipelineGeometry,
-    NULL,
+    &_MTLTexture_usage,
     &thunk32_SM50CompileTessellationPipelineHull,
     &thunk32_SM50CompileTessellationPipelineDomain,
     &_MTLCommandEncoder_setLabel,

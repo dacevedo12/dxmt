@@ -29,6 +29,7 @@ struct TextureViewDescriptor {
   uint32_t miplevelCount   : 4 = 1;
   uint32_t firstArraySlice : 12 = 0;
   uint32_t arraySize       : 12 = 1;
+  WMTTextureUsage intendedUsage : 8 = WMTTextureUsageUnknown;
 };
 
 struct TextureViewKey {

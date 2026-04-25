@@ -409,6 +409,15 @@ MTLTexture_pixelFormat(obj_handle_t texture) {
   return (enum WMTPixelFormat)params.ret;
 }
 
+WINEMETAL_API enum WMTTextureUsage
+MTLTexture_usage(obj_handle_t texture) {
+  struct unixcall_generic_obj_uint64_ret params;
+  params.handle = texture;
+  params.ret = 0;
+  UNIX_CALL(83, &params);
+  return (enum WMTTextureUsage)params.ret;
+}
+
 WINEMETAL_API uint64_t
 MTLTexture_width(obj_handle_t texture) {
   struct unixcall_generic_obj_uint64_ret params;

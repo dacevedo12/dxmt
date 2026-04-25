@@ -3262,8 +3262,19 @@ public:
     if (reflection->NumArguments && (dirty_sampler || dirty_srv || uav_bound)) {
       auto ArgumentTableQwords = reflection->ArgumentTableQwords;
       auto offset = PreAllocateArgumentBuffer(ArgumentTableQwords << 3, 32);
-      EmitST([=, arg = managed_shader->arguments_info()](ArgumentEncodingContext &enc) {
-        enc.encodeShaderResources<stage, kind>(reflection, arg, offset);
+      auto shader_hash = managed_shader->sha1().string();
+      EmitST([=, arg = managed_shader->arguments_info(), shader_hash = std::move(shader_hash)](ArgumentEncodingContext &enc) {
+        uint64_t demote_msaa_srv_mask_lo = 0;
+        uint64_t demote_msaa_srv_mask_hi = 0;
+        if constexpr (stage == PipelineStage::Pixel) {
+          auto render_encoder = enc.currentRenderEncoder();
+          demote_msaa_srv_mask_lo = render_encoder->pixel_shader_demote_msaa_srv_mask_lo;
+          demote_msaa_srv_mask_hi = render_encoder->pixel_shader_demote_msaa_srv_mask_hi;
+        }
+        enc.encodeShaderResources<stage, kind>(
+            reflection, arg, offset, shader_hash,
+            demote_msaa_srv_mask_lo, demote_msaa_srv_mask_hi
+        );
       });
       ShaderStage.Samplers.clear_dirty();
       ShaderStage.SRVs.clear_dirty();
@@ -3525,6 +3536,7 @@ public:
 
 
     auto &ShaderStage = state_.ShaderStages[Stage];
+    bool changed = false;
     for (unsigned slot = StartSlot; slot < StartSlot + NumViews; slot++) {
       auto pView = static_cast<D3D11ShaderResourceView *>(ppShaderResourceViews[slot - StartSlot]);
       if (pView && ValidateSRVHazard<Stage>(pView)) {
@@ -3532,6 +3544,7 @@ public:
         auto &entry = ShaderStage.SRVs.bind(slot, {pView}, replaced, !pView->hazardsFree());
         if (!replaced)
           continue;
+        changed = true;
         entry.SRV = pView;
         if (auto buffer = entry.SRV->buffer()) {
           EmitST([=, buffer = std::move(buffer), viewId = pView->viewId(),
@@ -3546,11 +3559,16 @@ public:
       } else {
         // BIND NULL
         if (ShaderStage.SRVs.unbind(slot)) {
+          changed = true;
           EmitST([=](ArgumentEncodingContext& enc) {
             enc.bindBuffer<Stage>(slot, {}, 0, {});
           });
         }
       }
+    }
+    if constexpr (Stage == PipelineStage::Pixel) {
+      if (changed && PixelShaderHasMultisampledSRV())
+        InvalidateRenderPipeline();
     }
   }
 
@@ -4460,6 +4478,27 @@ public:
           if (rtv.PixelFormat == WMTPixelFormatInvalid) {
             continue;
           }
+          if (!rtv.Texture.ptr()) {
+            WARN("RenderPass: RTV has no texture slot=", rtv.RenderTargetIndex,
+                 " view=", uint64_t(rtv.viewId), " format=", uint32_t(rtv.PixelFormat));
+            continue;
+          }
+          if (!(rtv.Texture->usage() & WMTTextureUsageRenderTarget)) {
+            WARN(
+                "RenderPass: RTV texture missing WMTTextureUsageRenderTarget",
+                " slot=", rtv.RenderTargetIndex,
+                " view=", uint64_t(rtv.viewId),
+                " usage=", uint32_t(rtv.Texture->usage()),
+                " view_format=", uint32_t(rtv.PixelFormat),
+                " texture_format=", uint32_t(rtv.Texture->pixelFormat()),
+                " texture_type=", uint32_t(rtv.Texture->textureType()),
+                " size=", rtv.Texture->width(), "x", rtv.Texture->height(), "x", rtv.Texture->depth(),
+                " array_size=", rtv.Texture->arrayLength(),
+                " mip_levels=", rtv.Texture->miplevelCount(),
+                " sample_count=", rtv.Texture->sampleCount()
+            );
+            continue;
+          }
           auto &color = info.colors[rtv.RenderTargetIndex];
           color.attachment = ctx.access<PipelineStage::Pixel>(rtv.Texture, rtv.viewId, ResourceAccess::ReadWrite);
           color.depth_plane = rtv.DepthPlane;
@@ -4556,6 +4595,66 @@ public:
     return ptr ? ptr->GetManagedShader() : nullptr;
   };
 
+  static bool
+  IsMultisampledTextureType(WMTTextureType type) {
+    return type == WMTTextureType2DMultisample || type == WMTTextureType2DMultisampleArray;
+  }
+
+  bool
+  PixelShaderHasMultisampledSRV() {
+    auto PS = GetManagedShader<PipelineStage::Pixel>();
+    if (!PS)
+      return false;
+
+    auto &reflection = PS->reflection();
+    auto args = PS->arguments_info();
+    for (uint32_t i = 0; i < reflection.NumArguments; i++) {
+      const auto &arg = args[i];
+      if (arg.Type == SM50BindingType::SRV &&
+          (arg.Flags & MTL_SM50_SHADER_ARGUMENT_TEXTURE_MULTISAMPLED))
+        return true;
+    }
+    return false;
+  }
+
+  std::pair<uint64_t, uint64_t>
+  PixelShaderSingleSampleMsaaSRVDemoteMask() {
+    uint64_t mask_lo = 0;
+    uint64_t mask_hi = 0;
+    auto PS = GetManagedShader<PipelineStage::Pixel>();
+    if (!PS)
+      return {mask_lo, mask_hi};
+
+    auto &reflection = PS->reflection();
+    auto args = PS->arguments_info();
+    auto &SRVs = state_.ShaderStages[PipelineStage::Pixel].SRVs;
+    for (uint32_t i = 0; i < reflection.NumArguments; i++) {
+      const auto &arg = args[i];
+      if (arg.Type != SM50BindingType::SRV ||
+          !(arg.Flags & MTL_SM50_SHADER_ARGUMENT_TEXTURE_MULTISAMPLED) ||
+          arg.SM50BindingSlot >= 128 ||
+          !SRVs.test_bound(arg.SM50BindingSlot))
+        continue;
+
+      auto srv = SRVs[arg.SM50BindingSlot].SRV.ptr();
+      if (!srv)
+        continue;
+
+      auto texture = srv->texture();
+      if (!texture.ptr())
+        continue;
+
+      if (IsMultisampledTextureType(texture->textureType(srv->viewId())))
+        continue;
+
+      if (arg.SM50BindingSlot < 64)
+        mask_lo |= uint64_t(1) << arg.SM50BindingSlot;
+      else
+        mask_hi |= uint64_t(1) << (arg.SM50BindingSlot - 64);
+    }
+    return {mask_lo, mask_hi};
+  }
+
   template <bool IndexedDraw>
   void
   InitializeGraphicsPipelineDesc(MTL_GRAPHICS_PIPELINE_DESC &Desc) {
@@ -4601,6 +4700,15 @@ public:
     if (!Desc.RasterizationEnabled)
       Desc.PixelShader = nullptr; // Even rasterization is disabled, Metal still checks if VS-PS signatures match.
     Desc.SampleMask = state_.OutputMerger.SampleMask;
+    if (Desc.PixelShader) {
+      auto [demote_msaa_srv_mask_lo, demote_msaa_srv_mask_hi] =
+          PixelShaderSingleSampleMsaaSRVDemoteMask();
+      Desc.PixelShaderDemoteMsaaSRVMaskLo = demote_msaa_srv_mask_lo;
+      Desc.PixelShaderDemoteMsaaSRVMaskHi = demote_msaa_srv_mask_hi;
+    } else {
+      Desc.PixelShaderDemoteMsaaSRVMaskLo = 0;
+      Desc.PixelShaderDemoteMsaaSRVMaskHi = 0;
+    }
     Desc.GSPassthrough = GS ? GS->reflection().GeometryShader.GSPassThrough : ~0u;
     if (unlikely(Desc.GSPassthrough == ~0u && Desc.GeometryShader != nullptr)) {
       Desc.GSStripTopology = is_strip_topology(state_.InputAssembler.Topology);
@@ -4668,9 +4776,13 @@ public:
       return DrawCallStatus::Invalid;
     }
 
-    EmitST([pso = std::move(pipeline)](ArgumentEncodingContext &enc) {
+    EmitST([pso = std::move(pipeline),
+            demote_msaa_srv_mask_lo = pipelineDesc.PixelShaderDemoteMsaaSRVMaskLo,
+            demote_msaa_srv_mask_hi = pipelineDesc.PixelShaderDemoteMsaaSRVMaskHi](ArgumentEncodingContext &enc) {
       auto render_encoder = enc.currentRenderEncoder();
       render_encoder->use_tessellation = 1;
+      render_encoder->pixel_shader_demote_msaa_srv_mask_lo = demote_msaa_srv_mask_lo;
+      render_encoder->pixel_shader_demote_msaa_srv_mask_hi = demote_msaa_srv_mask_hi;
       MTL_COMPILED_TESSELLATION_MESH_PIPELINE GraphicsPipeline{};
       pso->GetPipeline(&GraphicsPipeline); // may block
       enc.tess_num_output_control_point_element = GraphicsPipeline.NumControlPointOutputElement;
@@ -4720,9 +4832,13 @@ public:
     DebugDumpPipeline("geometry", pipelineDesc, "finalize geometry pipeline", false);
     WarnMissingMeshFragmentFunction("geometry", pipelineDesc);
     device->CreateGeometryPipeline(&pipelineDesc, &pipeline);
-    EmitST([pso = std::move(pipeline)](ArgumentEncodingContext& enc) {
+    EmitST([pso = std::move(pipeline),
+            demote_msaa_srv_mask_lo = pipelineDesc.PixelShaderDemoteMsaaSRVMaskLo,
+            demote_msaa_srv_mask_hi = pipelineDesc.PixelShaderDemoteMsaaSRVMaskHi](ArgumentEncodingContext& enc) {
       auto render_encoder = enc.currentRenderEncoder();
       render_encoder->use_geometry = 1;
+      render_encoder->pixel_shader_demote_msaa_srv_mask_lo = demote_msaa_srv_mask_lo;
+      render_encoder->pixel_shader_demote_msaa_srv_mask_hi = demote_msaa_srv_mask_hi;
       MTL_COMPILED_GRAPHICS_PIPELINE GraphicsPipeline{};
       pso->GetPipeline(&GraphicsPipeline); // may block
       if (!GraphicsPipeline.PipelineState)
@@ -4781,7 +4897,12 @@ public:
     DebugDumpPipeline("graphics", pipelineDesc, "finalize graphics pipeline", false);
 
     device->CreateGraphicsPipeline(&pipelineDesc, &pipeline);
-    EmitST([pso = std::move(pipeline)](ArgumentEncodingContext& enc) {
+    EmitST([pso = std::move(pipeline),
+            demote_msaa_srv_mask_lo = pipelineDesc.PixelShaderDemoteMsaaSRVMaskLo,
+            demote_msaa_srv_mask_hi = pipelineDesc.PixelShaderDemoteMsaaSRVMaskHi](ArgumentEncodingContext& enc) {
+      auto render_encoder = enc.currentRenderEncoder();
+      render_encoder->pixel_shader_demote_msaa_srv_mask_lo = demote_msaa_srv_mask_lo;
+      render_encoder->pixel_shader_demote_msaa_srv_mask_hi = demote_msaa_srv_mask_hi;
       MTL_COMPILED_GRAPHICS_PIPELINE GraphicsPipeline{};
       pso->GetPipeline(&GraphicsPipeline); // may block
       if (!GraphicsPipeline.PipelineState)
@@ -4789,7 +4910,7 @@ public:
       auto &cmd = enc.encodeRenderCommand<wmtcmd_render_setpso>();
       cmd.type = WMTRenderCommandSetPSO;
       cmd.pso = GraphicsPipeline.PipelineState;
-      enc.currentRenderEncoder()->last_pso = GraphicsPipeline.PipelineState;
+      render_encoder->last_pso = GraphicsPipeline.PipelineState;
     });
 
     cmdbuf_state = CommandBufferState::RenderPipelineReady;

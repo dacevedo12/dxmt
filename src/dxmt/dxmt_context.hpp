@@ -15,6 +15,7 @@
 #include "rc/util_rc_ptr.hpp"
 #include "airconv_public.h"
 #include <cassert>
+#include <string>
 
 #define DXMT_IMPLEMENT_ME __builtin_unreachable();
 #define DXMT_UNREACHABLE __builtin_unreachable();
@@ -77,6 +78,12 @@ struct UnorderedAccessViewBinding {
   Rc<Texture> texture;
   Rc<Buffer> counter;
   BufferSlice slice;
+};
+
+struct DummyTextureBinding {
+  WMT::Reference<WMT::Texture> texture;
+  uint64_t gpu_resource_id = 0;
+  uint32_t array_length = 1;
 };
 
 enum class EncoderType {
@@ -182,6 +189,8 @@ struct RenderEncoderData : EncoderData {
   bool use_geometry = 0;
   TileBarrierPSOKey tile_barrier_pso_key = {};
   WMT::RenderPipelineState last_pso = {};
+  uint64_t pixel_shader_demote_msaa_srv_mask_lo = 0;
+  uint64_t pixel_shader_demote_msaa_srv_mask_hi = 0;
 };
 
 struct ComputeEncoderData : EncoderData {
@@ -475,7 +484,8 @@ public:
   template <PipelineStage stage, PipelineKind kind>
   void encodeShaderResources(
       const MTL_SHADER_REFLECTION *reflection, const MTL_SM50_SHADER_ARGUMENT *arguments,
-      uint64_t argument_buffer_offset
+      uint64_t argument_buffer_offset, const std::string &shader_hash,
+      uint64_t demote_msaa_srv_mask_lo = 0, uint64_t demote_msaa_srv_mask_hi = 0
   );
 
   void retainAllocation(Allocation* allocation);
@@ -528,6 +538,8 @@ public:
       makeResident<stage, kind>(view.texture, requested);
     };
   }
+
+  DummyTextureBinding &dummySRVTexture(const MTL_SM50_SHADER_ARGUMENT &arg);
 
   template <typename cmd_struct>
   cmd_struct &
@@ -799,6 +811,7 @@ private:
   WMT::Reference<WMT::Buffer> dummy_cbuffer_;
   void *dummy_cbuffer_host_;
   WMTBufferInfo dummy_cbuffer_info_;
+  std::array<DummyTextureBinding, 28> dummy_srv_textures_;
 
   EncoderData encoder_head = {EncoderType::Null, nullptr, ~0ull};
   EncoderData *encoder_last = &encoder_head;

@@ -1,5 +1,6 @@
 #include "dxmt_texture.hpp"
 #include "dxmt_residency.hpp"
+#include "log/log.hpp"
 #include "wsi_platform.hpp"
 #include <atomic>
 #include <cassert>
@@ -7,6 +8,36 @@
 namespace dxmt {
 
 std::atomic_uint64_t global_texture_seq = {0};
+
+static void
+LogTextureUsageMismatch(
+    const char *message, Texture *descriptor, WMT::Texture texture, WMTTextureUsage info_usage,
+    WMTResourceOptions options, Flags<TextureAllocationFlag> flags, uint64_t gpu_resource_id
+) {
+  if (!descriptor || !texture)
+    return;
+
+  auto descriptor_usage = descriptor->usage();
+  auto actual_usage = texture.usage();
+  if (descriptor_usage == actual_usage)
+    return;
+
+  WARN(
+      message,
+      " descriptor=", reinterpret_cast<const void *>(descriptor),
+      " descriptor_usage=", uint32_t(descriptor_usage),
+      " info_usage=", uint32_t(info_usage),
+      " actual_usage=", uint32_t(actual_usage),
+      " options=", uint64_t(options),
+      " flags=", uint32_t(flags.raw()),
+      " gpu_resource_id=", gpu_resource_id,
+      " descriptor_format=", uint32_t(descriptor->pixelFormat()),
+      " actual_format=", uint32_t(texture.pixelFormat()),
+      " actual_size=", texture.width(), "x", texture.height(), "x", texture.depth(),
+      " actual_array=", texture.arrayLength(),
+      " actual_mips=", texture.mipmapLevelCount()
+  );
+}
 
 void
 TextureView::incRef() {
@@ -23,18 +54,54 @@ TextureView::TextureView(TextureAllocation *allocation) :
     texture(allocation->texture()),
     gpuResourceID(allocation->gpuResourceID),
     allocation(allocation),
-    key(allocation->descriptor->fullView) {}
+    key(allocation->descriptor->fullView) {
+  LogTextureUsageMismatch(
+      "DXMT diagnostic: full texture view usage mismatch", allocation->descriptor, texture,
+      allocation->descriptor->usage(), WMTResourceOptions(0), allocation->flags(), gpuResourceID
+  );
+}
 
 TextureView::TextureView(TextureAllocation *allocation, unsigned index, TextureViewDescriptor descriptor) :
     gpuResourceID(0),
     allocation(allocation),
     key(descriptor, index, allocation->descriptor->miplevelCount()) {
   auto parent = allocation->texture();
-  texture = parent.newTextureView(
+  auto view = parent.newTextureView(
       descriptor.format, descriptor.type, descriptor.firstMiplevel, descriptor.miplevelCount,
       descriptor.firstArraySlice, descriptor.arraySize,
       {WMTTextureSwizzleRed, WMTTextureSwizzleGreen, WMTTextureSwizzleBlue, WMTTextureSwizzleAlpha}, gpuResourceID
   );
+  auto parent_usage = parent ? parent.usage() : WMTTextureUsageUnknown;
+  auto view_usage = view ? view.usage() : WMTTextureUsageUnknown;
+  if ((descriptor.intendedUsage & WMTTextureUsageRenderTarget) && view &&
+      !(view_usage & WMTTextureUsageRenderTarget) && parent &&
+      (parent_usage & WMTTextureUsageRenderTarget) &&
+      parent.pixelFormat() == view.pixelFormat() &&
+      descriptor.firstMiplevel == 0 && descriptor.firstArraySlice == 0) {
+    texture = parent;
+    gpuResourceID = allocation->gpuResourceID;
+    return;
+  }
+  texture = std::move(view);
+  auto descriptor_usage = allocation->descriptor->usage();
+  if ((descriptor.intendedUsage & WMTTextureUsageRenderTarget) && !(view_usage & WMTTextureUsageRenderTarget)) {
+    WARN(
+        "DXMT diagnostic: texture view missing WMTTextureUsageRenderTarget",
+        " descriptor=", reinterpret_cast<const void *>(allocation->descriptor),
+        " view=", uint64_t(key),
+        " view_index=", index,
+        " descriptor_usage=", uint32_t(descriptor_usage),
+        " parent_usage=", uint32_t(parent_usage),
+        " view_usage=", uint32_t(view_usage),
+        " parent_format=", parent ? uint32_t(parent.pixelFormat()) : 0,
+        " view_format=", texture ? uint32_t(texture.pixelFormat()) : 0,
+        " requested_format=", uint32_t(descriptor.format),
+        " requested_type=", uint32_t(descriptor.type),
+        " requested_mip=", descriptor.firstMiplevel, "+", descriptor.miplevelCount,
+        " requested_slice=", descriptor.firstArraySlice, "+", descriptor.arraySize,
+        " gpu_resource_id=", gpuResourceID
+    );
+  }
 }
 
 TextureAllocation::TextureAllocation(
@@ -50,6 +117,10 @@ TextureAllocation::TextureAllocation(
 
   gpuResourceID = info_copy.gpu_resource_id;
   machPort = 0;
+  LogTextureUsageMismatch(
+      "DXMT diagnostic: buffer texture allocation usage mismatch", descriptor, obj_, info_copy.usage,
+      info_copy.options, flags, gpuResourceID
+  );
   fenceTrackers.resize(
       flags.test(TextureAllocationFlag::ShaderReadonly) ? 1 : descriptor->arrayLength() * descriptor->miplevelCount()
   );
@@ -65,6 +136,10 @@ TextureAllocation::TextureAllocation(
   mappedMemory = nullptr;
   gpuResourceID = textureDescriptor.gpu_resource_id;
   machPort = textureDescriptor.mach_port;
+  LogTextureUsageMismatch(
+      "DXMT diagnostic: texture allocation usage mismatch", descriptor, obj_, textureDescriptor.usage,
+      textureDescriptor.options, flags, gpuResourceID
+  );
   fenceTrackers.resize(
       flags.test(TextureAllocationFlag::ShaderReadonly) ? 1 : descriptor->arrayLength() * descriptor->miplevelCount()
   );
@@ -105,6 +180,8 @@ Texture::createView(TextureViewDescriptor const &descriptor) {
     if (viewDescriptors_[i].firstArraySlice != descriptor.firstArraySlice)
       continue;
     if (viewDescriptors_[i].arraySize != descriptor.arraySize)
+      continue;
+    if (viewDescriptors_[i].intendedUsage != descriptor.intendedUsage)
       continue;
     return TextureViewKey(descriptor, i, info_.mipmap_level_count);
   }
