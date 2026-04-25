@@ -142,6 +142,7 @@ class MTLCompiledComputePipelineImpl
 public:
   MTLCompiledComputePipelineImpl(MTLD3D11Device *pDevice, ManagedShader shader)
       : device_(pDevice) {
+    DebugDumpComputeShader(shader, "compute pipeline requested");
     ComputeShader = shader->get_shader(ShaderVariantDefault{});
     uint32_t total_tgsize = shader->reflection().ThreadgroupSize[0] *
                             shader->reflection().ThreadgroupSize[1] *

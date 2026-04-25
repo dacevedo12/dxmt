@@ -119,6 +119,8 @@ The following environment variables can be used for **debugging** purposes.
 - `DXMT_DUMP_PATH=/some/directory`: Changes path where shader and pipeline dump files are stored. Falls back to `DXMT_LOG_PATH` when unset.
 - `DXMT_DUMP_PIPELINES=0|problem|all`: Controls pipeline dumping. `problem` dumps known problematic pipelines, currently including mesh pipelines with rasterization enabled and no pixel shader; `all` dumps every graphics pipeline.
 - `DXMT_DUMP_PIPELINE_KEY=hex-key`: Restricts pipeline dumping to one logged pipeline key. This key is intended for the current process only and is not stable across runs.
+- `DXMT_DUMP_PIPELINE_VS|HS|DS|GS|PS=sha1|null`: Restricts pipeline dumping by stable shader SHA1 for the selected stage. Multiple stage filters are combined, which is useful when a pipeline key changes between process launches.
+- `DXMT_DUMP_COMPUTE_SHADERS=sha1-or-prefix[,sha1-or-prefix...]|all`: Dumps compute shader bytecode when a matching compute pipeline is requested. Prefix matching is supported so shader function names such as `cs_a4e4c668_...` can be used directly as filters.
 
 
 ### Logs

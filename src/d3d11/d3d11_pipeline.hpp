@@ -211,21 +211,83 @@ DebugPipelineDumpDirectory() {
 }
 
 inline bool
+DebugShaderHashMatchesFilter(ManagedShader shader, std::string filter) {
+  if (filter.empty())
+    return false;
+  if (!shader)
+    return filter == "null";
+
+  std::string hash = shader->sha1().string();
+  size_t start = 0;
+  for (;;) {
+    size_t end = filter.find_first_of(",; ", start);
+    std::string item = filter.substr(start, end == std::string::npos ? end : end - start);
+    if (!item.empty() && (hash == item || hash.starts_with(item)))
+      return true;
+    if (end == std::string::npos)
+      return false;
+    start = end + 1;
+  }
+}
+
+inline bool
 DebugShouldDumpPipeline(const MTL_GRAPHICS_PIPELINE_DESC &desc, bool problem) {
   std::string mode = env::getEnvVar("DXMT_DUMP_PIPELINES");
   if (mode == "0" || mode == "none" || mode == "false")
     return false;
-  if (mode == "all")
-    return true;
 
   std::string key = env::getEnvVar("DXMT_DUMP_PIPELINE_KEY");
+  std::string vs = env::getEnvVar("DXMT_DUMP_PIPELINE_VS");
+  std::string ps = env::getEnvVar("DXMT_DUMP_PIPELINE_PS");
+  std::string gs = env::getEnvVar("DXMT_DUMP_PIPELINE_GS");
+  std::string hs = env::getEnvVar("DXMT_DUMP_PIPELINE_HS");
+  std::string ds = env::getEnvVar("DXMT_DUMP_PIPELINE_DS");
+
   if (!key.empty()) {
     if (key.starts_with("0x") || key.starts_with("0X"))
       key = key.substr(2);
-    return key == DebugPipelineKey(desc);
+    if (key != DebugPipelineKey(desc))
+      return false;
   }
 
+  auto shader_matches = [](const std::string &expected, ManagedShader shader) {
+    if (expected.empty())
+      return true;
+    if (!shader)
+      return expected == "null";
+    return expected == shader->sha1().string();
+  };
+
+  bool has_shader_filter = !vs.empty() || !ps.empty() || !gs.empty() ||
+                           !hs.empty() || !ds.empty();
+  if (has_shader_filter) {
+    return shader_matches(vs, desc.VertexShader) &&
+           shader_matches(ps, desc.PixelShader) &&
+           shader_matches(gs, desc.GeometryShader) &&
+           shader_matches(hs, desc.HullShader) &&
+           shader_matches(ds, desc.DomainShader);
+  }
+
+  if (!key.empty())
+    return true;
+
+  if (mode == "all")
+    return true;
+
   return problem || mode == "1" || mode == "problem";
+}
+
+inline bool
+DebugShouldDumpComputeShader(ManagedShader shader) {
+  std::string filter = env::getEnvVar("DXMT_DUMP_COMPUTE_SHADERS");
+  if (filter == "0" || filter == "none" || filter == "false")
+    return false;
+  if (filter == "1" || filter == "all")
+    return true;
+
+  if (filter.empty())
+    filter = env::getEnvVar("DXMT_DUMP_PIPELINE_CS");
+  return DebugShaderHashMatchesFilter(shader, filter);
 }
 
 inline void
@@ -234,6 +296,28 @@ DebugDumpShader(const char *stage, ManagedShader shader) {
     return;
   WARN("DXMT diagnostic: dumping ", stage, " shader ", shader->sha1().string());
   shader->dump();
+}
+
+inline void
+DebugDumpComputeShader(ManagedShader shader, const char *reason) {
+  if (!DebugShouldDumpComputeShader(shader))
+    return;
+
+  std::string path = DebugPipelineDumpDirectory() + env::getExeBaseName() +
+                     "_pipeline_compute_" + shader->sha1().string().substr(0, 16) + ".txt";
+
+  std::ofstream dump(path, std::ios::out | std::ios::trunc);
+  if (dump) {
+    auto &reflection = shader->reflection();
+    dump << "reason=" << reason << "\n";
+    dump << "CS=" << DebugShaderName(shader) << "\n";
+    dump << "threadgroup_size=" << reflection.ThreadgroupSize[0] << ","
+         << reflection.ThreadgroupSize[1] << ","
+         << reflection.ThreadgroupSize[2] << "\n";
+  }
+
+  DebugDumpShader("CS", shader);
+  WARN("DXMT diagnostic: compute pipeline dumped to ", path);
 }
 
 inline void
