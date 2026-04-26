@@ -12,6 +12,75 @@ namespace dxmt {
 
 #pragma region DeviceTexture
 
+template <typename desc_t>
+static UINT
+TextureDescHeight(const desc_t &desc) {
+  if constexpr (std::is_same_v<desc_t, D3D11_TEXTURE1D_DESC>) {
+    return 1;
+  } else {
+    return desc.Height;
+  }
+}
+
+template <typename desc_t>
+static UINT
+TextureDescDepth(const desc_t &desc) {
+  if constexpr (std::is_same_v<desc_t, D3D11_TEXTURE3D_DESC1>) {
+    return desc.Depth;
+  } else {
+    return 1;
+  }
+}
+
+template <typename desc_t>
+static UINT
+TextureDescArraySize(const desc_t &desc) {
+  if constexpr (std::is_same_v<desc_t, D3D11_TEXTURE3D_DESC1>) {
+    return 1;
+  } else {
+    return desc.ArraySize;
+  }
+}
+
+template <typename desc_t>
+static UINT
+TextureDescSampleCount(const desc_t &desc) {
+  if constexpr (std::is_same_v<desc_t, D3D11_TEXTURE2D_DESC1>) {
+    return desc.SampleDesc.Count;
+  } else {
+    return 1;
+  }
+}
+
+static constexpr SIZE_T kD3DKMTExistingHeapPageSize = 0x1000;
+
+static SIZE_T
+AlignD3DKMTExistingHeapSize(SIZE_T size) {
+  if (!size)
+    size = kD3DKMTExistingHeapPageSize;
+  return (size + kD3DKMTExistingHeapPageSize - 1) & ~(kD3DKMTExistingHeapPageSize - 1);
+}
+
+template <typename desc_t>
+static SIZE_T
+CalculateD3DKMTExistingHeapSize(MTLD3D11Device *pDevice, const desc_t &desc) {
+  SIZE_T size = 0;
+  auto mipLevels = desc.MipLevels ? desc.MipLevels : 1;
+  auto arraySize = TextureDescArraySize(desc);
+  auto sampleCount = TextureDescSampleCount(desc);
+
+  for (UINT level = 0; level < mipLevels; level++) {
+    uint32_t bytesPerRow = 0;
+    uint32_t bytesPerImage = 0;
+    uint32_t bytesPerSlice = 0;
+    if (FAILED(GetLinearTextureLayout(pDevice, desc, level, bytesPerRow, bytesPerImage, bytesPerSlice, true)))
+      return kD3DKMTExistingHeapPageSize;
+    size += SIZE_T(bytesPerSlice) * arraySize * sampleCount;
+  }
+
+  return AlignD3DKMTExistingHeapSize(size);
+}
+
 template <typename tag_texture>
 class DeviceTexture : public TResourceBase<tag_texture, IMTLMinLODClampable> {
 private:
@@ -438,8 +507,15 @@ HRESULT CreateDeviceTextureInternal(MTLD3D11Device *pDevice,
   auto shared_flag =
       D3D11_RESOURCE_MISC_SHARED | D3D11_RESOURCE_MISC_SHARED_NTHANDLE | D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX;
   if (finalDesc.MiscFlags & shared_flag) {
-    if (!(pDevice->GetLocalD3DKMT() & 0xc0000000)) {
-      ERR("DeviceTexture: Invalid device handle");
+    auto local_kmt = pDevice->GetLocalD3DKMT();
+    if (!local_kmt) {
+      ERR(
+          "DeviceTexture: Invalid device handle",
+          " local_kmt=", local_kmt,
+          " misc_flags=", finalDesc.MiscFlags,
+          " dimension=", uint32_t(tag::dimension),
+          " size=", finalDesc.Width, "x", TextureDescHeight(finalDesc), "x", TextureDescDepth(finalDesc)
+      );
       return E_FAIL;
     }
     // use a dedicated path for now, because there are other works for private storage mode
@@ -468,24 +544,35 @@ HRESULT CreateDeviceTextureInternal(MTLD3D11Device *pDevice,
     memcpy(&runtimeData.desc, pDesc, sizeof(typename tag::DESC1));
 
     D3DKMT_CREATEALLOCATION create = {};
-    create.hDevice = pDevice->GetLocalD3DKMT();
+    create.hDevice = local_kmt;
     create.pPrivateRuntimeData = &runtimeData;
     create.PrivateRuntimeDataSize = sizeof(runtimeData);
     create.Flags.StandardAllocation = 1;
     create.NumAllocations = 1;
-    D3DDDI_ALLOCATIONINFO2 allocationInfo = {};
-    create.pAllocationInfo2 = &allocationInfo;
+    D3DDDI_ALLOCATIONINFO allocationInfo = {};
+    create.pAllocationInfo = &allocationInfo;
     D3DKMT_CREATESTANDARDALLOCATION standardAllocation = {};
     create.pStandardAllocation = &standardAllocation;
     standardAllocation.Type = D3DKMT_STANDARDALLOCATIONTYPE_EXISTINGHEAP;
+    standardAllocation.ExistingHeapData.Size = CalculateD3DKMTExistingHeapSize(pDevice, finalDesc);
     create.Flags.ExistingSysMem = 1;
-    D3DDDI_ALLOCATIONINFO systemMem;
-    allocationInfo.pSystemMem = &systemMem;
+    alignas(kD3DKMTExistingHeapPageSize) static const char systemMem[kD3DKMTExistingHeapPageSize] = {};
+    allocationInfo.pSystemMem = systemMem;
     create.Flags.CreateResource = 1;
     create.Flags.CreateShared = 1;
     create.Flags.NtSecuritySharing = !!(finalDesc.MiscFlags & D3D11_RESOURCE_MISC_SHARED_NTHANDLE);
-    if (D3DKMTCreateAllocation2(&create)) {
-      ERR("DeviceTexture: Failed to create D3DKMT for shared texture");
+    auto status = D3DKMTCreateAllocation2(&create);
+    if (status) {
+      ERR(
+          "DeviceTexture: Failed to create D3DKMT for shared texture",
+          " status=", status,
+          " hDevice=", create.hDevice,
+          " hResource=", create.hResource,
+          " hGlobalShare=", create.hGlobalShare,
+          " nt_security=", create.Flags.NtSecuritySharing,
+          " existing_heap_size=", standardAllocation.ExistingHeapData.Size,
+          " allocation_private_size=", allocationInfo.PrivateDriverDataSize
+      );
       return E_FAIL;
     }
 

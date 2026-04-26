@@ -94,8 +94,8 @@ CreateFence(MTLD3D11Device *pDevice, UINT64 InitialValue, D3D11_FENCE_FLAG Flags
   auto event = pDevice->GetMTLDevice().newSharedEvent();
   D3DKMT_HANDLE local_kmt = 0;
   if (shared) {
-    if (!(pDevice->GetLocalD3DKMT() & 0xc0000000)) {
-      ERR("D3D11Fence: Invalid device handle");
+    if (!pDevice->GetLocalD3DKMT()) {
+      ERR("D3D11Fence: Invalid device handle", " local_kmt=", pDevice->GetLocalD3DKMT());
       return E_FAIL;
     }
     D3DKMT_CREATESYNCHRONIZATIONOBJECT2 create = {};
