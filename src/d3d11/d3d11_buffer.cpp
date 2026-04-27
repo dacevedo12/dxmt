@@ -61,6 +61,30 @@ private:
     }
   };
 
+  using RTVBase = TResourceViewBase<tag_render_target_view<D3D11Buffer>>;
+
+  class TBufferRTV : public RTVBase {
+  public:
+    TBufferRTV(
+        const tag_render_target_view<>::DESC1 *pDesc, D3D11Buffer *pResource, MTLD3D11Device *pDevice,
+        BufferViewInfo const &info, WMTPixelFormat format
+    ) :
+        RTVBase(pDesc, pResource, pDevice) {
+      buffer_ = pResource->buffer_.ptr();
+      view_id_ = info.viewKey;
+      slice_ = {info.byteOffset, info.byteWidth, info.viewElementOffset, info.viewElementWidth};
+      subset_ = ResourceSubsetState(info.byteOffset, info.byteWidth);
+      format_ = format;
+      pass_desc_ = {
+          .RenderTargetArrayLength = 0,
+          .SampleCount = 1,
+          .DepthPlane = 0,
+          .Width = info.viewElementWidth,
+          .Height = 1,
+      };
+    }
+  };
+
 public:
   D3D11Buffer(const tag_buffer::DESC1 *pDesc, const D3D11_SUBRESOURCE_DATA *pInitialData, MTLD3D11Device *device) :
       TResourceBase<tag_buffer>(*pDesc, device) {
@@ -105,6 +129,16 @@ public:
   QueryInterface(REFIID riid, void **ppvObject) override {
     if (ppvObject == nullptr)
       return E_POINTER;
+
+    *ppvObject = nullptr;
+
+    if (riid == __uuidof(ID3D11Texture1D) ||
+        riid == __uuidof(ID3D11Texture2D) ||
+        riid == __uuidof(ID3D11Texture3D)) {
+      TRACE("D3D11Resource(buffer): texture interface query ",
+            str::format(riid));
+      return E_NOINTERFACE;
+    }
 
     return TResourceBase<tag_buffer>::QueryInterface(riid, ppvObject);
   }
@@ -203,6 +237,62 @@ public:
 
   HRESULT
   STDMETHODCALLTYPE
+  CreateRenderTargetView(const D3D11_RENDER_TARGET_VIEW_DESC1 *pDesc, ID3D11RenderTargetView1 **ppView) override {
+    if (!(desc.BindFlags & D3D11_BIND_RENDER_TARGET))
+      return E_INVALIDARG;
+
+    if (!pDesc)
+      return E_INVALIDARG;
+
+    D3D11_RENDER_TARGET_VIEW_DESC1 finalDesc = *pDesc;
+    if (finalDesc.ViewDimension != D3D11_RTV_DIMENSION_BUFFER)
+      return E_INVALIDARG;
+    if (structured || finalDesc.Format == DXGI_FORMAT_UNKNOWN)
+      return E_INVALIDARG;
+
+    MTL_DXGI_FORMAT_DESC format;
+    if (FAILED(MTLQueryDXGIFormat(m_parent->GetMTLDevice(), finalDesc.Format, format)))
+      return E_FAIL;
+    if (!format.BytesPerTexel || format.Flag & MTL_DXGI_FORMAT_TYPELESS)
+      return E_INVALIDARG;
+    if (!any_bit_set(m_parent->GetMTLPixelFormatCapability(format.PixelFormat) & FormatCapability::Color))
+      return E_INVALIDARG;
+
+    uint64_t byteOffset = uint64_t(finalDesc.Buffer.FirstElement) * format.BytesPerTexel;
+    uint64_t byteWidth = uint64_t(finalDesc.Buffer.NumElements) * format.BytesPerTexel;
+    if (!finalDesc.Buffer.NumElements || byteOffset > desc.ByteWidth || byteWidth > desc.ByteWidth - byteOffset)
+      return E_INVALIDARG;
+    if (byteOffset > UINT32_MAX || byteWidth > UINT32_MAX)
+      return E_INVALIDARG;
+
+    if (!ppView)
+      return S_FALSE;
+
+    auto viewId = buffer_->createView({
+        .format = format.PixelFormat,
+        .usage = WMTTextureUsageRenderTarget,
+        .type = WMTTextureType2D,
+        .byteOffset = uint32_t(byteOffset),
+        .byteLength = uint32_t(byteWidth),
+    });
+
+    auto rtv = ref(new TBufferRTV(
+        &finalDesc, this, m_parent,
+        {
+            .viewKey = viewId,
+            .viewElementOffset = finalDesc.Buffer.FirstElement,
+            .viewElementWidth = finalDesc.Buffer.NumElements,
+            .byteOffset = uint32_t(byteOffset),
+            .byteWidth = uint32_t(byteWidth),
+        },
+        format.PixelFormat
+    ));
+    *ppView = rtv;
+    return S_OK;
+  };
+
+  HRESULT
+  STDMETHODCALLTYPE
   CreateUnorderedAccessView(const D3D11_UNORDERED_ACCESS_VIEW_DESC1 *pDesc, ID3D11UnorderedAccessView1 **ppView)
       override {
     D3D11_UNORDERED_ACCESS_VIEW_DESC1 finalDesc;
@@ -268,7 +358,10 @@ public:
       return S_FALSE;
     }
 
-    auto viewId = buffer_->createView({.format = view_format});
+    auto viewId = buffer_->createView({
+        .format = view_format,
+        .usage = WMTTextureUsageShaderRead | WMTTextureUsageShaderWrite,
+    });
 
     auto srv = ref(new UAVWithCounter(
         &finalDesc, this, m_parent,

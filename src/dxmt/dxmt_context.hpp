@@ -137,6 +137,9 @@ struct TSDispatchArgumentsMarshal {
 
 struct RenderEncoderColorAttachmentData {
   TextureViewRef attachment;
+  Rc<Buffer> buffer_attachment;
+  WMT::Reference<WMT::Texture> buffer_texture;
+  uint64_t buffer_view_id = 0;
   enum WMTLoadAction load_action;
   enum WMTStoreAction store_action;
   uint16_t level;
@@ -218,6 +221,9 @@ struct ClearEncoderData : EncoderData {
     std::pair<float, uint8_t> depth_stencil;
   };
   TextureViewRef attachment;
+  Rc<Buffer> buffer_attachment;
+  WMT::Reference<WMT::Texture> buffer_texture;
+  uint64_t buffer_view_id = 0;
   unsigned clear_dsv;
   unsigned array_length;
   unsigned width;
@@ -641,6 +647,7 @@ public:
   };
 
   void clearColor(Rc<Texture> &&texture, uint64_t viewId, unsigned arrayLength, WMTClearColor color);
+  void clearColor(Rc<Buffer> &&buffer, uint64_t viewId, unsigned width, WMTClearColor color);
   void clearDepthStencil(
       Rc<Texture> &&texture, uint64_t viewId, unsigned arrayLength, unsigned flag, float depth, uint8_t stencil
   );

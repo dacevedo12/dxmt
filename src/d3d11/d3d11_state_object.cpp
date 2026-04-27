@@ -755,6 +755,8 @@ StateObjectCache<D3D11_SAMPLER_DESC, D3D11SamplerState>::CreateStateObject(
                desc.BorderColor[2] == 1.0f && desc.BorderColor[3] == 1.0f) {
       info.border_color = WMTSamplerBorderColorOpaqueWhite;
     } else {
+      // TODO: Emulate arbitrary D3D11 border colors; Metal sampler border
+      // colors are limited to transparent black, opaque black, and opaque white.
       WARN("CreateSamplerState: Unsupported border color (",
            desc.BorderColor[0], ", ", desc.BorderColor[1], ", ",
            desc.BorderColor[2], ", ", desc.BorderColor[3], ")");

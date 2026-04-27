@@ -95,6 +95,8 @@ struct D3D11UnorderedAccessView : ID3D11UnorderedAccessView1 {
 
 struct D3D11RenderTargetView : ID3D11RenderTargetView1 {
   Com<D3D11ResourceCommon, false> resource_{};
+  Buffer *buffer_{};
+  BufferSlice slice_{};
   Texture *texture_{};
   uint64_t view_id_{};
   MTL_RENDER_PASS_ATTACHMENT_DESC pass_desc_;
@@ -114,6 +116,18 @@ struct D3D11RenderTargetView : ID3D11RenderTargetView1 {
   texture() const {
     return texture_;
   };
+  Rc<Buffer>
+  buffer() const {
+    return buffer_;
+  };
+  BufferSlice
+  bufferSlice() const {
+    return slice_;
+  };
+  bool
+  isBufferView() const {
+    return buffer_ != nullptr;
+  }
   uint64_t
   viewId() const {
     return view_id_;

@@ -15,7 +15,7 @@ BufferAllocation::BufferAllocation(WMT::Device device, const WMTBufferInfo &info
     info_(info),
     flags_(flags) {
   // (sub)allocate a minimum of 256B buffer so that texture can be created
-  info_.length = std::max(info_.length, 256ull);
+  info_.length = align(std::max(info_.length, 256ull), 256ull);
   suballocation_size_ = info_.length;
   if (flags_.test(BufferAllocationFlag::SuballocateFromOnePage) && suballocation_size_ <= DXMT_PAGE_SIZE) {
     suballocation_size_ = align(info_.length, 16);
@@ -79,13 +79,15 @@ void
 Buffer::prepareAllocationViews(BufferAllocation *allocation) {
   std::unique_lock<dxmt::mutex> lock(mutex_);
   for (unsigned version = allocation->version_; version < version_; version++) {
-    auto format = viewDescriptors_[version].format;
+    auto descriptor = viewDescriptors_[version];
+    auto format = descriptor.format;
     auto texel_size = MTLGetTexelSize(format);
     assert(texel_size);
     assert(!(allocation->suballocation_size_ & (texel_size - 1)));
-    auto total_length = allocation->suballocation_size_ * allocation->suballocation_count_;
+    auto total_length = descriptor.byteLength ? descriptor.byteLength
+                                              : allocation->suballocation_size_ * allocation->suballocation_count_;
     WMTTextureInfo info;
-    info.type = WMTTextureTypeTextureBuffer;
+    info.type = descriptor.type;
     info.width = total_length / (uint64_t)texel_size;
     info.height = 1;
     info.depth = 1;
@@ -94,18 +96,19 @@ Buffer::prepareAllocationViews(BufferAllocation *allocation) {
     info.sample_count = 1;
     info.pixel_format = format;
     info.options = allocation->info_.options;
-    auto usage = WMTTextureUsageShaderRead;
+    auto usage = descriptor.usage;
     if (!allocation->flags().test(BufferAllocationFlag::GpuReadonly) &&
        ( allocation->flags().test(BufferAllocationFlag::GpuManaged) ||  allocation->flags().test(BufferAllocationFlag::GpuPrivate))) {
-      usage |= WMTTextureUsageShaderWrite;
-      if (format == WMTPixelFormatR32Uint || format == WMTPixelFormatR32Sint ||
-          (format == WMTPixelFormatRG32Uint && device_.supportsFamily(WMTGPUFamilyApple8))) {
-        usage |= WMTTextureUsageShaderAtomic;
+      if (usage & WMTTextureUsageShaderWrite) {
+        if (format == WMTPixelFormatR32Uint || format == WMTPixelFormatR32Sint ||
+            (format == WMTPixelFormatRG32Uint && device_.supportsFamily(WMTGPUFamilyApple8))) {
+          usage |= WMTTextureUsageShaderAtomic;
+        }
       }
     }
     info.usage = usage;
 
-    auto view = allocation->obj_.newTexture(info, 0, total_length);
+    auto view = allocation->obj_.newTexture(info, descriptor.byteOffset, total_length);
 
     allocation->cached_view_.push_back(std::make_unique<BufferView>(
         std::move(view), info.gpu_resource_id, allocation->suballocation_size_ / texel_size
@@ -119,7 +122,12 @@ Buffer::createView(BufferViewDescriptor const &descriptor) {
   std::unique_lock<dxmt::mutex> lock(mutex_);
   unsigned i = 0;
   for (; i < version_; i++) {
-    if (viewDescriptors_[i].format == descriptor.format) {
+    auto &existing = viewDescriptors_[i];
+    if (existing.format == descriptor.format &&
+        existing.usage == descriptor.usage &&
+        existing.type == descriptor.type &&
+        existing.byteOffset == descriptor.byteOffset &&
+        existing.byteLength == descriptor.byteLength) {
       return i;
     }
   }
