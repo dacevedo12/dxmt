@@ -1,5 +1,8 @@
 #include <stdatomic.h>
 #include <dlfcn.h>
+#include <stddef.h>
+#include <stdio.h>
+#include <string.h>
 #import <Cocoa/Cocoa.h>
 #import <ColorSync/ColorSync.h>
 #import <CoreFoundation/CFRunLoop.h>
@@ -938,6 +941,16 @@ _MTLRenderCommandEncoder_encodeCommands(void *obj) {
       break;
     case WMTRenderCommandUseResource: {
       struct wmtcmd_render_useresource *body = (struct wmtcmd_render_useresource *)next;
+      /*
+       * DXMT retains and synchronizes Metal buffers through its own allocation
+       * tracking. Redundant render useResource calls for every buffer can make
+       * Apple drivers fail otherwise valid command buffers with out-of-memory
+       * status under Rosetta-heavy D3D11 workloads. Texture resources still use
+       * Metal residency declarations.
+       */
+      if ([(id)body->resource respondsToSelector:@selector(length)]) {
+        break;
+      }
       [encoder useResource:(id<MTLResource>)body->resource
                      usage:(MTLResourceUsage)body->usage
                     stages:(MTLRenderStages)body->stages];
@@ -1891,7 +1904,15 @@ struct SM50_SHADER_PSO_PIXEL_SHADER_DATA32 {
   bool dual_source_blending;
   bool disable_depth_output;
   uint32_t unorm_output_reg_mask;
+  uint64_t demote_msaa_srv_mask_lo;
+  uint64_t demote_msaa_srv_mask_hi;
 };
+
+_Static_assert(sizeof(struct SM50_SHADER_PSO_PIXEL_SHADER_DATA32) == 40, "SM50 pixel PSO args32 size mismatch");
+_Static_assert(offsetof(struct SM50_SHADER_PSO_PIXEL_SHADER_DATA32, demote_msaa_srv_mask_lo) == 24,
+               "SM50 pixel PSO args32 demote mask lo offset mismatch");
+_Static_assert(offsetof(struct SM50_SHADER_PSO_PIXEL_SHADER_DATA32, demote_msaa_srv_mask_hi) == 32,
+               "SM50 pixel PSO args32 demote mask hi offset mismatch");
 
 struct SM50_SHADER_GS_PASS_THROUGH_DATA32 {
   uint32_t next;
@@ -1965,6 +1986,8 @@ sm50_compilation_argument32_convert(
       data->disable_depth_output = src->disable_depth_output;
       data->sample_mask = src->sample_mask;
       data->dual_source_blending = src->dual_source_blending;
+      data->demote_msaa_srv_mask_lo = src->demote_msaa_srv_mask_lo;
+      data->demote_msaa_srv_mask_hi = src->demote_msaa_srv_mask_hi;
       break;
     }
     case SM50_SHADER_IA_INPUT_LAYOUT: {
