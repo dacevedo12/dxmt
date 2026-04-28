@@ -3,6 +3,10 @@
 #include "com/com_guid.hpp"
 #include "com/com_object.hpp"
 #include "com/com_private_data.hpp"
+#include "d3d12_command_allocator.hpp"
+#include "d3d12_command_list.hpp"
+#include "d3d12_command_queue.hpp"
+#include "d3d12_fence.hpp"
 #include "log/log.hpp"
 #include "util_string.hpp"
 #include <algorithm>
@@ -196,14 +200,15 @@ public:
 
   HRESULT STDMETHODCALLTYPE CreateCommandQueue(const D3D12_COMMAND_QUEUE_DESC *desc,
                                                REFIID riid, void **command_queue) override {
-    InitReturnPtr(command_queue);
-    return E_NOTIMPL;
+    return d3d12::CreateCommandQueue(static_cast<IMTLD3D12Device *>(this), desc, riid, command_queue);
   }
 
   HRESULT STDMETHODCALLTYPE CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE type,
                                                    REFIID riid, void **command_allocator) override {
     InitReturnPtr(command_allocator);
-    return E_NOTIMPL;
+
+    auto allocator = d3d12::CreateCommandAllocator(static_cast<IMTLD3D12Device *>(this), type);
+    return allocator->QueryInterface(riid, command_allocator);
   }
 
   HRESULT STDMETHODCALLTYPE
@@ -225,7 +230,18 @@ public:
                                               ID3D12PipelineState *initial_pipeline_state,
                                               REFIID riid, void **command_list) override {
     InitReturnPtr(command_list);
-    return E_NOTIMPL;
+
+    if (node_mask > 1 || !command_allocator)
+      return E_INVALIDARG;
+
+    auto allocator_state = dynamic_cast<d3d12::CommandAllocator *>(command_allocator);
+    if (!allocator_state || allocator_state->GetCommandListType() != type)
+      return E_INVALIDARG;
+
+    auto list = d3d12::CreateGraphicsCommandList(
+        static_cast<IMTLD3D12Device *>(this), node_mask, type,
+        command_allocator, initial_pipeline_state);
+    return list->QueryInterface(riid, command_list);
   }
 
   HRESULT STDMETHODCALLTYPE CheckFeatureSupport(D3D12_FEATURE feature, void *feature_data,
@@ -441,7 +457,9 @@ public:
   HRESULT STDMETHODCALLTYPE CreateFence(UINT64 initial_value, D3D12_FENCE_FLAGS flags,
                                         REFIID riid, void **fence) override {
     InitReturnPtr(fence);
-    return E_NOTIMPL;
+
+    auto fence_object = d3d12::CreateFence(static_cast<IMTLD3D12Device *>(this), initial_value, flags);
+    return fence_object->QueryInterface(riid, fence);
   }
 
   HRESULT STDMETHODCALLTYPE GetDeviceRemovedReason() override {
