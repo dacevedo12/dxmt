@@ -6,6 +6,15 @@
 
 namespace dxmt::d3d12 {
 
-class Fence;
+class Fence {
+public:
+  virtual ~Fence() = default;
+
+  virtual HRESULT SignalFromQueue(UINT64 value) = 0;
+  virtual bool HasReached(UINT64 value) const = 0;
+};
+
+Com<ID3D12Fence>
+CreateFence(IMTLD3D12Device *device, UINT64 initial_value, D3D12_FENCE_FLAGS flags);
 
 } // namespace dxmt::d3d12
