@@ -1544,6 +1544,7 @@ enum WMTGPUFamily {
   WMTGPUFamilyMacCatalyst1 = 4001,
   WMTGPUFamilyMacCatalyst2 = 4002,
   WMTGPUFamilyMetal3 = 5001,
+  WMTGPUFamilyMetal4 = 5002,
 };
 
 WINEMETAL_API bool MTLDevice_supportsFamily(obj_handle_t device, enum WMTGPUFamily gpu_family);

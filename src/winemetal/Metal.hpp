@@ -10,6 +10,12 @@ namespace WMT {
 
 class String;
 
+struct OperatingSystemVersion {
+  uint64_t major;
+  uint64_t minor;
+  uint64_t patch;
+};
+
 class Object {
 public:
   obj_handle_t handle;
@@ -916,6 +922,13 @@ public:
 inline Reference<Array<Device>>
 CopyAllDevices() {
   return Reference<Array<Device>>(WMTCopyAllDevices());
+}
+
+inline OperatingSystemVersion
+GetOperatingSystemVersion() {
+  OperatingSystemVersion version = {};
+  WMTGetOSVersion(&version.major, &version.minor, &version.patch);
+  return version;
 }
 
 class CaptureManager : public Object {

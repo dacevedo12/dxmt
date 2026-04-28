@@ -1,3 +1,3 @@
 LIBRARY D3D12.DLL
 EXPORTS
-    ; Export list intentionally deferred until implementation starts.
+    D3D12CreateDevice
