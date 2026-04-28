@@ -941,16 +941,6 @@ _MTLRenderCommandEncoder_encodeCommands(void *obj) {
       break;
     case WMTRenderCommandUseResource: {
       struct wmtcmd_render_useresource *body = (struct wmtcmd_render_useresource *)next;
-      /*
-       * DXMT retains and synchronizes Metal buffers through its own allocation
-       * tracking. Redundant render useResource calls for every buffer can make
-       * Apple drivers fail otherwise valid command buffers with out-of-memory
-       * status under Rosetta-heavy D3D11 workloads. Texture resources still use
-       * Metal residency declarations.
-       */
-      if ([(id)body->resource respondsToSelector:@selector(length)]) {
-        break;
-      }
       [encoder useResource:(id<MTLResource>)body->resource
                      usage:(MTLResourceUsage)body->usage
                     stages:(MTLRenderStages)body->stages];
