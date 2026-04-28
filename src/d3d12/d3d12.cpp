@@ -2,9 +2,12 @@
 
 #include "com/com_object.hpp"
 #include "com/com_pointer.hpp"
+#include "d3d12_device.hpp"
 #include "dxgi_interfaces.h"
+#include "dxmt_device.hpp"
 #include "log/log.hpp"
 #include "util_env.hpp"
+#include "util_error.hpp"
 #include "util_string.hpp"
 #include <d3d12.h>
 #include <dxgi1_6.h>
@@ -116,5 +119,25 @@ D3D12CreateDevice(IUnknown *adapter, D3D_FEATURE_LEVEL minimum_feature_level, RE
       "D3D12CreateDevice: experimental D3D12 support gate passed, minimum feature level ",
       minimum_feature_level, ", riid ", dxmt::str::format(riid)));
 
-  return device ? E_NOTIMPL : S_FALSE;
+  constexpr D3D_FEATURE_LEVEL supported_feature_level = D3D_FEATURE_LEVEL_12_0;
+  if (minimum_feature_level > supported_feature_level) {
+    dxmt::Logger::err(dxmt::str::format(
+        "D3D12CreateDevice: requested feature level ", minimum_feature_level,
+        " exceeds supported feature level ", supported_feature_level));
+    return E_INVALIDARG;
+  }
+
+  if (!device)
+    return S_FALSE;
+
+  try {
+    auto d3d12_device = dxmt::d3d12::CreateD3D12Device(
+        dxmt::CreateDXMTDevice({.device = metal_adapter->GetMTLDevice()}),
+        metal_adapter.ptr());
+
+    return d3d12_device->QueryInterface(riid, device);
+  } catch (const dxmt::MTLD3DError &e) {
+    dxmt::Logger::err(dxmt::str::format("D3D12CreateDevice: failed to create device: ", e.message()));
+    return E_FAIL;
+  }
 }
