@@ -155,6 +155,7 @@ private:
   RingBumpState<StagingBufferBlockAllocator> staging_allocator;
   RingBumpState<GpuPrivateBufferBlockAllocator> copy_temp_allocator;
   RingBumpState<StagingBufferBlockAllocator, kCommandChunkGPUHeapSize> argbuf_allocator;
+  RingBumpState<HostBufferBlockAllocator, kCommandChunkGPUHeapSize> argbuf_shadow_allocator;
   RingBumpState<HostBufferBlockAllocator, kCommandChunkCPUHeapSize, dxmt::null_mutex> cpu_command_allocator;
   RingBumpState<HostBufferBlockAllocator, 0x1000 /* 4kB */> reftracker_storage_allocator;
   CaptureState capture_state;
@@ -252,10 +253,15 @@ public:
     return {block.buffer, offset, block.gpu_address};
   }
 
-  std::tuple<void *, WMT::Buffer, uint64_t>
+  AllocatedArgumentBufferSlice
   AllocateArgumentBuffer(uint64_t seq, size_t size) {
     auto [block, offset] = argbuf_allocator.allocate(seq, cpu_coherent.signaledValue(), size, 64);
-    return {ptr_add(block.mapped_address, offset), block.buffer, offset};
+    if constexpr (sizeof(void *) == 4) {
+      auto [shadow_block, shadow_offset] = argbuf_shadow_allocator.allocate(seq, cpu_coherent.signaledValue(), size, 64);
+      return {ptr_add(shadow_block.ptr, shadow_offset), block.buffer, offset, size, true};
+    } else {
+      return {ptr_add(block.mapped_address, offset), block.buffer, offset, size, false};
+    }
   }
 
   void *

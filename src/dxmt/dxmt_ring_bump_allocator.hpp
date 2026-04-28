@@ -94,9 +94,10 @@ public:
     WMT::Reference<WMT::Buffer> buffer;
     uint64_t gpu_address;
     void *mapped_address;
+    bool owns_mapped_address = false;
 
     ~Block() {
-      if (mapped_address) {
+      if (owns_mapped_address && mapped_address) {
         free(mapped_address);
         mapped_address = nullptr;
       }
@@ -109,7 +110,9 @@ public:
       buffer = std::move(move.buffer);
       gpu_address = move.gpu_address;
       mapped_address = move.mapped_address;
+      owns_mapped_address = move.owns_mapped_address;
       move.mapped_address = nullptr;
+      move.owns_mapped_address = false;
     };
   };
 
@@ -117,12 +120,15 @@ public:
   allocate(size_t block_size) {
     Block block{};
     block.mapped_address = placed_buffer_ ? malloc(block_size) : nullptr;
+    block.owns_mapped_address = placed_buffer_;
     WMTBufferInfo info;
     info.options = buffer_info_;
     info.memory.set(block.mapped_address);
     info.length = block_size;
     block.buffer = device_.newBuffer(info);
     block.gpu_address = info.gpu_address;
+    if (!placed_buffer_)
+      block.mapped_address = info.memory.get_accessible_or_null();
     return block;
   };
 

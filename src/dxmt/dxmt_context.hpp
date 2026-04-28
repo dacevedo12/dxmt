@@ -186,10 +186,12 @@ struct RenderEncoderData : EncoderData {
   wmtcmd_base *cmd_tail;
   WMT::Buffer allocated_argbuf;
   uint64_t allocated_argbuf_offset;
+  uint64_t allocated_argbuf_size;
   uint64_t encoder_id_vertex;
   FenceSet fence_wait_vertex;
   FenceSet fence_update_vertex;
   void *allocated_argbuf_mapping;
+  bool allocated_argbuf_needs_flush;
   uint8_t dsv_planar_flags;
   uint8_t dsv_readonly_flags;
   uint8_t render_target_count;
@@ -207,7 +209,9 @@ struct ComputeEncoderData : EncoderData {
   wmtcmd_base *cmd_tail;
   WMT::Buffer allocated_argbuf;
   uint64_t allocated_argbuf_offset;
+  uint64_t allocated_argbuf_size;
   void *allocated_argbuf_mapping;
+  bool allocated_argbuf_needs_flush;
 };
 
 struct BlitEncoderData : EncoderData {
@@ -322,6 +326,14 @@ struct AllocatedTempBufferSlice {
   WMT::Buffer gpu_buffer;
   uint64_t offset;
   uint64_t gpu_address;
+};
+
+struct AllocatedArgumentBufferSlice {
+  void *mapped;
+  WMT::Buffer gpu_buffer;
+  uint64_t offset;
+  uint64_t length;
+  bool needs_flush;
 };
 
 class ArgumentEncodingContext {

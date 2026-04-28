@@ -81,8 +81,10 @@ CommandQueue::CommandQueue(WMT::Device device) :
     copy_temp_allocator({device, WMTResourceHazardTrackingModeUntracked | WMTResourceStorageModePrivate}),
     argbuf_allocator({
         device,
-        WMTResourceHazardTrackingModeUntracked | WMTResourceCPUCacheModeWriteCombined | WMTResourceStorageModeShared
+        WMTResourceHazardTrackingModeUntracked | WMTResourceCPUCacheModeDefaultCache | WMTResourceStorageModeShared,
+        false
     }),
+    argbuf_shadow_allocator({}),
     cpu_command_allocator({}),
     reftracker_storage_allocator({}),
     cmd_library(device),
@@ -311,6 +313,7 @@ CommandQueue::WaitForFinishThread() {
     staging_allocator.free_blocks(internal_seq);
     copy_temp_allocator.free_blocks(internal_seq);
     argbuf_allocator.free_blocks(internal_seq);
+    argbuf_shadow_allocator.free_blocks(internal_seq);
 
     internal_seq++;
   }

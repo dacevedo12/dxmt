@@ -8,11 +8,13 @@
 #include "util_env.hpp"
 #include "util_string.hpp"
 #include "wsi_platform.hpp"
+#include <algorithm>
 #include <atomic>
 #include <cstdint>
 #include <cfloat>
 #include <cstdlib>
 #include <cstring>
+#include <string>
 #include <string_view>
 
 namespace dxmt {
@@ -462,6 +464,14 @@ static bool
 DebugEnabledEnv(const char *name) {
   auto value = env::getEnvVar(name);
   return value == "1" || value == "true" || value == "yes" || value == "trace";
+}
+
+static void
+NormalizeRenderPassInfo(WMTRenderPassInfo &info) {
+  if (!info.default_raster_sample_count)
+    info.default_raster_sample_count = 1;
+  if (!info.render_target_array_length)
+    info.render_target_array_length = 1;
 }
 
 static double
@@ -1174,10 +1184,12 @@ ArgumentEncodingContext::startRenderPass(
   encoder_info->dsv_planar_flags = dsv_planar_flags;
   encoder_info->dsv_readonly_flags = dsv_readonly_flags;
   encoder_info->render_target_count = render_target_count;
-  auto [gpu_buffer_contents, gpu_buffer_, offset] = queue_.AllocateArgumentBuffer(seq_id_, encoder_argbuf_size);
-  encoder_info->allocated_argbuf = gpu_buffer_;
-  encoder_info->allocated_argbuf_offset = offset;
-  encoder_info->allocated_argbuf_mapping = gpu_buffer_contents;
+  auto argbuf = queue_.AllocateArgumentBuffer(seq_id_, encoder_argbuf_size);
+  encoder_info->allocated_argbuf = argbuf.gpu_buffer;
+  encoder_info->allocated_argbuf_offset = argbuf.offset;
+  encoder_info->allocated_argbuf_size = argbuf.length;
+  encoder_info->allocated_argbuf_mapping = argbuf.mapped;
+  encoder_info->allocated_argbuf_needs_flush = argbuf.needs_flush;
   encoder_current = encoder_info;
 
   currentFrameStatistics().render_pass_count++;
@@ -1198,10 +1210,12 @@ ArgumentEncodingContext::startComputePass(uint64_t encoder_argbuf_size) {
   encoder_info->cmd_head.type = WMTComputeCommandNop;
   encoder_info->cmd_head.next.set(0);
   encoder_info->cmd_tail = (wmtcmd_base *)&encoder_info->cmd_head;
-  auto [gpu_buffer_contents, gpu_buffer_, offset] = queue_.AllocateArgumentBuffer(seq_id_, encoder_argbuf_size);
-  encoder_info->allocated_argbuf = gpu_buffer_;
-  encoder_info->allocated_argbuf_offset = offset;
-  encoder_info->allocated_argbuf_mapping = gpu_buffer_contents;
+  auto argbuf = queue_.AllocateArgumentBuffer(seq_id_, encoder_argbuf_size);
+  encoder_info->allocated_argbuf = argbuf.gpu_buffer;
+  encoder_info->allocated_argbuf_offset = argbuf.offset;
+  encoder_info->allocated_argbuf_size = argbuf.length;
+  encoder_info->allocated_argbuf_mapping = argbuf.mapped;
+  encoder_info->allocated_argbuf_needs_flush = argbuf.needs_flush;
   encoder_current = encoder_info;
 
   currentFrameStatistics().compute_pass_count++;
@@ -1389,6 +1403,17 @@ ArgumentEncodingContext::$$setEncodingContext(uint64_t seq_id, uint64_t frame_id
 
 constexpr unsigned kEncoderOptimizerThreshold = 64;
 
+static void
+FlushRenderEncoderArgumentBuffer(RenderEncoderData *data) {
+  if (!data->allocated_argbuf_needs_flush || !data->allocated_argbuf_size)
+    return;
+
+  data->allocated_argbuf.updateContents(
+      data->allocated_argbuf_offset, data->allocated_argbuf_mapping, data->allocated_argbuf_size
+  );
+  data->allocated_argbuf_needs_flush = false;
+}
+
 QueryReadbacks
 ArgumentEncodingContext::flushCommands(WMT::CommandBuffer cmdbuf, uint64_t seqId, uint64_t event_seq_id) {
   assert(!encoder_current);
@@ -1510,6 +1535,8 @@ ArgumentEncodingContext::flushCommands(WMT::CommandBuffer cmdbuf, uint64_t seqId
         data->~RenderEncoderData();
         break;
       }
+      NormalizeRenderPassInfo(render_pass_info);
+      FlushRenderEncoderArgumentBuffer(data);
       auto gpu_buffer_ = data->allocated_argbuf;
       auto encoder = cmdbuf.renderCommandEncoder(render_pass_info);
       data->fence_wait.forEach(
@@ -1543,9 +1570,8 @@ ArgumentEncodingContext::flushCommands(WMT::CommandBuffer cmdbuf, uint64_t seqId
           uint32_t vertex_count_per_warp;
           uint32_t end_of_command;
         };
-        auto [mapped_task_data, task_data_buffer, task_data_buffer_offset] =
-            queue_.AllocateArgumentBuffer(seq_id_, sizeof(GS_MARSHAL_TASK) * task_count);
-        auto tasks_data = (GS_MARSHAL_TASK *)mapped_task_data;
+        auto task_argbuf = queue_.AllocateArgumentBuffer(seq_id_, sizeof(GS_MARSHAL_TASK) * task_count);
+        auto tasks_data = (GS_MARSHAL_TASK *)task_argbuf.mapped;
         for (unsigned i = 0; i<task_count; i++) {
           auto & task = data->gs_arg_marshal_tasks[i];
           tasks_data[i].draw_args = task.draw_arguments_va;
@@ -1557,7 +1583,10 @@ ArgumentEncodingContext::flushCommands(WMT::CommandBuffer cmdbuf, uint64_t seqId
           encoder.useResource(task.dispatch_arguments_buffer, WMTResourceUsageWrite, WMTRenderStageVertex);
         }
         tasks_data[task_count - 1].end_of_command = 1;
-        emulated_cmd.MarshalGSDispatchArguments(encoder, task_data_buffer, task_data_buffer_offset);
+        if (task_argbuf.needs_flush) {
+          task_argbuf.gpu_buffer.updateContents(task_argbuf.offset, task_argbuf.mapped, task_argbuf.length);
+        }
+        emulated_cmd.MarshalGSDispatchArguments(encoder, task_argbuf.gpu_buffer, task_argbuf.offset);
       }
       if (data->ts_arg_marshal_tasks.size()) {
         auto task_count = data->ts_arg_marshal_tasks.size();
@@ -1569,9 +1598,8 @@ ArgumentEncodingContext::flushCommands(WMT::CommandBuffer cmdbuf, uint64_t seqId
           uint16_t patch_per_group;
           uint32_t end_of_command;
         };
-        auto [mapped_task_data, task_data_buffer, task_data_buffer_offset] =
-            queue_.AllocateArgumentBuffer(seq_id_, sizeof(TS_MARSHAL_TASK) * task_count);
-        auto tasks_data = (TS_MARSHAL_TASK *)mapped_task_data;
+        auto task_argbuf = queue_.AllocateArgumentBuffer(seq_id_, sizeof(TS_MARSHAL_TASK) * task_count);
+        auto tasks_data = (TS_MARSHAL_TASK *)task_argbuf.mapped;
         for (unsigned i = 0; i<task_count; i++) {
           auto & task = data->ts_arg_marshal_tasks[i];
           tasks_data[i].draw_args = task.draw_arguments_va;
@@ -1584,7 +1612,10 @@ ArgumentEncodingContext::flushCommands(WMT::CommandBuffer cmdbuf, uint64_t seqId
           encoder.useResource(task.dispatch_arguments_buffer, WMTResourceUsageWrite, WMTRenderStageVertex);
         }
         tasks_data[task_count - 1].end_of_command = 1;
-        emulated_cmd.MarshalTSDispatchArguments(encoder, task_data_buffer, task_data_buffer_offset);
+        if (task_argbuf.needs_flush) {
+          task_argbuf.gpu_buffer.updateContents(task_argbuf.offset, task_argbuf.mapped, task_argbuf.length);
+        }
+        emulated_cmd.MarshalTSDispatchArguments(encoder, task_argbuf.gpu_buffer, task_argbuf.offset);
       }
       if (data->gs_arg_marshal_tasks.size() > 0 || data->ts_arg_marshal_tasks.size() > 0) {
         encoder.memoryBarrier(
@@ -1604,6 +1635,10 @@ ArgumentEncodingContext::flushCommands(WMT::CommandBuffer cmdbuf, uint64_t seqId
     }
     case EncoderType::Compute: {
       auto data = static_cast<ComputeEncoderData *>(current);
+      if (data->allocated_argbuf_needs_flush) {
+        data->allocated_argbuf.updateContents(data->allocated_argbuf_offset, data->allocated_argbuf_mapping,
+                                              data->allocated_argbuf_size);
+      }
       auto encoder = cmdbuf.computeCommandEncoder(true);
       data->fence_wait.forEach([&](auto id) { encoder.waitForFence(fence_pool_[id]); });
       struct wmtcmd_compute_setbuffer setcmd;
@@ -1704,6 +1739,7 @@ ArgumentEncodingContext::flushCommands(WMT::CommandBuffer cmdbuf, uint64_t seqId
           info.colors[0].store_action = WMTStoreActionStore;
         }
         info.render_target_array_length = data->array_length;
+        NormalizeRenderPassInfo(info);
         auto encoder = cmdbuf.renderCommandEncoder(info);
         encoder.setLabel(WMT::String::string("ClearPass", WMTUTF8StringEncoding));
         data->fence_wait.forEach([&](auto id) { encoder.waitForFence(fence_pool_[id], WMTRenderStageFragment); });
@@ -1732,6 +1768,7 @@ ArgumentEncodingContext::flushCommands(WMT::CommandBuffer cmdbuf, uint64_t seqId
         info.colors[0].store_action = WMTStoreActionStoreAndMultisampleResolve;
         info.colors[0].resolve_texture = data->dst.texture();
 
+        NormalizeRenderPassInfo(info);
         auto encoder = cmdbuf.renderCommandEncoder(info);
         encoder.setLabel(WMT::String::string("ResolvePass", WMTUTF8StringEncoding));
         data->fence_wait.forEach([&](auto id) { encoder.waitForFence(fence_pool_[id], WMTRenderStageFragment); });
@@ -2012,6 +2049,10 @@ ArgumentEncodingContext::checkEncoderRelation(EncoderData *former, EncoderData *
       r1->fence_wait_vertex.subtract(r0->fence_update);
       does not make sense
       */
+
+      // r0's commands are prepended into r1, but r0 itself will not be encoded after this point.
+      // On 32-bit builds the argument buffer writes live in a shadow allocation until explicitly flushed.
+      FlushRenderEncoderArgumentBuffer(r0);
 
       currentFrameStatistics().render_pass_optimized++;
       r0->~RenderEncoderData();
