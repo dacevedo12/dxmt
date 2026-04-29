@@ -17,6 +17,15 @@ struct PendingEvent {
   HANDLE event;
 };
 
+static void
+SignalWin32Event(HANDLE event) {
+#ifdef _WIN32
+  ::SetEvent(event);
+#else
+  (void)event;
+#endif
+}
+
 class FenceImpl final : public ComObjectWithInitialRef<ID3D12Fence>, public Fence {
 public:
   FenceImpl(IMTLD3D12Device *device, UINT64 initial_value, D3D12_FENCE_FLAGS flags)
@@ -72,7 +81,7 @@ public:
 
     std::lock_guard lock(mutex_);
     if (GetCompletedValue() >= value) {
-      ::SetEvent(event);
+      SignalWin32Event(event);
       return S_OK;
     }
 
@@ -102,7 +111,7 @@ private:
 
     for (auto it = pending_events_.begin(); it != pending_events_.end();) {
       if (completed >= it->value) {
-        ::SetEvent(it->event);
+        SignalWin32Event(it->event);
         it = pending_events_.erase(it);
       } else {
         ++it;
