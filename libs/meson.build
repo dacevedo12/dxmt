@@ -1,1 +1,2 @@
 subdir('DXBCParser')
+subdir('DXILParser')

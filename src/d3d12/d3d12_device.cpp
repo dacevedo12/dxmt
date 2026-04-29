@@ -219,6 +219,7 @@ public:
   CreateGraphicsPipelineState(const D3D12_GRAPHICS_PIPELINE_STATE_DESC *desc,
                               REFIID riid, void **pipeline_state) override {
     InitReturnPtr(pipeline_state);
+    // TODO(dxil): parse desc shader bytecode with DXILParser before PSO creation.
     return E_NOTIMPL;
   }
 
@@ -226,6 +227,7 @@ public:
   CreateComputePipelineState(const D3D12_COMPUTE_PIPELINE_STATE_DESC *desc,
                              REFIID riid, void **pipeline_state) override {
     InitReturnPtr(pipeline_state);
+    // TODO(dxil): parse desc->CS bytecode with DXILParser before PSO creation.
     return E_NOTIMPL;
   }
 

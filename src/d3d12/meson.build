@@ -23,6 +23,7 @@ d3d12_dll = shared_library('d3d12', d3d12_src, d3d12_res,
   name_prefix         : '',
   dependencies        : [
     dxgi_dep,
+    dxil_parser_dep,
     airconv_forward_dep,
     dxmt_dep,
     winemetal_dep,
