@@ -119,6 +119,7 @@ public:
     return device_->QueryInterface(riid, device);
   }
 
+#ifdef __MINGW32__
   void STDMETHODCALLTYPE UpdateTileMappings(ID3D12Resource *resource, UINT region_count,
                                             const D3D12_TILED_RESOURCE_COORDINATE *region_start_coordinates,
                                             const D3D12_TILE_REGION_SIZE *region_sizes,
@@ -128,6 +129,16 @@ public:
                                             const UINT *heap_range_offsets,
                                             const UINT *range_tile_counts,
                                             D3D12_TILE_MAPPING_FLAGS flags) override {}
+#else
+  void STDMETHODCALLTYPE UpdateTileMappings(ID3D12Resource *resource, UINT region_count,
+                                            const D3D12_TILED_RESOURCE_COORDINATE *region_start_coordinates,
+                                            const D3D12_TILE_REGION_SIZE *region_sizes,
+                                            UINT range_count,
+                                            const D3D12_TILE_RANGE_FLAGS *range_flags,
+                                            UINT *heap_range_offsets,
+                                            UINT *range_tile_counts,
+                                            D3D12_TILE_MAPPING_FLAGS flags) override {}
+#endif
 
   void STDMETHODCALLTYPE CopyTileMappings(ID3D12Resource *dst_resource,
                                           const D3D12_TILED_RESOURCE_COORDINATE *dst_region_start_coordinate,
