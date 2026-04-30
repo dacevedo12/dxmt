@@ -4,9 +4,12 @@
 #include "com/com_object.hpp"
 #include "com/com_private_data.hpp"
 #include "log/log.hpp"
+#include "sha1/sha1_util.hpp"
 #include "util_string.hpp"
 #include <algorithm>
+#include <cstddef>
 #include <cstring>
+#include <string_view>
 #include <span>
 #include <utility>
 
@@ -19,6 +22,42 @@ constexpr uint32_t kShaderKindGeometry = 2;
 constexpr uint32_t kShaderKindHull = 3;
 constexpr uint32_t kShaderKindDomain = 4;
 constexpr uint32_t kShaderKindCompute = 5;
+
+class BlobImpl final : public ComObjectWithInitialRef<ID3DBlob> {
+public:
+  explicit BlobImpl(std::vector<std::byte> &&data) : data_(std::move(data)) {}
+
+  HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void **object) override {
+    if (!object)
+      return E_POINTER;
+    *object = nullptr;
+    if (riid == __uuidof(IUnknown) || riid == __uuidof(ID3D10Blob)) {
+      *object = ref(this);
+      return S_OK;
+    }
+    return E_NOINTERFACE;
+  }
+
+  void *STDMETHODCALLTYPE GetBufferPointer() override {
+    return data_.empty() ? nullptr : data_.data();
+  }
+
+  SIZE_T STDMETHODCALLTYPE GetBufferSize() override {
+    return data_.size();
+  }
+
+private:
+  std::vector<std::byte> data_;
+};
+
+Com<ID3DBlob>
+CreateBlob(std::span<const uint8_t> data) {
+  std::vector<std::byte> bytes;
+  bytes.resize(data.size());
+  if (!data.empty())
+    std::memcpy(bytes.data(), data.data(), data.size());
+  return Com<ID3DBlob>::transfer(new BlobImpl(std::move(bytes)));
+}
 
 const char *
 ShaderStageName(PipelineShaderStage stage) {
@@ -281,6 +320,73 @@ CopyCachedBlob(D3D12_CACHED_PIPELINE_STATE cached,
 }
 
 void
+HashBytes(Sha1HashState &hash, const void *data, size_t size) {
+  if (size)
+    hash.update(data, size);
+}
+
+template <typename T>
+void
+HashValue(Sha1HashState &hash, const T &value) {
+  hash.update(value);
+}
+
+void
+HashString(Sha1HashState &hash, std::string_view value) {
+  const auto size = uint32_t(value.size());
+  HashValue(hash, size);
+  HashBytes(hash, value.data(), value.size());
+}
+
+template <typename T>
+void
+HashVector(Sha1HashState &hash, const std::vector<T> &values) {
+  const auto size = uint32_t(values.size());
+  HashValue(hash, size);
+  HashBytes(hash, values.data(), values.size() * sizeof(T));
+}
+
+void
+HashDxilShaders(Sha1HashState &hash,
+                const std::vector<PipelineDxilShader> &shaders) {
+  const auto count = uint32_t(shaders.size());
+  HashValue(hash, count);
+  for (const auto &shader : shaders) {
+    HashValue(hash, shader.stage);
+    HashVector(hash, shader.bytecode);
+  }
+}
+
+std::string
+BuildShaderCacheKey(PipelineStateType type,
+                    const std::vector<PipelineDxilShader> &shaders) {
+  Sha1HashState hash;
+  HashString(hash, type == PipelineStateType::Graphics
+                       ? "dxmt-d3d12-graphics-shader-cache-v1"
+                       : "dxmt-d3d12-compute-shader-cache-v1");
+  HashDxilShaders(hash, shaders);
+  return hash.final().string();
+}
+
+std::vector<uint8_t>
+BuildCachedShaderBlob(PipelineStateType type,
+                      const PipelineGraphicsState &graphics_state,
+                      const PipelineComputeState &compute_state,
+                      std::string_view shader_cache_key) {
+  if (type == PipelineStateType::Graphics && !graphics_state.cached_pso.empty())
+    return graphics_state.cached_pso;
+  if (type == PipelineStateType::Compute && !compute_state.cached_pso.empty())
+    return compute_state.cached_pso;
+
+  constexpr std::string_view magic = "DXMT:D3D12:ShaderCache:";
+  std::vector<uint8_t> blob;
+  blob.reserve(magic.size() + shader_cache_key.size());
+  blob.insert(blob.end(), magic.begin(), magic.end());
+  blob.insert(blob.end(), shader_cache_key.begin(), shader_cache_key.end());
+  return blob;
+}
+
+void
 FixGraphicsStatePointers(PipelineGraphicsState &state,
                          const std::vector<PipelineDxilShader> &shaders) {
   state.desc.VS = ShaderBytecodeView(shaders, PipelineShaderStage::Vertex);
@@ -415,6 +521,10 @@ public:
         compute_state_(std::move(compute_state)) {
     FixGraphicsStatePointers(graphics_state_, shaders_);
     FixComputeStatePointers(compute_state_, shaders_);
+    shader_cache_key_ = BuildShaderCacheKey(type_, shaders_);
+    cached_shader_blob_ =
+        BuildCachedShaderBlob(type_, graphics_state_, compute_state_,
+                              shader_cache_key_);
   }
 
   HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void **object) override {
@@ -462,7 +572,11 @@ public:
 
   HRESULT STDMETHODCALLTYPE GetCachedBlob(ID3DBlob **blob) override {
     InitReturnPtr(blob);
-    return E_NOTIMPL;
+    if (!blob)
+      return E_POINTER;
+
+    *blob = CreateBlob(cached_shader_blob_).takeOwnership();
+    return S_OK;
   }
 
   PipelineStateType GetType() const override {
@@ -489,6 +603,10 @@ public:
     return type_ == PipelineStateType::Compute ? &compute_state_ : nullptr;
   }
 
+  const std::string &GetShaderCacheKey() const override {
+    return shader_cache_key_;
+  }
+
 private:
   Com<IMTLD3D12Device> device_;
   PipelineStateType type_;
@@ -497,6 +615,8 @@ private:
   std::vector<PipelineSignatureLink> signature_links_;
   PipelineGraphicsState graphics_state_;
   PipelineComputeState compute_state_;
+  std::string shader_cache_key_;
+  std::vector<uint8_t> cached_shader_blob_;
   ComPrivateData private_data_;
   std::string name_;
 };

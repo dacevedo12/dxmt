@@ -23,6 +23,8 @@ public:
       if (!allocator_state || allocator_state->GetCommandListType() != type_)
         allocator_ = nullptr;
     }
+    if (!IsPipelineStateCompatible(initial_pipeline_state_.ptr()))
+      initial_pipeline_state_ = nullptr;
     current_pipeline_state_ = initial_pipeline_state_;
   }
 
@@ -83,6 +85,8 @@ public:
     auto allocator_state = dynamic_cast<CommandAllocator *>(allocator);
     if (!allocator_state || allocator_state->GetCommandListType() != type_)
       return E_INVALIDARG;
+    if (!IsPipelineStateCompatible(initial_state))
+      return E_INVALIDARG;
 
     allocator_ = allocator;
     initial_pipeline_state_ = initial_state;
@@ -107,6 +111,8 @@ public:
   }
 
   void STDMETHODCALLTYPE ClearState(ID3D12PipelineState *pipeline_state) override {
+    if (!IsPipelineStateCompatible(pipeline_state))
+      return;
     current_pipeline_state_ = pipeline_state;
   }
   void STDMETHODCALLTYPE DrawInstanced(UINT vertex_count_per_instance, UINT instance_count,
@@ -138,6 +144,8 @@ public:
   void STDMETHODCALLTYPE OMSetBlendFactor(const FLOAT blend_factor[4]) override {}
   void STDMETHODCALLTYPE OMSetStencilRef(UINT stencil_ref) override {}
   void STDMETHODCALLTYPE SetPipelineState(ID3D12PipelineState *pipeline_state) override {
+    if (!IsPipelineStateCompatible(pipeline_state))
+      return;
     current_pipeline_state_ = pipeline_state;
   }
   void STDMETHODCALLTYPE ResourceBarrier(UINT barrier_count, const D3D12_RESOURCE_BARRIER *barriers) override {}
@@ -214,6 +222,25 @@ public:
                                          UINT64 count_buffer_offset) override {}
 
 private:
+  bool IsPipelineStateCompatible(ID3D12PipelineState *pipeline_state) const {
+    if (!pipeline_state)
+      return true;
+
+    const auto *state = dynamic_cast<PipelineState *>(pipeline_state);
+    if (!state)
+      return false;
+
+    switch (type_) {
+    case D3D12_COMMAND_LIST_TYPE_DIRECT:
+    case D3D12_COMMAND_LIST_TYPE_BUNDLE:
+      return true;
+    case D3D12_COMMAND_LIST_TYPE_COMPUTE:
+      return state->GetType() == PipelineStateType::Compute;
+    default:
+      return false;
+    }
+  }
+
   Com<IMTLD3D12Device> device_;
   UINT node_mask_;
   D3D12_COMMAND_LIST_TYPE type_;

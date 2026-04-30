@@ -70,6 +70,7 @@ public:
   virtual const std::vector<PipelineSignatureLink> &GetSignatureLinks() const = 0;
   virtual const PipelineGraphicsState *GetGraphicsState() const = 0;
   virtual const PipelineComputeState *GetComputeState() const = 0;
+  virtual const std::string &GetShaderCacheKey() const = 0;
 };
 
 Com<ID3D12PipelineState>
