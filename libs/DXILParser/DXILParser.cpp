@@ -6,6 +6,7 @@
 #include <llvm/ADT/StringRef.h>
 #include <llvm/Bitcode/BitcodeReader.h>
 #include <llvm/IR/Constants.h>
+#include <llvm/IR/DerivedTypes.h>
 #include <llvm/IR/Function.h>
 #include <llvm/IR/GlobalVariable.h>
 #include <llvm/IR/Instruction.h>
@@ -242,6 +243,120 @@ TypeString(const llvm::Type *type) {
   return stream.str();
 }
 
+LlvmTypeInfo
+ParseLlvmType(const llvm::Type *type, uint32_t depth = 0) {
+  LlvmTypeInfo info = {};
+  if (!type)
+    return info;
+
+  info.text = TypeString(type);
+  if (depth > 16)
+    return info;
+
+  switch (type->getTypeID()) {
+  case llvm::Type::VoidTyID:
+    info.kind = LlvmTypeKind::Void;
+    return info;
+  case llvm::Type::HalfTyID:
+    info.kind = LlvmTypeKind::Half;
+    info.bit_width = 16;
+    return info;
+  case llvm::Type::BFloatTyID:
+    info.kind = LlvmTypeKind::BFloat;
+    info.bit_width = 16;
+    return info;
+  case llvm::Type::FloatTyID:
+    info.kind = LlvmTypeKind::Float;
+    info.bit_width = 32;
+    return info;
+  case llvm::Type::DoubleTyID:
+    info.kind = LlvmTypeKind::Double;
+    info.bit_width = 64;
+    return info;
+  case llvm::Type::X86_FP80TyID:
+    info.kind = LlvmTypeKind::X86Fp80;
+    info.bit_width = 80;
+    return info;
+  case llvm::Type::FP128TyID:
+    info.kind = LlvmTypeKind::Fp128;
+    info.bit_width = 128;
+    return info;
+  case llvm::Type::PPC_FP128TyID:
+    info.kind = LlvmTypeKind::PpcFp128;
+    info.bit_width = 128;
+    return info;
+  case llvm::Type::X86_MMXTyID:
+    info.kind = LlvmTypeKind::X86Mmx;
+    info.bit_width = 64;
+    return info;
+  case llvm::Type::LabelTyID:
+    info.kind = LlvmTypeKind::Label;
+    return info;
+  case llvm::Type::MetadataTyID:
+    info.kind = LlvmTypeKind::Metadata;
+    return info;
+  case llvm::Type::TokenTyID:
+    info.kind = LlvmTypeKind::Token;
+    return info;
+  case llvm::Type::IntegerTyID:
+    info.kind = LlvmTypeKind::Integer;
+    info.bit_width = type->getIntegerBitWidth();
+    return info;
+  case llvm::Type::PointerTyID: {
+    info.kind = LlvmTypeKind::Pointer;
+    const auto *pointer = llvm::cast<llvm::PointerType>(type);
+    info.address_space = pointer->getAddressSpace();
+    info.is_opaque = pointer->isOpaque();
+    return info;
+  }
+  case llvm::Type::FixedVectorTyID:
+  case llvm::Type::ScalableVectorTyID: {
+    info.kind = LlvmTypeKind::Vector;
+    const auto *vector = llvm::cast<llvm::VectorType>(type);
+    const auto element_count = vector->getElementCount();
+    info.element_count = element_count.getKnownMinValue();
+    info.is_scalable = element_count.isScalable();
+    info.contained_types.push_back(
+        ParseLlvmType(vector->getElementType(), depth + 1));
+    return info;
+  }
+  case llvm::Type::ArrayTyID: {
+    info.kind = LlvmTypeKind::Array;
+    const auto *array = llvm::cast<llvm::ArrayType>(type);
+    info.element_count = array->getNumElements();
+    info.contained_types.push_back(
+        ParseLlvmType(array->getElementType(), depth + 1));
+    return info;
+  }
+  case llvm::Type::StructTyID: {
+    info.kind = LlvmTypeKind::Struct;
+    const auto *structure = llvm::cast<llvm::StructType>(type);
+    if (structure->hasName())
+      info.name = structure->getName().str();
+    info.is_opaque = structure->isOpaque();
+    if (!info.is_opaque) {
+      info.contained_types.reserve(structure->getNumElements());
+      for (const auto *element : structure->elements())
+        info.contained_types.push_back(ParseLlvmType(element, depth + 1));
+    }
+    return info;
+  }
+  case llvm::Type::FunctionTyID: {
+    info.kind = LlvmTypeKind::Function;
+    const auto *function = llvm::cast<llvm::FunctionType>(type);
+    info.is_var_arg = function->isVarArg();
+    info.contained_types.reserve(function->getNumParams() + 1);
+    info.contained_types.push_back(
+        ParseLlvmType(function->getReturnType(), depth + 1));
+    for (const auto *parameter : function->params())
+      info.contained_types.push_back(ParseLlvmType(parameter, depth + 1));
+    return info;
+  }
+  default:
+    return info;
+  }
+}
+
 std::string
 ValueOperandText(const llvm::Value *value) {
   if (!value)
@@ -277,6 +392,7 @@ ParseLlvmOperand(const llvm::Value *value) {
     return info;
 
   info.type = TypeString(value->getType());
+  info.type_info = ParseLlvmType(value->getType());
   info.text = ValueOperandText(value);
   if (auto integer = ConstantUInt64(value)) {
     info.is_integer = true;
@@ -303,6 +419,7 @@ ParseLlvmInstruction(const llvm::Instruction &instruction) {
   LlvmInstructionInfo info = {};
   info.opcode_name = instruction.getOpcodeName();
   info.result_type = TypeString(instruction.getType());
+  info.result_type_info = ParseLlvmType(instruction.getType());
   if (instruction.hasName())
     info.result_name = instruction.getName().str();
 
@@ -340,6 +457,7 @@ ParseDxilOperation(const LlvmInstructionInfo &instruction,
   info.opcode = instruction.dxil_opcode.value_or(0);
   info.opcode_name = instruction.dxil_opcode_name;
   info.result_type = instruction.result_type;
+  info.result_type_info = instruction.result_type_info;
   info.operands = instruction.operands;
   return info;
 }
@@ -1499,11 +1617,16 @@ ParseLlvmModule(std::span<const uint8_t> data, LlvmModuleInfo &info) {
     LlvmFunctionInfo function_info = {};
     function_info.name = function.getName().str();
     function_info.return_type = TypeString(function.getReturnType());
+    function_info.return_type_info = ParseLlvmType(function.getReturnType());
     function_info.is_declaration = function.isDeclaration();
     function_info.is_dx_intrinsic = function.getName().startswith("dx.op.");
     function_info.argument_types.reserve(function.arg_size());
-    for (const auto &argument : function.args())
+    function_info.argument_type_infos.reserve(function.arg_size());
+    for (const auto &argument : function.args()) {
       function_info.argument_types.push_back(TypeString(argument.getType()));
+      function_info.argument_type_infos.push_back(
+          ParseLlvmType(argument.getType()));
+    }
 
     if (!function.isDeclaration()) {
       for (const auto &block : function) {
@@ -1529,6 +1652,7 @@ ParseLlvmModule(std::span<const uint8_t> data, LlvmModuleInfo &info) {
     info.globals.push_back({
         .name = global.getName().str(),
         .value_type = TypeString(global.getValueType()),
+        .value_type_info = ParseLlvmType(global.getValueType()),
         .is_constant = global.isConstant(),
         .is_declaration = global.isDeclaration(),
     });

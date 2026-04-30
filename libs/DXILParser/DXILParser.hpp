@@ -148,8 +148,44 @@ struct LlvmModuleFlagInfo {
   std::string value;
 };
 
+enum class LlvmTypeKind {
+  Unknown,
+  Void,
+  Integer,
+  Half,
+  BFloat,
+  Float,
+  Double,
+  X86Fp80,
+  Fp128,
+  PpcFp128,
+  X86Mmx,
+  Label,
+  Metadata,
+  Token,
+  Pointer,
+  Vector,
+  Array,
+  Struct,
+  Function,
+};
+
+struct LlvmTypeInfo {
+  LlvmTypeKind kind = LlvmTypeKind::Unknown;
+  std::string text;
+  std::string name;
+  uint32_t bit_width = 0;
+  uint32_t address_space = 0;
+  uint64_t element_count = 0;
+  bool is_scalable = false;
+  bool is_opaque = false;
+  bool is_var_arg = false;
+  std::vector<LlvmTypeInfo> contained_types;
+};
+
 struct LlvmOperandInfo {
   std::string type;
+  LlvmTypeInfo type_info;
   std::string text;
   bool is_integer = false;
   uint64_t integer_value = 0;
@@ -159,6 +195,7 @@ struct LlvmInstructionInfo {
   std::string opcode_name;
   std::string result_name;
   std::string result_type;
+  LlvmTypeInfo result_type_info;
   std::vector<LlvmOperandInfo> operands;
   bool is_call = false;
   std::string called_function;
@@ -173,13 +210,16 @@ struct LlvmDxilOperationInfo {
   uint32_t opcode = 0;
   std::string opcode_name;
   std::string result_type;
+  LlvmTypeInfo result_type_info;
   std::vector<LlvmOperandInfo> operands;
 };
 
 struct LlvmFunctionInfo {
   std::string name;
   std::string return_type;
+  LlvmTypeInfo return_type_info;
   std::vector<std::string> argument_types;
+  std::vector<LlvmTypeInfo> argument_type_infos;
   uint32_t instruction_count = 0;
   bool is_declaration = false;
   bool is_dx_intrinsic = false;
@@ -190,6 +230,7 @@ struct LlvmFunctionInfo {
 struct LlvmGlobalInfo {
   std::string name;
   std::string value_type;
+  LlvmTypeInfo value_type_info;
   bool is_constant = false;
   bool is_declaration = false;
 };
