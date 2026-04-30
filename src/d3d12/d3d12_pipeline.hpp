@@ -45,6 +45,21 @@ struct PipelineSignatureLink {
   uint8_t consumer_component_mask = 0;
 };
 
+struct PipelineGraphicsState {
+  D3D12_GRAPHICS_PIPELINE_STATE_DESC desc = {};
+  std::vector<D3D12_INPUT_ELEMENT_DESC> input_elements;
+  std::vector<std::string> input_element_semantic_names;
+  std::vector<D3D12_SO_DECLARATION_ENTRY> stream_output_entries;
+  std::vector<std::string> stream_output_semantic_names;
+  std::vector<UINT> stream_output_strides;
+  std::vector<uint8_t> cached_pso;
+};
+
+struct PipelineComputeState {
+  D3D12_COMPUTE_PIPELINE_STATE_DESC desc = {};
+  std::vector<uint8_t> cached_pso;
+};
+
 class PipelineState {
 public:
   virtual ~PipelineState() = default;
@@ -53,6 +68,8 @@ public:
   virtual ID3D12RootSignature *GetRootSignature() const = 0;
   virtual const std::vector<PipelineDxilShader> &GetDxilShaders() const = 0;
   virtual const std::vector<PipelineSignatureLink> &GetSignatureLinks() const = 0;
+  virtual const PipelineGraphicsState *GetGraphicsState() const = 0;
+  virtual const PipelineComputeState *GetComputeState() const = 0;
 };
 
 Com<ID3D12PipelineState>

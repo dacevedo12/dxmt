@@ -7,6 +7,7 @@
 #include "util_string.hpp"
 #include <algorithm>
 #include <cstring>
+#include <span>
 #include <utility>
 
 namespace dxmt::d3d12 {
@@ -137,6 +138,20 @@ FindShader(const std::vector<PipelineDxilShader> &shaders,
   return nullptr;
 }
 
+D3D12_SHADER_BYTECODE
+ShaderBytecodeView(const std::vector<PipelineDxilShader> &shaders,
+                   PipelineShaderStage stage) {
+  const auto *shader = FindShader(shaders, stage);
+  if (!shader)
+    return {};
+
+  return {
+      .pShaderBytecode = shader->bytecode.empty() ? nullptr
+                                                  : shader->bytecode.data(),
+      .BytecodeLength = shader->bytecode.size(),
+  };
+}
+
 bool
 IsSystemGeneratedValue(const dxil::DxilTranslationSignatureElementInfo &sig) {
   return sig.semantic_kind != 0 || sig.semantic_key == "SV_POSITION0" ||
@@ -228,16 +243,179 @@ BuildSignatureLinks(const std::vector<PipelineDxilShader> &shaders) {
   return links;
 }
 
+Com<ID3D12RootSignature>
+ResolveRootSignature(IMTLD3D12Device *device,
+                     ID3D12RootSignature *explicit_root_signature,
+                     const std::vector<PipelineDxilShader> &shaders) {
+  if (explicit_root_signature)
+    return explicit_root_signature;
+
+  for (const auto &shader : shaders) {
+    const auto *info = shader.translation();
+    if (!info || !info->has_root_signature || info->root_signature.empty())
+      continue;
+
+    auto blob = std::span<const std::byte>(
+        reinterpret_cast<const std::byte *>(info->root_signature.data()),
+        info->root_signature.size());
+    auto root_signature = CreateRootSignatureFromBlob(device, blob);
+    if (root_signature)
+      return root_signature;
+  }
+
+  return nullptr;
+}
+
+bool
+CopyCachedBlob(D3D12_CACHED_PIPELINE_STATE cached,
+               std::vector<uint8_t> &out) {
+  out.clear();
+  if (!cached.CachedBlobSizeInBytes)
+    return true;
+  if (!cached.pCachedBlob)
+    return false;
+
+  const auto *bytes = static_cast<const uint8_t *>(cached.pCachedBlob);
+  out.assign(bytes, bytes + cached.CachedBlobSizeInBytes);
+  return true;
+}
+
+void
+FixGraphicsStatePointers(PipelineGraphicsState &state,
+                         const std::vector<PipelineDxilShader> &shaders) {
+  state.desc.VS = ShaderBytecodeView(shaders, PipelineShaderStage::Vertex);
+  state.desc.PS = ShaderBytecodeView(shaders, PipelineShaderStage::Pixel);
+  state.desc.DS = ShaderBytecodeView(shaders, PipelineShaderStage::Domain);
+  state.desc.HS = ShaderBytecodeView(shaders, PipelineShaderStage::Hull);
+  state.desc.GS = ShaderBytecodeView(shaders, PipelineShaderStage::Geometry);
+
+  for (size_t i = 0; i < state.input_elements.size(); i++) {
+    state.input_elements[i].SemanticName =
+        state.input_element_semantic_names[i].empty()
+            ? nullptr
+            : state.input_element_semantic_names[i].c_str();
+  }
+  state.desc.InputLayout.NumElements =
+      UINT(state.input_elements.size());
+  state.desc.InputLayout.pInputElementDescs =
+      state.input_elements.empty() ? nullptr : state.input_elements.data();
+
+  for (size_t i = 0; i < state.stream_output_entries.size(); i++) {
+    state.stream_output_entries[i].SemanticName =
+        state.stream_output_semantic_names[i].empty()
+            ? nullptr
+            : state.stream_output_semantic_names[i].c_str();
+  }
+  state.desc.StreamOutput.NumEntries =
+      UINT(state.stream_output_entries.size());
+  state.desc.StreamOutput.pSODeclaration =
+      state.stream_output_entries.empty()
+          ? nullptr
+          : state.stream_output_entries.data();
+  state.desc.StreamOutput.NumStrides =
+      UINT(state.stream_output_strides.size());
+  state.desc.StreamOutput.pBufferStrides =
+      state.stream_output_strides.empty()
+          ? nullptr
+          : state.stream_output_strides.data();
+
+  state.desc.CachedPSO.pCachedBlob =
+      state.cached_pso.empty() ? nullptr : state.cached_pso.data();
+  state.desc.CachedPSO.CachedBlobSizeInBytes = state.cached_pso.size();
+}
+
+void
+FixComputeStatePointers(PipelineComputeState &state,
+                        const std::vector<PipelineDxilShader> &shaders) {
+  state.desc.CS = ShaderBytecodeView(shaders, PipelineShaderStage::Compute);
+  state.desc.CachedPSO.pCachedBlob =
+      state.cached_pso.empty() ? nullptr : state.cached_pso.data();
+  state.desc.CachedPSO.CachedBlobSizeInBytes = state.cached_pso.size();
+}
+
+HRESULT
+CloneGraphicsState(const D3D12_GRAPHICS_PIPELINE_STATE_DESC &desc,
+                   PipelineGraphicsState &state) {
+  if (desc.NumRenderTargets > D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT ||
+      desc.SampleDesc.Count == 0)
+    return E_INVALIDARG;
+  if ((desc.HS.BytecodeLength || desc.HS.pShaderBytecode ||
+       desc.DS.BytecodeLength || desc.DS.pShaderBytecode) &&
+      (!HasBytecode(desc.HS) || !HasBytecode(desc.DS)))
+    return E_INVALIDARG;
+  if (!HasBytecode(desc.VS))
+    return E_INVALIDARG;
+  if (desc.InputLayout.NumElements && !desc.InputLayout.pInputElementDescs)
+    return E_INVALIDARG;
+  if (desc.StreamOutput.NumEntries && !desc.StreamOutput.pSODeclaration)
+    return E_INVALIDARG;
+  if (desc.StreamOutput.NumStrides && !desc.StreamOutput.pBufferStrides)
+    return E_INVALIDARG;
+
+  state = {};
+  state.desc = desc;
+
+  state.input_elements.reserve(desc.InputLayout.NumElements);
+  state.input_element_semantic_names.reserve(desc.InputLayout.NumElements);
+  for (UINT i = 0; i < desc.InputLayout.NumElements; i++) {
+    const auto &element = desc.InputLayout.pInputElementDescs[i];
+    if (!element.SemanticName)
+      return E_INVALIDARG;
+    state.input_element_semantic_names.emplace_back(element.SemanticName);
+    state.input_elements.push_back(element);
+  }
+
+  state.stream_output_entries.reserve(desc.StreamOutput.NumEntries);
+  state.stream_output_semantic_names.reserve(desc.StreamOutput.NumEntries);
+  for (UINT i = 0; i < desc.StreamOutput.NumEntries; i++) {
+    const auto &entry = desc.StreamOutput.pSODeclaration[i];
+    state.stream_output_semantic_names.emplace_back(
+        entry.SemanticName ? entry.SemanticName : "");
+    state.stream_output_entries.push_back(entry);
+  }
+
+  if (desc.StreamOutput.NumStrides) {
+    state.stream_output_strides.assign(
+        desc.StreamOutput.pBufferStrides,
+        desc.StreamOutput.pBufferStrides + desc.StreamOutput.NumStrides);
+  }
+
+  if (!CopyCachedBlob(desc.CachedPSO, state.cached_pso))
+    return E_INVALIDARG;
+
+  return S_OK;
+}
+
+HRESULT
+CloneComputeState(const D3D12_COMPUTE_PIPELINE_STATE_DESC &desc,
+                  PipelineComputeState &state) {
+  if (!HasBytecode(desc.CS))
+    return E_INVALIDARG;
+
+  state = {};
+  state.desc = desc;
+  if (!CopyCachedBlob(desc.CachedPSO, state.cached_pso))
+    return E_INVALIDARG;
+  return S_OK;
+}
+
 class PipelineStateImpl final : public ComObjectWithInitialRef<ID3D12PipelineState>,
                                 public PipelineState {
 public:
   PipelineStateImpl(IMTLD3D12Device *device, PipelineStateType type,
                     ID3D12RootSignature *root_signature,
                     std::vector<PipelineDxilShader> &&shaders,
-                    std::vector<PipelineSignatureLink> &&signature_links)
+                    std::vector<PipelineSignatureLink> &&signature_links,
+                    PipelineGraphicsState &&graphics_state,
+                    PipelineComputeState &&compute_state)
       : device_(device), type_(type), root_signature_(root_signature),
         shaders_(std::move(shaders)),
-        signature_links_(std::move(signature_links)) {}
+        signature_links_(std::move(signature_links)),
+        graphics_state_(std::move(graphics_state)),
+        compute_state_(std::move(compute_state)) {
+    FixGraphicsStatePointers(graphics_state_, shaders_);
+    FixComputeStatePointers(compute_state_, shaders_);
+  }
 
   HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void **object) override {
     if (!object)
@@ -303,12 +481,22 @@ public:
     return signature_links_;
   }
 
+  const PipelineGraphicsState *GetGraphicsState() const override {
+    return type_ == PipelineStateType::Graphics ? &graphics_state_ : nullptr;
+  }
+
+  const PipelineComputeState *GetComputeState() const override {
+    return type_ == PipelineStateType::Compute ? &compute_state_ : nullptr;
+  }
+
 private:
   Com<IMTLD3D12Device> device_;
   PipelineStateType type_;
   Com<ID3D12RootSignature> root_signature_;
   std::vector<PipelineDxilShader> shaders_;
   std::vector<PipelineSignatureLink> signature_links_;
+  PipelineGraphicsState graphics_state_;
+  PipelineComputeState compute_state_;
   ComPrivateData private_data_;
   std::string name_;
 };
@@ -316,11 +504,17 @@ private:
 Com<ID3D12PipelineState>
 CreatePipelineStateObject(IMTLD3D12Device *device, PipelineStateType type,
                           ID3D12RootSignature *root_signature,
-                          std::vector<PipelineDxilShader> &&shaders) {
+                          std::vector<PipelineDxilShader> &&shaders,
+                          PipelineGraphicsState &&graphics_state,
+                          PipelineComputeState &&compute_state) {
   auto signature_links = BuildSignatureLinks(shaders);
+  auto resolved_root_signature =
+      ResolveRootSignature(device, root_signature, shaders);
   return Com<ID3D12PipelineState>::transfer(
-      new PipelineStateImpl(device, type, root_signature, std::move(shaders),
-                            std::move(signature_links)));
+      new PipelineStateImpl(device, type, resolved_root_signature.ptr(),
+                            std::move(shaders), std::move(signature_links),
+                            std::move(graphics_state),
+                            std::move(compute_state)));
 }
 
 void
@@ -340,10 +534,17 @@ CreateGraphicsPipelineState(IMTLD3D12Device *device,
     return nullptr;
   }
 
+  PipelineGraphicsState graphics_state = {};
+  HRESULT hr = CloneGraphicsState(*desc, graphics_state);
+  if (FAILED(hr)) {
+    StoreStatus(status, hr);
+    return nullptr;
+  }
+
   std::vector<PipelineDxilShader> shaders;
   shaders.reserve(5);
 
-  HRESULT hr = AppendDxilShader(PipelineShaderStage::Vertex, desc->VS, shaders);
+  hr = AppendDxilShader(PipelineShaderStage::Vertex, desc->VS, shaders);
   if (FAILED(hr)) {
     StoreStatus(status, hr);
     return nullptr;
@@ -373,9 +574,11 @@ CreateGraphicsPipelineState(IMTLD3D12Device *device,
     return nullptr;
   }
 
+  PipelineComputeState compute_state = {};
   auto pso = CreatePipelineStateObject(
       device, PipelineStateType::Graphics, desc->pRootSignature,
-      std::move(shaders));
+      std::move(shaders), std::move(graphics_state),
+      std::move(compute_state));
   StoreStatus(status, pso ? S_OK : E_OUTOFMEMORY);
   return pso;
 }
@@ -389,10 +592,16 @@ CreateComputePipelineState(IMTLD3D12Device *device,
     return nullptr;
   }
 
+  PipelineComputeState compute_state = {};
+  HRESULT hr = CloneComputeState(*desc, compute_state);
+  if (FAILED(hr)) {
+    StoreStatus(status, hr);
+    return nullptr;
+  }
+
   std::vector<PipelineDxilShader> shaders;
   shaders.reserve(1);
-  const auto hr =
-      AppendDxilShader(PipelineShaderStage::Compute, desc->CS, shaders);
+  hr = AppendDxilShader(PipelineShaderStage::Compute, desc->CS, shaders);
   if (FAILED(hr)) {
     StoreStatus(status, hr);
     return nullptr;
@@ -402,9 +611,11 @@ CreateComputePipelineState(IMTLD3D12Device *device,
     return nullptr;
   }
 
+  PipelineGraphicsState graphics_state = {};
   auto pso = CreatePipelineStateObject(
       device, PipelineStateType::Compute, desc->pRootSignature,
-      std::move(shaders));
+      std::move(shaders), std::move(graphics_state),
+      std::move(compute_state));
   StoreStatus(status, pso ? S_OK : E_OUTOFMEMORY);
   return pso;
 }
