@@ -2,6 +2,7 @@
 #include "DXBCParser/BlobContainer.h"
 #include "DXBCParser/ShaderBinary.h"
 #include "airconv_error.hpp"
+#include "airconv_internal.hpp"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/IR/BasicBlock.h"
 #include "llvm/IR/Constants.h"
@@ -24,16 +25,6 @@
 #include "airconv_context.hpp"
 
 #include "ftl.hpp"
-
-class SM50CompiledBitcodeInternal {
-public:
-  llvm::SmallVector<char, 0> vec;
-};
-
-class SM50ErrorInternal {
-public:
-  llvm::SmallVector<char, 0> buf;
-};
 
 namespace dxmt::dxbc {
 

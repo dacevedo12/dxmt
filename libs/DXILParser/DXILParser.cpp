@@ -24,6 +24,7 @@
 #endif
 
 #include <algorithm>
+#include <initializer_list>
 #include <iterator>
 #include <limits>
 #include <sstream>
@@ -324,6 +325,338 @@ IntegerOperandUInt32(const std::vector<LlvmOperandInfo> &operands,
   return uint32_t(operands[index].integer_value);
 }
 
+void
+AppendTypedOperand(DxilTypedOperationInfo &typed,
+                   const std::vector<LlvmOperandInfo> &operands,
+                   uint32_t index,
+                   std::string_view name) {
+  if (index >= operands.size())
+    return;
+
+  const auto &operand = operands[index];
+  typed.operands.push_back({
+      .operand_index = index,
+      .name = std::string(name),
+      .type = operand.type,
+      .type_info = operand.type_info,
+      .text = operand.text,
+      .is_integer = operand.is_integer,
+      .integer_value = operand.integer_value,
+  });
+}
+
+void
+AppendTypedOperands(DxilTypedOperationInfo &typed,
+                    const std::vector<LlvmOperandInfo> &operands,
+                    std::initializer_list<std::string_view> names) {
+  uint32_t index = 1;
+  for (const auto name : names)
+    AppendTypedOperand(typed, operands, index++, name);
+}
+
+void
+AppendRemainingTypedOperands(DxilTypedOperationInfo &typed,
+                             const std::vector<LlvmOperandInfo> &operands,
+                             uint32_t first_index,
+                             std::string_view prefix) {
+  for (uint32_t index = first_index; index < operands.size(); index++) {
+    std::ostringstream name;
+    name << prefix << (index - first_index);
+    AppendTypedOperand(typed, operands, index, name.str());
+  }
+}
+
+bool
+SetTypedUInt32(const std::vector<LlvmOperandInfo> &operands,
+               size_t index,
+               uint32_t &out,
+               bool &has_out) {
+  if (auto value = IntegerOperandUInt32(operands, index)) {
+    out = *value;
+    has_out = true;
+    return true;
+  }
+  return false;
+}
+
+bool
+SetTypedBool(const std::vector<LlvmOperandInfo> &operands,
+             size_t index,
+             bool &out,
+             bool &has_out) {
+  if (auto value = IntegerOperandUInt32(operands, index)) {
+    out = *value != 0;
+    has_out = true;
+    return true;
+  }
+  return false;
+}
+
+DxilSystemValueKind
+SystemValueKindFromOpcode(std::string_view name) {
+  if (name == "ThreadId")
+    return DxilSystemValueKind::ThreadId;
+  if (name == "GroupId")
+    return DxilSystemValueKind::GroupId;
+  if (name == "ThreadIdInGroup")
+    return DxilSystemValueKind::ThreadIdInGroup;
+  if (name == "FlattenedThreadIdInGroup")
+    return DxilSystemValueKind::FlattenedThreadIdInGroup;
+  if (name == "DispatchRaysIndex")
+    return DxilSystemValueKind::DispatchRaysIndex;
+  if (name == "DispatchRaysDimensions")
+    return DxilSystemValueKind::DispatchRaysDimensions;
+  if (name == "DomainLocation")
+    return DxilSystemValueKind::DomainLocation;
+  if (name == "OutputControlPointID")
+    return DxilSystemValueKind::OutputControlPointID;
+  if (name == "PrimitiveID")
+    return DxilSystemValueKind::PrimitiveID;
+  if (name == "ViewID")
+    return DxilSystemValueKind::ViewID;
+  if (name == "SampleIndex")
+    return DxilSystemValueKind::SampleIndex;
+  if (name == "Coverage")
+    return DxilSystemValueKind::Coverage;
+  if (name == "InnerCoverage")
+    return DxilSystemValueKind::InnerCoverage;
+  if (name == "GSInstanceID")
+    return DxilSystemValueKind::GSInstanceID;
+  if (name == "InstanceID")
+    return DxilSystemValueKind::InstanceID;
+  if (name == "InstanceIndex")
+    return DxilSystemValueKind::InstanceIndex;
+  if (name == "PrimitiveIndex")
+    return DxilSystemValueKind::PrimitiveIndex;
+  if (name == "GeometryIndex")
+    return DxilSystemValueKind::GeometryIndex;
+  if (name == "HitKind")
+    return DxilSystemValueKind::HitKind;
+  if (name == "RayFlags")
+    return DxilSystemValueKind::RayFlags;
+  return DxilSystemValueKind::Unknown;
+}
+
+bool
+IsSampleOpcode(std::string_view name) {
+  return name == "Sample" || name == "SampleBias" ||
+         name == "SampleLevel" || name == "SampleGrad" ||
+         name == "SampleCmp" || name == "SampleCmpLevelZero" ||
+         name == "CalculateLOD" ||
+         name.starts_with("WriteSamplerFeedback");
+}
+
+bool
+IsGatherOpcode(std::string_view name) {
+  return name == "TextureGather" || name == "TextureGatherCmp";
+}
+
+DxilTypedOperationInfo
+ParseDxilTypedOperation(std::string_view name,
+                        const std::vector<LlvmOperandInfo> &operands) {
+  DxilTypedOperationInfo typed = {};
+
+  if (name == "CreateHandle") {
+    typed.kind = DxilTypedOperationKind::CreateHandle;
+    AppendTypedOperands(typed, operands,
+                        {"resource_class", "range_id", "index",
+                         "non_uniform_index"});
+    SetTypedUInt32(operands, 1, typed.resource_class,
+                   typed.has_resource_class);
+    SetTypedUInt32(operands, 2, typed.resource_range_id,
+                   typed.has_resource_range_id);
+    SetTypedUInt32(operands, 3, typed.resource_index,
+                   typed.has_resource_index);
+    SetTypedBool(operands, 4, typed.non_uniform, typed.has_non_uniform);
+    return typed;
+  }
+
+  if (name == "CreateHandleFromBinding") {
+    typed.kind = DxilTypedOperationKind::CreateHandleFromBinding;
+    AppendTypedOperands(typed, operands,
+                        {"binding", "index", "non_uniform_index"});
+    SetTypedUInt32(operands, 2, typed.resource_index,
+                   typed.has_resource_index);
+    SetTypedBool(operands, 3, typed.non_uniform, typed.has_non_uniform);
+    return typed;
+  }
+
+  if (name == "CreateHandleFromHeap") {
+    typed.kind = DxilTypedOperationKind::CreateHandleFromHeap;
+    AppendTypedOperands(typed, operands,
+                        {"resource_class", "heap_index",
+                         "non_uniform_index"});
+    SetTypedUInt32(operands, 1, typed.resource_class,
+                   typed.has_resource_class);
+    SetTypedUInt32(operands, 2, typed.resource_index,
+                   typed.has_resource_index);
+    SetTypedBool(operands, 3, typed.non_uniform, typed.has_non_uniform);
+    return typed;
+  }
+
+  if (name == "AnnotateHandle") {
+    typed.kind = DxilTypedOperationKind::AnnotateHandle;
+    AppendTypedOperands(typed, operands, {"handle", "properties"});
+    return typed;
+  }
+
+  if (name == "CBufferLoad" || name == "CBufferLoadLegacy") {
+    typed.kind = DxilTypedOperationKind::CBufferLoad;
+    typed.is_read = true;
+    AppendTypedOperands(typed, operands, {"handle", "index"});
+    SetTypedUInt32(operands, 2, typed.resource_index,
+                   typed.has_resource_index);
+    return typed;
+  }
+
+  if (name == "TextureLoad") {
+    typed.kind = DxilTypedOperationKind::TextureLoad;
+    typed.is_read = true;
+    AppendTypedOperands(typed, operands,
+                        {"handle", "mip_or_sample", "coord0", "coord1",
+                         "coord2", "offset0", "offset1", "offset2"});
+    return typed;
+  }
+
+  if (name == "TextureStore") {
+    typed.kind = DxilTypedOperationKind::TextureStore;
+    typed.is_write = true;
+    AppendTypedOperands(typed, operands,
+                        {"handle", "coord0", "coord1", "coord2", "value0",
+                         "value1", "value2", "value3", "mask"});
+    SetTypedUInt32(operands, 9, typed.mask, typed.has_mask);
+    return typed;
+  }
+
+  if (name == "BufferLoad") {
+    typed.kind = DxilTypedOperationKind::BufferLoad;
+    typed.is_read = true;
+    AppendTypedOperands(typed, operands, {"handle", "index", "wot"});
+    SetTypedUInt32(operands, 2, typed.resource_index,
+                   typed.has_resource_index);
+    return typed;
+  }
+
+  if (name == "BufferStore") {
+    typed.kind = DxilTypedOperationKind::BufferStore;
+    typed.is_write = true;
+    AppendTypedOperands(typed, operands,
+                        {"handle", "index", "wot", "value0", "value1",
+                         "value2", "value3", "mask"});
+    SetTypedUInt32(operands, 2, typed.resource_index,
+                   typed.has_resource_index);
+    SetTypedUInt32(operands, 8, typed.mask, typed.has_mask);
+    return typed;
+  }
+
+  if (name == "RawBufferLoad") {
+    typed.kind = DxilTypedOperationKind::RawBufferLoad;
+    typed.is_read = true;
+    AppendTypedOperands(typed, operands,
+                        {"handle", "index", "element_offset", "mask",
+                         "alignment"});
+    SetTypedUInt32(operands, 2, typed.resource_index,
+                   typed.has_resource_index);
+    SetTypedUInt32(operands, 4, typed.mask, typed.has_mask);
+    SetTypedUInt32(operands, 5, typed.alignment, typed.has_alignment);
+    return typed;
+  }
+
+  if (name == "RawBufferStore") {
+    typed.kind = DxilTypedOperationKind::RawBufferStore;
+    typed.is_write = true;
+    AppendTypedOperands(typed, operands,
+                        {"handle", "index", "element_offset", "value0",
+                         "value1", "value2", "value3", "mask",
+                         "alignment"});
+    SetTypedUInt32(operands, 2, typed.resource_index,
+                   typed.has_resource_index);
+    SetTypedUInt32(operands, 8, typed.mask, typed.has_mask);
+    SetTypedUInt32(operands, 9, typed.alignment, typed.has_alignment);
+    return typed;
+  }
+
+  if (IsSampleOpcode(name)) {
+    typed.kind = DxilTypedOperationKind::Sample;
+    typed.is_read = true;
+    typed.is_sample = true;
+    AppendTypedOperands(typed, operands, {"texture_handle", "sampler_handle"});
+    AppendRemainingTypedOperands(typed, operands, 3, "sample_operand");
+    return typed;
+  }
+
+  if (IsGatherOpcode(name)) {
+    typed.kind = DxilTypedOperationKind::Gather;
+    typed.is_read = true;
+    typed.is_gather = true;
+    AppendTypedOperands(typed, operands, {"texture_handle", "sampler_handle"});
+    AppendRemainingTypedOperands(typed, operands, 3, "gather_operand");
+    return typed;
+  }
+
+  if (name == "AtomicBinOp") {
+    typed.kind = DxilTypedOperationKind::Atomic;
+    typed.is_write = true;
+    typed.is_atomic = true;
+    AppendTypedOperands(typed, operands,
+                        {"handle", "atomic_operation", "offset0", "offset1",
+                         "offset2", "new_value"});
+    SetTypedUInt32(operands, 2, typed.atomic_operation,
+                   typed.has_atomic_operation);
+    return typed;
+  }
+
+  if (name == "AtomicCompareExchange") {
+    typed.kind = DxilTypedOperationKind::Atomic;
+    typed.is_write = true;
+    typed.is_atomic = true;
+    AppendTypedOperands(typed, operands,
+                        {"handle", "offset0", "offset1", "offset2",
+                         "compare_value", "new_value"});
+    return typed;
+  }
+
+  if (name == "LoadInput" || name == "LoadOutputControlPoint" ||
+      name == "LoadPatchConstant") {
+    typed.kind = DxilTypedOperationKind::LoadInput;
+    typed.is_read = true;
+    AppendTypedOperands(typed, operands,
+                        {"signature_element_id", "row_index", "column_index",
+                         "vertex_or_control_point_index"});
+    SetTypedUInt32(operands, 1, typed.signature_element_id,
+                   typed.has_signature_element_id);
+    SetTypedUInt32(operands, 2, typed.row_index, typed.has_row_index);
+    SetTypedUInt32(operands, 3, typed.column_index, typed.has_column_index);
+    return typed;
+  }
+
+  if (name == "StoreOutput" || name == "StorePatchConstant" ||
+      name == "StoreVertexOutput" || name == "StorePrimitiveOutput") {
+    typed.kind = DxilTypedOperationKind::StoreOutput;
+    typed.is_write = true;
+    AppendTypedOperands(typed, operands,
+                        {"signature_element_id", "row_index", "column_index",
+                         "value"});
+    SetTypedUInt32(operands, 1, typed.signature_element_id,
+                   typed.has_signature_element_id);
+    SetTypedUInt32(operands, 2, typed.row_index, typed.has_row_index);
+    SetTypedUInt32(operands, 3, typed.column_index, typed.has_column_index);
+    return typed;
+  }
+
+  const auto system_value = SystemValueKindFromOpcode(name);
+  if (system_value != DxilSystemValueKind::Unknown) {
+    typed.kind = DxilTypedOperationKind::SystemValue;
+    typed.system_value = system_value;
+    AppendTypedOperands(typed, operands, {"component_index"});
+    SetTypedUInt32(operands, 1, typed.component_index,
+                   typed.has_component_index);
+    return typed;
+  }
+
+  return typed;
+}
+
 DxilSemanticOperationKind
 ClassifyDxilOperation(std::string_view name,
                       std::string_view opcode_class,
@@ -471,15 +804,22 @@ ParseDxilOperation(const LlvmInstructionInfo &instruction,
   info.semantic_kind = ClassifyDxilOperation(
       info.opcode_name, info.opcode_class, info.opcode_category,
       info.semantic_flags);
+  info.typed = ParseDxilTypedOperation(info.opcode_name, info.operands);
   if (info.semantic_kind == DxilSemanticOperationKind::SignatureInput ||
       info.semantic_kind == DxilSemanticOperationKind::SignatureOutput) {
-    if (auto id = IntegerOperandUInt32(info.operands, 1)) {
+    if (info.typed.has_signature_element_id) {
+      info.signature_element_id = info.typed.signature_element_id;
+      info.has_signature_element_id = true;
+    } else if (auto id = IntegerOperandUInt32(info.operands, 1)) {
       info.signature_element_id = *id;
       info.has_signature_element_id = true;
     }
   }
   if (info.semantic_kind == DxilSemanticOperationKind::ResourceHandle) {
-    if (auto id = IntegerOperandUInt32(info.operands, 2)) {
+    if (info.typed.has_resource_range_id) {
+      info.resource_id = info.typed.resource_range_id;
+      info.has_resource_id = true;
+    } else if (auto id = IntegerOperandUInt32(info.operands, 2)) {
       info.resource_id = *id;
       info.has_resource_id = true;
     } else if (auto id = IntegerOperandUInt32(info.operands, 1)) {
@@ -1730,6 +2070,7 @@ Parser::reset() {
   psv_info_.reset();
   shader_reflection_.reset();
   dxil_validation_.reset();
+  dxil_translation_.reset();
 }
 
 ParseStatus
@@ -1774,6 +2115,12 @@ Parser::parse(const void *data, size_t size) {
   if (status != ParseStatus::Ok)
     return status;
   dxil_validation_ = std::move(validation_info);
+
+  DxilTranslationInfo translation_info = {};
+  status = BuildDxilTranslationInfo(*this, translation_info);
+  if (status != ParseStatus::Ok)
+    return status;
+  dxil_translation_ = std::move(translation_info);
   return ParseStatus::Ok;
 }
 
@@ -3751,6 +4098,7 @@ AppendReflectionMetadataResource(ShaderReflectionInfo &info,
                                  const DxilMetadataResourceInfo &resource) {
   ShaderReflectionResourceInfo reflected = {};
   reflected.name = resource.name;
+  reflected.resource_class = uint32_t(resource.resource_class);
   reflected.resource_kind = resource.kind;
   reflected.id = resource.id;
   reflected.space = resource.space;
@@ -3859,6 +4207,425 @@ AppendLlvmDxilOperations(ShaderReflectionInfo &info,
     info.dxil_operations.insert(info.dxil_operations.end(),
                                 function_info.dxil_operations.begin(),
                                 function_info.dxil_operations.end());
+  }
+}
+
+uint32_t
+TranslationSourceMask(const ShaderReflectionResourceInfo &resource) {
+  uint32_t source_mask = 0;
+  if (resource.from_runtime_data)
+    source_mask |= DxilTranslationSourceRuntimeData;
+  if (resource.from_metadata)
+    source_mask |= DxilTranslationSourceMetadata;
+  if (resource.from_resource_def)
+    source_mask |= DxilTranslationSourceResourceDef;
+  if (resource.from_psv)
+    source_mask |= DxilTranslationSourcePipelineStateValidation;
+  return source_mask;
+}
+
+DxilTranslationResourceClass
+TranslationResourceClassFromMetadata(DxilMetadataResourceClass resource_class) {
+  switch (resource_class) {
+  case DxilMetadataResourceClass::Srv:
+    return DxilTranslationResourceClass::Srv;
+  case DxilMetadataResourceClass::Uav:
+    return DxilTranslationResourceClass::Uav;
+  case DxilMetadataResourceClass::Cbv:
+    return DxilTranslationResourceClass::Cbv;
+  case DxilMetadataResourceClass::Sampler:
+    return DxilTranslationResourceClass::Sampler;
+  case DxilMetadataResourceClass::Unknown:
+    break;
+  }
+  return DxilTranslationResourceClass::Unknown;
+}
+
+DxilTranslationResourceClass
+TranslationResourceClassFromValue(uint32_t resource_class) {
+  switch (resource_class) {
+  case 0:
+    return DxilTranslationResourceClass::Srv;
+  case 1:
+    return DxilTranslationResourceClass::Uav;
+  case 2:
+    return DxilTranslationResourceClass::Cbv;
+  case 3:
+    return DxilTranslationResourceClass::Sampler;
+  default:
+    return DxilTranslationResourceClass::Unknown;
+  }
+}
+
+DxilTranslationResourceClass
+TranslationResourceClassFromResourceDefType(uint32_t resource_type) {
+  switch (resource_type) {
+  case 0:
+    return DxilTranslationResourceClass::Cbv;
+  case 3:
+    return DxilTranslationResourceClass::Sampler;
+  case 4:
+  case 6:
+  case 8:
+  case 9:
+  case 10:
+  case 11:
+  case 13:
+    return DxilTranslationResourceClass::Uav;
+  case 1:
+  case 2:
+  case 5:
+  case 7:
+  case 12:
+    return DxilTranslationResourceClass::Srv;
+  default:
+    return DxilTranslationResourceClass::Unknown;
+  }
+}
+
+DxilTranslationResourceClass
+ClassifyTranslationResource(const ShaderReflectionResourceInfo &resource) {
+  if (resource.from_metadata) {
+    return TranslationResourceClassFromMetadata(
+        static_cast<DxilMetadataResourceClass>(resource.resource_class));
+  }
+  if (resource.from_runtime_data) {
+    const auto result =
+        TranslationResourceClassFromValue(resource.resource_class);
+    if (result != DxilTranslationResourceClass::Unknown)
+      return result;
+  }
+  return TranslationResourceClassFromResourceDefType(resource.resource_type);
+}
+
+DxilTranslationResourceInfo
+BuildTranslationResource(const ShaderReflectionResourceInfo &resource) {
+  DxilTranslationResourceInfo out = {};
+  out.name = resource.name;
+  out.resource_class = ClassifyTranslationResource(resource);
+  out.source_mask = TranslationSourceMask(resource);
+  out.id = resource.id;
+  out.space = resource.space;
+  out.lower_bound = resource.lower_bound;
+  out.upper_bound = resource.upper_bound;
+  out.bind_count = resource.bind_count;
+  out.unbounded = resource.upper_bound == std::numeric_limits<uint32_t>::max() ||
+                  resource.bind_count == std::numeric_limits<uint32_t>::max();
+  out.resource_type = resource.resource_type;
+  out.resource_kind = resource.resource_kind;
+  out.return_type = resource.return_type;
+  out.dimension = resource.dimension;
+  out.num_samples = resource.num_samples;
+  out.flags = resource.flags;
+  return out;
+}
+
+void
+ApplyOperationToTranslationResource(DxilTranslationResourceInfo &resource,
+                                    const DxilTranslationOperationInfo &operation) {
+  if (!operation.has_resource_id || operation.resource_id != resource.id)
+    return;
+
+  switch (operation.semantic_kind) {
+  case DxilSemanticOperationKind::ResourceHandle:
+    resource.referenced_by_handle = true;
+    break;
+  case DxilSemanticOperationKind::ResourceRead:
+    resource.read = true;
+    break;
+  case DxilSemanticOperationKind::ResourceWrite:
+    resource.written = true;
+    break;
+  case DxilSemanticOperationKind::ResourceSample:
+    resource.sampled = true;
+    resource.read = true;
+    break;
+  case DxilSemanticOperationKind::ResourceQuery:
+    resource.queried = true;
+    break;
+  default:
+    break;
+  }
+}
+
+bool
+MetadataSignatureElementMatches(
+    const DxilMetadataSignatureElementInfo &metadata,
+    const RdatSignatureElementInfo &element) {
+  return metadata.semantic_name == element.semantic_name &&
+         metadata.semantic_indices == element.semantic_indices &&
+         metadata.semantic_kind == element.semantic_kind &&
+         metadata.component_type == element.component_type &&
+         metadata.start_row == element.start_row &&
+         metadata.start_col == element.start_col;
+}
+
+const DxilMetadataSignatureElementInfo *
+FindMetadataSignatureElement(
+    const std::vector<DxilMetadataSignatureElementInfo> &metadata,
+    const RdatSignatureElementInfo &element) {
+  const auto it = std::find_if(
+      metadata.begin(), metadata.end(),
+      [&](const DxilMetadataSignatureElementInfo &candidate) {
+        return MetadataSignatureElementMatches(candidate, element);
+      });
+  return it != metadata.end() ? &*it : nullptr;
+}
+
+DxilTranslationSignatureElementInfo
+BuildTranslationSignatureElement(
+    DxilTranslationSignatureKind kind,
+    const RdatSignatureElementInfo &element,
+    uint32_t source_mask,
+    const DxilMetadataSignatureElementInfo *metadata) {
+  DxilTranslationSignatureElementInfo out = {};
+  out.kind = kind;
+  out.source_mask = source_mask;
+  if (metadata) {
+    out.element_id = metadata->id;
+    out.has_element_id = true;
+    out.rows = metadata->rows > 0xffu ? 0xffu : uint8_t(metadata->rows);
+  }
+  out.semantic_name = element.semantic_name;
+  out.semantic_indices = element.semantic_indices;
+  out.semantic_kind = element.semantic_kind;
+  out.component_type = element.component_type;
+  out.interpolation_mode = element.interpolation_mode;
+  out.start_row = element.start_row;
+  out.cols = element.cols;
+  out.start_col = element.start_col;
+  out.output_stream = element.output_stream;
+  out.usage_mask = element.usage_mask;
+  out.dynamic_index_mask = element.dynamic_index_mask;
+  out.allocated = element.start_row != 0xff;
+  return out;
+}
+
+DxilTranslationSignatureElementInfo
+BuildTranslationMetadataSignatureElement(
+    DxilTranslationSignatureKind kind,
+    const DxilMetadataSignatureElementInfo &element) {
+  DxilTranslationSignatureElementInfo out = {};
+  out.kind = kind;
+  out.source_mask = DxilTranslationSourceMetadata;
+  out.element_id = element.id;
+  out.has_element_id = true;
+  out.semantic_name = element.semantic_name;
+  out.semantic_indices = element.semantic_indices;
+  out.rows = element.rows > 0xffu ? 0xffu : uint8_t(element.rows);
+  out.cols = element.cols > 0xffu ? 0xffu : uint8_t(element.cols);
+  out.start_row = element.start_row > 0xffu ? 0xffu : uint8_t(element.start_row);
+  out.start_col = element.start_col > 0xffu ? 0xffu : uint8_t(element.start_col);
+  out.semantic_kind = element.semantic_kind > 0xffu
+                          ? 0xffu
+                          : uint8_t(element.semantic_kind);
+  out.component_type = element.component_type > 0xffu
+                           ? 0xffu
+                           : uint8_t(element.component_type);
+  out.interpolation_mode = element.interpolation_mode > 0xffu
+                               ? 0xffu
+                               : uint8_t(element.interpolation_mode);
+  out.dynamic_index_mask = element.dynamic_index_mask > 0xffu
+                               ? 0xffu
+                               : uint8_t(element.dynamic_index_mask);
+  out.output_stream = element.stream > 0xffu ? 0xffu : uint8_t(element.stream);
+  out.allocated = out.start_row != 0xff;
+  return out;
+}
+
+DxilTranslationSignatureElementInfo
+BuildTranslationPsvSignatureElement(DxilTranslationSignatureKind kind,
+                                    const PsvSignatureElement &element) {
+  DxilTranslationSignatureElementInfo out = {};
+  out.kind = kind;
+  out.source_mask = DxilTranslationSourcePipelineStateValidation;
+  out.semantic_name = element.semantic_name;
+  out.semantic_indices = element.semantic_indexes;
+  out.rows = element.rows;
+  out.cols = element.cols;
+  out.start_row = element.start_row;
+  out.start_col = element.start_col;
+  out.semantic_kind = element.semantic_kind;
+  out.component_type = element.component_type;
+  out.interpolation_mode = element.interpolation_mode;
+  out.dynamic_index_mask = element.dynamic_index_mask;
+  out.output_stream = element.output_stream;
+  out.allocated = element.allocated;
+  return out;
+}
+
+DxilTranslationSignatureElementInfo
+BuildTranslationLegacySignatureElement(DxilTranslationSignatureKind kind,
+                                       const SignatureElement &element) {
+  DxilTranslationSignatureElementInfo out = {};
+  out.kind = kind;
+  out.source_mask = DxilTranslationSourceLegacySignature;
+  out.semantic_name = element.semantic_name;
+  out.semantic_indices.push_back(element.semantic_index);
+  out.start_row = element.register_index > 0xffu
+                      ? 0xffu
+                      : uint8_t(element.register_index);
+  out.cols = 4;
+  out.start_col = 0;
+  out.semantic_kind = element.system_value > 0xffu
+                          ? 0xffu
+                          : uint8_t(element.system_value);
+  out.component_type = element.component_type > 0xffu
+                           ? 0xffu
+                           : uint8_t(element.component_type);
+  out.usage_mask = element.mask;
+  out.dynamic_index_mask = element.read_write_mask;
+  out.output_stream = element.stream > 0xffu ? 0xffu : uint8_t(element.stream);
+  out.allocated = true;
+  return out;
+}
+
+void
+AppendTranslationSignatures(
+    DxilTranslationInfo &info,
+    DxilTranslationSignatureKind kind,
+    const std::vector<RdatSignatureElementInfo> &elements,
+    uint32_t source_mask,
+    const std::vector<DxilMetadataSignatureElementInfo> &metadata) {
+  for (const auto &element : elements) {
+    auto *metadata_element = FindMetadataSignatureElement(metadata, element);
+    auto out =
+        BuildTranslationSignatureElement(kind, element, source_mask,
+                                         metadata_element);
+    if (metadata_element)
+      out.source_mask |= DxilTranslationSourceMetadata;
+    info.signatures.push_back(std::move(out));
+  }
+}
+
+void
+AppendTranslationMetadataSignatures(
+    DxilTranslationInfo &info,
+    DxilTranslationSignatureKind kind,
+    const std::vector<DxilMetadataSignatureElementInfo> &elements) {
+  for (const auto &element : elements)
+    info.signatures.push_back(
+        BuildTranslationMetadataSignatureElement(kind, element));
+}
+
+void
+AppendTranslationPsvSignatures(DxilTranslationInfo &info,
+                               DxilTranslationSignatureKind kind,
+                               const std::vector<PsvSignatureElement> &elements) {
+  for (const auto &element : elements)
+    info.signatures.push_back(BuildTranslationPsvSignatureElement(kind, element));
+}
+
+bool
+HasTranslationSignatureKind(const DxilTranslationInfo &info,
+                            DxilTranslationSignatureKind kind) {
+  return std::any_of(info.signatures.begin(), info.signatures.end(),
+                     [kind](const DxilTranslationSignatureElementInfo &element) {
+                       return element.kind == kind;
+                     });
+}
+
+DxilTranslationSignatureKind
+LegacySignatureKind(uint32_t part_fourcc) {
+  if (part_fourcc == fourcc::OutputSignature)
+    return DxilTranslationSignatureKind::Output;
+  if (part_fourcc == fourcc::PatchConstantSignature)
+    return DxilTranslationSignatureKind::PatchConstant;
+  return DxilTranslationSignatureKind::Input;
+}
+
+const LlvmBasicBlockInfo *
+FindBasicBlockForInstruction(const LlvmFunctionInfo &function,
+                             uint32_t instruction_index) {
+  for (const auto &block : function.basic_blocks) {
+    if (instruction_index >= block.instruction_start &&
+        instruction_index < block.instruction_start + block.instruction_count)
+      return &block;
+  }
+  return nullptr;
+}
+
+bool
+ShouldExposeTranslationFunction(const LlvmFunctionInfo &function,
+                                std::string_view entry_function_name) {
+  return !function.is_declaration && !function.is_dx_intrinsic &&
+         (function.is_entry_reachable ||
+          ShaderNamesEqual(function.name, entry_function_name));
+}
+
+DxilTranslationOperationInfo
+BuildTranslationOperation(const LlvmFunctionInfo &function,
+                          const LlvmDxilOperationInfo &operation) {
+  DxilTranslationOperationInfo out = {};
+  out.function_name = function.name;
+  if (const auto *block =
+          FindBasicBlockForInstruction(function, operation.instruction_index))
+    out.basic_block_name = block->name;
+  out.instruction_index = operation.instruction_index;
+  out.opcode = operation.opcode;
+  out.opcode_name = operation.opcode_name;
+  out.opcode_class = operation.opcode_class;
+  out.opcode_category = operation.opcode_category;
+  out.semantic_kind = operation.semantic_kind;
+  out.min_shader_model_major = operation.min_shader_model_major;
+  out.min_shader_model_minor = operation.min_shader_model_minor;
+  out.semantic_flags = operation.semantic_flags;
+  out.opcode_known = operation.opcode_known;
+  out.opcode_reserved = operation.opcode_reserved;
+  out.resource_id = operation.resource_id;
+  out.has_resource_id = operation.has_resource_id;
+  out.signature_element_id = operation.signature_element_id;
+  out.has_signature_element_id = operation.has_signature_element_id;
+  out.result_type = operation.result_type;
+  out.result_type_info = operation.result_type_info;
+  out.operands = operation.operands;
+  out.typed = operation.typed;
+  return out;
+}
+
+void
+AppendTranslationIrInfo(DxilTranslationInfo &info,
+                        const LlvmModuleInfo &module) {
+  info.call_graph_edges = module.call_graph.edges;
+  info.entry_reachable_functions = module.call_graph.entry_reachable_functions;
+  info.recursive_functions = module.call_graph.recursive_functions;
+  info.unused_dx_intrinsic_declarations =
+      module.call_graph.unused_dx_intrinsic_declarations;
+  info.has_indirect_calls = module.call_graph.has_indirect_calls;
+  info.has_recursion = module.call_graph.has_recursion;
+
+  for (const auto &function : module.functions) {
+    if (!ShouldExposeTranslationFunction(function, info.function_name))
+      continue;
+
+    DxilTranslationFunctionInfo function_info = {};
+    function_info.name = function.name;
+    function_info.is_entry_function =
+        ShaderNamesEqual(function.name, info.function_name) ||
+        ShaderNamesEqual(function.name, info.entry_point_name);
+    function_info.is_entry_reachable = function.is_entry_reachable;
+    function_info.is_recursive = function.is_recursive;
+    function_info.has_indirect_calls = function.has_indirect_calls;
+    function_info.called_functions = function.called_functions;
+    info.functions.push_back(std::move(function_info));
+
+    for (const auto &block : function.basic_blocks) {
+      DxilTranslationBasicBlockInfo block_info = {};
+      block_info.function_name = function.name;
+      block_info.name = block.name;
+      block_info.instruction_start = block.instruction_start;
+      block_info.instruction_count = block.instruction_count;
+      block_info.terminator_opcode = block.terminator_opcode;
+      block_info.successors = block.successors;
+      block_info.has_return = block.has_return;
+      block_info.has_branch = block.has_branch;
+      block_info.has_switch = block.has_switch;
+      block_info.has_unreachable = block.has_unreachable;
+      info.basic_blocks.push_back(std::move(block_info));
+    }
+
+    for (const auto &operation : function.dxil_operations)
+      info.operations.push_back(BuildTranslationOperation(function, operation));
   }
 }
 
@@ -4782,6 +5549,141 @@ BuildShaderReflection(const Parser &parser, ShaderReflectionInfo &info) {
     info.psv_output_signature = psv->output_signature_elements;
     info.psv_patch_constant_or_primitive_signature =
         psv->patch_constant_or_primitive_signature_elements;
+  }
+
+  return ParseStatus::Ok;
+}
+
+ParseStatus
+BuildDxilTranslationInfo(const Parser &parser, DxilTranslationInfo &info) {
+  info = {};
+
+  const auto &reflection = parser.shaderReflection();
+  if (!reflection)
+    return ParseStatus::Ok;
+
+  info.valid = reflection->valid;
+  info.entry_point_name = reflection->entry_point_name;
+  info.function_name = reflection->function_name;
+  info.shader_model_kind = reflection->shader_model_kind;
+  info.shader_stage_name = reflection->shader_stage_name;
+  info.shader_kind = reflection->shader_kind;
+  info.shader_model_major = reflection->shader_model_major;
+  info.shader_model_minor = reflection->shader_model_minor;
+  info.dxil_major = reflection->dxil_major;
+  info.dxil_minor = reflection->dxil_minor;
+  info.has_runtime_data = reflection->has_runtime_data;
+  info.has_pipeline_state_validation =
+      reflection->has_pipeline_state_validation;
+  info.has_resource_def = reflection->has_resource_def;
+  info.has_root_signature = reflection->has_root_signature;
+  info.root_signature_offset = reflection->root_signature_offset;
+  info.root_signature = reflection->root_signature;
+  info.uses_view_id = reflection->uses_view_id;
+  info.num_threads_x = reflection->num_threads_x;
+  info.num_threads_y = reflection->num_threads_y;
+  info.num_threads_z = reflection->num_threads_z;
+  info.group_shared_bytes_used = reflection->group_shared_bytes_used;
+  info.feature_flags = reflection->feature_flags;
+  info.min_shader_target = reflection->min_shader_target;
+  info.shader_flags = reflection->shader_flags;
+
+  const LlvmModuleInfo *module = nullptr;
+  const DxilEntryPointInfo *metadata_entry = nullptr;
+  if (const auto &llvm_module = parser.llvmModule()) {
+    module = &*llvm_module;
+    metadata_entry = FindReflectionEntryPoint(*module);
+    info.has_metadata = !module->entry_points.empty() ||
+                        !module->resources.empty() ||
+                        !module->signature_elements.empty();
+    AppendTranslationIrInfo(info, *module);
+  }
+
+  info.resources.reserve(reflection->resources.size());
+  for (const auto &resource : reflection->resources)
+    info.resources.push_back(BuildTranslationResource(resource));
+  for (auto &resource : info.resources) {
+    for (const auto &operation : info.operations)
+      ApplyOperationToTranslationResource(resource, operation);
+  }
+
+  uint32_t signature_source = DxilTranslationSourceMetadata;
+  if (parser.runtimeData()) {
+    const auto *rdat_function = FindReflectionRdatFunction(
+        *parser.runtimeData(), info.entry_point_name, info.function_name);
+    const auto *rdat_shader_info =
+        rdat_function ? parser.runtimeData()->findShaderInfo(
+                            rdat_function->shader_info_table_type,
+                            rdat_function->shader_info_index)
+                      : nullptr;
+    if (rdat_shader_info &&
+        (!rdat_shader_info->input_signature_indices.empty() ||
+         !rdat_shader_info->output_signature_indices.empty() ||
+         !rdat_shader_info->patch_constant_signature_indices.empty() ||
+         !rdat_shader_info->primitive_signature_indices.empty())) {
+      signature_source = DxilTranslationSourceRuntimeData;
+    }
+  }
+
+  const auto empty_metadata =
+      std::vector<DxilMetadataSignatureElementInfo>();
+  const auto &metadata_inputs =
+      metadata_entry ? metadata_entry->input_signature : empty_metadata;
+  const auto &metadata_outputs =
+      metadata_entry ? metadata_entry->output_signature : empty_metadata;
+  const auto &metadata_patch_constants =
+      metadata_entry ? metadata_entry->patch_constant_signature : empty_metadata;
+
+  AppendTranslationSignatures(info, DxilTranslationSignatureKind::Input,
+                              reflection->input_signature, signature_source,
+                              metadata_inputs);
+  AppendTranslationSignatures(info, DxilTranslationSignatureKind::Output,
+                              reflection->output_signature, signature_source,
+                              metadata_outputs);
+  AppendTranslationSignatures(info, DxilTranslationSignatureKind::PatchConstant,
+                              reflection->patch_constant_signature,
+                              signature_source, metadata_patch_constants);
+  AppendTranslationSignatures(info, DxilTranslationSignatureKind::Primitive,
+                              reflection->primitive_signature,
+                              signature_source, empty_metadata);
+
+  if (!HasTranslationSignatureKind(info, DxilTranslationSignatureKind::Input))
+    AppendTranslationMetadataSignatures(info, DxilTranslationSignatureKind::Input,
+                                        metadata_inputs);
+  if (!HasTranslationSignatureKind(info, DxilTranslationSignatureKind::Output))
+    AppendTranslationMetadataSignatures(info, DxilTranslationSignatureKind::Output,
+                                        metadata_outputs);
+  if (!HasTranslationSignatureKind(
+          info, DxilTranslationSignatureKind::PatchConstant)) {
+    AppendTranslationMetadataSignatures(
+        info, DxilTranslationSignatureKind::PatchConstant,
+        metadata_patch_constants);
+  }
+
+  if (!HasTranslationSignatureKind(info, DxilTranslationSignatureKind::Input)) {
+    AppendTranslationPsvSignatures(info, DxilTranslationSignatureKind::Input,
+                                   reflection->psv_input_signature);
+  }
+  if (!HasTranslationSignatureKind(info, DxilTranslationSignatureKind::Output)) {
+    AppendTranslationPsvSignatures(info, DxilTranslationSignatureKind::Output,
+                                   reflection->psv_output_signature);
+  }
+  const auto psv_patch_or_primitive_kind =
+      info.shader_kind == 13 ? DxilTranslationSignatureKind::Primitive
+                             : DxilTranslationSignatureKind::PatchConstant;
+  if (!HasTranslationSignatureKind(info, psv_patch_or_primitive_kind)) {
+    AppendTranslationPsvSignatures(
+        info, psv_patch_or_primitive_kind,
+        reflection->psv_patch_constant_or_primitive_signature);
+  }
+
+  for (const auto &signature : reflection->legacy_signatures) {
+    const auto kind = LegacySignatureKind(signature.part_fourcc);
+    if (HasTranslationSignatureKind(info, kind))
+      continue;
+    for (const auto &element : signature.elements)
+      info.signatures.push_back(
+          BuildTranslationLegacySignatureElement(kind, element));
   }
 
   return ParseStatus::Ok;

@@ -3,6 +3,7 @@ airconv_src = files([
  'air_type.cpp',
  'air_signature.cpp',
  'air_operations.cpp',
+ 'dxil_converter.cpp',
  'dxbc_converter.cpp',
  'dxbc_converter_gs.cpp',
  'dxbc_converter_ts.cpp',
@@ -78,7 +79,7 @@ llvm_include_path = include_directories('../../toolchains/llvm/include') # FIXME
 airconv_lib = static_library('airconv', airconv_src,
   include_directories : [ dxmt_include_path, llvm_include_path ],
   cpp_args            : [ airconv_args, '-DWIN_EXPORT' ],
-  dependencies        : [ dxbc_parser_dep ],
+  dependencies        : [ dxbc_parser_dep, dxil_parser_dep ],
   link_args           : llvm_ld_flags
 )
 
@@ -93,7 +94,7 @@ lib_d3dcompiler = cpp.find_library('d3dcompiler_47')
 executable('airconv', airconv_src + airconv_cli_src,
   include_directories : [ dxmt_include_path, llvm_include_path ],
   cpp_args            : [ airconv_args, '-DWIN_EXPORT' ],
-  dependencies        : [ dxbc_parser_dep, lib_d3dcompiler ],
+  dependencies        : [ dxbc_parser_dep, dxil_parser_dep, lib_d3dcompiler ],
   link_args           : [ llvm_ld_flags, llvm_deps ]
 )
 

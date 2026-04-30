@@ -286,6 +286,94 @@ enum class DxilSemanticOperationKind {
   Math,
 };
 
+enum class DxilTypedOperationKind {
+  Unknown,
+  CreateHandle,
+  CreateHandleFromBinding,
+  CreateHandleFromHeap,
+  AnnotateHandle,
+  CBufferLoad,
+  TextureLoad,
+  TextureStore,
+  BufferLoad,
+  BufferStore,
+  RawBufferLoad,
+  RawBufferStore,
+  Sample,
+  Gather,
+  Atomic,
+  LoadInput,
+  StoreOutput,
+  SystemValue,
+};
+
+enum class DxilSystemValueKind {
+  Unknown,
+  ThreadId,
+  GroupId,
+  ThreadIdInGroup,
+  FlattenedThreadIdInGroup,
+  DispatchRaysIndex,
+  DispatchRaysDimensions,
+  DomainLocation,
+  OutputControlPointID,
+  PrimitiveID,
+  ViewID,
+  SampleIndex,
+  Coverage,
+  InnerCoverage,
+  GSInstanceID,
+  InstanceID,
+  InstanceIndex,
+  PrimitiveIndex,
+  GeometryIndex,
+  HitKind,
+  RayFlags,
+};
+
+struct DxilTypedOperandInfo {
+  uint32_t operand_index = 0;
+  std::string name;
+  std::string type;
+  LlvmTypeInfo type_info;
+  std::string text;
+  bool is_integer = false;
+  uint64_t integer_value = 0;
+};
+
+struct DxilTypedOperationInfo {
+  DxilTypedOperationKind kind = DxilTypedOperationKind::Unknown;
+  DxilSystemValueKind system_value = DxilSystemValueKind::Unknown;
+  std::vector<DxilTypedOperandInfo> operands;
+  bool is_read = false;
+  bool is_write = false;
+  bool is_sample = false;
+  bool is_gather = false;
+  bool is_atomic = false;
+  uint32_t resource_class = 0;
+  uint32_t resource_range_id = 0;
+  uint32_t resource_index = 0;
+  uint32_t signature_element_id = 0;
+  uint32_t row_index = 0;
+  uint32_t column_index = 0;
+  uint32_t component_index = 0;
+  uint32_t mask = 0;
+  uint32_t alignment = 0;
+  uint32_t atomic_operation = 0;
+  bool non_uniform = false;
+  bool has_resource_class = false;
+  bool has_resource_range_id = false;
+  bool has_resource_index = false;
+  bool has_signature_element_id = false;
+  bool has_row_index = false;
+  bool has_column_index = false;
+  bool has_component_index = false;
+  bool has_mask = false;
+  bool has_alignment = false;
+  bool has_atomic_operation = false;
+  bool has_non_uniform = false;
+};
+
 struct LlvmInstructionInfo {
   std::string opcode_name;
   std::string result_name;
@@ -351,6 +439,7 @@ struct LlvmDxilOperationInfo {
   std::string result_type;
   LlvmTypeInfo result_type_info;
   std::vector<LlvmOperandInfo> operands;
+  DxilTypedOperationInfo typed;
 };
 
 struct LlvmFunctionInfo {
@@ -833,6 +922,158 @@ struct ShaderReflectionInfo {
   std::vector<LlvmDxilOperationInfo> dxil_operations;
 };
 
+enum DxilTranslationSourceFlag : uint32_t {
+  DxilTranslationSourceRuntimeData = 1u << 0,
+  DxilTranslationSourceMetadata = 1u << 1,
+  DxilTranslationSourceResourceDef = 1u << 2,
+  DxilTranslationSourcePipelineStateValidation = 1u << 3,
+  DxilTranslationSourceLegacySignature = 1u << 4,
+};
+
+enum class DxilTranslationResourceClass {
+  Unknown,
+  Srv,
+  Uav,
+  Cbv,
+  Sampler,
+};
+
+enum class DxilTranslationSignatureKind {
+  Input,
+  Output,
+  PatchConstant,
+  Primitive,
+};
+
+struct DxilTranslationResourceInfo {
+  std::string name;
+  DxilTranslationResourceClass resource_class =
+      DxilTranslationResourceClass::Unknown;
+  uint32_t source_mask = 0;
+  uint32_t id = 0;
+  uint32_t space = 0;
+  uint32_t lower_bound = 0;
+  uint32_t upper_bound = 0;
+  uint32_t bind_count = 0;
+  bool unbounded = false;
+  uint32_t resource_type = 0;
+  uint32_t resource_kind = 0;
+  uint32_t return_type = 0;
+  uint32_t dimension = 0;
+  uint32_t num_samples = 0;
+  uint32_t flags = 0;
+  bool referenced_by_handle = false;
+  bool read = false;
+  bool written = false;
+  bool sampled = false;
+  bool queried = false;
+};
+
+struct DxilTranslationSignatureElementInfo {
+  DxilTranslationSignatureKind kind = DxilTranslationSignatureKind::Input;
+  uint32_t source_mask = 0;
+  uint32_t element_id = 0;
+  bool has_element_id = false;
+  std::string semantic_name;
+  std::vector<uint32_t> semantic_indices;
+  uint8_t rows = 0;
+  uint8_t cols = 0;
+  uint8_t start_row = 0xff;
+  uint8_t start_col = 0;
+  uint8_t semantic_kind = 0;
+  uint8_t component_type = 0;
+  uint8_t interpolation_mode = 0;
+  uint8_t dynamic_index_mask = 0;
+  uint8_t output_stream = 0;
+  uint8_t usage_mask = 0;
+  bool allocated = false;
+};
+
+struct DxilTranslationOperationInfo {
+  std::string function_name;
+  std::string basic_block_name;
+  uint32_t instruction_index = 0;
+  uint32_t opcode = 0;
+  std::string opcode_name;
+  std::string opcode_class;
+  std::string opcode_category;
+  DxilSemanticOperationKind semantic_kind = DxilSemanticOperationKind::Unknown;
+  uint32_t min_shader_model_major = 0;
+  uint32_t min_shader_model_minor = 0;
+  uint32_t semantic_flags = 0;
+  bool opcode_known = false;
+  bool opcode_reserved = false;
+  uint32_t resource_id = 0;
+  bool has_resource_id = false;
+  uint32_t signature_element_id = 0;
+  bool has_signature_element_id = false;
+  std::string result_type;
+  LlvmTypeInfo result_type_info;
+  std::vector<LlvmOperandInfo> operands;
+  DxilTypedOperationInfo typed;
+};
+
+struct DxilTranslationBasicBlockInfo {
+  std::string function_name;
+  std::string name;
+  uint32_t instruction_start = 0;
+  uint32_t instruction_count = 0;
+  std::string terminator_opcode;
+  std::vector<std::string> successors;
+  bool has_return = false;
+  bool has_branch = false;
+  bool has_switch = false;
+  bool has_unreachable = false;
+};
+
+struct DxilTranslationFunctionInfo {
+  std::string name;
+  bool is_entry_function = false;
+  bool is_entry_reachable = false;
+  bool is_recursive = false;
+  bool has_indirect_calls = false;
+  std::vector<std::string> called_functions;
+};
+
+struct DxilTranslationInfo {
+  bool valid = false;
+  std::string entry_point_name;
+  std::string function_name;
+  std::string shader_model_kind;
+  std::string shader_stage_name;
+  uint32_t shader_kind = 0;
+  uint32_t shader_model_major = 0;
+  uint32_t shader_model_minor = 0;
+  uint32_t dxil_major = 0;
+  uint32_t dxil_minor = 0;
+  bool has_runtime_data = false;
+  bool has_metadata = false;
+  bool has_pipeline_state_validation = false;
+  bool has_resource_def = false;
+  bool has_root_signature = false;
+  uint32_t root_signature_offset = 0;
+  std::span<const uint8_t> root_signature;
+  bool uses_view_id = false;
+  uint32_t num_threads_x = 1;
+  uint32_t num_threads_y = 1;
+  uint32_t num_threads_z = 1;
+  uint32_t group_shared_bytes_used = 0;
+  uint64_t feature_flags = 0;
+  uint32_t min_shader_target = 0;
+  uint32_t shader_flags = 0;
+  std::vector<DxilTranslationResourceInfo> resources;
+  std::vector<DxilTranslationSignatureElementInfo> signatures;
+  std::vector<DxilTranslationOperationInfo> operations;
+  std::vector<DxilTranslationBasicBlockInfo> basic_blocks;
+  std::vector<DxilTranslationFunctionInfo> functions;
+  std::vector<LlvmCallGraphEdgeInfo> call_graph_edges;
+  std::vector<std::string> entry_reachable_functions;
+  std::vector<std::string> recursive_functions;
+  std::vector<std::string> unused_dx_intrinsic_declarations;
+  bool has_indirect_calls = false;
+  bool has_recursion = false;
+};
+
 enum class DxilValidationSeverity {
   Info,
   Warning,
@@ -924,6 +1165,9 @@ public:
   const std::optional<DxilValidationInfo> &dxilValidation() const {
     return dxil_validation_;
   }
+  const std::optional<DxilTranslationInfo> &dxilTranslation() const {
+    return dxil_translation_;
+  }
   const BlobPart *findPart(uint32_t fourcc, size_t start_index = 0) const {
     return container_.findPart(fourcc, start_index);
   }
@@ -951,6 +1195,7 @@ private:
   std::optional<PipelineStateValidationInfo> psv_info_;
   std::optional<ShaderReflectionInfo> shader_reflection_;
   std::optional<DxilValidationInfo> dxil_validation_;
+  std::optional<DxilTranslationInfo> dxil_translation_;
 };
 
 ParseStatus ParseContainer(const void *data, size_t size, ContainerInfo &info);
@@ -972,6 +1217,8 @@ ParseStatus ParsePipelineStateValidation(const BlobPart &part,
 ParseStatus BuildShaderReflection(const Parser &parser,
                                   ShaderReflectionInfo &info);
 ParseStatus ValidateDxil(const Parser &parser, DxilValidationInfo &info);
+ParseStatus BuildDxilTranslationInfo(const Parser &parser,
+                                     DxilTranslationInfo &info);
 const DxilOpcodeInfo *FindDxilOpcodeInfo(uint32_t opcode);
 const char *DxilOpcodeName(uint32_t opcode);
 const char *DxilValidationSeverityName(DxilValidationSeverity severity);
