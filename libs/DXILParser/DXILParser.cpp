@@ -8,6 +8,8 @@
 #include <llvm/IR/Constants.h>
 #include <llvm/IR/Function.h>
 #include <llvm/IR/GlobalVariable.h>
+#include <llvm/IR/Instruction.h>
+#include <llvm/IR/Instructions.h>
 #include <llvm/IR/LLVMContext.h>
 #include <llvm/IR/Metadata.h>
 #include <llvm/IR/Module.h>
@@ -238,6 +240,108 @@ TypeString(const llvm::Type *type) {
   llvm::raw_string_ostream stream(text);
   type->print(stream);
   return stream.str();
+}
+
+std::string
+ValueOperandText(const llvm::Value *value) {
+  if (!value)
+    return {};
+
+  std::string text;
+  llvm::raw_string_ostream stream(text);
+  value->printAsOperand(stream, false);
+  return stream.str();
+}
+
+std::optional<uint64_t>
+ConstantUInt64(const llvm::Value *value) {
+  const auto *integer = llvm::dyn_cast_or_null<llvm::ConstantInt>(value);
+  if (!integer)
+    return std::nullopt;
+
+  return integer->getValue().getLimitedValue();
+}
+
+std::optional<uint32_t>
+ConstantUInt32(const llvm::Value *value) {
+  auto value64 = ConstantUInt64(value);
+  if (!value64 || *value64 > std::numeric_limits<uint32_t>::max())
+    return std::nullopt;
+  return uint32_t(*value64);
+}
+
+LlvmOperandInfo
+ParseLlvmOperand(const llvm::Value *value) {
+  LlvmOperandInfo info = {};
+  if (!value)
+    return info;
+
+  info.type = TypeString(value->getType());
+  info.text = ValueOperandText(value);
+  if (auto integer = ConstantUInt64(value)) {
+    info.is_integer = true;
+    info.integer_value = *integer;
+  }
+  return info;
+}
+
+std::string
+DxilOperationName(std::string_view called_function) {
+  constexpr std::string_view prefix = "dx.op.";
+  if (!called_function.starts_with(prefix))
+    return {};
+
+  auto name = called_function.substr(prefix.size());
+  const auto overload_offset = name.find('.');
+  if (overload_offset != std::string_view::npos)
+    name = name.substr(0, overload_offset);
+  return std::string(name);
+}
+
+LlvmInstructionInfo
+ParseLlvmInstruction(const llvm::Instruction &instruction) {
+  LlvmInstructionInfo info = {};
+  info.opcode_name = instruction.getOpcodeName();
+  info.result_type = TypeString(instruction.getType());
+  if (instruction.hasName())
+    info.result_name = instruction.getName().str();
+
+  info.operands.reserve(instruction.getNumOperands());
+  for (const auto &operand : instruction.operands())
+    info.operands.push_back(ParseLlvmOperand(operand.get()));
+
+  const auto *call = llvm::dyn_cast<llvm::CallBase>(&instruction);
+  if (!call)
+    return info;
+
+  info.is_call = true;
+  if (const auto *called = call->getCalledFunction())
+    info.called_function = called->getName().str();
+  else
+    info.called_function = ValueOperandText(call->getCalledOperand());
+
+  info.is_dx_intrinsic_call =
+      std::string_view(info.called_function).starts_with("dx.op.");
+  if (info.is_dx_intrinsic_call) {
+    if (call->arg_size() > 0)
+      info.dxil_opcode = ConstantUInt32(call->getArgOperand(0));
+    info.dxil_opcode_name = DxilOperationName(info.called_function);
+  }
+
+  return info;
+}
+
+LlvmDxilOperationInfo
+ParseDxilOperation(const LlvmInstructionInfo &instruction,
+                   uint32_t instruction_index) {
+  LlvmDxilOperationInfo info = {};
+  info.instruction_index = instruction_index;
+  info.called_function = instruction.called_function;
+  info.opcode = instruction.dxil_opcode.value_or(0);
+  info.opcode_name = instruction.dxil_opcode_name;
+  info.result_type = instruction.result_type;
+  info.operands = instruction.operands;
+  return info;
 }
 
 std::optional<uint32_t>
@@ -1402,8 +1506,19 @@ ParseLlvmModule(std::span<const uint8_t> data, LlvmModuleInfo &info) {
       function_info.argument_types.push_back(TypeString(argument.getType()));
 
     if (!function.isDeclaration()) {
-      for (const auto &block : function)
+      for (const auto &block : function) {
         function_info.instruction_count += uint32_t(block.size());
+        function_info.instructions.reserve(
+            function_info.instructions.size() + block.size());
+        for (const auto &instruction : block) {
+          auto instruction_info = ParseLlvmInstruction(instruction);
+          if (instruction_info.is_dx_intrinsic_call &&
+              instruction_info.dxil_opcode)
+            function_info.dxil_operations.push_back(ParseDxilOperation(
+                instruction_info, uint32_t(function_info.instructions.size())));
+          function_info.instructions.push_back(std::move(instruction_info));
+        }
+      }
     }
 
     info.functions.push_back(std::move(function_info));

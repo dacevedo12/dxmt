@@ -148,6 +148,34 @@ struct LlvmModuleFlagInfo {
   std::string value;
 };
 
+struct LlvmOperandInfo {
+  std::string type;
+  std::string text;
+  bool is_integer = false;
+  uint64_t integer_value = 0;
+};
+
+struct LlvmInstructionInfo {
+  std::string opcode_name;
+  std::string result_name;
+  std::string result_type;
+  std::vector<LlvmOperandInfo> operands;
+  bool is_call = false;
+  std::string called_function;
+  bool is_dx_intrinsic_call = false;
+  std::optional<uint32_t> dxil_opcode;
+  std::string dxil_opcode_name;
+};
+
+struct LlvmDxilOperationInfo {
+  uint32_t instruction_index = 0;
+  std::string called_function;
+  uint32_t opcode = 0;
+  std::string opcode_name;
+  std::string result_type;
+  std::vector<LlvmOperandInfo> operands;
+};
+
 struct LlvmFunctionInfo {
   std::string name;
   std::string return_type;
@@ -155,6 +183,8 @@ struct LlvmFunctionInfo {
   uint32_t instruction_count = 0;
   bool is_declaration = false;
   bool is_dx_intrinsic = false;
+  std::vector<LlvmInstructionInfo> instructions;
+  std::vector<LlvmDxilOperationInfo> dxil_operations;
 };
 
 struct LlvmGlobalInfo {
