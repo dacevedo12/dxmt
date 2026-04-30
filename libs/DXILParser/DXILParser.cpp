@@ -7,6 +7,7 @@
 #if DXILPARSER_USE_LLVM
 #include <llvm/ADT/StringRef.h>
 #include <llvm/Bitcode/BitcodeReader.h>
+#include <llvm/IR/CFG.h>
 #include <llvm/IR/Constants.h>
 #include <llvm/IR/DerivedTypes.h>
 #include <llvm/IR/Function.h>
@@ -361,10 +362,12 @@ ParseLlvmInstruction(const llvm::Instruction &instruction) {
     return info;
 
   info.is_call = true;
-  if (const auto *called = call->getCalledFunction())
+  if (const auto *called = call->getCalledFunction()) {
     info.called_function = called->getName().str();
-  else
+  } else {
+    info.is_indirect_call = true;
     info.called_function = ValueOperandText(call->getCalledOperand());
+  }
 
   info.is_dx_intrinsic_call =
       std::string_view(info.called_function).starts_with("dx.op.");
@@ -678,6 +681,160 @@ ParseDxilMetadataResourceLists(const llvm::MDNode *node) {
     }
   }
   return resources;
+}
+
+std::string
+BasicBlockName(const llvm::BasicBlock &block) {
+  if (block.hasName())
+    return block.getName().str();
+
+  std::string text;
+  llvm::raw_string_ostream stream(text);
+  block.printAsOperand(stream, false);
+  return stream.str();
+}
+
+LlvmBasicBlockInfo
+ParseLlvmBasicBlockInfo(const llvm::BasicBlock &block,
+                        uint32_t instruction_start) {
+  LlvmBasicBlockInfo info = {};
+  info.name = BasicBlockName(block);
+  info.instruction_start = instruction_start;
+  info.instruction_count = uint32_t(block.size());
+
+  const auto *terminator = block.getTerminator();
+  if (terminator) {
+    info.terminator_opcode = terminator->getOpcodeName();
+    info.has_return = llvm::isa<llvm::ReturnInst>(terminator);
+    info.has_branch = llvm::isa<llvm::BranchInst>(terminator);
+    info.has_switch = llvm::isa<llvm::SwitchInst>(terminator);
+    info.has_unreachable = llvm::isa<llvm::UnreachableInst>(terminator);
+    for (const auto *successor : llvm::successors(&block))
+      info.successors.push_back(BasicBlockName(*successor));
+  }
+
+  return info;
+}
+
+LlvmFunctionInfo *
+FindLlvmFunctionInfo(LlvmModuleInfo &module, std::string_view name) {
+  if (name.empty())
+    return nullptr;
+  auto function = std::find_if(
+      module.functions.begin(), module.functions.end(),
+      [name](const LlvmFunctionInfo &info) { return info.name == name; });
+  return function != module.functions.end() ? &*function : nullptr;
+}
+
+void
+BuildLlvmCallGraph(LlvmModuleInfo &module) {
+  module.call_graph = {};
+
+  for (auto &function : module.functions) {
+    function.called_functions.clear();
+    function.has_indirect_calls = false;
+    function.is_entry_reachable = false;
+    function.is_recursive = false;
+
+    for (uint32_t i = 0; i < function.instructions.size(); i++) {
+      const auto &instruction = function.instructions[i];
+      if (!instruction.is_call)
+        continue;
+
+      LlvmCallGraphEdgeInfo edge = {};
+      edge.caller = function.name;
+      edge.callee = instruction.called_function;
+      edge.instruction_index = i;
+      edge.is_indirect = instruction.is_indirect_call;
+      edge.is_dx_intrinsic = instruction.is_dx_intrinsic_call;
+      module.call_graph.has_indirect_calls =
+          module.call_graph.has_indirect_calls || edge.is_indirect;
+      function.has_indirect_calls = function.has_indirect_calls || edge.is_indirect;
+      module.call_graph.edges.push_back(edge);
+
+      if (!edge.is_indirect && !edge.is_dx_intrinsic &&
+          FindLlvmFunctionInfo(module, edge.callee))
+        function.called_functions.push_back(edge.callee);
+    }
+  }
+
+  std::vector<std::string> worklist;
+  for (const auto &entry : module.entry_points) {
+    if (!entry.function_name.empty())
+      worklist.push_back(entry.function_name);
+  }
+  if (worklist.empty()) {
+    for (const auto &function : module.functions) {
+      if (!function.is_declaration && !function.is_dx_intrinsic) {
+        worklist.push_back(function.name);
+        break;
+      }
+    }
+  }
+
+  std::vector<std::string> reachable;
+  while (!worklist.empty()) {
+    const auto name = std::move(worklist.back());
+    worklist.pop_back();
+    if (std::find(reachable.begin(), reachable.end(), name) != reachable.end())
+      continue;
+
+    auto *function = FindLlvmFunctionInfo(module, name);
+    if (!function || function->is_declaration)
+      continue;
+
+    function->is_entry_reachable = true;
+    reachable.push_back(function->name);
+    for (const auto &callee : function->called_functions)
+      worklist.push_back(callee);
+  }
+  module.call_graph.entry_reachable_functions = reachable;
+
+  for (auto &function : module.functions) {
+    if (function.is_declaration)
+      continue;
+
+    std::vector<std::string> stack;
+    std::vector<std::string> visited;
+    stack.push_back(function.name);
+    while (!stack.empty()) {
+      const auto current = std::move(stack.back());
+      stack.pop_back();
+      const auto *current_function = FindLlvmFunctionInfo(module, current);
+      if (!current_function)
+        continue;
+      for (const auto &callee : current_function->called_functions) {
+        if (callee == function.name) {
+          function.is_recursive = true;
+          module.call_graph.has_recursion = true;
+          if (std::find(module.call_graph.recursive_functions.begin(),
+                        module.call_graph.recursive_functions.end(),
+                        function.name) ==
+              module.call_graph.recursive_functions.end())
+            module.call_graph.recursive_functions.push_back(function.name);
+          stack.clear();
+          break;
+        }
+        if (std::find(visited.begin(), visited.end(), callee) == visited.end()) {
+          visited.push_back(callee);
+          stack.push_back(callee);
+        }
+      }
+    }
+  }
+
+  for (const auto &function : module.functions) {
+    if (!function.is_dx_intrinsic)
+      continue;
+
+    const auto used = std::any_of(
+        module.call_graph.edges.begin(), module.call_graph.edges.end(),
+        [&](const LlvmCallGraphEdgeInfo &edge) {
+          return edge.is_dx_intrinsic && edge.callee == function.name;
+        });
+    if (!used)
+      module.call_graph.unused_dx_intrinsic_declarations.push_back(function.name);
+  }
 }
 #endif
 
@@ -1952,6 +2109,8 @@ ParseLlvmModule(std::span<const uint8_t> data, LlvmModuleInfo &info) {
 
     if (!function.isDeclaration()) {
       for (const auto &block : function) {
+        function_info.basic_blocks.push_back(ParseLlvmBasicBlockInfo(
+            block, uint32_t(function_info.instructions.size())));
         function_info.instruction_count += uint32_t(block.size());
         function_info.instructions.reserve(
             function_info.instructions.size() + block.size());
@@ -1968,6 +2127,8 @@ ParseLlvmModule(std::span<const uint8_t> data, LlvmModuleInfo &info) {
 
     info.functions.push_back(std::move(function_info));
   }
+
+  BuildLlvmCallGraph(info);
 
   info.globals.reserve(module->global_size());
   for (const auto &global : module->globals()) {

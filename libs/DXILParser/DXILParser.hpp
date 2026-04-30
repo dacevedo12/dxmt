@@ -275,10 +275,40 @@ struct LlvmInstructionInfo {
   LlvmTypeInfo result_type_info;
   std::vector<LlvmOperandInfo> operands;
   bool is_call = false;
+  bool is_indirect_call = false;
   std::string called_function;
   bool is_dx_intrinsic_call = false;
   std::optional<uint32_t> dxil_opcode;
   std::string dxil_opcode_name;
+};
+
+struct LlvmBasicBlockInfo {
+  std::string name;
+  uint32_t instruction_start = 0;
+  uint32_t instruction_count = 0;
+  std::string terminator_opcode;
+  std::vector<std::string> successors;
+  bool has_return = false;
+  bool has_branch = false;
+  bool has_switch = false;
+  bool has_unreachable = false;
+};
+
+struct LlvmCallGraphEdgeInfo {
+  std::string caller;
+  std::string callee;
+  uint32_t instruction_index = 0;
+  bool is_indirect = false;
+  bool is_dx_intrinsic = false;
+};
+
+struct LlvmCallGraphInfo {
+  std::vector<LlvmCallGraphEdgeInfo> edges;
+  std::vector<std::string> entry_reachable_functions;
+  std::vector<std::string> recursive_functions;
+  std::vector<std::string> unused_dx_intrinsic_declarations;
+  bool has_indirect_calls = false;
+  bool has_recursion = false;
 };
 
 struct LlvmDxilOperationInfo {
@@ -309,6 +339,11 @@ struct LlvmFunctionInfo {
   uint32_t instruction_count = 0;
   bool is_declaration = false;
   bool is_dx_intrinsic = false;
+  bool is_entry_reachable = false;
+  bool is_recursive = false;
+  bool has_indirect_calls = false;
+  std::vector<std::string> called_functions;
+  std::vector<LlvmBasicBlockInfo> basic_blocks;
   std::vector<LlvmInstructionInfo> instructions;
   std::vector<LlvmDxilOperationInfo> dxil_operations;
 };
@@ -334,6 +369,7 @@ struct LlvmModuleInfo {
   std::vector<DxilMetadataResourceInfo> resources;
   std::vector<DxilMetadataSignatureElementInfo> signature_elements;
   std::vector<LlvmModuleFlagInfo> module_flags;
+  LlvmCallGraphInfo call_graph;
   std::vector<LlvmFunctionInfo> functions;
   std::vector<LlvmGlobalInfo> globals;
 
