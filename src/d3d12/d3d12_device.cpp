@@ -7,6 +7,7 @@
 #include "d3d12_command_list.hpp"
 #include "d3d12_command_queue.hpp"
 #include "d3d12_fence.hpp"
+#include "d3d12_pipeline.hpp"
 #include "d3d12_root_signature.hpp"
 #include "log/log.hpp"
 #include "util_string.hpp"
@@ -220,16 +221,24 @@ public:
   CreateGraphicsPipelineState(const D3D12_GRAPHICS_PIPELINE_STATE_DESC *desc,
                               REFIID riid, void **pipeline_state) override {
     InitReturnPtr(pipeline_state);
-    // TODO(dxil): parse desc shader bytecode with DXILParser before PSO creation.
-    return E_NOTIMPL;
+    HRESULT status = S_OK;
+    auto state = d3d12::CreateGraphicsPipelineState(
+        static_cast<IMTLD3D12Device *>(this), desc, &status);
+    if (!state)
+      return status;
+    return state->QueryInterface(riid, pipeline_state);
   }
 
   HRESULT STDMETHODCALLTYPE
   CreateComputePipelineState(const D3D12_COMPUTE_PIPELINE_STATE_DESC *desc,
                              REFIID riid, void **pipeline_state) override {
     InitReturnPtr(pipeline_state);
-    // TODO(dxil): parse desc->CS bytecode with DXILParser before PSO creation.
-    return E_NOTIMPL;
+    HRESULT status = S_OK;
+    auto state = d3d12::CreateComputePipelineState(
+        static_cast<IMTLD3D12Device *>(this), desc, &status);
+    if (!state)
+      return status;
+    return state->QueryInterface(riid, pipeline_state);
   }
 
   HRESULT STDMETHODCALLTYPE CreateCommandList(UINT node_mask, D3D12_COMMAND_LIST_TYPE type,

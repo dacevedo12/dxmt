@@ -23,6 +23,7 @@ public:
       if (!allocator_state || allocator_state->GetCommandListType() != type_)
         allocator_ = nullptr;
     }
+    current_pipeline_state_ = initial_pipeline_state_;
   }
 
   HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void **ppvObject) override {
@@ -85,6 +86,7 @@ public:
 
     allocator_ = allocator;
     initial_pipeline_state_ = initial_state;
+    current_pipeline_state_ = initial_pipeline_state_;
     compute_root_signature_ = nullptr;
     graphics_root_signature_ = nullptr;
     closed_ = false;
@@ -104,7 +106,9 @@ public:
     return S_OK;
   }
 
-  void STDMETHODCALLTYPE ClearState(ID3D12PipelineState *pipeline_state) override {}
+  void STDMETHODCALLTYPE ClearState(ID3D12PipelineState *pipeline_state) override {
+    current_pipeline_state_ = pipeline_state;
+  }
   void STDMETHODCALLTYPE DrawInstanced(UINT vertex_count_per_instance, UINT instance_count,
                                        UINT start_vertex_location, UINT start_instance_location) override {}
   void STDMETHODCALLTYPE DrawIndexedInstanced(UINT index_count_per_instance, UINT instance_count,
@@ -133,7 +137,9 @@ public:
   void STDMETHODCALLTYPE RSSetScissorRects(UINT rect_count, const D3D12_RECT *rects) override {}
   void STDMETHODCALLTYPE OMSetBlendFactor(const FLOAT blend_factor[4]) override {}
   void STDMETHODCALLTYPE OMSetStencilRef(UINT stencil_ref) override {}
-  void STDMETHODCALLTYPE SetPipelineState(ID3D12PipelineState *pipeline_state) override {}
+  void STDMETHODCALLTYPE SetPipelineState(ID3D12PipelineState *pipeline_state) override {
+    current_pipeline_state_ = pipeline_state;
+  }
   void STDMETHODCALLTYPE ResourceBarrier(UINT barrier_count, const D3D12_RESOURCE_BARRIER *barriers) override {}
   void STDMETHODCALLTYPE ExecuteBundle(ID3D12GraphicsCommandList *command_list) override {}
   void STDMETHODCALLTYPE SetDescriptorHeaps(UINT heap_count, ID3D12DescriptorHeap *const *heaps) override {}
@@ -213,6 +219,7 @@ private:
   D3D12_COMMAND_LIST_TYPE type_;
   Com<ID3D12CommandAllocator> allocator_;
   Com<ID3D12PipelineState> initial_pipeline_state_;
+  Com<ID3D12PipelineState> current_pipeline_state_;
   Com<ID3D12RootSignature> compute_root_signature_;
   Com<ID3D12RootSignature> graphics_root_signature_;
   ComPrivateData private_data_;
