@@ -8,6 +8,7 @@
 #include <optional>
 #include <span>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace dxmt::dxil {
@@ -67,6 +68,7 @@ enum class ParseStatus {
   InvalidShaderStatistics,
   InvalidResourceDef,
   InvalidBitcode,
+  InvalidLlvmModule,
 };
 
 const char *StatusName(ParseStatus status);
@@ -115,6 +117,68 @@ struct BitcodeInfo {
   uint32_t wrapper_cpu_type = 0;
   std::vector<BitcodeBlockInfo> blocks;
   std::vector<BitcodeRecordInfo> records;
+};
+
+struct NamedMetadataInfo {
+  std::string name;
+  uint32_t operand_count = 0;
+};
+
+struct DxilShaderModelInfo {
+  std::string kind;
+  uint32_t major = 0;
+  uint32_t minor = 0;
+};
+
+struct DxilEntryPointInfo {
+  std::string name;
+  std::string function_name;
+  bool has_signature = false;
+  bool has_resources = false;
+  bool has_properties = false;
+  uint32_t signature_operand_count = 0;
+  uint32_t resource_operand_count = 0;
+  uint32_t property_operand_count = 0;
+  std::vector<uint32_t> properties;
+};
+
+struct LlvmModuleFlagInfo {
+  std::string key;
+  uint32_t behavior = 0;
+  std::string value;
+};
+
+struct LlvmFunctionInfo {
+  std::string name;
+  std::string return_type;
+  std::vector<std::string> argument_types;
+  uint32_t instruction_count = 0;
+  bool is_declaration = false;
+  bool is_dx_intrinsic = false;
+};
+
+struct LlvmGlobalInfo {
+  std::string name;
+  std::string value_type;
+  bool is_constant = false;
+  bool is_declaration = false;
+};
+
+struct LlvmModuleInfo {
+  std::string module_identifier;
+  std::string source_file_name;
+  std::string target_triple;
+  std::string data_layout;
+  std::vector<NamedMetadataInfo> named_metadata;
+  std::optional<DxilShaderModelInfo> shader_model;
+  std::vector<uint32_t> dxil_version;
+  std::vector<uint32_t> validator_version;
+  std::vector<DxilEntryPointInfo> entry_points;
+  std::vector<LlvmModuleFlagInfo> module_flags;
+  std::vector<LlvmFunctionInfo> functions;
+  std::vector<LlvmGlobalInfo> globals;
+
+  bool hasNamedMetadata(std::string_view name) const;
 };
 
 struct SignatureElement {
@@ -324,6 +388,7 @@ public:
   const ContainerInfo &container() const { return container_; }
   const std::optional<DxilProgramInfo> &dxilProgram() const { return dxil_program_; }
   const std::optional<BitcodeInfo> &bitcode() const { return bitcode_; }
+  const std::optional<LlvmModuleInfo> &llvmModule() const { return llvm_module_; }
   const std::vector<SignatureInfo> &signatures() const { return signatures_; }
   const std::optional<FeatureInfo> &featureInfo() const { return feature_info_; }
   const std::optional<ShaderHashInfo> &shaderHash() const { return shader_hash_; }
@@ -356,6 +421,7 @@ private:
   ContainerInfo container_;
   std::optional<DxilProgramInfo> dxil_program_;
   std::optional<BitcodeInfo> bitcode_;
+  std::optional<LlvmModuleInfo> llvm_module_;
   std::vector<SignatureInfo> signatures_;
   std::optional<FeatureInfo> feature_info_;
   std::optional<ShaderHashInfo> shader_hash_;
@@ -372,6 +438,7 @@ private:
 ParseStatus ParseContainer(const void *data, size_t size, ContainerInfo &info);
 ParseStatus ParseDxilProgram(const BlobPart &part, DxilProgramInfo &info);
 ParseStatus ParseBitcode(std::span<const uint8_t> data, BitcodeInfo &info);
+ParseStatus ParseLlvmModule(std::span<const uint8_t> data, LlvmModuleInfo &info);
 ParseStatus ParseSignature(const BlobPart &part, SignatureInfo &info);
 ParseStatus ParseFeatureInfo(const BlobPart &part, FeatureInfo &info);
 ParseStatus ParseShaderHash(const BlobPart &part, ShaderHashInfo &info);

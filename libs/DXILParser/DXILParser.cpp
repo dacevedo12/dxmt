@@ -2,6 +2,21 @@
 // SPDX-License-Identifier: LGPL-2.1-or-later
 #include "DXILParser/DXILParser.hpp"
 
+#if DXILPARSER_USE_LLVM
+#include <llvm/ADT/StringRef.h>
+#include <llvm/Bitcode/BitcodeReader.h>
+#include <llvm/IR/Constants.h>
+#include <llvm/IR/Function.h>
+#include <llvm/IR/GlobalVariable.h>
+#include <llvm/IR/LLVMContext.h>
+#include <llvm/IR/Metadata.h>
+#include <llvm/IR/Module.h>
+#include <llvm/IR/Type.h>
+#include <llvm/Support/Error.h>
+#include <llvm/Support/MemoryBufferRef.h>
+#include <llvm/Support/raw_ostream.h>
+#endif
+
 #include <algorithm>
 #include <limits>
 #include <sstream>
@@ -122,6 +137,111 @@ ReadStringList(std::span<const uint8_t> data, std::vector<std::string> &out) {
   }
   return true;
 }
+
+bool
+ExtractBitstream(std::span<const uint8_t> data, std::span<const uint8_t> &bitstream,
+                 BitcodeInfo *wrapper_info = nullptr) {
+  if (data.size() < sizeof(uint32_t))
+    return false;
+
+  bitstream = data;
+  const auto magic = ReadU32(data, 0);
+  if (magic != kBitcodeWrapperMagicValue)
+    return true;
+
+  if (data.size() < kBitcodeWrapperHeaderSize)
+    return false;
+
+  const auto wrapper_offset = ReadU32(data, 8);
+  const auto wrapper_size = ReadU32(data, 12);
+  size_t bitstream_end = 0;
+  if (!CheckedEnd(wrapper_offset, wrapper_size, data.size(), bitstream_end))
+    return false;
+
+  bitstream = std::span<const uint8_t>(data.data() + wrapper_offset,
+                                       wrapper_size);
+  if (wrapper_info) {
+    wrapper_info->has_wrapper = true;
+    wrapper_info->wrapper_version = ReadU32(data, 4);
+    wrapper_info->wrapper_offset = wrapper_offset;
+    wrapper_info->wrapper_size = wrapper_size;
+    wrapper_info->wrapper_cpu_type = ReadU32(data, 16);
+  }
+  return true;
+}
+
+#if DXILPARSER_USE_LLVM
+std::string
+MetadataString(const llvm::Metadata *metadata) {
+  if (!metadata)
+    return {};
+
+  if (const auto *string = llvm::dyn_cast<llvm::MDString>(metadata))
+    return string->getString().str();
+
+  if (const auto *value = llvm::dyn_cast<llvm::ValueAsMetadata>(metadata)) {
+    if (const auto *named_value = value->getValue();
+        named_value && named_value->hasName())
+      return named_value->getName().str();
+  }
+
+  return {};
+}
+
+std::string
+MetadataText(const llvm::Metadata *metadata) {
+  if (!metadata)
+    return {};
+
+  std::string text;
+  llvm::raw_string_ostream stream(text);
+  metadata->print(stream);
+  return stream.str();
+}
+
+std::string
+TypeString(const llvm::Type *type) {
+  if (!type)
+    return {};
+
+  std::string text;
+  llvm::raw_string_ostream stream(text);
+  type->print(stream);
+  return stream.str();
+}
+
+std::optional<uint32_t>
+MetadataUInt32(const llvm::Metadata *metadata) {
+  if (!metadata)
+    return std::nullopt;
+
+  const auto *constant = llvm::dyn_cast<llvm::ConstantAsMetadata>(metadata);
+  if (!constant)
+    return std::nullopt;
+
+  const auto *integer = llvm::dyn_cast<llvm::ConstantInt>(constant->getValue());
+  if (!integer)
+    return std::nullopt;
+
+  return uint32_t(integer->getZExtValue());
+}
+
+std::vector<uint32_t>
+MetadataUInt32List(const llvm::MDNode *node) {
+  std::vector<uint32_t> values;
+  if (!node)
+    return values;
+
+  values.reserve(node->getNumOperands());
+  for (const auto &operand : node->operands()) {
+    auto value = MetadataUInt32(operand.get());
+    if (!value)
+      break;
+    values.push_back(*value);
+  }
+  return values;
+}
+#endif
 
 bool
 ReadU32Array(std::span<const uint8_t> data, uint32_t offset, uint32_t count,
@@ -636,6 +756,14 @@ ShaderHashInfo::is_populated() const {
                      [](uint8_t value) { return value != 0; });
 }
 
+bool
+LlvmModuleInfo::hasNamedMetadata(std::string_view name) const {
+  return std::any_of(named_metadata.begin(), named_metadata.end(),
+                     [name](const NamedMetadataInfo &metadata) {
+                       return metadata.name == name;
+                     });
+}
+
 const char *
 StatusName(ParseStatus status) {
   switch (status) {
@@ -685,6 +813,8 @@ StatusName(ParseStatus status) {
     return "invalid resource definition";
   case ParseStatus::InvalidBitcode:
     return "invalid bitcode";
+  case ParseStatus::InvalidLlvmModule:
+    return "invalid LLVM module";
   }
   return "unknown";
 }
@@ -703,6 +833,7 @@ Parser::reset() {
   container_ = {};
   dxil_program_.reset();
   bitcode_.reset();
+  llvm_module_.reset();
   signatures_.clear();
   feature_info_.reset();
   shader_hash_.reset();
@@ -734,6 +865,14 @@ Parser::parse(const void *data, size_t size) {
   status = parseBitcode();
   if (status != ParseStatus::Ok)
     return status;
+
+#if DXILPARSER_USE_LLVM
+  LlvmModuleInfo module_info = {};
+  status = ParseLlvmModule(dxil_program_->bitcode, module_info);
+  if (status != ParseStatus::Ok)
+    return status;
+  llvm_module_ = std::move(module_info);
+#endif
 
   return parseKnownParts();
 }
@@ -979,29 +1118,10 @@ ParseDxilProgram(const BlobPart &part, DxilProgramInfo &info) {
 
 ParseStatus
 ParseBitcode(std::span<const uint8_t> data, BitcodeInfo &info) {
-  if (data.size() < sizeof(uint32_t))
-    return ParseStatus::InvalidBitcode;
-
   BitcodeInfo wrapper = {};
-  auto bitstream = data;
-  const auto magic = ReadU32(data, 0);
-  if (magic == kBitcodeWrapperMagicValue) {
-    if (data.size() < kBitcodeWrapperHeaderSize)
-      return ParseStatus::InvalidBitcode;
-
-    wrapper.has_wrapper = true;
-    wrapper.wrapper_version = ReadU32(data, 4);
-    wrapper.wrapper_offset = ReadU32(data, 8);
-    wrapper.wrapper_size = ReadU32(data, 12);
-    wrapper.wrapper_cpu_type = ReadU32(data, 16);
-
-    size_t bitstream_end = 0;
-    if (!CheckedEnd(wrapper.wrapper_offset, wrapper.wrapper_size, data.size(),
-                    bitstream_end))
-      return ParseStatus::InvalidBitcode;
-    bitstream = std::span<const uint8_t>(data.data() + wrapper.wrapper_offset,
-                                         wrapper.wrapper_size);
-  }
+  std::span<const uint8_t> bitstream;
+  if (!ExtractBitstream(data, bitstream, &wrapper))
+    return ParseStatus::InvalidBitcode;
 
   BitcodeParser parser(bitstream, info);
   if (!parser.parse())
@@ -1015,6 +1135,147 @@ ParseBitcode(std::span<const uint8_t> data, BitcodeInfo &info) {
     info.wrapper_cpu_type = wrapper.wrapper_cpu_type;
   }
   return ParseStatus::Ok;
+}
+
+ParseStatus
+ParseLlvmModule(std::span<const uint8_t> data, LlvmModuleInfo &info) {
+#if DXILPARSER_USE_LLVM
+  std::span<const uint8_t> bitstream;
+  if (!ExtractBitstream(data, bitstream))
+    return ParseStatus::InvalidLlvmModule;
+
+  llvm::LLVMContext context;
+  const auto buffer = llvm::MemoryBufferRef(
+      llvm::StringRef(reinterpret_cast<const char *>(bitstream.data()),
+                      bitstream.size()),
+      "dxil");
+  auto module_or_error = llvm::parseBitcodeFile(buffer, context);
+  if (!module_or_error) {
+    llvm::consumeError(module_or_error.takeError());
+    return ParseStatus::InvalidLlvmModule;
+  }
+
+  const auto module = std::move(*module_or_error);
+  info = {};
+  info.module_identifier = module->getModuleIdentifier();
+  info.source_file_name = module->getSourceFileName();
+  info.target_triple = module->getTargetTriple();
+  info.data_layout = module->getDataLayoutStr();
+
+  for (const auto &metadata : module->named_metadata()) {
+    info.named_metadata.push_back({
+        .name = metadata.getName().str(),
+        .operand_count = metadata.getNumOperands(),
+    });
+  }
+
+  if (const auto *shader_model = module->getNamedMetadata("dx.shaderModel");
+      shader_model && shader_model->getNumOperands()) {
+    const auto *node = shader_model->getOperand(0);
+    if (node && node->getNumOperands() >= 3) {
+      DxilShaderModelInfo shader_model_info = {};
+      shader_model_info.kind = MetadataString(node->getOperand(0).get());
+      if (auto major = MetadataUInt32(node->getOperand(1).get()))
+        shader_model_info.major = *major;
+      if (auto minor = MetadataUInt32(node->getOperand(2).get()))
+        shader_model_info.minor = *minor;
+      info.shader_model = std::move(shader_model_info);
+    }
+  }
+
+  if (const auto *version = module->getNamedMetadata("dx.version");
+      version && version->getNumOperands())
+    info.dxil_version = MetadataUInt32List(version->getOperand(0));
+
+  if (const auto *validator_version = module->getNamedMetadata("dx.valver");
+      validator_version && validator_version->getNumOperands())
+    info.validator_version = MetadataUInt32List(validator_version->getOperand(0));
+
+  if (const auto *entry_points = module->getNamedMetadata("dx.entryPoints")) {
+    info.entry_points.reserve(entry_points->getNumOperands());
+    for (const auto *entry : entry_points->operands()) {
+      if (!entry || entry->getNumOperands() < 2)
+        continue;
+
+      DxilEntryPointInfo entry_info = {};
+      entry_info.function_name = MetadataString(entry->getOperand(0).get());
+      entry_info.name = MetadataString(entry->getOperand(1).get());
+      if (entry->getNumOperands() > 2) {
+        if (const auto *signature = llvm::dyn_cast_or_null<llvm::MDNode>(
+                entry->getOperand(2).get())) {
+          entry_info.has_signature = true;
+          entry_info.signature_operand_count = signature->getNumOperands();
+        }
+      }
+      if (entry->getNumOperands() > 3) {
+        if (const auto *resources = llvm::dyn_cast_or_null<llvm::MDNode>(
+                entry->getOperand(3).get())) {
+          entry_info.has_resources = true;
+          entry_info.resource_operand_count = resources->getNumOperands();
+        }
+      }
+      if (entry->getNumOperands() > 4) {
+        if (const auto *properties = llvm::dyn_cast_or_null<llvm::MDNode>(
+                entry->getOperand(4).get())) {
+          entry_info.has_properties = true;
+          entry_info.property_operand_count = properties->getNumOperands();
+          entry_info.properties = MetadataUInt32List(properties);
+        }
+      }
+      info.entry_points.push_back(std::move(entry_info));
+    }
+  }
+
+  if (const auto *module_flags = module->getModuleFlagsMetadata()) {
+    info.module_flags.reserve(module_flags->getNumOperands());
+    for (const auto *flag : module_flags->operands()) {
+      if (!flag || flag->getNumOperands() < 3)
+        continue;
+
+      LlvmModuleFlagInfo flag_info = {};
+      if (auto behavior = MetadataUInt32(flag->getOperand(0).get()))
+        flag_info.behavior = *behavior;
+      flag_info.key = MetadataString(flag->getOperand(1).get());
+      flag_info.value = MetadataText(flag->getOperand(2).get());
+      info.module_flags.push_back(std::move(flag_info));
+    }
+  }
+
+  info.functions.reserve(module->size());
+  for (const auto &function : module->functions()) {
+    LlvmFunctionInfo function_info = {};
+    function_info.name = function.getName().str();
+    function_info.return_type = TypeString(function.getReturnType());
+    function_info.is_declaration = function.isDeclaration();
+    function_info.is_dx_intrinsic = function.getName().startswith("dx.op.");
+    function_info.argument_types.reserve(function.arg_size());
+    for (const auto &argument : function.args())
+      function_info.argument_types.push_back(TypeString(argument.getType()));
+
+    if (!function.isDeclaration()) {
+      for (const auto &block : function)
+        function_info.instruction_count += uint32_t(block.size());
+    }
+
+    info.functions.push_back(std::move(function_info));
+  }
+
+  info.globals.reserve(module->global_size());
+  for (const auto &global : module->globals()) {
+    info.globals.push_back({
+        .name = global.getName().str(),
+        .value_type = TypeString(global.getValueType()),
+        .is_constant = global.isConstant(),
+        .is_declaration = global.isDeclaration(),
+    });
+  }
+
+  return ParseStatus::Ok;
+#else
+  (void)data;
+  (void)info;
+  return ParseStatus::InvalidLlvmModule;
+#endif
 }
 
 ParseStatus
