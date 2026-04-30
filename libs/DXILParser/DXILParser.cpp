@@ -53,6 +53,15 @@ constexpr uint32_t kRdatNullRef = 0xffffffffu;
 constexpr size_t kRdatResourceRecordSize = 32;
 constexpr size_t kRdatFunctionRecordSize = 44;
 constexpr size_t kRdatFunctionRecord2Size = 52;
+constexpr size_t kRdatSubobjectRecordSize = 24;
+constexpr size_t kRdatNodeIdRecordSize = 8;
+constexpr size_t kRdatNodeShaderFuncAttribRecordSize = 8;
+constexpr size_t kRdatNodeShaderIoAttribRecordSize = 8;
+constexpr size_t kRdatIoNodeRecordSize = 8;
+constexpr size_t kRdatNodeShaderInfoRecordSize = 20;
+constexpr size_t kRdatPdbInfoSourceRecordSize = 8;
+constexpr size_t kRdatPdbInfoLibraryRecordSize = 12;
+constexpr size_t kRdatPdbInfoRecordSize = 44;
 constexpr size_t kRdatSignatureElementRecordPayloadSize = 14;
 constexpr size_t kRdatVSInfoRecordSize = 16;
 constexpr size_t kRdatPSInfoRecordSize = 8;
@@ -92,6 +101,12 @@ constexpr uint32_t IndexArrays = 2;
 constexpr uint32_t ResourceTable = 3;
 constexpr uint32_t FunctionTable = 4;
 constexpr uint32_t RawBytes = 5;
+constexpr uint32_t SubobjectTable = 6;
+constexpr uint32_t NodeIDTable = 7;
+constexpr uint32_t NodeShaderIOAttribTable = 8;
+constexpr uint32_t NodeShaderFuncAttribTable = 9;
+constexpr uint32_t IONodeTable = 10;
+constexpr uint32_t NodeShaderInfoTable = 11;
 constexpr uint32_t SignatureElementTable = 13;
 constexpr uint32_t VSInfoTable = 14;
 constexpr uint32_t PSInfoTable = 15;
@@ -101,6 +116,9 @@ constexpr uint32_t GSInfoTable = 18;
 constexpr uint32_t CSInfoTable = 19;
 constexpr uint32_t MSInfoTable = 20;
 constexpr uint32_t ASInfoTable = 21;
+constexpr uint32_t DxilPdbInfoTable = 0x10001;
+constexpr uint32_t DxilPdbInfoSourceTable = 0x10002;
+constexpr uint32_t DxilPdbInfoLibraryTable = 0x10003;
 } // namespace rdat
 
 uint16_t
@@ -854,6 +872,25 @@ ReadNullableRdatIndexArray(const RuntimeDataInfo &info, uint32_t offset,
                            std::vector<uint32_t> &out) {
   out.clear();
   return offset == kRdatNullRef || info.readIndexArray(offset, out);
+}
+
+bool
+ReadNullableRdatStringArray(const RuntimeDataInfo &info, uint32_t offset,
+                            std::vector<std::string> &out) {
+  out.clear();
+
+  std::vector<uint32_t> string_offsets;
+  if (!ReadNullableRdatIndexArray(info, offset, string_offsets))
+    return false;
+
+  out.reserve(string_offsets.size());
+  for (const auto string_offset : string_offsets) {
+    std::string value;
+    if (!ReadNullableRdatString(info, string_offset, value))
+      return false;
+    out.push_back(std::move(value));
+  }
+  return true;
 }
 
 bool
@@ -2329,6 +2366,290 @@ ParseRuntimeDataResourceTable(RuntimeDataInfo &info) {
 }
 
 ParseStatus
+ParseRuntimeDataSubobjectTable(RuntimeDataInfo &info) {
+  const auto *table = info.findPart(rdat::SubobjectTable);
+  if (!table) {
+    info.subobjects.clear();
+    return ParseStatus::Ok;
+  }
+  if (!table->record_count) {
+    info.subobjects.clear();
+    return ParseStatus::Ok;
+  }
+  if (!table->is_table || table->record_stride < kRdatSubobjectRecordSize)
+    return ParseStatus::InvalidRuntimeData;
+
+  info.subobjects.clear();
+  info.subobjects.reserve(table->record_count);
+  for (uint32_t i = 0; i < table->record_count; i++) {
+    const auto offset = size_t(i) * table->record_stride;
+    const auto record = table->table_data.subspan(offset, kRdatSubobjectRecordSize);
+
+    RdatSubobjectInfo subobject = {};
+    subobject.kind = ReadU32(record, 0);
+    if (!ReadNullableRdatString(info, ReadU32(record, 4), subobject.name))
+      return ParseStatus::InvalidRuntimeData;
+
+    const auto payload = record.subspan(8);
+    switch (subobject.kind) {
+    case 0: // StateObjectConfig
+      subobject.state_object_flags = ReadU32(payload, 0);
+      break;
+    case 1: // GlobalRootSignature
+    case 2: // LocalRootSignature
+      if (!ReadNullableRdatBytes(info, ReadU32(payload, 0), ReadU32(payload, 4),
+                                 subobject.root_signature))
+        return ParseStatus::InvalidRuntimeData;
+      break;
+    case 8: // SubobjectToExportsAssociation
+      if (!ReadNullableRdatString(info, ReadU32(payload, 0),
+                                  subobject.associated_subobject) ||
+          !ReadNullableRdatStringArray(info, ReadU32(payload, 4),
+                                       subobject.associated_exports))
+        return ParseStatus::InvalidRuntimeData;
+      break;
+    case 9: // RaytracingShaderConfig
+      subobject.max_payload_size_in_bytes = ReadU32(payload, 0);
+      subobject.max_attribute_size_in_bytes = ReadU32(payload, 4);
+      break;
+    case 10: // RaytracingPipelineConfig
+      subobject.max_trace_recursion_depth = ReadU32(payload, 0);
+      break;
+    case 11: // HitGroup
+      subobject.hit_group_type = ReadU32(payload, 0);
+      if (!ReadNullableRdatString(info, ReadU32(payload, 4),
+                                  subobject.any_hit) ||
+          !ReadNullableRdatString(info, ReadU32(payload, 8),
+                                  subobject.closest_hit) ||
+          !ReadNullableRdatString(info, ReadU32(payload, 12),
+                                  subobject.intersection))
+        return ParseStatus::InvalidRuntimeData;
+      break;
+    case 12: // RaytracingPipelineConfig1
+      subobject.max_trace_recursion_depth = ReadU32(payload, 0);
+      subobject.raytracing_pipeline_flags = ReadU32(payload, 4);
+      break;
+    default:
+      break;
+    }
+
+    info.subobjects.push_back(std::move(subobject));
+  }
+
+  return ParseStatus::Ok;
+}
+
+ParseStatus
+ParseRuntimeDataNodeIdTable(RuntimeDataInfo &info) {
+  const auto *table = info.findPart(rdat::NodeIDTable);
+  if (!table) {
+    info.node_ids.clear();
+    return ParseStatus::Ok;
+  }
+  if (!table->record_count) {
+    info.node_ids.clear();
+    return ParseStatus::Ok;
+  }
+  if (!table->is_table || table->record_stride < kRdatNodeIdRecordSize)
+    return ParseStatus::InvalidRuntimeData;
+
+  info.node_ids.clear();
+  info.node_ids.reserve(table->record_count);
+  for (uint32_t i = 0; i < table->record_count; i++) {
+    const auto offset = size_t(i) * table->record_stride;
+    const auto record = table->table_data.subspan(offset, kRdatNodeIdRecordSize);
+
+    RdatNodeIdInfo node_id = {};
+    if (!ReadNullableRdatString(info, ReadU32(record, 0), node_id.name))
+      return ParseStatus::InvalidRuntimeData;
+    node_id.index = ReadU32(record, 4);
+    info.node_ids.push_back(std::move(node_id));
+  }
+
+  return ParseStatus::Ok;
+}
+
+ParseStatus
+ParseRuntimeDataNodeShaderFuncAttribTable(RuntimeDataInfo &info) {
+  const auto *table = info.findPart(rdat::NodeShaderFuncAttribTable);
+  if (!table) {
+    info.node_function_attributes.clear();
+    return ParseStatus::Ok;
+  }
+  if (!table->record_count) {
+    info.node_function_attributes.clear();
+    return ParseStatus::Ok;
+  }
+  if (!table->is_table ||
+      table->record_stride < kRdatNodeShaderFuncAttribRecordSize)
+    return ParseStatus::InvalidRuntimeData;
+
+  info.node_function_attributes.clear();
+  info.node_function_attributes.reserve(table->record_count);
+  for (uint32_t i = 0; i < table->record_count; i++) {
+    const auto offset = size_t(i) * table->record_stride;
+    const auto record = table->table_data.subspan(
+        offset, kRdatNodeShaderFuncAttribRecordSize);
+
+    RdatNodeShaderFuncAttribInfo attribute = {};
+    attribute.kind = ReadU32(record, 0);
+    const auto payload = ReadU32(record, 4);
+    switch (attribute.kind) {
+    case 1: // ID
+    case 3: // ShareInputOf
+      if (payload >= info.node_ids.size())
+        return ParseStatus::InvalidRuntimeData;
+      attribute.node_id_index = payload;
+      break;
+    case 2: // NumThreads
+    case 4: // DispatchGrid
+    case 7: // MaxDispatchGrid
+      if (!ReadNullableRdatIndexArray(info, payload, attribute.values))
+        return ParseStatus::InvalidRuntimeData;
+      break;
+    case 5: // MaxRecursionDepth
+    case 6: // LocalRootArgumentsTableIndex
+    case 8: // Reserved_MeshNodePreview1
+    case 9: // Reserved_MeshNodePreview2
+      attribute.value = payload;
+      break;
+    default:
+      break;
+    }
+    info.node_function_attributes.push_back(std::move(attribute));
+  }
+
+  return ParseStatus::Ok;
+}
+
+ParseStatus
+ParseRuntimeDataNodeShaderIoAttribTable(RuntimeDataInfo &info) {
+  const auto *table = info.findPart(rdat::NodeShaderIOAttribTable);
+  if (!table) {
+    info.node_io_attributes.clear();
+    return ParseStatus::Ok;
+  }
+  if (!table->record_count) {
+    info.node_io_attributes.clear();
+    return ParseStatus::Ok;
+  }
+  if (!table->is_table ||
+      table->record_stride < kRdatNodeShaderIoAttribRecordSize)
+    return ParseStatus::InvalidRuntimeData;
+
+  info.node_io_attributes.clear();
+  info.node_io_attributes.reserve(table->record_count);
+  for (uint32_t i = 0; i < table->record_count; i++) {
+    const auto offset = size_t(i) * table->record_stride;
+    const auto record = table->table_data.subspan(
+        offset, kRdatNodeShaderIoAttribRecordSize);
+
+    RdatNodeShaderIoAttribInfo attribute = {};
+    attribute.kind = ReadU32(record, 0);
+    switch (attribute.kind) {
+    case 1: { // OutputID
+      const auto node_id_index = ReadU32(record, 4);
+      if (node_id_index >= info.node_ids.size())
+        return ParseStatus::InvalidRuntimeData;
+      attribute.node_id_index = node_id_index;
+      break;
+    }
+    case 5: { // RecordDispatchGrid
+      const auto component = ReadU16(record, 6);
+      attribute.record_dispatch_grid.byte_offset = ReadU16(record, 4);
+      attribute.record_dispatch_grid.component_count = component & 0x3u;
+      attribute.record_dispatch_grid.component_type = component >> 2;
+      break;
+    }
+    case 2: // MaxRecords
+    case 3: // MaxRecordsSharedWith
+    case 4: // RecordSizeInBytes
+    case 6: // OutputArraySize
+    case 7: // AllowSparseNodes
+    case 8: // RecordAlignmentInBytes
+      attribute.value = ReadU32(record, 4);
+      break;
+    default:
+      break;
+    }
+    info.node_io_attributes.push_back(std::move(attribute));
+  }
+
+  return ParseStatus::Ok;
+}
+
+ParseStatus
+ParseRuntimeDataIoNodeTable(RuntimeDataInfo &info) {
+  const auto *table = info.findPart(rdat::IONodeTable);
+  if (!table) {
+    info.io_nodes.clear();
+    return ParseStatus::Ok;
+  }
+  if (!table->record_count) {
+    info.io_nodes.clear();
+    return ParseStatus::Ok;
+  }
+  if (!table->is_table || table->record_stride < kRdatIoNodeRecordSize)
+    return ParseStatus::InvalidRuntimeData;
+
+  info.io_nodes.clear();
+  info.io_nodes.reserve(table->record_count);
+  for (uint32_t i = 0; i < table->record_count; i++) {
+    const auto offset = size_t(i) * table->record_stride;
+    const auto record = table->table_data.subspan(offset, kRdatIoNodeRecordSize);
+
+    RdatIoNodeInfo node = {};
+    node.io_flags_and_kind = ReadU32(record, 0);
+    if (!ReadNullableRdatRecordArray(info, ReadU32(record, 4),
+                                     info.node_io_attributes.size(),
+                                     node.attribute_indices))
+      return ParseStatus::InvalidRuntimeData;
+    info.io_nodes.push_back(std::move(node));
+  }
+
+  return ParseStatus::Ok;
+}
+
+ParseStatus
+ParseRuntimeDataNodeShaderInfoTable(RuntimeDataInfo &info) {
+  const auto *table = info.findPart(rdat::NodeShaderInfoTable);
+  if (!table) {
+    info.node_shader_infos.clear();
+    return ParseStatus::Ok;
+  }
+  if (!table->record_count) {
+    info.node_shader_infos.clear();
+    return ParseStatus::Ok;
+  }
+  if (!table->is_table || table->record_stride < kRdatNodeShaderInfoRecordSize)
+    return ParseStatus::InvalidRuntimeData;
+
+  info.node_shader_infos.clear();
+  info.node_shader_infos.reserve(table->record_count);
+  for (uint32_t i = 0; i < table->record_count; i++) {
+    const auto offset = size_t(i) * table->record_stride;
+    const auto record = table->table_data.subspan(offset, kRdatNodeShaderInfoRecordSize);
+
+    RdatNodeShaderInfo shader = {};
+    shader.launch_type = ReadU32(record, 0);
+    shader.group_shared_bytes_used = ReadU32(record, 4);
+    if (!ReadNullableRdatRecordArray(info, ReadU32(record, 8),
+                                     info.node_function_attributes.size(),
+                                     shader.attribute_indices) ||
+        !ReadNullableRdatRecordArray(info, ReadU32(record, 12),
+                                     info.io_nodes.size(),
+                                     shader.output_indices) ||
+        !ReadNullableRdatRecordArray(info, ReadU32(record, 16),
+                                     info.io_nodes.size(),
+                                     shader.input_indices))
+      return ParseStatus::InvalidRuntimeData;
+    info.node_shader_infos.push_back(std::move(shader));
+  }
+
+  return ParseStatus::Ok;
+}
+
+ParseStatus
 ParseRuntimeDataFunctionTable(RuntimeDataInfo &info) {
   const auto *table = info.findPart(rdat::FunctionTable);
   if (!table)
@@ -2397,6 +2718,10 @@ ParseRuntimeDataFunctionTable(RuntimeDataInfo &info) {
         function.shader_info_table_type = rdat::ASInfoTable;
         function.has_shader_info = function.shader_info_index != kRdatNullRef;
         break;
+      case 15:
+        function.shader_info_table_type = rdat::NodeShaderInfoTable;
+        function.has_shader_info = function.shader_info_index != kRdatNullRef;
+        break;
       default:
         break;
       }
@@ -2426,10 +2751,15 @@ ParseRuntimeDataFunctionTable(RuntimeDataInfo &info) {
       function.function_dependencies.push_back(std::move(dependency));
     }
 
-    if (function.has_shader_info &&
-        !info.findShaderInfo(function.shader_info_table_type,
-                             function.shader_info_index))
-      return ParseStatus::InvalidRuntimeData;
+    if (function.has_shader_info) {
+      if (function.shader_info_table_type == rdat::NodeShaderInfoTable) {
+        if (function.shader_info_index >= info.node_shader_infos.size())
+          return ParseStatus::InvalidRuntimeData;
+      } else if (!info.findShaderInfo(function.shader_info_table_type,
+                                      function.shader_info_index)) {
+        return ParseStatus::InvalidRuntimeData;
+      }
+    }
 
     info.functions.push_back(std::move(function));
   }
@@ -2652,8 +2982,150 @@ ParseRuntimeDataShaderInfoTables(RuntimeDataInfo &info) {
 }
 
 ParseStatus
+ParseRuntimeDataPdbSourceTable(RuntimeDataInfo &info) {
+  const auto *table = info.findPart(rdat::DxilPdbInfoSourceTable);
+  if (!table) {
+    info.pdb_sources.clear();
+    return ParseStatus::Ok;
+  }
+  if (!table->record_count) {
+    info.pdb_sources.clear();
+    return ParseStatus::Ok;
+  }
+  if (!table->is_table || table->record_stride < kRdatPdbInfoSourceRecordSize)
+    return ParseStatus::InvalidRuntimeData;
+
+  info.pdb_sources.clear();
+  info.pdb_sources.reserve(table->record_count);
+  for (uint32_t i = 0; i < table->record_count; i++) {
+    const auto offset = size_t(i) * table->record_stride;
+    const auto record = table->table_data.subspan(offset, kRdatPdbInfoSourceRecordSize);
+
+    RdatPdbInfoSource source = {};
+    if (!ReadNullableRdatString(info, ReadU32(record, 0), source.name) ||
+        !ReadNullableRdatString(info, ReadU32(record, 4), source.content))
+      return ParseStatus::InvalidRuntimeData;
+    info.pdb_sources.push_back(std::move(source));
+  }
+
+  return ParseStatus::Ok;
+}
+
+ParseStatus
+ParseRuntimeDataPdbLibraryTable(RuntimeDataInfo &info) {
+  const auto *table = info.findPart(rdat::DxilPdbInfoLibraryTable);
+  if (!table) {
+    info.pdb_libraries.clear();
+    return ParseStatus::Ok;
+  }
+  if (!table->record_count) {
+    info.pdb_libraries.clear();
+    return ParseStatus::Ok;
+  }
+  if (!table->is_table || table->record_stride < kRdatPdbInfoLibraryRecordSize)
+    return ParseStatus::InvalidRuntimeData;
+
+  info.pdb_libraries.clear();
+  info.pdb_libraries.reserve(table->record_count);
+  for (uint32_t i = 0; i < table->record_count; i++) {
+    const auto offset = size_t(i) * table->record_stride;
+    const auto record = table->table_data.subspan(offset, kRdatPdbInfoLibraryRecordSize);
+
+    RdatPdbInfoLibrary library = {};
+    if (!ReadNullableRdatString(info, ReadU32(record, 0), library.name) ||
+        !ReadNullableRdatBytes(info, ReadU32(record, 4), ReadU32(record, 8),
+                               library.data))
+      return ParseStatus::InvalidRuntimeData;
+    info.pdb_libraries.push_back(std::move(library));
+  }
+
+  return ParseStatus::Ok;
+}
+
+ParseStatus
+ParseRuntimeDataPdbInfoTable(RuntimeDataInfo &info) {
+  const auto *table = info.findPart(rdat::DxilPdbInfoTable);
+  if (!table) {
+    info.pdb_infos.clear();
+    return ParseStatus::Ok;
+  }
+  if (!table->record_count) {
+    info.pdb_infos.clear();
+    return ParseStatus::Ok;
+  }
+  if (!table->is_table || table->record_stride < kRdatPdbInfoRecordSize)
+    return ParseStatus::InvalidRuntimeData;
+
+  info.pdb_infos.clear();
+  info.pdb_infos.reserve(table->record_count);
+  for (uint32_t i = 0; i < table->record_count; i++) {
+    const auto offset = size_t(i) * table->record_stride;
+    const auto record = table->table_data.subspan(offset, kRdatPdbInfoRecordSize);
+
+    RdatPdbInfo pdb = {};
+    if (!ReadNullableRdatRecordArray(info, ReadU32(record, 0),
+                                     info.pdb_sources.size(),
+                                     pdb.source_indices) ||
+        !ReadNullableRdatRecordArray(info, ReadU32(record, 4),
+                                     info.pdb_libraries.size(),
+                                     pdb.library_indices) ||
+        !ReadNullableRdatStringArray(info, ReadU32(record, 8),
+                                     pdb.arg_pairs) ||
+        !ReadNullableRdatBytes(info, ReadU32(record, 12), ReadU32(record, 16),
+                               pdb.hash) ||
+        !ReadNullableRdatString(info, ReadU32(record, 20), pdb.pdb_name) ||
+        !ReadNullableRdatBytes(info, ReadU32(record, 28), ReadU32(record, 32),
+                               pdb.custom_toolchain_data) ||
+        !ReadNullableRdatBytes(info, ReadU32(record, 36), ReadU32(record, 40),
+                               pdb.whole_dxil))
+      return ParseStatus::InvalidRuntimeData;
+    pdb.custom_toolchain_id = ReadU32(record, 24);
+    info.pdb_infos.push_back(std::move(pdb));
+  }
+
+  return ParseStatus::Ok;
+}
+
+ParseStatus
+ParseRuntimeDataPdbInfoTables(RuntimeDataInfo &info) {
+  auto status = ParseRuntimeDataPdbSourceTable(info);
+  if (status != ParseStatus::Ok)
+    return status;
+
+  status = ParseRuntimeDataPdbLibraryTable(info);
+  if (status != ParseStatus::Ok)
+    return status;
+
+  return ParseRuntimeDataPdbInfoTable(info);
+}
+
+ParseStatus
 ParseRuntimeDataCoreTables(RuntimeDataInfo &info) {
   auto status = ParseRuntimeDataResourceTable(info);
+  if (status != ParseStatus::Ok)
+    return status;
+
+  status = ParseRuntimeDataSubobjectTable(info);
+  if (status != ParseStatus::Ok)
+    return status;
+
+  status = ParseRuntimeDataNodeIdTable(info);
+  if (status != ParseStatus::Ok)
+    return status;
+
+  status = ParseRuntimeDataNodeShaderFuncAttribTable(info);
+  if (status != ParseStatus::Ok)
+    return status;
+
+  status = ParseRuntimeDataNodeShaderIoAttribTable(info);
+  if (status != ParseStatus::Ok)
+    return status;
+
+  status = ParseRuntimeDataIoNodeTable(info);
+  if (status != ParseStatus::Ok)
+    return status;
+
+  status = ParseRuntimeDataNodeShaderInfoTable(info);
   if (status != ParseStatus::Ok)
     return status;
 
@@ -2665,7 +3137,11 @@ ParseRuntimeDataCoreTables(RuntimeDataInfo &info) {
   if (status != ParseStatus::Ok)
     return status;
 
-  return ParseRuntimeDataFunctionTable(info);
+  status = ParseRuntimeDataFunctionTable(info);
+  if (status != ParseStatus::Ok)
+    return status;
+
+  return ParseRuntimeDataPdbInfoTables(info);
 }
 
 ParseStatus

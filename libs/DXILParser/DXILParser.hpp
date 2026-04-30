@@ -479,6 +479,82 @@ struct RdatShaderInfo {
   uint8_t mesh_output_topology = 0;
 };
 
+struct RdatSubobjectInfo {
+  uint32_t kind = 0;
+  std::string name;
+  uint32_t state_object_flags = 0;
+  std::span<const uint8_t> root_signature;
+  std::string associated_subobject;
+  std::vector<std::string> associated_exports;
+  uint32_t max_payload_size_in_bytes = 0;
+  uint32_t max_attribute_size_in_bytes = 0;
+  uint32_t max_trace_recursion_depth = 0;
+  uint32_t raytracing_pipeline_flags = 0;
+  uint32_t hit_group_type = 0;
+  std::string any_hit;
+  std::string closest_hit;
+  std::string intersection;
+};
+
+struct RdatNodeIdInfo {
+  std::string name;
+  uint32_t index = 0;
+};
+
+struct RdatRecordDispatchGridInfo {
+  uint16_t byte_offset = 0;
+  uint8_t component_count = 0;
+  uint16_t component_type = 0;
+};
+
+struct RdatNodeShaderFuncAttribInfo {
+  uint32_t kind = 0;
+  uint32_t node_id_index = 0;
+  std::vector<uint32_t> values;
+  uint32_t value = 0;
+};
+
+struct RdatNodeShaderIoAttribInfo {
+  uint32_t kind = 0;
+  uint32_t node_id_index = 0;
+  uint32_t value = 0;
+  RdatRecordDispatchGridInfo record_dispatch_grid;
+};
+
+struct RdatIoNodeInfo {
+  uint32_t io_flags_and_kind = 0;
+  std::vector<uint32_t> attribute_indices;
+};
+
+struct RdatNodeShaderInfo {
+  uint32_t launch_type = 0;
+  uint32_t group_shared_bytes_used = 0;
+  std::vector<uint32_t> attribute_indices;
+  std::vector<uint32_t> output_indices;
+  std::vector<uint32_t> input_indices;
+};
+
+struct RdatPdbInfoSource {
+  std::string name;
+  std::string content;
+};
+
+struct RdatPdbInfoLibrary {
+  std::string name;
+  std::span<const uint8_t> data;
+};
+
+struct RdatPdbInfo {
+  std::vector<uint32_t> source_indices;
+  std::vector<uint32_t> library_indices;
+  std::vector<std::string> arg_pairs;
+  std::span<const uint8_t> hash;
+  std::string pdb_name;
+  uint32_t custom_toolchain_id = 0;
+  std::span<const uint8_t> custom_toolchain_data;
+  std::span<const uint8_t> whole_dxil;
+};
+
 struct RuntimeDataInfo {
   uint32_t version = 0;
   uint32_t part_count = 0;
@@ -487,6 +563,15 @@ struct RuntimeDataInfo {
   std::vector<RdatFunctionInfo> functions;
   std::vector<RdatSignatureElementInfo> signature_elements;
   std::vector<RdatShaderInfo> shader_infos;
+  std::vector<RdatSubobjectInfo> subobjects;
+  std::vector<RdatNodeIdInfo> node_ids;
+  std::vector<RdatNodeShaderFuncAttribInfo> node_function_attributes;
+  std::vector<RdatNodeShaderIoAttribInfo> node_io_attributes;
+  std::vector<RdatIoNodeInfo> io_nodes;
+  std::vector<RdatNodeShaderInfo> node_shader_infos;
+  std::vector<RdatPdbInfoSource> pdb_sources;
+  std::vector<RdatPdbInfoLibrary> pdb_libraries;
+  std::vector<RdatPdbInfo> pdb_infos;
 
   const RuntimeDataPartInfo *findPart(uint32_t type,
                                       size_t start_index = 0) const;
