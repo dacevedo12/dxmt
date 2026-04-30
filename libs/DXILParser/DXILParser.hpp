@@ -191,6 +191,28 @@ struct LlvmOperandInfo {
   uint64_t integer_value = 0;
 };
 
+enum DxilOpcodeSemanticFlag : uint32_t {
+  DxilOpcodeSemanticDerivative = 1u << 0,
+  DxilOpcodeSemanticGradient = 1u << 1,
+  DxilOpcodeSemanticFeedback = 1u << 2,
+  DxilOpcodeSemanticWave = 1u << 3,
+  DxilOpcodeSemanticRequiresUniformInputs = 1u << 4,
+  DxilOpcodeSemanticBarrier = 1u << 5,
+};
+
+struct DxilOpcodeInfo {
+  uint32_t opcode = 0;
+  std::string_view name;
+  std::string_view opcode_class;
+  std::string_view category;
+  std::string_view function_attribute;
+  std::string_view overload_types;
+  uint32_t min_shader_model_major = 0;
+  uint32_t min_shader_model_minor = 0;
+  uint32_t semantic_flags = 0;
+  bool is_reserved = false;
+};
+
 struct LlvmInstructionInfo {
   std::string opcode_name;
   std::string result_name;
@@ -209,6 +231,15 @@ struct LlvmDxilOperationInfo {
   std::string called_function;
   uint32_t opcode = 0;
   std::string opcode_name;
+  std::string opcode_class;
+  std::string opcode_category;
+  std::string opcode_function_attribute;
+  std::string opcode_overload_types;
+  uint32_t min_shader_model_major = 0;
+  uint32_t min_shader_model_minor = 0;
+  uint32_t semantic_flags = 0;
+  bool opcode_known = false;
+  bool opcode_reserved = false;
   std::string result_type;
   LlvmTypeInfo result_type_info;
   std::vector<LlvmOperandInfo> operands;
@@ -680,6 +711,8 @@ ParseStatus ParsePipelineStateValidation(const BlobPart &part,
                                          PipelineStateValidationInfo &info);
 ParseStatus BuildShaderReflection(const Parser &parser,
                                   ShaderReflectionInfo &info);
+const DxilOpcodeInfo *FindDxilOpcodeInfo(uint32_t opcode);
+const char *DxilOpcodeName(uint32_t opcode);
 std::string DescribeContainerParts(const ContainerInfo &info);
 
 } // namespace dxmt::dxil
