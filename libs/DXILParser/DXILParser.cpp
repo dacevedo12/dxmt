@@ -1216,6 +1216,7 @@ Parser::reset() {
   resource_def_.reset();
   runtime_data_.reset();
   psv_info_.reset();
+  shader_reflection_.reset();
 }
 
 ParseStatus
@@ -1245,7 +1246,16 @@ Parser::parse(const void *data, size_t size) {
   llvm_module_ = std::move(module_info);
 #endif
 
-  return parseKnownParts();
+  status = parseKnownParts();
+  if (status != ParseStatus::Ok)
+    return status;
+
+  ShaderReflectionInfo reflection_info = {};
+  status = BuildShaderReflection(*this, reflection_info);
+  if (status != ParseStatus::Ok)
+    return status;
+  shader_reflection_ = std::move(reflection_info);
+  return ParseStatus::Ok;
 }
 
 ParseStatus
@@ -2556,6 +2566,332 @@ ParsePipelineStateValidation(const BlobPart &part,
   // them available as an opaque slice until the PSO validator consumes them.
   info.dependency_payload = std::span<const uint8_t>(data.data() + offset,
                                                     data.size() - offset);
+  return ParseStatus::Ok;
+}
+
+namespace {
+
+std::string_view
+CanonicalShaderName(std::string_view name) {
+  if (!name.empty() && name.front() == '\1')
+    name.remove_prefix(1);
+  return name;
+}
+
+bool
+ShaderNamesEqual(std::string_view lhs, std::string_view rhs) {
+  if (lhs.empty() || rhs.empty())
+    return false;
+  return lhs == rhs ||
+         CanonicalShaderName(lhs) == CanonicalShaderName(rhs);
+}
+
+uint32_t
+ShaderBindingCount(uint32_t lower_bound, uint32_t upper_bound) {
+  if (upper_bound < lower_bound)
+    return 0;
+  if (upper_bound == std::numeric_limits<uint32_t>::max())
+    return std::numeric_limits<uint32_t>::max();
+  return upper_bound - lower_bound + 1;
+}
+
+const DxilEntryPointInfo *
+FindReflectionEntryPoint(const LlvmModuleInfo &module) {
+  if (module.entry_points.empty())
+    return nullptr;
+  auto entry = std::find_if(
+      module.entry_points.begin(), module.entry_points.end(),
+      [](const DxilEntryPointInfo &info) {
+        return !info.name.empty() || !info.function_name.empty();
+      });
+  return entry != module.entry_points.end() ? &*entry : &module.entry_points[0];
+}
+
+const LlvmFunctionInfo *
+FindReflectionLlvmFunction(const LlvmModuleInfo &module,
+                           std::string_view entry_point_name,
+                           std::string_view function_name) {
+  auto match = [&](const LlvmFunctionInfo &function) {
+    return ShaderNamesEqual(function.name, function_name) ||
+           ShaderNamesEqual(function.name, entry_point_name);
+  };
+
+  auto function = std::find_if(module.functions.begin(), module.functions.end(),
+                               match);
+  if (function != module.functions.end())
+    return &*function;
+
+  const LlvmFunctionInfo *candidate = nullptr;
+  for (const auto &function_info : module.functions) {
+    if (function_info.is_declaration || function_info.is_dx_intrinsic)
+      continue;
+    if (candidate)
+      return nullptr;
+    candidate = &function_info;
+  }
+  return candidate;
+}
+
+const RdatFunctionInfo *
+FindReflectionRdatFunction(const RuntimeDataInfo &runtime_data,
+                           std::string_view entry_point_name,
+                           std::string_view function_name) {
+  if (runtime_data.functions.empty())
+    return nullptr;
+  if (runtime_data.functions.size() == 1)
+    return &runtime_data.functions[0];
+
+  const RdatFunctionInfo *best = nullptr;
+  uint32_t best_score = 0;
+  for (const auto &function : runtime_data.functions) {
+    uint32_t score = 0;
+    if (ShaderNamesEqual(function.name, function_name))
+      score = std::max(score, 4u);
+    if (ShaderNamesEqual(function.unmangled_name, function_name))
+      score = std::max(score, 4u);
+    if (ShaderNamesEqual(function.name, entry_point_name))
+      score = std::max(score, 3u);
+    if (ShaderNamesEqual(function.unmangled_name, entry_point_name))
+      score = std::max(score, 3u);
+    if (score > best_score) {
+      best = &function;
+      best_score = score;
+    }
+  }
+  return best;
+}
+
+void
+AppendReflectionRdatResource(ShaderReflectionInfo &info,
+                             const RdatResourceInfo &resource) {
+  ShaderReflectionResourceInfo reflected = {};
+  reflected.name = resource.name;
+  reflected.resource_class = resource.resource_class;
+  reflected.resource_kind = resource.kind;
+  reflected.id = resource.id;
+  reflected.space = resource.space;
+  reflected.lower_bound = resource.lower_bound;
+  reflected.upper_bound = resource.upper_bound;
+  reflected.bind_point = resource.lower_bound;
+  reflected.bind_count =
+      ShaderBindingCount(resource.lower_bound, resource.upper_bound);
+  reflected.flags = resource.flags;
+  reflected.from_runtime_data = true;
+  info.resources.push_back(std::move(reflected));
+}
+
+void
+AppendReflectionResourceDef(ShaderReflectionInfo &info,
+                            const ResourceBindingInfo &resource) {
+  ShaderReflectionResourceInfo reflected = {};
+  reflected.name = resource.name;
+  reflected.resource_type = resource.type;
+  reflected.return_type = resource.return_type;
+  reflected.dimension = resource.dimension;
+  reflected.num_samples = resource.num_samples;
+  reflected.id = resource.id;
+  reflected.space = resource.space;
+  reflected.bind_point = resource.bind_point;
+  reflected.bind_count = resource.bind_count;
+  reflected.lower_bound = resource.bind_point;
+  if (resource.bind_count == std::numeric_limits<uint32_t>::max())
+    reflected.upper_bound = std::numeric_limits<uint32_t>::max();
+  else if (resource.bind_count)
+    reflected.upper_bound = resource.bind_point + resource.bind_count - 1;
+  else
+    reflected.upper_bound = resource.bind_point;
+  reflected.flags = resource.flags;
+  reflected.from_resource_def = true;
+  info.resources.push_back(std::move(reflected));
+}
+
+void
+AppendReflectionPsvResource(ShaderReflectionInfo &info,
+                            const PsvResourceBindInfo &resource,
+                            uint32_t index) {
+  ShaderReflectionResourceInfo reflected = {};
+  reflected.resource_type = resource.resource_type;
+  reflected.resource_kind = resource.resource_kind;
+  reflected.id = index;
+  reflected.space = resource.space;
+  reflected.lower_bound = resource.lower_bound;
+  reflected.upper_bound = resource.upper_bound;
+  reflected.bind_point = resource.lower_bound;
+  reflected.bind_count =
+      ShaderBindingCount(resource.lower_bound, resource.upper_bound);
+  reflected.flags = resource.resource_flags;
+  reflected.from_psv = true;
+  info.resources.push_back(std::move(reflected));
+}
+
+void
+CopyRdatSignature(const RuntimeDataInfo &runtime_data,
+                  const std::vector<uint32_t> &indices,
+                  std::vector<RdatSignatureElementInfo> &out) {
+  out.clear();
+  out.reserve(indices.size());
+  for (const auto index : indices) {
+    if (index < runtime_data.signature_elements.size())
+      out.push_back(runtime_data.signature_elements[index]);
+  }
+}
+
+void
+ApplyRdatShaderInfo(ShaderReflectionInfo &info,
+                    const RuntimeDataInfo &runtime_data,
+                    const RdatShaderInfo &shader_info) {
+  CopyRdatSignature(runtime_data, shader_info.input_signature_indices,
+                    info.input_signature);
+  CopyRdatSignature(runtime_data, shader_info.output_signature_indices,
+                    info.output_signature);
+  CopyRdatSignature(runtime_data, shader_info.patch_constant_signature_indices,
+                    info.patch_constant_signature);
+  CopyRdatSignature(runtime_data, shader_info.primitive_signature_indices,
+                    info.primitive_signature);
+  info.num_threads_x = shader_info.num_threads_x;
+  info.num_threads_y = shader_info.num_threads_y;
+  info.num_threads_z = shader_info.num_threads_z;
+  info.group_shared_bytes_used = shader_info.group_shared_bytes_used;
+  info.uses_view_id = info.uses_view_id ||
+                      !shader_info.view_id_output_mask.empty() ||
+                      !shader_info.view_id_patch_constant_output_mask.empty() ||
+                      !shader_info.view_id_primitive_output_mask.empty();
+}
+
+void
+AppendLlvmDxilOperations(ShaderReflectionInfo &info,
+                         const LlvmModuleInfo &module,
+                         const LlvmFunctionInfo *function) {
+  if (function) {
+    info.dxil_operations = function->dxil_operations;
+    return;
+  }
+
+  for (const auto &function_info : module.functions) {
+    if (function_info.is_declaration || function_info.is_dx_intrinsic)
+      continue;
+    info.dxil_operations.insert(info.dxil_operations.end(),
+                                function_info.dxil_operations.begin(),
+                                function_info.dxil_operations.end());
+  }
+}
+
+} // namespace
+
+ParseStatus
+BuildShaderReflection(const Parser &parser, ShaderReflectionInfo &info) {
+  info = {};
+  info.valid = parser.dxilProgram().has_value();
+  info.has_llvm_module = parser.llvmModule().has_value();
+  info.has_runtime_data = parser.runtimeData().has_value();
+  info.has_pipeline_state_validation =
+      parser.pipelineStateValidation().has_value();
+  info.has_resource_def = parser.resourceDef().has_value();
+  info.legacy_signatures = parser.signatures();
+
+  if (const auto *root_signature =
+          parser.container().findPart(fourcc::RootSignature)) {
+    info.has_root_signature = true;
+    info.root_signature_offset = root_signature->offset;
+    info.root_signature = root_signature->data;
+  }
+
+  if (const auto &dxil_program = parser.dxilProgram()) {
+    info.shader_kind = dxil_program->shader_kind();
+    info.shader_stage_name = PsvShaderKindName(uint8_t(info.shader_kind));
+    info.shader_model_major = dxil_program->major_version();
+    info.shader_model_minor = dxil_program->minor_version();
+    info.dxil_major = dxil_program->dxil_version >> 16;
+    info.dxil_minor = dxil_program->dxil_version & 0xffffu;
+  }
+
+  if (const auto &feature_info = parser.featureInfo())
+    info.feature_flags = feature_info->feature_flags;
+
+  const LlvmFunctionInfo *llvm_function = nullptr;
+  if (const auto &module = parser.llvmModule()) {
+    if (module->shader_model) {
+      info.shader_model_kind = module->shader_model->kind;
+      info.shader_model_major = module->shader_model->major;
+      info.shader_model_minor = module->shader_model->minor;
+    }
+    if (module->dxil_version.size() >= 2) {
+      info.dxil_major = module->dxil_version[0];
+      info.dxil_minor = module->dxil_version[1];
+    }
+    if (const auto *entry = FindReflectionEntryPoint(*module)) {
+      info.entry_point_name = entry->name;
+      info.function_name = entry->function_name;
+    }
+    llvm_function = FindReflectionLlvmFunction(
+        *module, info.entry_point_name, info.function_name);
+    if (llvm_function && info.function_name.empty())
+      info.function_name = llvm_function->name;
+    AppendLlvmDxilOperations(info, *module, llvm_function);
+  }
+
+  const RdatFunctionInfo *rdat_function = nullptr;
+  if (const auto &runtime_data = parser.runtimeData()) {
+    rdat_function = FindReflectionRdatFunction(
+        *runtime_data, info.entry_point_name, info.function_name);
+    if (rdat_function) {
+      if (info.entry_point_name.empty())
+        info.entry_point_name = rdat_function->unmangled_name.empty()
+                                    ? rdat_function->name
+                                    : rdat_function->unmangled_name;
+      if (info.function_name.empty())
+        info.function_name = rdat_function->name;
+      info.shader_kind = rdat_function->shader_kind;
+      info.shader_stage_name = PsvShaderKindName(uint8_t(info.shader_kind));
+      info.feature_flags = rdat_function->feature_flags();
+      info.min_shader_target = rdat_function->min_shader_target;
+      info.shader_flags = rdat_function->shader_flags;
+      if (const auto *shader_info = runtime_data->findShaderInfo(
+              rdat_function->shader_info_table_type,
+              rdat_function->shader_info_index))
+        ApplyRdatShaderInfo(info, *runtime_data, *shader_info);
+    }
+
+    if (rdat_function && !rdat_function->resource_indices.empty()) {
+      for (const auto resource_index : rdat_function->resource_indices)
+        AppendReflectionRdatResource(
+            info, runtime_data->resources[resource_index]);
+    } else {
+      for (const auto &resource : runtime_data->resources)
+        AppendReflectionRdatResource(info, resource);
+    }
+  }
+
+  if (const auto &resource_def = parser.resourceDef()) {
+    for (const auto &resource : resource_def->resources)
+      AppendReflectionResourceDef(info, resource);
+  }
+
+  if (const auto &psv = parser.pipelineStateValidation()) {
+    if (info.entry_point_name.empty())
+      info.entry_point_name = psv->entry_function_name;
+    info.uses_view_id = info.uses_view_id || psv->uses_view_id;
+    if (psv->has_runtime_info_1) {
+      info.shader_kind = psv->shader_stage;
+      info.shader_stage_name = PsvShaderKindName(psv->shader_stage);
+    }
+    if (psv->has_runtime_info_2 &&
+        (psv->num_threads_x || psv->num_threads_y || psv->num_threads_z)) {
+      info.num_threads_x = psv->num_threads_x;
+      info.num_threads_y = psv->num_threads_y;
+      info.num_threads_z = psv->num_threads_z;
+    }
+    if (psv->has_runtime_info_4)
+      info.group_shared_bytes_used = psv->num_bytes_group_shared_memory;
+
+    for (uint32_t i = 0; i < psv->resources.size(); i++)
+      AppendReflectionPsvResource(info, psv->resources[i], i);
+    info.psv_input_signature = psv->input_signature_elements;
+    info.psv_output_signature = psv->output_signature_elements;
+    info.psv_patch_constant_or_primitive_signature =
+        psv->patch_constant_or_primitive_signature_elements;
+  }
+
   return ParseStatus::Ok;
 }
 

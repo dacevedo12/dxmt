@@ -526,6 +526,64 @@ struct PipelineStateValidationInfo {
   std::span<const uint8_t> dependency_payload;
 };
 
+struct ShaderReflectionResourceInfo {
+  std::string name;
+  uint32_t resource_class = 0;
+  uint32_t resource_type = 0;
+  uint32_t resource_kind = 0;
+  uint32_t return_type = 0;
+  uint32_t dimension = 0;
+  uint32_t num_samples = 0;
+  uint32_t id = 0;
+  uint32_t space = 0;
+  uint32_t lower_bound = 0;
+  uint32_t upper_bound = 0;
+  uint32_t bind_point = 0;
+  uint32_t bind_count = 0;
+  uint32_t flags = 0;
+  bool from_runtime_data = false;
+  bool from_resource_def = false;
+  bool from_psv = false;
+};
+
+struct ShaderReflectionInfo {
+  bool valid = false;
+  std::string entry_point_name;
+  std::string function_name;
+  std::string shader_model_kind;
+  std::string shader_stage_name;
+  uint32_t shader_kind = 0;
+  uint32_t shader_model_major = 0;
+  uint32_t shader_model_minor = 0;
+  uint32_t dxil_major = 0;
+  uint32_t dxil_minor = 0;
+  bool has_llvm_module = false;
+  bool has_runtime_data = false;
+  bool has_pipeline_state_validation = false;
+  bool has_resource_def = false;
+  bool has_root_signature = false;
+  uint32_t root_signature_offset = 0;
+  std::span<const uint8_t> root_signature;
+  bool uses_view_id = false;
+  uint32_t num_threads_x = 1;
+  uint32_t num_threads_y = 1;
+  uint32_t num_threads_z = 1;
+  uint32_t group_shared_bytes_used = 0;
+  uint64_t feature_flags = 0;
+  uint32_t min_shader_target = 0;
+  uint32_t shader_flags = 0;
+  std::vector<ShaderReflectionResourceInfo> resources;
+  std::vector<RdatSignatureElementInfo> input_signature;
+  std::vector<RdatSignatureElementInfo> output_signature;
+  std::vector<RdatSignatureElementInfo> patch_constant_signature;
+  std::vector<RdatSignatureElementInfo> primitive_signature;
+  std::vector<PsvSignatureElement> psv_input_signature;
+  std::vector<PsvSignatureElement> psv_output_signature;
+  std::vector<PsvSignatureElement> psv_patch_constant_or_primitive_signature;
+  std::vector<SignatureInfo> legacy_signatures;
+  std::vector<LlvmDxilOperationInfo> dxil_operations;
+};
+
 struct ContainerInfo {
   std::array<uint8_t, 16> hash = {};
   uint16_t major_version = 0;
@@ -573,6 +631,9 @@ public:
   const std::optional<PipelineStateValidationInfo> &pipelineStateValidation() const {
     return psv_info_;
   }
+  const std::optional<ShaderReflectionInfo> &shaderReflection() const {
+    return shader_reflection_;
+  }
   const BlobPart *findPart(uint32_t fourcc, size_t start_index = 0) const {
     return container_.findPart(fourcc, start_index);
   }
@@ -598,6 +659,7 @@ private:
   std::optional<ResourceDefInfo> resource_def_;
   std::optional<RuntimeDataInfo> runtime_data_;
   std::optional<PipelineStateValidationInfo> psv_info_;
+  std::optional<ShaderReflectionInfo> shader_reflection_;
 };
 
 ParseStatus ParseContainer(const void *data, size_t size, ContainerInfo &info);
@@ -616,6 +678,8 @@ ParseStatus ParseResourceDef(const BlobPart &part, ResourceDefInfo &info);
 ParseStatus ParseRuntimeData(const BlobPart &part, RuntimeDataInfo &info);
 ParseStatus ParsePipelineStateValidation(const BlobPart &part,
                                          PipelineStateValidationInfo &info);
+ParseStatus BuildShaderReflection(const Parser &parser,
+                                  ShaderReflectionInfo &info);
 std::string DescribeContainerParts(const ContainerInfo &info);
 
 } // namespace dxmt::dxil
