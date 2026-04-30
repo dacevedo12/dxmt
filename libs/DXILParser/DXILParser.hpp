@@ -700,6 +700,44 @@ struct ShaderReflectionInfo {
   std::vector<LlvmDxilOperationInfo> dxil_operations;
 };
 
+enum class DxilValidationSeverity {
+  Info,
+  Warning,
+  Error,
+};
+
+enum class DxilValidationCategory {
+  Container,
+  Program,
+  Metadata,
+  RuntimeData,
+  PipelineStateValidation,
+  Instruction,
+  Reflection,
+};
+
+struct DxilValidationDiagnostic {
+  DxilValidationSeverity severity = DxilValidationSeverity::Error;
+  DxilValidationCategory category = DxilValidationCategory::Program;
+  std::string code;
+  std::string message;
+  std::string function_name;
+  uint32_t instruction_index = 0;
+  uint32_t opcode = 0;
+  bool has_instruction = false;
+  bool has_opcode = false;
+};
+
+struct DxilValidationInfo {
+  bool valid = false;
+  uint32_t error_count = 0;
+  uint32_t warning_count = 0;
+  uint32_t info_count = 0;
+  std::vector<DxilValidationDiagnostic> diagnostics;
+
+  bool has_errors() const { return error_count != 0; }
+};
+
 struct ContainerInfo {
   std::array<uint8_t, 16> hash = {};
   uint16_t major_version = 0;
@@ -750,6 +788,9 @@ public:
   const std::optional<ShaderReflectionInfo> &shaderReflection() const {
     return shader_reflection_;
   }
+  const std::optional<DxilValidationInfo> &dxilValidation() const {
+    return dxil_validation_;
+  }
   const BlobPart *findPart(uint32_t fourcc, size_t start_index = 0) const {
     return container_.findPart(fourcc, start_index);
   }
@@ -776,6 +817,7 @@ private:
   std::optional<RuntimeDataInfo> runtime_data_;
   std::optional<PipelineStateValidationInfo> psv_info_;
   std::optional<ShaderReflectionInfo> shader_reflection_;
+  std::optional<DxilValidationInfo> dxil_validation_;
 };
 
 ParseStatus ParseContainer(const void *data, size_t size, ContainerInfo &info);
@@ -796,8 +838,11 @@ ParseStatus ParsePipelineStateValidation(const BlobPart &part,
                                          PipelineStateValidationInfo &info);
 ParseStatus BuildShaderReflection(const Parser &parser,
                                   ShaderReflectionInfo &info);
+ParseStatus ValidateDxil(const Parser &parser, DxilValidationInfo &info);
 const DxilOpcodeInfo *FindDxilOpcodeInfo(uint32_t opcode);
 const char *DxilOpcodeName(uint32_t opcode);
+const char *DxilValidationSeverityName(DxilValidationSeverity severity);
+const char *DxilValidationCategoryName(DxilValidationCategory category);
 std::string DescribeContainerParts(const ContainerInfo &info);
 
 } // namespace dxmt::dxil

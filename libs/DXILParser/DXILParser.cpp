@@ -1195,6 +1195,7 @@ Parser::reset() {
   runtime_data_.reset();
   psv_info_.reset();
   shader_reflection_.reset();
+  dxil_validation_.reset();
 }
 
 ParseStatus
@@ -1233,6 +1234,12 @@ Parser::parse(const void *data, size_t size) {
   if (status != ParseStatus::Ok)
     return status;
   shader_reflection_ = std::move(reflection_info);
+
+  DxilValidationInfo validation_info = {};
+  status = ValidateDxil(*this, validation_info);
+  if (status != ParseStatus::Ok)
+    return status;
+  dxil_validation_ = std::move(validation_info);
   return ParseStatus::Ok;
 }
 
@@ -3193,6 +3200,619 @@ AppendLlvmDxilOperations(ShaderReflectionInfo &info,
   }
 }
 
+std::string
+LowerAscii(std::string_view value) {
+  std::string out;
+  out.reserve(value.size());
+  for (char ch : value) {
+    if (ch >= 'A' && ch <= 'Z')
+      out.push_back(char(ch - 'A' + 'a'));
+    else
+      out.push_back(ch);
+  }
+  return out;
+}
+
+std::string
+FormatVersion(uint32_t major, uint32_t minor) {
+  std::ostringstream stream;
+  stream << major << "." << minor;
+  return stream.str();
+}
+
+std::string
+FormatBinding(uint32_t space, uint32_t lower_bound, uint32_t upper_bound) {
+  std::ostringstream stream;
+  stream << "space" << space << " [" << lower_bound << ", ";
+  if (upper_bound == std::numeric_limits<uint32_t>::max())
+    stream << "unbounded";
+  else
+    stream << upper_bound;
+  stream << "]";
+  return stream.str();
+}
+
+uint32_t
+ShaderKindFromModelKind(std::string_view kind) {
+  const auto lower = LowerAscii(kind);
+  if (lower == "ps")
+    return 0;
+  if (lower == "vs")
+    return 1;
+  if (lower == "gs")
+    return 2;
+  if (lower == "hs")
+    return 3;
+  if (lower == "ds")
+    return 4;
+  if (lower == "cs")
+    return 5;
+  if (lower == "lib")
+    return 6;
+  if (lower == "raygeneration")
+    return 7;
+  if (lower == "intersection")
+    return 8;
+  if (lower == "anyhit")
+    return 9;
+  if (lower == "closesthit")
+    return 10;
+  if (lower == "miss")
+    return 11;
+  if (lower == "callable")
+    return 12;
+  if (lower == "ms")
+    return 13;
+  if (lower == "as")
+    return 14;
+  if (lower == "node")
+    return 15;
+  return std::numeric_limits<uint32_t>::max();
+}
+
+bool
+ShaderModelAtLeast(uint32_t major, uint32_t minor,
+                   uint32_t required_major, uint32_t required_minor) {
+  return major > required_major ||
+         (major == required_major && minor >= required_minor);
+}
+
+const LlvmFunctionInfo *
+FindLlvmFunction(const LlvmModuleInfo &module, std::string_view name) {
+  if (name.empty())
+    return nullptr;
+  auto function = std::find_if(
+      module.functions.begin(), module.functions.end(),
+      [name](const LlvmFunctionInfo &info) {
+        return ShaderNamesEqual(info.name, name);
+      });
+  return function != module.functions.end() ? &*function : nullptr;
+}
+
+size_t
+CountParts(const ContainerInfo &container, uint32_t fourcc) {
+  return std::count_if(container.parts.begin(), container.parts.end(),
+                       [fourcc](const BlobPart &part) {
+                         return part.fourcc == fourcc;
+                       });
+}
+
+void
+AddDiagnostic(DxilValidationInfo &info,
+              DxilValidationSeverity severity,
+              DxilValidationCategory category,
+              std::string code,
+              std::string message,
+              std::string function_name = {},
+              uint32_t instruction_index = 0,
+              std::optional<uint32_t> opcode = std::nullopt) {
+  switch (severity) {
+  case DxilValidationSeverity::Info:
+    info.info_count++;
+    break;
+  case DxilValidationSeverity::Warning:
+    info.warning_count++;
+    break;
+  case DxilValidationSeverity::Error:
+    info.error_count++;
+    break;
+  }
+
+  DxilValidationDiagnostic diagnostic = {};
+  diagnostic.severity = severity;
+  diagnostic.category = category;
+  diagnostic.code = std::move(code);
+  diagnostic.message = std::move(message);
+  diagnostic.function_name = std::move(function_name);
+  diagnostic.instruction_index = instruction_index;
+  diagnostic.has_instruction = !diagnostic.function_name.empty();
+  if (opcode) {
+    diagnostic.opcode = *opcode;
+    diagnostic.has_opcode = true;
+  }
+  info.diagnostics.push_back(std::move(diagnostic));
+}
+
+void
+AddError(DxilValidationInfo &info,
+         DxilValidationCategory category,
+         std::string code,
+         std::string message,
+         std::string function_name = {},
+         uint32_t instruction_index = 0,
+         std::optional<uint32_t> opcode = std::nullopt) {
+  AddDiagnostic(info, DxilValidationSeverity::Error, category,
+                std::move(code), std::move(message),
+                std::move(function_name), instruction_index, opcode);
+}
+
+void
+AddWarning(DxilValidationInfo &info,
+           DxilValidationCategory category,
+           std::string code,
+           std::string message) {
+  AddDiagnostic(info, DxilValidationSeverity::Warning, category,
+                std::move(code), std::move(message));
+}
+
+void
+ValidateContainerInfo(const Parser &parser, DxilValidationInfo &info) {
+  const auto &container = parser.container();
+  if (CountParts(container, fourcc::Dxil) != 1) {
+    AddError(info, DxilValidationCategory::Container, "dxil-part-count",
+             "DXContainer must contain exactly one DXIL part");
+  }
+
+  for (auto fourcc : {fourcc::FeatureInfo, fourcc::ShaderHash,
+                     fourcc::CompilerVersion, fourcc::ResourceDef,
+                     fourcc::RuntimeData, fourcc::PipelineStateValidation}) {
+    if (CountParts(container, fourcc) > 1) {
+      AddWarning(info, DxilValidationCategory::Container,
+                 "duplicate-singleton-part",
+                 FourCCString(fourcc) + " appears more than once");
+    }
+  }
+
+  struct PartRange {
+    uint32_t fourcc = 0;
+    uint32_t begin = 0;
+    uint32_t end = 0;
+  };
+  std::vector<PartRange> ranges;
+  ranges.reserve(container.parts.size());
+  for (const auto &part : container.parts) {
+    ranges.push_back({
+        .fourcc = part.fourcc,
+        .begin = part.offset,
+        .end = uint32_t(part.offset + kPartHeaderSize + part.data.size()),
+    });
+  }
+  std::sort(ranges.begin(), ranges.end(),
+            [](const PartRange &lhs, const PartRange &rhs) {
+              return lhs.begin < rhs.begin;
+            });
+  for (size_t i = 1; i < ranges.size(); i++) {
+    if (ranges[i].begin < ranges[i - 1].end) {
+      AddError(info, DxilValidationCategory::Container, "overlapping-parts",
+               FourCCString(ranges[i - 1].fourcc) + " overlaps " +
+                   FourCCString(ranges[i].fourcc));
+    }
+  }
+}
+
+void
+ValidateProgramInfo(const Parser &parser, DxilValidationInfo &info) {
+  const auto &dxil_program = parser.dxilProgram();
+  if (!dxil_program) {
+    AddError(info, DxilValidationCategory::Program, "missing-dxil-program",
+             "DXIL program header was not parsed");
+    return;
+  }
+
+  if (dxil_program->shader_kind() > 15) {
+    AddError(info, DxilValidationCategory::Program, "invalid-shader-kind",
+             "DXIL program has an unknown shader kind");
+  }
+  if (dxil_program->major_version() < 6) {
+    AddError(info, DxilValidationCategory::Program, "invalid-shader-model",
+             "DXIL shader model must be 6.x or newer");
+  }
+  if ((dxil_program->dxil_version >> 16) == 0) {
+    AddError(info, DxilValidationCategory::Program, "invalid-dxil-version",
+             "DXIL version in the program header is zero");
+  }
+
+  if (const auto *part = parser.container().findPart(fourcc::Dxil)) {
+    const auto declared_size = size_t(dxil_program->size_in_uint32) *
+                               sizeof(uint32_t);
+    if (declared_size != part->data.size()) {
+      AddWarning(info, DxilValidationCategory::Program,
+                 "dxil-size-mismatch",
+                 "DXIL program size does not match the DXIL part size");
+    }
+  }
+}
+
+void
+ValidateModuleMetadata(const Parser &parser, DxilValidationInfo &info) {
+  const auto &module = parser.llvmModule();
+  if (!module) {
+    AddWarning(info, DxilValidationCategory::Metadata,
+               "llvm-module-unavailable",
+               "LLVM module information is unavailable; instruction validation is limited");
+    return;
+  }
+
+  const auto &dxil_program = parser.dxilProgram();
+  if (!module->shader_model) {
+    AddError(info, DxilValidationCategory::Metadata,
+             "missing-shader-model",
+             "LLVM module is missing dx.shaderModel metadata");
+  } else if (dxil_program) {
+    const auto metadata_kind = ShaderKindFromModelKind(module->shader_model->kind);
+    if (metadata_kind == std::numeric_limits<uint32_t>::max()) {
+      AddError(info, DxilValidationCategory::Metadata,
+               "unknown-shader-model-kind",
+               "dx.shaderModel uses an unknown shader kind '" +
+                   module->shader_model->kind + "'");
+    } else if (metadata_kind != dxil_program->shader_kind()) {
+      AddError(info, DxilValidationCategory::Metadata,
+               "shader-kind-mismatch",
+               "DXIL header shader kind " +
+                   std::string(PsvShaderKindName(uint8_t(dxil_program->shader_kind()))) +
+                   " does not match dx.shaderModel kind " +
+                   module->shader_model->kind);
+    }
+    if (module->shader_model->major != dxil_program->major_version() ||
+        module->shader_model->minor != dxil_program->minor_version()) {
+      AddError(info, DxilValidationCategory::Metadata,
+               "shader-model-mismatch",
+               "DXIL header shader model " +
+                   FormatVersion(dxil_program->major_version(),
+                                 dxil_program->minor_version()) +
+                   " does not match dx.shaderModel " +
+                   FormatVersion(module->shader_model->major,
+                                 module->shader_model->minor));
+    }
+  }
+
+  if (module->dxil_version.size() < 2) {
+    AddError(info, DxilValidationCategory::Metadata,
+             "missing-dxil-version",
+             "LLVM module is missing dx.version metadata");
+  } else if (dxil_program) {
+    const auto header_major = dxil_program->dxil_version >> 16;
+    const auto header_minor = dxil_program->dxil_version & 0xffffu;
+    if (module->dxil_version[0] != header_major ||
+        module->dxil_version[1] != header_minor) {
+      AddError(info, DxilValidationCategory::Metadata,
+               "dxil-version-mismatch",
+               "DXIL header version " +
+                   FormatVersion(header_major, header_minor) +
+                   " does not match dx.version " +
+                   FormatVersion(module->dxil_version[0],
+                                 module->dxil_version[1]));
+    }
+  }
+
+  if (module->validator_version.size() < 2) {
+    AddWarning(info, DxilValidationCategory::Metadata,
+               "missing-validator-version",
+               "LLVM module is missing dx.valver metadata");
+  }
+
+  if (module->entry_points.empty()) {
+    AddError(info, DxilValidationCategory::Metadata,
+             "missing-entry-points",
+             "LLVM module is missing dx.entryPoints metadata");
+  }
+
+  const bool is_library =
+      module->shader_model &&
+      ShaderKindFromModelKind(module->shader_model->kind) == 6;
+  for (const auto &entry : module->entry_points) {
+    if (!is_library && entry.function_name.empty()) {
+      AddError(info, DxilValidationCategory::Metadata,
+               "missing-entry-function",
+               "dx.entryPoints contains an entry without a function reference");
+      continue;
+    }
+    if (!entry.function_name.empty() &&
+        !FindLlvmFunction(*module, entry.function_name)) {
+      AddError(info, DxilValidationCategory::Metadata,
+               "missing-entry-function",
+               "Entry point function '" + entry.function_name +
+                   "' is not present in the LLVM module");
+    }
+  }
+}
+
+void
+ValidateDxilOperations(const Parser &parser, DxilValidationInfo &info) {
+  const auto &module = parser.llvmModule();
+  if (!module)
+    return;
+
+  uint32_t shader_model_major = 0;
+  uint32_t shader_model_minor = 0;
+  if (const auto &reflection = parser.shaderReflection()) {
+    shader_model_major = reflection->shader_model_major;
+    shader_model_minor = reflection->shader_model_minor;
+  } else if (const auto &dxil_program = parser.dxilProgram()) {
+    shader_model_major = dxil_program->major_version();
+    shader_model_minor = dxil_program->minor_version();
+  }
+
+  for (const auto &function : module->functions) {
+    if (function.is_dx_intrinsic && !function.is_declaration) {
+      AddError(info, DxilValidationCategory::Instruction,
+               "defined-dx-intrinsic",
+               "dx.op intrinsic '" + function.name +
+                   "' must be a declaration");
+    }
+
+    if (function.is_declaration)
+      continue;
+
+    for (uint32_t i = 0; i < function.instructions.size(); i++) {
+      const auto &instruction = function.instructions[i];
+      if (!instruction.is_dx_intrinsic_call)
+        continue;
+
+      if (!instruction.dxil_opcode) {
+        AddError(info, DxilValidationCategory::Instruction,
+                 "missing-constant-opcode",
+                 "dx.op call does not use a constant opcode operand",
+                 function.name, i);
+        continue;
+      }
+
+      const auto opcode = *instruction.dxil_opcode;
+      const auto *opcode_info = FindDxilOpcodeInfo(opcode);
+      if (!opcode_info) {
+        AddError(info, DxilValidationCategory::Instruction,
+                 "unknown-opcode",
+                 "dx.op call uses unknown opcode " + std::to_string(opcode),
+                 function.name, i, opcode);
+        continue;
+      }
+      if (opcode_info->is_reserved) {
+        AddError(info, DxilValidationCategory::Instruction,
+                 "reserved-opcode",
+                 "dx.op call uses reserved opcode " + std::to_string(opcode),
+                 function.name, i, opcode);
+      }
+
+      if (shader_model_major &&
+          !ShaderModelAtLeast(shader_model_major, shader_model_minor,
+                              opcode_info->min_shader_model_major,
+                              opcode_info->min_shader_model_minor)) {
+        AddError(info, DxilValidationCategory::Instruction,
+                 "opcode-shader-model",
+                 "Opcode " + std::string(opcode_info->name) +
+                     " requires shader model " +
+                     FormatVersion(opcode_info->min_shader_model_major,
+                                   opcode_info->min_shader_model_minor) +
+                     " but shader is " +
+                     FormatVersion(shader_model_major, shader_model_minor),
+                 function.name, i, opcode);
+      }
+
+      if (!instruction.dxil_opcode_name.empty() &&
+          LowerAscii(instruction.dxil_opcode_name) !=
+              LowerAscii(opcode_info->opcode_class)) {
+        AddError(info, DxilValidationCategory::Instruction,
+                 "opcode-function-mismatch",
+                 "dx.op function class '" + instruction.dxil_opcode_name +
+                     "' does not match opcode " +
+                     std::string(opcode_info->name) + " class " +
+                     std::string(opcode_info->opcode_class),
+                 function.name, i, opcode);
+      }
+    }
+  }
+}
+
+void
+ValidateRuntimeDataInfo(const Parser &parser, DxilValidationInfo &info) {
+  const auto &runtime_data = parser.runtimeData();
+  if (!runtime_data)
+    return;
+
+  if (runtime_data->functions.empty()) {
+    AddWarning(info, DxilValidationCategory::RuntimeData,
+               "missing-rdat-functions",
+               "RDAT is present but has no function records");
+  }
+
+  for (const auto &function : runtime_data->functions) {
+    if (function.shader_kind > 15) {
+      AddError(info, DxilValidationCategory::RuntimeData,
+               "invalid-rdat-shader-kind",
+               "RDAT function '" + function.name +
+                   "' has an unknown shader kind");
+    }
+    if (function.has_shader_info &&
+        !runtime_data->findShaderInfo(function.shader_info_table_type,
+                                      function.shader_info_index)) {
+      AddError(info, DxilValidationCategory::RuntimeData,
+               "missing-rdat-shader-info",
+               "RDAT function '" + function.name +
+                   "' references a missing shader info record");
+    }
+    if (function.minimum_expected_wave_lane_count &&
+        function.maximum_expected_wave_lane_count &&
+        function.minimum_expected_wave_lane_count >
+            function.maximum_expected_wave_lane_count) {
+      AddError(info, DxilValidationCategory::RuntimeData,
+               "invalid-wave-lane-range",
+               "RDAT function '" + function.name +
+                   "' has an invalid expected wave lane range");
+    }
+  }
+
+  for (size_t i = 0; i < runtime_data->resources.size(); i++) {
+    const auto &lhs = runtime_data->resources[i];
+    if (lhs.upper_bound < lhs.lower_bound &&
+        lhs.upper_bound != std::numeric_limits<uint32_t>::max()) {
+      AddError(info, DxilValidationCategory::RuntimeData,
+               "invalid-rdat-resource-range",
+               "RDAT resource '" + lhs.name + "' has an invalid binding range");
+    }
+    for (size_t j = i + 1; j < runtime_data->resources.size(); j++) {
+      const auto &rhs = runtime_data->resources[j];
+      if (lhs.resource_class != rhs.resource_class || lhs.space != rhs.space)
+        continue;
+      const auto lhs_upper = lhs.upper_bound;
+      const auto rhs_upper = rhs.upper_bound;
+      if (lhs.lower_bound <= rhs_upper && rhs.lower_bound <= lhs_upper) {
+        AddWarning(info, DxilValidationCategory::RuntimeData,
+                   "overlapping-rdat-resources",
+                   "RDAT resources '" + lhs.name + "' and '" + rhs.name +
+                       "' overlap at " +
+                       FormatBinding(lhs.space,
+                                     std::max(lhs.lower_bound, rhs.lower_bound),
+                                     std::min(lhs_upper, rhs_upper)));
+      }
+    }
+  }
+}
+
+bool
+ThreadGroupSizePresent(const ShaderReflectionInfo &info) {
+  return info.num_threads_x || info.num_threads_y || info.num_threads_z;
+}
+
+void
+ValidatePipelineStateValidationInfo(const Parser &parser,
+                                    DxilValidationInfo &info) {
+  const auto &psv = parser.pipelineStateValidation();
+  if (!psv)
+    return;
+
+  if (!psv->has_runtime_info_1) {
+    AddWarning(info, DxilValidationCategory::PipelineStateValidation,
+               "old-psv-runtime-info",
+               "PSV0 runtime info is older than runtime-info-1");
+    return;
+  }
+
+  if (psv->shader_stage > 15) {
+    AddError(info, DxilValidationCategory::PipelineStateValidation,
+             "invalid-psv-shader-stage",
+             "PSV0 contains an unknown shader stage");
+  }
+
+  if (const auto &dxil_program = parser.dxilProgram()) {
+    if (psv->shader_stage != dxil_program->shader_kind()) {
+      AddError(info, DxilValidationCategory::PipelineStateValidation,
+               "psv-stage-mismatch",
+               "PSV0 shader stage " +
+                   std::string(PsvShaderKindName(psv->shader_stage)) +
+                   " does not match DXIL header stage " +
+                   PsvShaderKindName(uint8_t(dxil_program->shader_kind())));
+    }
+  }
+
+  if (psv->has_runtime_info_2 &&
+      (psv->shader_stage == 5 || psv->shader_stage == 13 ||
+       psv->shader_stage == 14 || psv->shader_stage == 15) &&
+      (!psv->num_threads_x || !psv->num_threads_y || !psv->num_threads_z)) {
+    AddError(info, DxilValidationCategory::PipelineStateValidation,
+             "invalid-thread-group-size",
+             "PSV0 thread group dimensions must be non-zero");
+  }
+
+  for (const auto &resource : psv->resources) {
+    if (resource.upper_bound < resource.lower_bound &&
+        resource.upper_bound != std::numeric_limits<uint32_t>::max()) {
+      AddError(info, DxilValidationCategory::PipelineStateValidation,
+               "invalid-psv-resource-range",
+               "PSV0 resource has an invalid binding range");
+    }
+  }
+}
+
+bool
+SameResourceBinding(const ShaderReflectionResourceInfo &lhs,
+                    const ShaderReflectionResourceInfo &rhs) {
+  return lhs.space == rhs.space &&
+         lhs.lower_bound == rhs.lower_bound &&
+         lhs.upper_bound == rhs.upper_bound &&
+         (!lhs.resource_kind || !rhs.resource_kind ||
+          lhs.resource_kind == rhs.resource_kind) &&
+         (!lhs.resource_type || !rhs.resource_type ||
+          lhs.resource_type == rhs.resource_type);
+}
+
+void
+ValidateReflectionConsistency(const Parser &parser, DxilValidationInfo &info) {
+  const auto &reflection = parser.shaderReflection();
+  if (!reflection)
+    return;
+
+  if (!reflection->has_runtime_data) {
+    AddWarning(info, DxilValidationCategory::Reflection,
+               "missing-rdat",
+               "RDAT is missing; PSO integration will have reduced reflection data");
+  }
+  if (!reflection->has_pipeline_state_validation) {
+    AddWarning(info, DxilValidationCategory::Reflection,
+               "missing-psv",
+               "PSV0 is missing; pipeline-state validation data is unavailable");
+  }
+
+  if (const auto &runtime_data = parser.runtimeData()) {
+    if (const auto *rdat_function = FindReflectionRdatFunction(
+            *runtime_data, reflection->entry_point_name,
+            reflection->function_name)) {
+      if (rdat_function->shader_kind != reflection->shader_kind) {
+        AddError(info, DxilValidationCategory::Reflection,
+                 "reflection-stage-mismatch",
+                 "Reflected shader stage does not match RDAT function stage");
+      }
+    }
+  }
+
+  if (const auto &psv = parser.pipelineStateValidation()) {
+    if (psv->has_runtime_info_1 &&
+        psv->shader_stage != reflection->shader_kind) {
+      AddError(info, DxilValidationCategory::Reflection,
+               "reflection-psv-stage-mismatch",
+               "Reflected shader stage does not match PSV0 shader stage");
+    }
+    if (psv->has_runtime_info_2 && ThreadGroupSizePresent(*reflection) &&
+        (psv->num_threads_x || psv->num_threads_y || psv->num_threads_z) &&
+        (psv->num_threads_x != reflection->num_threads_x ||
+         psv->num_threads_y != reflection->num_threads_y ||
+         psv->num_threads_z != reflection->num_threads_z)) {
+      AddError(info, DxilValidationCategory::Reflection,
+               "thread-group-size-mismatch",
+               "Reflected thread group size does not match PSV0");
+    }
+  }
+
+  for (const auto &resource : reflection->resources) {
+    if (!resource.from_psv)
+      continue;
+    auto match = std::find_if(
+        reflection->resources.begin(), reflection->resources.end(),
+        [&](const ShaderReflectionResourceInfo &candidate) {
+          return &candidate != &resource && !candidate.from_psv &&
+                 SameResourceBinding(resource, candidate);
+        });
+    if (match == reflection->resources.end() &&
+        (reflection->has_runtime_data || reflection->has_resource_def)) {
+      AddWarning(info, DxilValidationCategory::Reflection,
+                 "unmatched-psv-resource",
+                 "PSV0 resource " +
+                     FormatBinding(resource.space, resource.lower_bound,
+                                   resource.upper_bound) +
+                     " has no matching RDAT/RDEF resource");
+    }
+  }
+}
+
 } // namespace
 
 ParseStatus
@@ -3310,6 +3930,56 @@ BuildShaderReflection(const Parser &parser, ShaderReflectionInfo &info) {
   }
 
   return ParseStatus::Ok;
+}
+
+ParseStatus
+ValidateDxil(const Parser &parser, DxilValidationInfo &info) {
+  info = {};
+  ValidateContainerInfo(parser, info);
+  ValidateProgramInfo(parser, info);
+  ValidateModuleMetadata(parser, info);
+  ValidateDxilOperations(parser, info);
+  ValidateRuntimeDataInfo(parser, info);
+  ValidatePipelineStateValidationInfo(parser, info);
+  ValidateReflectionConsistency(parser, info);
+  info.valid = !info.has_errors();
+  return ParseStatus::Ok;
+}
+
+const char *
+DxilValidationSeverityName(DxilValidationSeverity severity) {
+  switch (severity) {
+  case DxilValidationSeverity::Info:
+    return "info";
+  case DxilValidationSeverity::Warning:
+    return "warning";
+  case DxilValidationSeverity::Error:
+    return "error";
+  default:
+    return "unknown";
+  }
+}
+
+const char *
+DxilValidationCategoryName(DxilValidationCategory category) {
+  switch (category) {
+  case DxilValidationCategory::Container:
+    return "container";
+  case DxilValidationCategory::Program:
+    return "program";
+  case DxilValidationCategory::Metadata:
+    return "metadata";
+  case DxilValidationCategory::RuntimeData:
+    return "runtime-data";
+  case DxilValidationCategory::PipelineStateValidation:
+    return "pipeline-state-validation";
+  case DxilValidationCategory::Instruction:
+    return "instruction";
+  case DxilValidationCategory::Reflection:
+    return "reflection";
+  default:
+    return "unknown";
+  }
 }
 
 std::string
