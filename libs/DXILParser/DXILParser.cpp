@@ -49,7 +49,16 @@ constexpr size_t kRuntimeDataTableHeaderSize = 8;
 constexpr uint32_t kRdatNullRef = 0xffffffffu;
 constexpr size_t kRdatResourceRecordSize = 32;
 constexpr size_t kRdatFunctionRecordSize = 44;
+constexpr size_t kRdatFunctionRecord2Size = 52;
 constexpr size_t kRdatSignatureElementRecordPayloadSize = 14;
+constexpr size_t kRdatVSInfoRecordSize = 16;
+constexpr size_t kRdatPSInfoRecordSize = 8;
+constexpr size_t kRdatHSInfoRecordSize = 48;
+constexpr size_t kRdatDSInfoRecordSize = 38;
+constexpr size_t kRdatGSInfoRecordSize = 28;
+constexpr size_t kRdatCSInfoRecordSize = 8;
+constexpr size_t kRdatMSInfoRecordSize = 45;
+constexpr size_t kRdatASInfoRecordSize = 12;
 constexpr size_t kPsvRuntimeInfo1Size = 36;
 constexpr size_t kPsvRuntimeInfo2Size = 48;
 constexpr size_t kPsvRuntimeInfo3Size = 52;
@@ -79,7 +88,16 @@ constexpr uint32_t StringBuffer = 1;
 constexpr uint32_t IndexArrays = 2;
 constexpr uint32_t ResourceTable = 3;
 constexpr uint32_t FunctionTable = 4;
+constexpr uint32_t RawBytes = 5;
 constexpr uint32_t SignatureElementTable = 13;
+constexpr uint32_t VSInfoTable = 14;
+constexpr uint32_t PSInfoTable = 15;
+constexpr uint32_t HSInfoTable = 16;
+constexpr uint32_t DSInfoTable = 17;
+constexpr uint32_t GSInfoTable = 18;
+constexpr uint32_t CSInfoTable = 19;
+constexpr uint32_t MSInfoTable = 20;
+constexpr uint32_t ASInfoTable = 21;
 } // namespace rdat
 
 uint16_t
@@ -282,6 +300,46 @@ ReadNullableRdatIndexArray(const RuntimeDataInfo &info, uint32_t offset,
                            std::vector<uint32_t> &out) {
   out.clear();
   return offset == kRdatNullRef || info.readIndexArray(offset, out);
+}
+
+bool
+ReadNullableRdatRecordArray(const RuntimeDataInfo &info, uint32_t offset,
+                            size_t record_count, std::vector<uint32_t> &out) {
+  if (!ReadNullableRdatIndexArray(info, offset, out))
+    return false;
+
+  for (const auto index : out) {
+    if (index >= record_count)
+      return false;
+  }
+  return true;
+}
+
+bool
+ReadNullableRdatBytes(const RuntimeDataInfo &info, uint32_t offset,
+                      uint32_t size, std::span<const uint8_t> &out) {
+  out = {};
+  if (!size)
+    return true;
+  return offset != kRdatNullRef && info.readBytes(offset, size, out);
+}
+
+bool
+ReadRdatNumThreads(const RuntimeDataInfo &info, uint32_t offset,
+                   uint32_t &x, uint32_t &y, uint32_t &z) {
+  x = 1;
+  y = 1;
+  z = 1;
+  std::vector<uint32_t> values;
+  if (!ReadNullableRdatIndexArray(info, offset, values))
+    return false;
+  if (values.size() > 0)
+    x = values[0];
+  if (values.size() > 1)
+    y = values[1];
+  if (values.size() > 2)
+    z = values[2];
+  return true;
 }
 
 bool
@@ -799,6 +857,16 @@ RuntimeDataInfo::findPart(uint32_t type, size_t start_index) const {
   return nullptr;
 }
 
+const RdatShaderInfo *
+RuntimeDataInfo::findShaderInfo(uint32_t table_type,
+                                uint32_t record_index) const {
+  for (const auto &info : shader_infos) {
+    if (info.table_type == table_type && info.record_index == record_index)
+      return &info;
+  }
+  return nullptr;
+}
+
 bool
 RuntimeDataInfo::readString(uint32_t offset, std::string &out) const {
   const auto *strings = findPart(rdat::StringBuffer);
@@ -827,6 +895,21 @@ RuntimeDataInfo::readIndexArray(uint32_t offset, std::vector<uint32_t> &out) con
   out.reserve(element_count);
   for (uint32_t i = 0; i < element_count; i++)
     out.push_back(ReadU32(indices->data, byte_offset + sizeof(uint32_t) * (i + 1)));
+  return true;
+}
+
+bool
+RuntimeDataInfo::readBytes(uint32_t offset, uint32_t size,
+                           std::span<const uint8_t> &out) const {
+  const auto *raw_bytes = findPart(rdat::RawBytes);
+  if (!raw_bytes)
+    return false;
+
+  size_t end = 0;
+  if (!CheckedEnd(offset, size, raw_bytes->data.size(), end))
+    return false;
+
+  out = std::span<const uint8_t>(raw_bytes->data.data() + offset, size);
   return true;
 }
 
@@ -1676,6 +1759,49 @@ ParseRuntimeDataFunctionTable(RuntimeDataInfo &info) {
     function.feature_info2 = ReadU32(record, 32);
     function.shader_stage_flag = ReadU32(record, 36);
     function.min_shader_target = ReadU32(record, 40);
+    if (table->record_stride >= kRdatFunctionRecord2Size) {
+      const auto record2 = table->table_data.subspan(offset, kRdatFunctionRecord2Size);
+      function.minimum_expected_wave_lane_count = record2[44];
+      function.maximum_expected_wave_lane_count = record2[45];
+      function.shader_flags = ReadU16(record2, 46);
+      function.shader_info_index = ReadU32(record2, 48);
+      switch (function.shader_kind) {
+      case 0:
+        function.shader_info_table_type = rdat::PSInfoTable;
+        function.has_shader_info = function.shader_info_index != kRdatNullRef;
+        break;
+      case 1:
+        function.shader_info_table_type = rdat::VSInfoTable;
+        function.has_shader_info = function.shader_info_index != kRdatNullRef;
+        break;
+      case 2:
+        function.shader_info_table_type = rdat::GSInfoTable;
+        function.has_shader_info = function.shader_info_index != kRdatNullRef;
+        break;
+      case 3:
+        function.shader_info_table_type = rdat::HSInfoTable;
+        function.has_shader_info = function.shader_info_index != kRdatNullRef;
+        break;
+      case 4:
+        function.shader_info_table_type = rdat::DSInfoTable;
+        function.has_shader_info = function.shader_info_index != kRdatNullRef;
+        break;
+      case 5:
+        function.shader_info_table_type = rdat::CSInfoTable;
+        function.has_shader_info = function.shader_info_index != kRdatNullRef;
+        break;
+      case 13:
+        function.shader_info_table_type = rdat::MSInfoTable;
+        function.has_shader_info = function.shader_info_index != kRdatNullRef;
+        break;
+      case 14:
+        function.shader_info_table_type = rdat::ASInfoTable;
+        function.has_shader_info = function.shader_info_index != kRdatNullRef;
+        break;
+      default:
+        break;
+      }
+    }
 
     if (!ReadNullableRdatString(info, name_offset, function.name) ||
         !ReadNullableRdatString(info, unmangled_name_offset,
@@ -1700,6 +1826,11 @@ ParseRuntimeDataFunctionTable(RuntimeDataInfo &info) {
         return ParseStatus::InvalidRuntimeData;
       function.function_dependencies.push_back(std::move(dependency));
     }
+
+    if (function.has_shader_info &&
+        !info.findShaderInfo(function.shader_info_table_type,
+                             function.shader_info_index))
+      return ParseStatus::InvalidRuntimeData;
 
     info.functions.push_back(std::move(function));
   }
@@ -1754,17 +1885,188 @@ ParseRuntimeDataSignatureElementTable(RuntimeDataInfo &info) {
   return ParseStatus::Ok;
 }
 
+bool
+ReadRdatSignatureArray(const RuntimeDataInfo &info, uint32_t offset,
+                       std::vector<uint32_t> &out) {
+  return ReadNullableRdatRecordArray(info, offset, info.signature_elements.size(), out);
+}
+
+ParseStatus
+ParseRuntimeDataShaderInfoTable(RuntimeDataInfo &info, uint32_t table_type,
+                                size_t minimum_record_size) {
+  const auto *table = info.findPart(table_type);
+  if (!table || !table->record_count)
+    return ParseStatus::Ok;
+  if (!table->is_table || table->record_stride < minimum_record_size)
+    return ParseStatus::InvalidRuntimeData;
+
+  for (uint32_t i = 0; i < table->record_count; i++) {
+    const auto offset = size_t(i) * table->record_stride;
+    const auto record = table->table_data.subspan(offset, minimum_record_size);
+
+    RdatShaderInfo shader = {};
+    shader.table_type = table_type;
+    shader.record_index = i;
+
+    switch (table_type) {
+    case rdat::VSInfoTable:
+      if (!ReadRdatSignatureArray(info, ReadU32(record, 0),
+                                  shader.input_signature_indices) ||
+          !ReadRdatSignatureArray(info, ReadU32(record, 4),
+                                  shader.output_signature_indices) ||
+          !ReadNullableRdatBytes(info, ReadU32(record, 8), ReadU32(record, 12),
+                                 shader.view_id_output_mask))
+        return ParseStatus::InvalidRuntimeData;
+      break;
+
+    case rdat::PSInfoTable:
+      if (!ReadRdatSignatureArray(info, ReadU32(record, 0),
+                                  shader.input_signature_indices) ||
+          !ReadRdatSignatureArray(info, ReadU32(record, 4),
+                                  shader.output_signature_indices))
+        return ParseStatus::InvalidRuntimeData;
+      break;
+
+    case rdat::HSInfoTable:
+      if (!ReadRdatSignatureArray(info, ReadU32(record, 0),
+                                  shader.input_signature_indices) ||
+          !ReadRdatSignatureArray(info, ReadU32(record, 4),
+                                  shader.output_signature_indices) ||
+          !ReadRdatSignatureArray(info, ReadU32(record, 8),
+                                  shader.patch_constant_signature_indices) ||
+          !ReadNullableRdatBytes(info, ReadU32(record, 12), ReadU32(record, 16),
+                                 shader.view_id_output_mask) ||
+          !ReadNullableRdatBytes(info, ReadU32(record, 20), ReadU32(record, 24),
+                                 shader.view_id_patch_constant_output_mask) ||
+          !ReadNullableRdatBytes(info, ReadU32(record, 28), ReadU32(record, 32),
+                                 shader.input_to_output_masks) ||
+          !ReadNullableRdatBytes(info, ReadU32(record, 36), ReadU32(record, 40),
+                                 shader.input_to_patch_constant_output_masks))
+        return ParseStatus::InvalidRuntimeData;
+      shader.input_control_point_count = record[44];
+      shader.output_control_point_count = record[45];
+      shader.tessellator_domain = record[46];
+      shader.tessellator_output_primitive = record[47];
+      break;
+
+    case rdat::DSInfoTable:
+      if (!ReadRdatSignatureArray(info, ReadU32(record, 0),
+                                  shader.input_signature_indices) ||
+          !ReadRdatSignatureArray(info, ReadU32(record, 4),
+                                  shader.output_signature_indices) ||
+          !ReadRdatSignatureArray(info, ReadU32(record, 8),
+                                  shader.patch_constant_signature_indices) ||
+          !ReadNullableRdatBytes(info, ReadU32(record, 12), ReadU32(record, 16),
+                                 shader.view_id_output_mask) ||
+          !ReadNullableRdatBytes(info, ReadU32(record, 20), ReadU32(record, 24),
+                                 shader.input_to_output_masks) ||
+          !ReadNullableRdatBytes(info, ReadU32(record, 28), ReadU32(record, 32),
+                                 shader.patch_constant_input_to_output_masks))
+        return ParseStatus::InvalidRuntimeData;
+      shader.input_control_point_count = record[36];
+      shader.tessellator_domain = record[37];
+      break;
+
+    case rdat::GSInfoTable:
+      if (!ReadRdatSignatureArray(info, ReadU32(record, 0),
+                                  shader.input_signature_indices) ||
+          !ReadRdatSignatureArray(info, ReadU32(record, 4),
+                                  shader.output_signature_indices) ||
+          !ReadNullableRdatBytes(info, ReadU32(record, 8), ReadU32(record, 12),
+                                 shader.view_id_output_mask) ||
+          !ReadNullableRdatBytes(info, ReadU32(record, 16), ReadU32(record, 20),
+                                 shader.input_to_output_masks))
+        return ParseStatus::InvalidRuntimeData;
+      shader.input_primitive = record[24];
+      shader.output_topology = record[25];
+      shader.max_vertex_count = record[26];
+      shader.output_stream_mask = record[27];
+      break;
+
+    case rdat::CSInfoTable:
+      if (!ReadRdatNumThreads(info, ReadU32(record, 0), shader.num_threads_x,
+                              shader.num_threads_y, shader.num_threads_z))
+        return ParseStatus::InvalidRuntimeData;
+      shader.group_shared_bytes_used = ReadU32(record, 4);
+      break;
+
+    case rdat::MSInfoTable:
+      if (!ReadRdatSignatureArray(info, ReadU32(record, 0),
+                                  shader.output_signature_indices) ||
+          !ReadRdatSignatureArray(info, ReadU32(record, 4),
+                                  shader.primitive_signature_indices) ||
+          !ReadNullableRdatBytes(info, ReadU32(record, 8), ReadU32(record, 12),
+                                 shader.view_id_output_mask) ||
+          !ReadNullableRdatBytes(info, ReadU32(record, 16), ReadU32(record, 20),
+                                 shader.view_id_primitive_output_mask) ||
+          !ReadRdatNumThreads(info, ReadU32(record, 24), shader.num_threads_x,
+                              shader.num_threads_y, shader.num_threads_z))
+        return ParseStatus::InvalidRuntimeData;
+      shader.group_shared_bytes_used = ReadU32(record, 28);
+      shader.group_shared_bytes_dependent_on_view_id = ReadU32(record, 32);
+      shader.payload_size_in_bytes = ReadU32(record, 36);
+      shader.max_output_vertices = ReadU16(record, 40);
+      shader.max_output_primitives = ReadU16(record, 42);
+      shader.mesh_output_topology = record[44];
+      break;
+
+    case rdat::ASInfoTable:
+      if (!ReadRdatNumThreads(info, ReadU32(record, 0), shader.num_threads_x,
+                              shader.num_threads_y, shader.num_threads_z))
+        return ParseStatus::InvalidRuntimeData;
+      shader.group_shared_bytes_used = ReadU32(record, 4);
+      shader.payload_size_in_bytes = ReadU32(record, 8);
+      break;
+
+    default:
+      return ParseStatus::InvalidRuntimeData;
+    }
+
+    info.shader_infos.push_back(std::move(shader));
+  }
+
+  return ParseStatus::Ok;
+}
+
+ParseStatus
+ParseRuntimeDataShaderInfoTables(RuntimeDataInfo &info) {
+  info.shader_infos.clear();
+
+  const std::pair<uint32_t, size_t> tables[] = {
+      {rdat::VSInfoTable, kRdatVSInfoRecordSize},
+      {rdat::PSInfoTable, kRdatPSInfoRecordSize},
+      {rdat::HSInfoTable, kRdatHSInfoRecordSize},
+      {rdat::DSInfoTable, kRdatDSInfoRecordSize},
+      {rdat::GSInfoTable, kRdatGSInfoRecordSize},
+      {rdat::CSInfoTable, kRdatCSInfoRecordSize},
+      {rdat::MSInfoTable, kRdatMSInfoRecordSize},
+      {rdat::ASInfoTable, kRdatASInfoRecordSize},
+  };
+
+  for (const auto &[table_type, record_size] : tables) {
+    auto status = ParseRuntimeDataShaderInfoTable(info, table_type, record_size);
+    if (status != ParseStatus::Ok)
+      return status;
+  }
+
+  return ParseStatus::Ok;
+}
+
 ParseStatus
 ParseRuntimeDataCoreTables(RuntimeDataInfo &info) {
   auto status = ParseRuntimeDataResourceTable(info);
   if (status != ParseStatus::Ok)
     return status;
 
-  status = ParseRuntimeDataFunctionTable(info);
+  status = ParseRuntimeDataSignatureElementTable(info);
   if (status != ParseStatus::Ok)
     return status;
 
-  return ParseRuntimeDataSignatureElementTable(info);
+  status = ParseRuntimeDataShaderInfoTables(info);
+  if (status != ParseStatus::Ok)
+    return status;
+
+  return ParseRuntimeDataFunctionTable(info);
 }
 
 ParseStatus

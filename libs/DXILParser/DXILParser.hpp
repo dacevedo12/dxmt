@@ -319,6 +319,12 @@ struct RdatFunctionInfo {
   uint32_t feature_info2 = 0;
   uint32_t shader_stage_flag = 0;
   uint32_t min_shader_target = 0;
+  uint8_t minimum_expected_wave_lane_count = 0;
+  uint8_t maximum_expected_wave_lane_count = 0;
+  uint16_t shader_flags = 0;
+  bool has_shader_info = false;
+  uint32_t shader_info_table_type = 0;
+  uint32_t shader_info_index = 0;
 
   uint64_t feature_flags() const {
     return (uint64_t(feature_info2) << 32) | feature_info1;
@@ -339,6 +345,38 @@ struct RdatSignatureElementInfo {
   uint8_t dynamic_index_mask = 0;
 };
 
+struct RdatShaderInfo {
+  uint32_t table_type = 0;
+  uint32_t record_index = 0;
+  std::vector<uint32_t> input_signature_indices;
+  std::vector<uint32_t> output_signature_indices;
+  std::vector<uint32_t> patch_constant_signature_indices;
+  std::vector<uint32_t> primitive_signature_indices;
+  std::span<const uint8_t> view_id_output_mask;
+  std::span<const uint8_t> view_id_patch_constant_output_mask;
+  std::span<const uint8_t> view_id_primitive_output_mask;
+  std::span<const uint8_t> input_to_output_masks;
+  std::span<const uint8_t> input_to_patch_constant_output_masks;
+  std::span<const uint8_t> patch_constant_input_to_output_masks;
+  uint32_t num_threads_x = 1;
+  uint32_t num_threads_y = 1;
+  uint32_t num_threads_z = 1;
+  uint32_t group_shared_bytes_used = 0;
+  uint32_t group_shared_bytes_dependent_on_view_id = 0;
+  uint32_t payload_size_in_bytes = 0;
+  uint16_t max_output_vertices = 0;
+  uint16_t max_output_primitives = 0;
+  uint8_t input_control_point_count = 0;
+  uint8_t output_control_point_count = 0;
+  uint8_t tessellator_domain = 0;
+  uint8_t tessellator_output_primitive = 0;
+  uint8_t input_primitive = 0;
+  uint8_t output_topology = 0;
+  uint8_t max_vertex_count = 0;
+  uint8_t output_stream_mask = 0;
+  uint8_t mesh_output_topology = 0;
+};
+
 struct RuntimeDataInfo {
   uint32_t version = 0;
   uint32_t part_count = 0;
@@ -346,11 +384,16 @@ struct RuntimeDataInfo {
   std::vector<RdatResourceInfo> resources;
   std::vector<RdatFunctionInfo> functions;
   std::vector<RdatSignatureElementInfo> signature_elements;
+  std::vector<RdatShaderInfo> shader_infos;
 
   const RuntimeDataPartInfo *findPart(uint32_t type,
                                       size_t start_index = 0) const;
+  const RdatShaderInfo *findShaderInfo(uint32_t table_type,
+                                       uint32_t record_index) const;
   bool readString(uint32_t offset, std::string &out) const;
   bool readIndexArray(uint32_t offset, std::vector<uint32_t> &out) const;
+  bool readBytes(uint32_t offset, uint32_t size,
+                 std::span<const uint8_t> &out) const;
 };
 
 struct PsvSignatureElement {
