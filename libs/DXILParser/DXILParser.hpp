@@ -268,6 +268,24 @@ struct DxilOpcodeInfo {
   bool is_reserved = false;
 };
 
+enum class DxilSemanticOperationKind {
+  Unknown,
+  SignatureInput,
+  SignatureOutput,
+  ResourceHandle,
+  ResourceRead,
+  ResourceWrite,
+  ResourceSample,
+  ResourceQuery,
+  Barrier,
+  Wave,
+  Derivative,
+  Raytracing,
+  Mesh,
+  Node,
+  Math,
+};
+
 struct LlvmInstructionInfo {
   std::string opcode_name;
   std::string result_name;
@@ -325,6 +343,11 @@ struct LlvmDxilOperationInfo {
   uint32_t semantic_flags = 0;
   bool opcode_known = false;
   bool opcode_reserved = false;
+  DxilSemanticOperationKind semantic_kind = DxilSemanticOperationKind::Unknown;
+  uint32_t resource_id = 0;
+  uint32_t signature_element_id = 0;
+  bool has_resource_id = false;
+  bool has_signature_element_id = false;
   std::string result_type;
   LlvmTypeInfo result_type_info;
   std::vector<LlvmOperandInfo> operands;

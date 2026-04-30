@@ -315,6 +315,70 @@ ConstantUInt32(const llvm::Value *value) {
   return uint32_t(*value64);
 }
 
+std::optional<uint32_t>
+IntegerOperandUInt32(const std::vector<LlvmOperandInfo> &operands,
+                     size_t index) {
+  if (index >= operands.size() || !operands[index].is_integer ||
+      operands[index].integer_value > std::numeric_limits<uint32_t>::max())
+    return std::nullopt;
+  return uint32_t(operands[index].integer_value);
+}
+
+DxilSemanticOperationKind
+ClassifyDxilOperation(std::string_view name,
+                      std::string_view opcode_class,
+                      std::string_view category,
+                      uint32_t semantic_flags) {
+  if (name == "LoadInput" || name == "LoadOutputControlPoint" ||
+      name == "LoadPatchConstant" || name == "AttributeAtVertex")
+    return DxilSemanticOperationKind::SignatureInput;
+  if (name == "StoreOutput" || name == "StorePatchConstant" ||
+      name == "StoreVertexOutput" || name == "StorePrimitiveOutput")
+    return DxilSemanticOperationKind::SignatureOutput;
+  if (name == "CreateHandle" || name == "CreateHandleForLib" ||
+      name == "CreateHandleFromBinding" || name == "CreateHandleFromHeap" ||
+      name == "AnnotateHandle")
+    return DxilSemanticOperationKind::ResourceHandle;
+  if (name.find("Sample") != std::string_view::npos ||
+      name.find("Gather") != std::string_view::npos ||
+      name.find("SamplerFeedback") != std::string_view::npos)
+    return DxilSemanticOperationKind::ResourceSample;
+  if (name.find("Store") != std::string_view::npos ||
+      name.find("Atomic") != std::string_view::npos ||
+      name == "BufferUpdateCounter")
+    return DxilSemanticOperationKind::ResourceWrite;
+  if (name.find("Load") != std::string_view::npos ||
+      name == "CBufferLoad" || name == "CBufferLoadLegacy")
+    return DxilSemanticOperationKind::ResourceRead;
+  if (name == "GetDimensions" || name == "CheckAccessFullyMapped" ||
+      name == "CalculateLOD")
+    return DxilSemanticOperationKind::ResourceQuery;
+  if (semantic_flags & DxilOpcodeSemanticBarrier)
+    return DxilSemanticOperationKind::Barrier;
+  if (semantic_flags & DxilOpcodeSemanticWave)
+    return DxilSemanticOperationKind::Wave;
+  if (semantic_flags & (DxilOpcodeSemanticDerivative |
+                        DxilOpcodeSemanticGradient))
+    return DxilSemanticOperationKind::Derivative;
+  if (category.find("Ray") != std::string_view::npos ||
+      category.find("HitObject") != std::string_view::npos ||
+      opcode_class.find("RayQuery") != std::string_view::npos)
+    return DxilSemanticOperationKind::Raytracing;
+  if (category.find("Mesh") != std::string_view::npos ||
+      category.find("Amplification") != std::string_view::npos)
+    return DxilSemanticOperationKind::Mesh;
+  if (category.find("Node") != std::string_view::npos ||
+      name.find("Node") != std::string_view::npos)
+    return DxilSemanticOperationKind::Node;
+  if (category.find("float") != std::string_view::npos ||
+      category.find("int") != std::string_view::npos ||
+      opcode_class == "Unary" || opcode_class == "Binary" ||
+      opcode_class == "Tertiary" || opcode_class == "Quaternary" ||
+      opcode_class == "Dot")
+    return DxilSemanticOperationKind::Math;
+  return DxilSemanticOperationKind::Unknown;
+}
+
 LlvmOperandInfo
 ParseLlvmOperand(const llvm::Value *value) {
   LlvmOperandInfo info = {};
@@ -404,6 +468,25 @@ ParseDxilOperation(const LlvmInstructionInfo &instruction,
   info.result_type = instruction.result_type;
   info.result_type_info = instruction.result_type_info;
   info.operands = instruction.operands;
+  info.semantic_kind = ClassifyDxilOperation(
+      info.opcode_name, info.opcode_class, info.opcode_category,
+      info.semantic_flags);
+  if (info.semantic_kind == DxilSemanticOperationKind::SignatureInput ||
+      info.semantic_kind == DxilSemanticOperationKind::SignatureOutput) {
+    if (auto id = IntegerOperandUInt32(info.operands, 1)) {
+      info.signature_element_id = *id;
+      info.has_signature_element_id = true;
+    }
+  }
+  if (info.semantic_kind == DxilSemanticOperationKind::ResourceHandle) {
+    if (auto id = IntegerOperandUInt32(info.operands, 2)) {
+      info.resource_id = *id;
+      info.has_resource_id = true;
+    } else if (auto id = IntegerOperandUInt32(info.operands, 1)) {
+      info.resource_id = *id;
+      info.has_resource_id = true;
+    }
+  }
   return info;
 }
 
