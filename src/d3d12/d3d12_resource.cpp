@@ -9,9 +9,38 @@
 #include "util_string.hpp"
 #include <algorithm>
 #include <cstring>
+#include <mutex>
+#include <vector>
 
 namespace dxmt::d3d12 {
 namespace {
+
+struct BufferGpuVirtualAddressRange {
+  D3D12_GPU_VIRTUAL_ADDRESS base = 0;
+  UINT64 size = 0;
+  Resource *resource = nullptr;
+};
+
+std::mutex g_buffer_va_mutex;
+std::vector<BufferGpuVirtualAddressRange> g_buffer_va_ranges;
+
+void RegisterBufferGpuVirtualAddress(Resource *resource,
+                                     D3D12_GPU_VIRTUAL_ADDRESS base,
+                                     UINT64 size) {
+  if (!base || !size)
+    return;
+
+  std::lock_guard lock(g_buffer_va_mutex);
+  g_buffer_va_ranges.push_back({base, size, resource});
+}
+
+void UnregisterBufferGpuVirtualAddress(Resource *resource) {
+  std::lock_guard lock(g_buffer_va_mutex);
+  std::erase_if(g_buffer_va_ranges,
+                [resource](const BufferGpuVirtualAddressRange &range) {
+                  return range.resource == resource;
+                });
+}
 
 WMTTextureUsage
 GetTextureUsage(D3D12_RESOURCE_FLAGS flags) {
@@ -48,6 +77,10 @@ public:
       CreateBuffer();
     else
       CreateTexture2D();
+  }
+
+  ~ResourceImpl() {
+    UnregisterBufferGpuVirtualAddress(this);
   }
 
   HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid,
@@ -133,6 +166,10 @@ public:
 
   D3D12_GPU_VIRTUAL_ADDRESS STDMETHODCALLTYPE
   GetGPUVirtualAddress() override {
+    return GetGpuVirtualAddress();
+  }
+
+  D3D12_GPU_VIRTUAL_ADDRESS GetGpuVirtualAddress() const override {
     if (desc_.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER ||
         !buffer_allocation_)
       return 0;
@@ -204,6 +241,7 @@ private:
     buffer_allocation_ =
         buffer_->allocate(GetHeapBufferAllocationFlags(heap_properties_));
     buffer_->rename(Rc<dxmt::BufferAllocation>(buffer_allocation_));
+    RegisterBufferGpuVirtualAddress(this, GetGpuVirtualAddress(), desc_.Width);
   }
 
   void CreateTexture2D() {
@@ -250,6 +288,20 @@ private:
 };
 
 } // namespace
+
+Resource *
+LookupBufferResourceByGpuVirtualAddress(D3D12_GPU_VIRTUAL_ADDRESS address,
+                                        UINT64 *offset) {
+  std::lock_guard lock(g_buffer_va_mutex);
+  for (const auto &range : g_buffer_va_ranges) {
+    if (address >= range.base && address < range.base + range.size) {
+      if (offset)
+        *offset = address - range.base;
+      return range.resource;
+    }
+  }
+  return nullptr;
+}
 
 bool
 IsSupportedResourceDesc(const D3D12_RESOURCE_DESC &desc) {

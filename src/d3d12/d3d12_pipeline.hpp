@@ -3,8 +3,10 @@
 #include "d3d12_root_signature.hpp"
 #include "Metal.hpp"
 #include "DXILParser/DXILParser.hpp"
+#include "airconv_public.h"
 #include <d3d12.h>
 #include <cstdint>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -28,11 +30,30 @@ struct PipelineDxilShader {
   PipelineShaderStage stage = PipelineShaderStage::Vertex;
   std::vector<uint8_t> bytecode;
   dxil::Parser parser;
+  dxil_shader_t shader = nullptr;
+  MTL_SHADER_REFLECTION reflection = {};
 
   const dxil::DxilTranslationInfo *translation() const {
     const auto &info = parser.dxilTranslation();
     return info ? &*info : nullptr;
   }
+};
+
+struct PipelineMetalShader {
+  WMT::Reference<WMT::Library> library;
+  WMT::Reference<WMT::Function> function;
+};
+
+struct PipelineMetalGraphicsState {
+  PipelineMetalShader vertex;
+  PipelineMetalShader pixel;
+  WMT::Reference<WMT::RenderPipelineState> pso;
+};
+
+struct PipelineMetalComputeState {
+  PipelineMetalShader compute;
+  WMT::Reference<WMT::ComputePipelineState> pso;
+  WMTSize threadgroup_size = {1, 1, 1};
 };
 
 struct PipelineSignatureLink {
@@ -71,6 +92,8 @@ public:
   virtual const PipelineGraphicsState *GetGraphicsState() const = 0;
   virtual const PipelineComputeState *GetComputeState() const = 0;
   virtual const std::string &GetShaderCacheKey() const = 0;
+  virtual const PipelineMetalGraphicsState *GetMetalGraphicsState() = 0;
+  virtual const PipelineMetalComputeState *GetMetalComputeState() = 0;
 };
 
 Com<ID3D12PipelineState>
