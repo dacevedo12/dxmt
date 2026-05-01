@@ -240,10 +240,11 @@ struct unixcall_enumerate {
 struct unixcall_mtllibrary_newfunction_with_constants {
   obj_handle_t library;
   struct WMTConstMemoryPointer name;
-  struct WMTConstMemoryPointer constants;
   uint64_t num_constants;
   obj_handle_t ret;
   obj_handle_t ret_error;
+  struct WMTFunctionConstant constants[8];
+  uint64_t bool_values;
 };
 
 struct unixcall_query_display_setting {

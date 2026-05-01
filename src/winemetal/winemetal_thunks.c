@@ -844,10 +844,17 @@ MTLLibrary_newFunctionWithConstants(
   struct unixcall_mtllibrary_newfunction_with_constants params;
   params.library = library;
   WMT_MEMPTR_SET(params.name, name);
-  WMT_MEMPTR_SET(params.constants, constants);
-  params.num_constants = num_constants;
+  params.num_constants = num_constants > 8 ? 8 : num_constants;
   params.ret = 0;
   params.ret_error = 0;
+  params.bool_values = 0;
+  memset(params.constants, 0, sizeof(params.constants));
+  for (uint32_t i = 0; i < params.num_constants; i++) {
+    params.constants[i] = constants[i];
+    if (constants[i].type == WMTDataTypeBool && constants[i].data.ptr &&
+        *(const uint32_t *)constants[i].data.ptr)
+      params.bool_values |= UINT64_C(1) << i;
+  }
   UNIX_CALL(102, &params);
   if (err_out)
     *err_out = params.ret_error;
