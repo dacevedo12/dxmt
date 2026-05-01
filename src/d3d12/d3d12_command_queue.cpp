@@ -44,6 +44,38 @@ GetResource(ID3D12Resource *resource) {
   return dynamic_cast<Resource *>(resource);
 }
 
+static PipelineState *
+GetPipelineState(ID3D12PipelineState *pipeline_state) {
+  return dynamic_cast<PipelineState *>(pipeline_state);
+}
+
+static WMTPrimitiveType
+GetPrimitiveType(D3D12_PRIMITIVE_TOPOLOGY topology) {
+  switch (topology) {
+  case D3D_PRIMITIVE_TOPOLOGY_POINTLIST:
+    return WMTPrimitiveTypePoint;
+  case D3D_PRIMITIVE_TOPOLOGY_LINELIST:
+    return WMTPrimitiveTypeLine;
+  case D3D_PRIMITIVE_TOPOLOGY_LINESTRIP:
+    return WMTPrimitiveTypeLineStrip;
+  case D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP:
+    return WMTPrimitiveTypeTriangleStrip;
+  default:
+    return WMTPrimitiveTypeTriangle;
+  }
+}
+
+static WMTIndexType
+GetIndexType(DXGI_FORMAT format) {
+  return format == DXGI_FORMAT_R32_UINT ? WMTIndexTypeUInt32
+                                        : WMTIndexTypeUInt16;
+}
+
+static UINT
+GetIndexSize(DXGI_FORMAT format) {
+  return format == DXGI_FORMAT_R32_UINT ? 4 : 2;
+}
+
 static UINT
 GetMipLevel(const Resource &resource, UINT subresource) {
   const auto &desc = resource.GetResourceDesc();
@@ -500,16 +532,52 @@ public:
   }
 
 private:
+  struct ReplayState {
+    Com<ID3D12PipelineState> pipeline_state;
+    D3D12_PRIMITIVE_TOPOLOGY topology = D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
+    std::vector<D3D12_VIEWPORT> viewports;
+    std::vector<D3D12_RECT> scissors;
+    std::vector<DescriptorRecord> render_targets;
+    std::optional<DescriptorRecord> depth_stencil;
+    std::array<std::optional<D3D12_VERTEX_BUFFER_VIEW>, 32> vertex_buffers = {};
+    std::optional<D3D12_INDEX_BUFFER_VIEW> index_buffer;
+  };
+
+  struct ReplayRenderTargetAttachment {
+    Rc<Texture> texture;
+    TextureViewKey view = {};
+    UINT slot = 0;
+    UINT array_length = 1;
+    uint32_t width = 0;
+    uint32_t height = 0;
+    WMTPixelFormat format = WMTPixelFormatInvalid;
+  };
+
+  struct ReplayDepthStencilAttachment {
+    Rc<Texture> texture;
+    TextureViewKey view = {};
+    UINT array_length = 1;
+    uint32_t width = 0;
+    uint32_t height = 0;
+    WMTPixelFormat format = WMTPixelFormatInvalid;
+  };
+
+  struct ReplayRenderPassAttachments {
+    std::vector<ReplayRenderTargetAttachment> colors;
+    std::optional<ReplayDepthStencilAttachment> depth_stencil;
+  };
+
   void ReplayCommandRecords(const std::vector<CommandRecord> &records) {
     auto *chunk = device_->GetDXMTDevice().queue().CurrentChunk();
+    ReplayState state = {};
     for (const auto &record : records) {
-      std::visit([&](const auto &payload) { ReplayRecord(chunk, payload); },
+      std::visit([&](const auto &payload) { ReplayRecord(chunk, state, payload); },
                  record.payload);
     }
   }
 
   template <typename T>
-  void ReplayRecord(CommandChunk *chunk, const T &record) {
+  void ReplayRecord(CommandChunk *chunk, ReplayState &state, const T &record) {
     if constexpr (std::is_same_v<T, CopyBufferRegionRecord>) {
       ReplayCopyBufferRegion(chunk, record);
     } else if constexpr (std::is_same_v<T, CopyTextureRegionRecord>) {
@@ -520,6 +588,32 @@ private:
       ReplayClearRenderTarget(chunk, record);
     } else if constexpr (std::is_same_v<T, ClearDepthStencilRecord>) {
       ReplayClearDepthStencil(chunk, record);
+    } else if constexpr (std::is_same_v<T, PipelineStateRecord>) {
+      state.pipeline_state = record.pipeline_state;
+    } else if constexpr (std::is_same_v<T, PrimitiveTopologyRecord>) {
+      state.topology = record.topology;
+    } else if constexpr (std::is_same_v<T, ViewportRecord>) {
+      state.viewports = record.viewports;
+    } else if constexpr (std::is_same_v<T, ScissorRecord>) {
+      state.scissors = record.rects;
+    } else if constexpr (std::is_same_v<T, RenderTargetsRecord>) {
+      state.render_targets = record.render_targets;
+      state.depth_stencil = record.depth_stencil;
+    } else if constexpr (std::is_same_v<T, VertexBuffersRecord>) {
+      for (UINT i = 0; i < record.views.size() &&
+                       record.start_slot + i < state.vertex_buffers.size();
+           i++)
+        state.vertex_buffers[record.start_slot + i] = record.views[i];
+    } else if constexpr (std::is_same_v<T, IndexBufferRecord>) {
+      state.index_buffer = record.view;
+    } else if constexpr (std::is_same_v<T, ResourceBarrierRecord>) {
+      ReplayResourceBarrier(chunk, record);
+    } else if constexpr (std::is_same_v<T, DrawInstancedRecord>) {
+      ReplayDrawInstanced(chunk, state, record);
+    } else if constexpr (std::is_same_v<T, DrawIndexedInstancedRecord>) {
+      ReplayDrawIndexedInstanced(chunk, state, record);
+    } else if constexpr (std::is_same_v<T, DispatchRecord>) {
+      ReplayDispatch(chunk, state, record);
     }
   }
 
@@ -548,6 +642,298 @@ private:
       copy.dst = dst_allocation->buffer();
       copy.dst_offset = dst_offset;
       copy.copy_length = byte_count;
+      enc.endPass();
+    });
+  }
+
+  void ReplayResourceBarrier(CommandChunk *chunk,
+                             const ResourceBarrierRecord &record) {
+    if (record.barriers.empty())
+      return;
+
+    chunk->emitcc([](ArgumentEncodingContext &enc) {
+      enc.endPass();
+    });
+  }
+
+  ReplayRenderPassAttachments BuildRenderPassAttachments(
+      const ReplayState &state) {
+    ReplayRenderPassAttachments attachments = {};
+    attachments.colors.reserve(state.render_targets.size());
+
+    for (UINT i = 0; i < state.render_targets.size(); i++) {
+      const auto &descriptor = state.render_targets[i];
+      auto *resource = GetResource(descriptor.resource.ptr());
+      if (!resource || !resource->GetTexture())
+        continue;
+
+      auto view = CreateRenderTargetView(*resource, descriptor);
+      auto *texture = resource->GetTexture();
+      attachments.colors.push_back({
+          .texture = texture,
+          .view = view,
+          .slot = i,
+          .array_length = GetRenderTargetArrayLength(descriptor),
+          .width = texture->width(),
+          .height = texture->height(),
+          .format = texture->pixelFormat(),
+      });
+    }
+
+    if (state.depth_stencil) {
+      auto *resource = GetResource(state.depth_stencil->resource.ptr());
+      if (resource && resource->GetTexture()) {
+        auto view = CreateDepthStencilView(*resource, *state.depth_stencil);
+        auto *texture = resource->GetTexture();
+        attachments.depth_stencil = ReplayDepthStencilAttachment{
+            .texture = texture,
+            .view = view,
+            .array_length = GetDepthStencilArrayLength(*state.depth_stencil),
+            .width = texture->width(),
+            .height = texture->height(),
+            .format = texture->pixelFormat(),
+        };
+      }
+    }
+
+    return attachments;
+  }
+
+  static bool BeginRenderPass(ArgumentEncodingContext &enc,
+                              ReplayRenderPassAttachments &attachments) {
+    if (attachments.colors.empty() && !attachments.depth_stencil)
+      return false;
+
+    UINT render_target_count = 0;
+    uint32_t width = 0;
+    uint32_t height = 0;
+    uint32_t array_length = 1;
+    for (const auto &color : attachments.colors) {
+      render_target_count = std::max(render_target_count, color.slot + 1);
+      width = width ? width : color.width;
+      height = height ? height : color.height;
+      array_length = std::max<uint32_t>(array_length, color.array_length);
+    }
+    if (attachments.depth_stencil) {
+      width = width ? width : attachments.depth_stencil->width;
+      height = height ? height : attachments.depth_stencil->height;
+      array_length =
+          std::max<uint32_t>(array_length, attachments.depth_stencil->array_length);
+    }
+
+    const auto dsv_format = attachments.depth_stencil
+                                ? attachments.depth_stencil->format
+                                : WMTPixelFormatInvalid;
+    auto &info = *enc.startRenderPass(DepthStencilPlanarFlags(dsv_format), 0,
+                                      render_target_count, 0);
+    for (auto &rtv : attachments.colors) {
+      auto &color = info.colors[rtv.slot];
+      color.attachment = enc.access<PipelineStage::Pixel>(
+          rtv.texture, rtv.view, ResourceAccess::ReadWrite);
+      color.load_action = WMTLoadActionLoad;
+      color.store_action = WMTStoreActionStore;
+      color.depth_plane = 0;
+      info.tile_barrier_pso_key.color_formats[rtv.slot] = rtv.format;
+    }
+
+    if (attachments.depth_stencil) {
+      const auto planar_flags =
+          DepthStencilPlanarFlags(attachments.depth_stencil->format);
+      if (planar_flags & 1) {
+        auto &depth = info.depth;
+        depth.attachment = enc.access<PipelineStage::Pixel>(
+            attachments.depth_stencil->texture, attachments.depth_stencil->view,
+            ResourceAccess::ReadWrite);
+        depth.load_action = WMTLoadActionLoad;
+        depth.store_action = WMTStoreActionStore;
+      }
+      if (planar_flags & 2) {
+        auto &stencil = info.stencil;
+        stencil.attachment = enc.access<PipelineStage::Pixel>(
+            attachments.depth_stencil->texture, attachments.depth_stencil->view,
+            ResourceAccess::ReadWrite);
+        stencil.load_action = WMTLoadActionLoad;
+        stencil.store_action = WMTStoreActionStore;
+      }
+    }
+
+    info.render_target_width = width;
+    info.render_target_height = height;
+    info.render_target_array_length = array_length;
+    info.tile_barrier_pso_key.raster_sample_count = 1;
+    return true;
+  }
+
+  void ReplayDrawInstanced(CommandChunk *chunk, ReplayState &state,
+                           const DrawInstancedRecord &record) {
+    if (!record.vertex_count_per_instance || !record.instance_count)
+      return;
+
+    auto *pipeline = GetPipelineState(state.pipeline_state.ptr());
+    if (!pipeline) {
+      WARN("D3D12CommandQueue: draw skipped without graphics pipeline state");
+      return;
+    }
+
+    auto *metal = pipeline->GetMetalGraphicsState();
+    if (!metal || !metal->pso) {
+      WARN("D3D12CommandQueue: draw skipped because Metal graphics PSO is unavailable");
+      return;
+    }
+
+    const auto primitive = GetPrimitiveType(state.topology);
+    auto viewports = state.viewports;
+    auto scissors = state.scissors;
+    auto attachments = BuildRenderPassAttachments(state);
+    chunk->emitcc([metal_pso = metal->pso, primitive,
+                   vertex_start = record.start_vertex_location,
+                   vertex_count = record.vertex_count_per_instance,
+                   instance_count = record.instance_count,
+                   base_instance = record.start_instance_location,
+                   viewports = std::move(viewports),
+                   scissors = std::move(scissors),
+                   attachments = std::move(attachments)](ArgumentEncodingContext &enc) mutable {
+      if (!BeginRenderPass(enc, attachments))
+        return;
+
+      auto &set_pso = enc.encodeRenderCommand<wmtcmd_render_setpso>();
+      set_pso.type = WMTRenderCommandSetPSO;
+      set_pso.pso = metal_pso;
+
+      if (!viewports.empty()) {
+        auto &cmd = enc.encodeRenderCommand<wmtcmd_render_setviewports>();
+        cmd.type = WMTRenderCommandSetViewports;
+        auto *data = static_cast<WMTViewport *>(
+            enc.allocate_cpu_heap(sizeof(WMTViewport) * viewports.size(),
+                                  alignof(WMTViewport)));
+        for (size_t i = 0; i < viewports.size(); i++) {
+          const auto &viewport = viewports[i];
+          data[i] = {viewport.TopLeftX, viewport.TopLeftY, viewport.Width,
+                     viewport.Height, viewport.MinDepth, viewport.MaxDepth};
+        }
+        cmd.viewports.set(data);
+        cmd.viewport_count = viewports.size();
+      }
+
+      if (!scissors.empty()) {
+        auto &cmd = enc.encodeRenderCommand<wmtcmd_render_setscissorrects>();
+        cmd.type = WMTRenderCommandSetScissorRects;
+        auto *data = static_cast<WMTScissorRect *>(
+            enc.allocate_cpu_heap(sizeof(WMTScissorRect) * scissors.size(),
+                                  alignof(WMTScissorRect)));
+        for (size_t i = 0; i < scissors.size(); i++) {
+          const auto &rect = scissors[i];
+          data[i] = {uint32_t(std::max<LONG>(0, rect.left)),
+                     uint32_t(std::max<LONG>(0, rect.top)),
+                     uint32_t(std::max<LONG>(0, rect.right - rect.left)),
+                     uint32_t(std::max<LONG>(0, rect.bottom - rect.top))};
+        }
+        cmd.scissor_rects.set(data);
+        cmd.rect_count = scissors.size();
+      }
+
+      auto &draw = enc.encodeRenderCommand<wmtcmd_render_draw>();
+      draw.type = WMTRenderCommandDraw;
+      draw.primitive_type = primitive;
+      draw.vertex_start = vertex_start;
+      draw.vertex_count = vertex_count;
+      draw.instance_count = instance_count;
+      draw.base_instance = base_instance;
+      enc.endPass();
+    });
+  }
+
+  void ReplayDrawIndexedInstanced(CommandChunk *chunk, ReplayState &state,
+                                  const DrawIndexedInstancedRecord &record) {
+    if (!record.index_count_per_instance || !record.instance_count ||
+        !state.index_buffer)
+      return;
+
+    auto *pipeline = GetPipelineState(state.pipeline_state.ptr());
+    if (!pipeline) {
+      WARN("D3D12CommandQueue: indexed draw skipped without graphics pipeline state");
+      return;
+    }
+
+    auto *metal = pipeline->GetMetalGraphicsState();
+    if (!metal || !metal->pso) {
+      WARN("D3D12CommandQueue: indexed draw skipped because Metal graphics PSO is unavailable");
+      return;
+    }
+
+    UINT64 index_resource_offset = 0;
+    auto *index_resource = LookupBufferResourceByGpuVirtualAddress(
+        state.index_buffer->BufferLocation, &index_resource_offset);
+    if (!index_resource || !index_resource->GetBufferAllocation()) {
+      WARN("D3D12CommandQueue: indexed draw skipped because index buffer binding is unavailable");
+      return;
+    }
+
+    Rc<BufferAllocation> index_allocation = index_resource->GetBufferAllocation();
+    const auto primitive = GetPrimitiveType(state.topology);
+    const auto index_type = GetIndexType(state.index_buffer->Format);
+    const UINT64 index_offset = index_resource->GetHeapOffset() +
+                                index_resource_offset +
+                                record.start_index_location *
+                                    GetIndexSize(state.index_buffer->Format);
+    auto attachments = BuildRenderPassAttachments(state);
+    chunk->emitcc([metal_pso = metal->pso, index_allocation, primitive,
+                   index_type, index_offset,
+                   index_count = record.index_count_per_instance,
+                   instance_count = record.instance_count,
+                   base_vertex = record.base_vertex_location,
+                   base_instance = record.start_instance_location,
+                   attachments = std::move(attachments)](ArgumentEncodingContext &enc) mutable {
+      enc.retainAllocation(index_allocation.ptr());
+      if (!BeginRenderPass(enc, attachments))
+        return;
+      auto &set_pso = enc.encodeRenderCommand<wmtcmd_render_setpso>();
+      set_pso.type = WMTRenderCommandSetPSO;
+      set_pso.pso = metal_pso;
+
+      auto &draw = enc.encodeRenderCommand<wmtcmd_render_draw_indexed>();
+      draw.type = WMTRenderCommandDrawIndexed;
+      draw.primitive_type = primitive;
+      draw.index_type = index_type;
+      draw.index_count = index_count;
+      draw.index_buffer = index_allocation->buffer();
+      draw.index_buffer_offset = index_offset;
+      draw.instance_count = instance_count;
+      draw.base_vertex = base_vertex;
+      draw.base_instance = base_instance;
+      enc.endPass();
+    });
+  }
+
+  void ReplayDispatch(CommandChunk *chunk, ReplayState &state,
+                      const DispatchRecord &record) {
+    if (!record.x || !record.y || !record.z)
+      return;
+
+    auto *pipeline = GetPipelineState(state.pipeline_state.ptr());
+    if (!pipeline) {
+      WARN("D3D12CommandQueue: dispatch skipped without compute pipeline state");
+      return;
+    }
+
+    auto *metal = pipeline->GetMetalComputeState();
+    if (!metal || !metal->pso) {
+      WARN("D3D12CommandQueue: dispatch skipped because Metal compute PSO is unavailable");
+      return;
+    }
+
+    chunk->emitcc([metal_pso = metal->pso,
+                   threadgroup_size = metal->threadgroup_size,
+                   x = record.x, y = record.y, z = record.z](ArgumentEncodingContext &enc) {
+      enc.startComputePass(0);
+      auto &set_pso = enc.encodeComputeCommand<wmtcmd_compute_setpso>();
+      set_pso.type = WMTComputeCommandSetPSO;
+      set_pso.pso = metal_pso;
+      set_pso.threadgroup_size = threadgroup_size;
+
+      auto &dispatch = enc.encodeComputeCommand<wmtcmd_compute_dispatch>();
+      dispatch.type = WMTComputeCommandDispatch;
+      dispatch.size = {x, y, z};
       enc.endPass();
     });
   }

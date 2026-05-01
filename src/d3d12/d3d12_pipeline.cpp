@@ -3,6 +3,7 @@
 #include "com/com_guid.hpp"
 #include "com/com_object.hpp"
 #include "com/com_private_data.hpp"
+#include "dxmt_format.hpp"
 #include "log/log.hpp"
 #include "sha1/sha1_util.hpp"
 #include "util_string.hpp"
@@ -113,6 +114,7 @@ IsDxilContainer(const D3D12_SHADER_BYTECODE &bytecode) {
 
 HRESULT
 ParseDxilShader(PipelineShaderStage stage,
+                IMTLD3D12Device *device,
                 const D3D12_SHADER_BYTECODE &bytecode,
                 PipelineDxilShader &shader) {
   if (!bytecode.pShaderBytecode && bytecode.BytecodeLength)
@@ -146,15 +148,25 @@ ParseDxilShader(PipelineShaderStage stage,
     return E_INVALIDARG;
   }
 
+  sm50_error_t error = nullptr;
+  if (DXILInitialize(shader.bytecode.data(), shader.bytecode.size(),
+                     &shader.shader, &shader.reflection, &error)) {
+    WARN("D3D12PipelineState: failed to initialize ", ShaderStageName(stage),
+         " DXIL shader: ", SM50GetErrorMessageString(error));
+    SM50FreeError(error);
+    return E_INVALIDARG;
+  }
+
   return S_OK;
 }
 
 HRESULT
 AppendDxilShader(PipelineShaderStage stage,
+                 IMTLD3D12Device *device,
                  const D3D12_SHADER_BYTECODE &bytecode,
                  std::vector<PipelineDxilShader> &shaders) {
   PipelineDxilShader shader = {};
-  const auto hr = ParseDxilShader(stage, bytecode, shader);
+  const auto hr = ParseDxilShader(stage, device, bytecode, shader);
   if (hr == S_FALSE)
     return S_OK;
   if (FAILED(hr))
@@ -387,6 +399,269 @@ BuildCachedShaderBlob(PipelineStateType type,
 }
 
 void
+DestroyDxilShaders(std::vector<PipelineDxilShader> &shaders) {
+  for (auto &shader : shaders) {
+    if (shader.shader) {
+      DXILDestroy(shader.shader);
+      shader.shader = nullptr;
+    }
+  }
+}
+
+std::string
+BuildFunctionName(const char *prefix, std::string_view key) {
+  std::string name(prefix);
+  name += "_";
+  name += key.substr(0, std::min<size_t>(key.size(), 16));
+  return name;
+}
+
+SM50_SHADER_METAL_VERSION
+GetMetalVersion(IMTLD3D12Device *device) {
+  return static_cast<SM50_SHADER_METAL_VERSION>(
+      device->GetDXMTDevice().metalVersion());
+}
+
+SM50_SHADER_FLAG
+GetShaderFlags() {
+  return SM50_SHADER_FLAG(0);
+}
+
+bool
+CompileMetalFunction(IMTLD3D12Device *device, PipelineDxilShader &shader,
+                     const char *function_name,
+                     SM50_SHADER_COMPILATION_ARGUMENT_DATA *args,
+                     PipelineMetalShader &out) {
+  sm50_bitcode_t bitcode_handle = nullptr;
+  sm50_error_t error = nullptr;
+  if (DXILCompile(shader.shader, args, function_name, &bitcode_handle, &error)) {
+    WARN("D3D12PipelineState: failed to compile ", ShaderStageName(shader.stage),
+         " DXIL shader: ", SM50GetErrorMessageString(error));
+    SM50FreeError(error);
+    return false;
+  }
+
+  SM50_COMPILED_BITCODE bitcode = {};
+  SM50GetCompiledBitcode(bitcode_handle, &bitcode);
+
+  WMT::Reference<WMT::Error> metal_error;
+  out.library = device->GetMTLDevice().newLibrary(bitcode.Data, bitcode.Size,
+                                                  metal_error);
+  SM50DestroyBitcode(bitcode_handle);
+  if (metal_error || !out.library) {
+    WARN("D3D12PipelineState: failed to create Metal library for ",
+         ShaderStageName(shader.stage), ": ",
+         metal_error ? metal_error.description().getUTF8String()
+                     : "unknown error");
+    return false;
+  }
+
+  out.function = out.library.newFunction(function_name);
+  if (!out.function) {
+    WARN("D3D12PipelineState: Metal function not found: ", function_name);
+    return false;
+  }
+
+  return true;
+}
+
+WMTPrimitiveTopologyClass
+GetTopologyClass(D3D12_PRIMITIVE_TOPOLOGY_TYPE type) {
+  switch (type) {
+  case D3D12_PRIMITIVE_TOPOLOGY_TYPE_POINT:
+    return WMTPrimitiveTopologyClassPoint;
+  case D3D12_PRIMITIVE_TOPOLOGY_TYPE_LINE:
+    return WMTPrimitiveTopologyClassLine;
+  case D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE:
+    return WMTPrimitiveTopologyClassTriangle;
+  default:
+    return WMTPrimitiveTopologyClassUnspecified;
+  }
+}
+
+bool
+BuildInputElements(IMTLD3D12Device *device,
+                   const PipelineGraphicsState &state,
+                   std::vector<SM50_IA_INPUT_ELEMENT> &elements,
+                   uint32_t &slot_mask) {
+  elements.clear();
+  slot_mask = 0;
+  elements.reserve(state.input_elements.size());
+
+  for (uint32_t i = 0; i < state.input_elements.size(); i++) {
+    const auto &input = state.input_elements[i];
+    MTL_DXGI_FORMAT_DESC format = {};
+    if (FAILED(MTLQueryDXGIFormat(device->GetMTLDevice(), input.Format,
+                                  format)) ||
+        format.AttributeFormat == WMTAttributeFormatInvalid) {
+      WARN("D3D12PipelineState: unsupported input layout format ",
+           uint32_t(input.Format));
+      return false;
+    }
+
+    elements.push_back({
+        .reg = i,
+        .slot = input.InputSlot,
+        .aligned_byte_offset = input.AlignedByteOffset,
+        .format = uint32_t(format.AttributeFormat),
+        .step_function = input.InputSlotClass ==
+                         D3D12_INPUT_CLASSIFICATION_PER_INSTANCE_DATA,
+        .step_rate = input.InstanceDataStepRate,
+    });
+    if (input.InputSlot < 32)
+      slot_mask |= 1u << input.InputSlot;
+  }
+
+  return true;
+}
+
+bool
+CreateMetalGraphicsPipeline(IMTLD3D12Device *device,
+                            std::vector<PipelineDxilShader> &shaders,
+                            const PipelineGraphicsState &state,
+                            std::string_view shader_cache_key,
+                            PipelineMetalGraphicsState &out) {
+  auto *vs = const_cast<PipelineDxilShader *>(
+      FindShader(shaders, PipelineShaderStage::Vertex));
+  auto *ps = const_cast<PipelineDxilShader *>(
+      FindShader(shaders, PipelineShaderStage::Pixel));
+  if (!vs)
+    return false;
+
+  SM50_SHADER_COMMON_DATA common = {};
+  common.type = SM50_SHADER_COMMON;
+  common.metal_version = GetMetalVersion(device);
+  common.flags = GetShaderFlags();
+  common.next = nullptr;
+
+  std::vector<SM50_IA_INPUT_ELEMENT> input_elements;
+  uint32_t slot_mask = 0;
+  if (!BuildInputElements(device, state, input_elements, slot_mask))
+    return false;
+
+  SM50_SHADER_IA_INPUT_LAYOUT_DATA ia_layout = {};
+  ia_layout.type = SM50_SHADER_IA_INPUT_LAYOUT;
+  ia_layout.next = &common;
+  ia_layout.index_buffer_format = SM50_INDEX_BUFFER_FORMAT_NONE;
+  ia_layout.slot_mask = slot_mask;
+  ia_layout.num_elements = uint32_t(input_elements.size());
+  ia_layout.elements = input_elements.empty() ? nullptr : input_elements.data();
+
+  const auto vs_name = BuildFunctionName("vs", shader_cache_key);
+  if (!CompileMetalFunction(device, *vs, vs_name.c_str(),
+                            reinterpret_cast<SM50_SHADER_COMPILATION_ARGUMENT_DATA *>(&ia_layout),
+                            out.vertex))
+    return false;
+
+  if (ps) {
+    uint32_t unorm_output_reg_mask = 0;
+    for (UINT i = 0; i < state.desc.NumRenderTargets; i++) {
+      MTL_DXGI_FORMAT_DESC format = {};
+      if (SUCCEEDED(MTLQueryDXGIFormat(device->GetMTLDevice(),
+                                       state.desc.RTVFormats[i], format)) &&
+          IsUnorm8RenderTargetFormat(format.PixelFormat))
+        unorm_output_reg_mask |= 1u << i;
+    }
+
+    SM50_SHADER_PSO_PIXEL_SHADER_DATA ps_args = {};
+    ps_args.type = SM50_SHADER_PSO_PIXEL_SHADER;
+    ps_args.next = &common;
+    ps_args.sample_mask = state.desc.SampleMask;
+    ps_args.dual_source_blending = false;
+    ps_args.disable_depth_output = state.desc.DSVFormat == DXGI_FORMAT_UNKNOWN;
+    ps_args.unorm_output_reg_mask = unorm_output_reg_mask;
+
+    const auto ps_name = BuildFunctionName("ps", shader_cache_key);
+    if (!CompileMetalFunction(device, *ps, ps_name.c_str(),
+                              reinterpret_cast<SM50_SHADER_COMPILATION_ARGUMENT_DATA *>(&ps_args),
+                              out.pixel))
+      return false;
+  }
+
+  WMTRenderPipelineInfo info = {};
+  WMT::InitializeRenderPipelineInfo(info);
+  info.vertex_function = out.vertex.function;
+  info.fragment_function = out.pixel.function;
+  info.rasterization_enabled = true;
+  info.raster_sample_count = state.desc.SampleDesc.Count;
+  info.input_primitive_topology =
+      GetTopologyClass(state.desc.PrimitiveTopologyType);
+  info.immutable_vertex_buffers = (1 << 16) | (1 << 29) | (1 << 30);
+  info.immutable_fragment_buffers = (1 << 29) | (1 << 30);
+
+  for (UINT i = 0; i < state.desc.NumRenderTargets; i++) {
+    MTL_DXGI_FORMAT_DESC format = {};
+    if (state.desc.RTVFormats[i] != DXGI_FORMAT_UNKNOWN &&
+        SUCCEEDED(MTLQueryDXGIFormat(device->GetMTLDevice(),
+                                     state.desc.RTVFormats[i], format)))
+      info.colors[i].pixel_format = format.PixelFormat;
+  }
+
+  if (state.desc.DSVFormat != DXGI_FORMAT_UNKNOWN) {
+    MTL_DXGI_FORMAT_DESC format = {};
+    if (SUCCEEDED(MTLQueryDXGIFormat(device->GetMTLDevice(),
+                                     state.desc.DSVFormat, format))) {
+      info.depth_pixel_format = format.PixelFormat;
+      if (DepthStencilPlanarFlags(format.PixelFormat) & 2)
+        info.stencil_pixel_format = format.PixelFormat;
+    }
+  }
+
+  WMT::Reference<WMT::Error> error;
+  out.pso = device->GetMTLDevice().newRenderPipelineState(info, error);
+  if (error || !out.pso) {
+    WARN("D3D12PipelineState: failed to create Metal graphics PSO: ",
+         error ? error.description().getUTF8String() : "unknown error");
+    return false;
+  }
+
+  return true;
+}
+
+bool
+CreateMetalComputePipeline(IMTLD3D12Device *device,
+                           std::vector<PipelineDxilShader> &shaders,
+                           std::string_view shader_cache_key,
+                           PipelineMetalComputeState &out) {
+  auto *cs = const_cast<PipelineDxilShader *>(
+      FindShader(shaders, PipelineShaderStage::Compute));
+  if (!cs)
+    return false;
+
+  SM50_SHADER_COMMON_DATA common = {};
+  common.type = SM50_SHADER_COMMON;
+  common.metal_version = GetMetalVersion(device);
+  common.flags = GetShaderFlags();
+  common.next = nullptr;
+
+  const auto cs_name = BuildFunctionName("cs", shader_cache_key);
+  if (!CompileMetalFunction(device, *cs, cs_name.c_str(),
+                            reinterpret_cast<SM50_SHADER_COMPILATION_ARGUMENT_DATA *>(&common),
+                            out.compute))
+    return false;
+
+  WMTComputePipelineInfo info = {};
+  WMT::InitializeComputePipelineInfo(info);
+  info.compute_function = out.compute.function;
+  info.immutable_buffers = (1 << 29) | (1 << 30);
+  const auto tgx = std::max<uint32_t>(1, cs->reflection.ThreadgroupSize[0]);
+  const auto tgy = std::max<uint32_t>(1, cs->reflection.ThreadgroupSize[1]);
+  const auto tgz = std::max<uint32_t>(1, cs->reflection.ThreadgroupSize[2]);
+  info.tgsize_is_multiple_of_sgwidth = ((tgx * tgy * tgz) % 32) == 0;
+
+  WMT::Reference<WMT::Error> error;
+  out.pso = device->GetMTLDevice().newComputePipelineState(info, error);
+  if (error || !out.pso) {
+    WARN("D3D12PipelineState: failed to create Metal compute PSO: ",
+         error ? error.description().getUTF8String() : "unknown error");
+    return false;
+  }
+
+  out.threadgroup_size = {tgx, tgy, tgz};
+  return true;
+}
+
+void
 FixGraphicsStatePointers(PipelineGraphicsState &state,
                          const std::vector<PipelineDxilShader> &shaders) {
   state.desc.VS = ShaderBytecodeView(shaders, PipelineShaderStage::Vertex);
@@ -527,6 +802,10 @@ public:
                               shader_cache_key_);
   }
 
+  ~PipelineStateImpl() {
+    DestroyDxilShaders(shaders_);
+  }
+
   HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void **object) override {
     if (!object)
       return E_POINTER;
@@ -607,6 +886,36 @@ public:
     return shader_cache_key_;
   }
 
+  const PipelineMetalGraphicsState *GetMetalGraphicsState() override {
+    if (type_ != PipelineStateType::Graphics)
+      return nullptr;
+
+    std::lock_guard lock(metal_mutex_);
+    if (!metal_graphics_ready_) {
+      metal_graphics_ready_ = true;
+      if (!CreateMetalGraphicsPipeline(device_.ptr(), shaders_, graphics_state_,
+                                       shader_cache_key_, metal_graphics_))
+        metal_graphics_ = {};
+    }
+
+    return metal_graphics_.pso ? &metal_graphics_ : nullptr;
+  }
+
+  const PipelineMetalComputeState *GetMetalComputeState() override {
+    if (type_ != PipelineStateType::Compute)
+      return nullptr;
+
+    std::lock_guard lock(metal_mutex_);
+    if (!metal_compute_ready_) {
+      metal_compute_ready_ = true;
+      if (!CreateMetalComputePipeline(device_.ptr(), shaders_,
+                                      shader_cache_key_, metal_compute_))
+        metal_compute_ = {};
+    }
+
+    return metal_compute_.pso ? &metal_compute_ : nullptr;
+  }
+
 private:
   Com<IMTLD3D12Device> device_;
   PipelineStateType type_;
@@ -617,6 +926,11 @@ private:
   PipelineComputeState compute_state_;
   std::string shader_cache_key_;
   std::vector<uint8_t> cached_shader_blob_;
+  std::mutex metal_mutex_;
+  bool metal_graphics_ready_ = false;
+  bool metal_compute_ready_ = false;
+  PipelineMetalGraphicsState metal_graphics_;
+  PipelineMetalComputeState metal_compute_;
   ComPrivateData private_data_;
   std::string name_;
 };
@@ -664,32 +978,38 @@ CreateGraphicsPipelineState(IMTLD3D12Device *device,
   std::vector<PipelineDxilShader> shaders;
   shaders.reserve(5);
 
-  hr = AppendDxilShader(PipelineShaderStage::Vertex, desc->VS, shaders);
+  hr = AppendDxilShader(PipelineShaderStage::Vertex, device, desc->VS, shaders);
   if (FAILED(hr)) {
+    DestroyDxilShaders(shaders);
     StoreStatus(status, hr);
     return nullptr;
   }
-  hr = AppendDxilShader(PipelineShaderStage::Pixel, desc->PS, shaders);
+  hr = AppendDxilShader(PipelineShaderStage::Pixel, device, desc->PS, shaders);
   if (FAILED(hr)) {
+    DestroyDxilShaders(shaders);
     StoreStatus(status, hr);
     return nullptr;
   }
-  hr = AppendDxilShader(PipelineShaderStage::Geometry, desc->GS, shaders);
+  hr = AppendDxilShader(PipelineShaderStage::Geometry, device, desc->GS, shaders);
   if (FAILED(hr)) {
+    DestroyDxilShaders(shaders);
     StoreStatus(status, hr);
     return nullptr;
   }
-  hr = AppendDxilShader(PipelineShaderStage::Hull, desc->HS, shaders);
+  hr = AppendDxilShader(PipelineShaderStage::Hull, device, desc->HS, shaders);
   if (FAILED(hr)) {
+    DestroyDxilShaders(shaders);
     StoreStatus(status, hr);
     return nullptr;
   }
-  hr = AppendDxilShader(PipelineShaderStage::Domain, desc->DS, shaders);
+  hr = AppendDxilShader(PipelineShaderStage::Domain, device, desc->DS, shaders);
   if (FAILED(hr)) {
+    DestroyDxilShaders(shaders);
     StoreStatus(status, hr);
     return nullptr;
   }
   if (shaders.empty()) {
+    DestroyDxilShaders(shaders);
     StoreStatus(status, E_INVALIDARG);
     return nullptr;
   }
@@ -721,12 +1041,14 @@ CreateComputePipelineState(IMTLD3D12Device *device,
 
   std::vector<PipelineDxilShader> shaders;
   shaders.reserve(1);
-  hr = AppendDxilShader(PipelineShaderStage::Compute, desc->CS, shaders);
+  hr = AppendDxilShader(PipelineShaderStage::Compute, device, desc->CS, shaders);
   if (FAILED(hr)) {
+    DestroyDxilShaders(shaders);
     StoreStatus(status, hr);
     return nullptr;
   }
   if (shaders.empty()) {
+    DestroyDxilShaders(shaders);
     StoreStatus(status, E_INVALIDARG);
     return nullptr;
   }

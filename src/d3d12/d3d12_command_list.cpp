@@ -61,6 +61,8 @@ public:
     if (!IsPipelineStateCompatible(initial_pipeline_state_.ptr()))
       initial_pipeline_state_ = nullptr;
     current_pipeline_state_ = initial_pipeline_state_;
+    if (current_pipeline_state_)
+      AddRecord(PipelineStateRecord{current_pipeline_state_});
   }
 
   HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void **ppvObject) override {
@@ -131,6 +133,8 @@ public:
     records_.clear();
     closed_ = false;
     submitted_ = false;
+    if (current_pipeline_state_)
+      AddRecord(PipelineStateRecord{current_pipeline_state_});
     return S_OK;
   }
 
@@ -154,6 +158,7 @@ public:
     if (!IsPipelineStateCompatible(pipeline_state))
       return;
     current_pipeline_state_ = pipeline_state;
+    AddRecord(PipelineStateRecord{current_pipeline_state_});
   }
   void STDMETHODCALLTYPE DrawInstanced(UINT vertex_count_per_instance, UINT instance_count,
                                        UINT start_vertex_location, UINT start_instance_location) override {
@@ -209,7 +214,9 @@ public:
   void STDMETHODCALLTYPE ResolveSubresource(ID3D12Resource *dst_resource, UINT dst_sub_resource,
                                             ID3D12Resource *src_resource, UINT src_sub_resource,
                                             DXGI_FORMAT format) override {}
-  void STDMETHODCALLTYPE IASetPrimitiveTopology(D3D12_PRIMITIVE_TOPOLOGY primitive_topology) override {}
+  void STDMETHODCALLTYPE IASetPrimitiveTopology(D3D12_PRIMITIVE_TOPOLOGY primitive_topology) override {
+    AddRecord(PrimitiveTopologyRecord{primitive_topology});
+  }
   void STDMETHODCALLTYPE RSSetViewports(UINT viewport_count, const D3D12_VIEWPORT *viewports) override {
     ViewportRecord record = {};
     if (viewports && viewport_count)
@@ -228,6 +235,7 @@ public:
     if (!IsPipelineStateCompatible(pipeline_state))
       return;
     current_pipeline_state_ = pipeline_state;
+    AddRecord(PipelineStateRecord{current_pipeline_state_});
   }
   void STDMETHODCALLTYPE ResourceBarrier(UINT barrier_count, const D3D12_RESOURCE_BARRIER *barriers) override {
     if (!barriers || !barrier_count)

@@ -48,6 +48,10 @@ struct DispatchRecord {
   UINT z = 0;
 };
 
+struct PipelineStateRecord {
+  Com<ID3D12PipelineState> pipeline_state;
+};
+
 struct CopyBufferRegionRecord {
   Com<ID3D12Resource> dst;
   UINT64 dst_offset = 0;
@@ -96,6 +100,10 @@ struct ScissorRecord {
   std::vector<D3D12_RECT> rects;
 };
 
+struct PrimitiveTopologyRecord {
+  D3D12_PRIMITIVE_TOPOLOGY topology = D3D_PRIMITIVE_TOPOLOGY_UNDEFINED;
+};
+
 struct RenderTargetsRecord {
   std::vector<DescriptorRecord> render_targets;
   std::optional<DescriptorRecord> depth_stencil;
@@ -127,9 +135,10 @@ struct RootDescriptorTableRecord {
 
 using CommandRecordPayload = std::variant<
     DrawInstancedRecord, DrawIndexedInstancedRecord, DispatchRecord,
-    CopyBufferRegionRecord, CopyTextureRegionRecord, CopyResourceRecord,
-    ResourceBarrierRecord, ClearRenderTargetRecord, ClearDepthStencilRecord,
-    ViewportRecord, ScissorRecord, RenderTargetsRecord, VertexBuffersRecord,
+    PipelineStateRecord, CopyBufferRegionRecord, CopyTextureRegionRecord,
+    CopyResourceRecord, ResourceBarrierRecord, ClearRenderTargetRecord,
+    ClearDepthStencilRecord, ViewportRecord, ScissorRecord,
+    PrimitiveTopologyRecord, RenderTargetsRecord, VertexBuffersRecord,
     IndexBufferRecord, RootSignatureRecord, DescriptorHeapsRecord,
     RootDescriptorTableRecord>;
 
