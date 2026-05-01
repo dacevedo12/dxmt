@@ -9,12 +9,17 @@
 #include "d3d12_root_signature.hpp"
 #include "dxmt_context.hpp"
 #include "dxmt_format.hpp"
+#include "dxmt_hud_state.hpp"
+#include "dxmt_info.hpp"
+#include "dxmt_presenter.hpp"
 #include "dxmt_sampler.hpp"
 #include "log/log.hpp"
 #include "util_string.hpp"
+#include "wsi_window.hpp"
 #include <algorithm>
 #include <array>
 #include <cstring>
+#include <cfloat>
 #include <mutex>
 #include <optional>
 #include <type_traits>
@@ -89,6 +94,30 @@ GetPrimitiveType(D3D12_PRIMITIVE_TOPOLOGY topology) {
   default:
     return WMTPrimitiveTypeTriangle;
   }
+}
+
+static WMTPixelFormat
+GetSwapChainPixelFormat(DXGI_FORMAT format) {
+  switch (format) {
+  case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:
+  case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
+    return WMTPixelFormatBGRA8Unorm_sRGB;
+  case DXGI_FORMAT_B8G8R8A8_UNORM:
+  case DXGI_FORMAT_R8G8B8A8_UNORM:
+    return WMTPixelFormatBGRA8Unorm;
+  case DXGI_FORMAT_R10G10B10A2_UNORM:
+    return WMTPixelFormatRGB10A2Unorm;
+  case DXGI_FORMAT_R16G16B16A16_FLOAT:
+    return WMTPixelFormatRGBA16Float;
+  default:
+    return WMTPixelFormatInvalid;
+  }
+}
+
+static WMTColorSpace
+GetSwapChainColorSpace(DXGI_FORMAT format) {
+  return format == DXGI_FORMAT_R16G16B16A16_FLOAT ? WMTColorSpaceSRGBLinear
+                                                  : WMTColorSpaceSRGB;
 }
 
 static WMTIndexType
@@ -607,11 +636,439 @@ public:
                                             const DXGI_SWAP_CHAIN_FULLSCREEN_DESC *fullscreen_desc,
                                             IDXGISwapChain1 **swap_chain) override {
     InitReturnPtr(swap_chain);
-    Logger::err("D3D12CommandQueue: DXGI swapchain bridge is not implemented yet");
-    return DXGI_ERROR_UNSUPPORTED;
+    if (!swap_chain || !factory || !hWnd || !desc)
+      return DXGI_ERROR_INVALID_CALL;
+    if (desc_.Type != D3D12_COMMAND_LIST_TYPE_DIRECT)
+      return DXGI_ERROR_UNSUPPORTED;
+
+    auto object = Com<IDXGISwapChain1>::transfer(
+        new SwapChainImpl(this, factory, hWnd, desc, fullscreen_desc));
+    return object->QueryInterface(IID_PPV_ARGS(swap_chain));
   }
 
 private:
+  class SwapChainImpl final : public ComObjectWithInitialRef<IDXGISwapChain4> {
+  public:
+    SwapChainImpl(CommandQueueImpl *queue, IDXGIFactory1 *factory, HWND hWnd,
+                  const DXGI_SWAP_CHAIN_DESC1 *desc,
+                  const DXGI_SWAP_CHAIN_FULLSCREEN_DESC *fullscreen_desc)
+        : queue_(queue), factory_(factory), hWnd_(hWnd), desc_(*desc),
+          fullscreen_desc_(fullscreen_desc ? *fullscreen_desc
+                                           : DXGI_SWAP_CHAIN_FULLSCREEN_DESC{}),
+          hud_(WMT::DeveloperHUDProperties::instance()) {
+      if (!fullscreen_desc)
+        fullscreen_desc_.Windowed = TRUE;
+
+      native_view_ = WMT::CreateMetalViewFromHWND(
+          reinterpret_cast<intptr_t>(hWnd_), queue->device_->GetMTLDevice(),
+          layer_);
+      if (!native_view_) {
+        Logger::err("D3D12SwapChain: failed to create Metal view");
+        return;
+      }
+
+      presenter_ = Rc(new Presenter(
+          queue->device_->GetMTLDevice(), layer_,
+          queue->device_->GetDXMTDevice().queue().cmd_library, 1.0f,
+          desc_.SampleDesc.Count ? desc_.SampleDesc.Count : 1));
+      hud_.initialize(GetVersionDescriptionText(12, D3D_FEATURE_LEVEL_12_0));
+      ResizeBuffers(desc_.BufferCount, desc_.Width, desc_.Height, desc_.Format,
+                    desc_.Flags);
+    }
+
+    ~SwapChainImpl() {
+      backbuffers_.clear();
+      if (native_view_)
+        WMT::ReleaseMetalView(native_view_);
+    }
+
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid,
+                                             void **object) override {
+      if (!object)
+        return E_POINTER;
+      *object = nullptr;
+      if (riid == __uuidof(IUnknown) || riid == __uuidof(IDXGIObject) ||
+          riid == __uuidof(IDXGIDeviceSubObject) ||
+          riid == __uuidof(IDXGISwapChain) ||
+          riid == __uuidof(IDXGISwapChain1) ||
+          riid == __uuidof(IDXGISwapChain2) ||
+          riid == __uuidof(IDXGISwapChain3) ||
+          riid == __uuidof(IDXGISwapChain4)) {
+        *object = ref(this);
+        return S_OK;
+      }
+      if (logQueryInterfaceError(__uuidof(IDXGISwapChain1), riid))
+        WARN("D3D12SwapChain: unknown interface query ", str::format(riid));
+      return E_NOINTERFACE;
+    }
+
+    HRESULT STDMETHODCALLTYPE GetParent(REFIID riid, void **parent) override {
+      return factory_->QueryInterface(riid, parent);
+    }
+
+    HRESULT STDMETHODCALLTYPE GetPrivateData(REFGUID guid, UINT *data_size,
+                                             void *data) override {
+      return private_data_.getData(guid, data_size, data);
+    }
+
+    HRESULT STDMETHODCALLTYPE SetPrivateData(REFGUID guid, UINT data_size,
+                                             const void *data) override {
+      return private_data_.setData(guid, data_size, data);
+    }
+
+    HRESULT STDMETHODCALLTYPE
+    SetPrivateDataInterface(REFGUID guid, const IUnknown *object) override {
+      return private_data_.setInterface(guid, object);
+    }
+
+    HRESULT STDMETHODCALLTYPE GetDevice(REFIID riid, void **device) override {
+      return queue_->device_->QueryInterface(riid, device);
+    }
+
+    HRESULT STDMETHODCALLTYPE Present(UINT sync_interval,
+                                      UINT flags) override {
+      return Present1(sync_interval, flags, nullptr);
+    }
+
+    HRESULT STDMETHODCALLTYPE GetBuffer(UINT buffer_idx, REFIID riid,
+                                        void **surface) override {
+      if (!surface)
+        return E_POINTER;
+      *surface = nullptr;
+      if (buffer_idx >= backbuffers_.size())
+        return DXGI_ERROR_INVALID_CALL;
+      return backbuffers_[buffer_idx]->QueryInterface(riid, surface);
+    }
+
+    HRESULT STDMETHODCALLTYPE SetFullscreenState(BOOL fullscreen,
+                                                 IDXGIOutput *target) override {
+      fullscreen_desc_.Windowed = !fullscreen;
+      target_ = target;
+      return S_OK;
+    }
+
+    HRESULT STDMETHODCALLTYPE GetFullscreenState(BOOL *fullscreen,
+                                                 IDXGIOutput **target) override {
+      if (fullscreen)
+        *fullscreen = !fullscreen_desc_.Windowed;
+      if (target)
+        *target = target_.ref();
+      return S_OK;
+    }
+
+    HRESULT STDMETHODCALLTYPE GetDesc(DXGI_SWAP_CHAIN_DESC *desc) override {
+      if (!desc)
+        return E_INVALIDARG;
+      desc->BufferDesc.Width = desc_.Width;
+      desc->BufferDesc.Height = desc_.Height;
+      desc->BufferDesc.RefreshRate = fullscreen_desc_.RefreshRate;
+      desc->BufferDesc.Format = desc_.Format;
+      desc->BufferDesc.ScanlineOrdering = fullscreen_desc_.ScanlineOrdering;
+      desc->BufferDesc.Scaling = fullscreen_desc_.Scaling;
+      desc->SampleDesc = desc_.SampleDesc;
+      desc->BufferUsage = desc_.BufferUsage;
+      desc->BufferCount = desc_.BufferCount;
+      desc->OutputWindow = hWnd_;
+      desc->Windowed = fullscreen_desc_.Windowed;
+      desc->SwapEffect = desc_.SwapEffect;
+      desc->Flags = desc_.Flags;
+      return S_OK;
+    }
+
+    HRESULT STDMETHODCALLTYPE ResizeBuffers(UINT buffer_count, UINT width,
+                                            UINT height, DXGI_FORMAT format,
+                                            UINT flags) override {
+      if (buffer_count == 0)
+        buffer_count = desc_.BufferCount ? desc_.BufferCount : 2;
+      if (buffer_count > DXGI_MAX_SWAP_CHAIN_BUFFERS)
+        return DXGI_ERROR_INVALID_CALL;
+
+      desc_.BufferCount = buffer_count;
+      if (width == 0 || height == 0)
+        wsi::getWindowSize(hWnd_, width ? nullptr : &width,
+                           height ? nullptr : &height);
+      desc_.Width = width ? width : 1;
+      desc_.Height = height ? height : 1;
+      if (format != DXGI_FORMAT_UNKNOWN)
+        desc_.Format = format;
+      desc_.Flags = flags;
+
+      if (GetSwapChainPixelFormat(desc_.Format) == WMTPixelFormatInvalid)
+        return DXGI_ERROR_UNSUPPORTED;
+
+      presenter_->changeLayerProperties(GetSwapChainPixelFormat(desc_.Format),
+                                        GetSwapChainColorSpace(desc_.Format),
+                                        desc_.Width, desc_.Height,
+                                        desc_.SampleDesc.Count
+                                            ? desc_.SampleDesc.Count
+                                            : 1);
+
+      backbuffers_.clear();
+      backbuffers_.reserve(desc_.BufferCount);
+      for (UINT i = 0; i < desc_.BufferCount; i++) {
+        D3D12_HEAP_PROPERTIES heap_props = {};
+        heap_props.Type = D3D12_HEAP_TYPE_DEFAULT;
+        heap_props.CPUPageProperty = D3D12_CPU_PAGE_PROPERTY_UNKNOWN;
+        heap_props.MemoryPoolPreference = D3D12_MEMORY_POOL_UNKNOWN;
+        heap_props.CreationNodeMask = 1;
+        heap_props.VisibleNodeMask = 1;
+
+        D3D12_RESOURCE_DESC resource_desc = {};
+        resource_desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        resource_desc.Alignment = 0;
+        resource_desc.Width = desc_.Width;
+        resource_desc.Height = desc_.Height;
+        resource_desc.DepthOrArraySize = 1;
+        resource_desc.MipLevels = 1;
+        resource_desc.Format = desc_.Format;
+        resource_desc.SampleDesc = desc_.SampleDesc;
+        if (!resource_desc.SampleDesc.Count)
+          resource_desc.SampleDesc.Count = 1;
+        resource_desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+        resource_desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+
+        backbuffers_.push_back(CreateResource(
+            queue_->device_.ptr(), &heap_props, D3D12_HEAP_FLAG_NONE,
+            &resource_desc, D3D12_RESOURCE_STATE_PRESENT, 0));
+        if (!backbuffers_.back())
+          return E_FAIL;
+      }
+
+      current_backbuffer_ = 0;
+      return S_OK;
+    }
+
+    HRESULT STDMETHODCALLTYPE ResizeTarget(const DXGI_MODE_DESC *desc) override {
+      return desc ? S_OK : DXGI_ERROR_INVALID_CALL;
+    }
+
+    HRESULT STDMETHODCALLTYPE GetContainingOutput(IDXGIOutput **output) override {
+      InitReturnPtr(output);
+      return DXGI_ERROR_NOT_FOUND;
+    }
+
+    HRESULT STDMETHODCALLTYPE
+    GetFrameStatistics(DXGI_FRAME_STATISTICS *stats) override {
+      if (!stats)
+        return E_INVALIDARG;
+      stats->PresentCount = presentation_count_;
+      stats->SyncRefreshCount = presentation_count_;
+      stats->PresentRefreshCount = presentation_count_;
+      stats->SyncGPUTime = {};
+      stats->SyncQPCTime = {};
+      return S_OK;
+    }
+
+    HRESULT STDMETHODCALLTYPE GetLastPresentCount(UINT *last_present_count) override {
+      if (!last_present_count)
+        return E_POINTER;
+      *last_present_count = presentation_count_;
+      return S_OK;
+    }
+
+    HRESULT STDMETHODCALLTYPE GetDesc1(DXGI_SWAP_CHAIN_DESC1 *desc) override {
+      if (!desc)
+        return E_POINTER;
+      *desc = desc_;
+      return S_OK;
+    }
+
+    HRESULT STDMETHODCALLTYPE
+    GetFullscreenDesc(DXGI_SWAP_CHAIN_FULLSCREEN_DESC *desc) override {
+      if (!desc)
+        return E_POINTER;
+      *desc = fullscreen_desc_;
+      return S_OK;
+    }
+
+    HRESULT STDMETHODCALLTYPE GetHwnd(HWND *hWnd) override {
+      if (!hWnd)
+        return E_POINTER;
+      *hWnd = hWnd_;
+      return S_OK;
+    }
+
+    HRESULT STDMETHODCALLTYPE GetCoreWindow(REFIID riid, void **window) override {
+      InitReturnPtr(window);
+      return E_NOTIMPL;
+    }
+
+    HRESULT STDMETHODCALLTYPE Present1(
+        UINT sync_interval, UINT flags,
+        const DXGI_PRESENT_PARAMETERS *present_parameters) override {
+      if (sync_interval > 4)
+        return DXGI_ERROR_INVALID_CALL;
+
+      bool occluded = wsi::isMinimized(hWnd_);
+      HRESULT hr = occluded ? DXGI_STATUS_OCCLUDED : S_OK;
+      if (flags & DXGI_PRESENT_TEST)
+        return hr;
+      if (hr == DXGI_STATUS_OCCLUDED)
+        return hr;
+
+      auto *resource = dynamic_cast<Resource *>(
+          backbuffers_[current_backbuffer_].ptr());
+      if (!resource || !resource->GetTexture())
+        return E_FAIL;
+
+      double vsync_duration = sync_interval ? sync_interval / 60.0 : 0.0;
+      auto &dxmt_queue = queue_->device_->GetDXMTDevice().queue();
+      auto *chunk = dxmt_queue.CurrentChunk();
+      chunk->signal_frame_latency_fence_ = dxmt_queue.CurrentFrameSeq();
+      auto state = presenter_->synchronizeLayerProperties();
+      chunk->emitcc([
+        backbuffer = Rc<Texture>(resource->GetTexture()),
+        presenter = presenter_,
+        vsync_duration,
+        state = std::move(state)
+      ](ArgumentEncodingContext &ctx) mutable {
+        ctx.present(backbuffer, presenter, vsync_duration, state.metadata);
+      });
+      dxmt_queue.CommitCurrentChunk();
+      dxmt_queue.PresentBoundary();
+
+      presentation_count_++;
+      current_backbuffer_ =
+          desc_.BufferCount ? (current_backbuffer_ + 1) % desc_.BufferCount : 0;
+      return S_OK;
+    }
+
+    BOOL STDMETHODCALLTYPE IsTemporaryMonoSupported() override { return FALSE; }
+
+    HRESULT STDMETHODCALLTYPE
+    GetRestrictToOutput(IDXGIOutput **restrict_to_output) override {
+      InitReturnPtr(restrict_to_output);
+      return E_NOTIMPL;
+    }
+
+    HRESULT STDMETHODCALLTYPE SetBackgroundColor(const DXGI_RGBA *color) override {
+      background_color_ = color ? *color : DXGI_RGBA{};
+      return color ? S_OK : E_INVALIDARG;
+    }
+
+    HRESULT STDMETHODCALLTYPE GetBackgroundColor(DXGI_RGBA *color) override {
+      if (!color)
+        return E_INVALIDARG;
+      *color = background_color_;
+      return S_OK;
+    }
+
+    HRESULT STDMETHODCALLTYPE SetRotation(DXGI_MODE_ROTATION rotation) override {
+      rotation_ = rotation;
+      return S_OK;
+    }
+
+    HRESULT STDMETHODCALLTYPE GetRotation(DXGI_MODE_ROTATION *rotation) override {
+      if (!rotation)
+        return E_INVALIDARG;
+      *rotation = rotation_;
+      return S_OK;
+    }
+
+    HRESULT STDMETHODCALLTYPE SetSourceSize(UINT width, UINT height) override {
+      if (!width || !height)
+        return E_INVALIDARG;
+      source_width_ = width;
+      source_height_ = height;
+      return S_OK;
+    }
+
+    HRESULT STDMETHODCALLTYPE GetSourceSize(UINT *width, UINT *height) override {
+      if (width)
+        *width = source_width_ ? source_width_ : desc_.Width;
+      if (height)
+        *height = source_height_ ? source_height_ : desc_.Height;
+      return S_OK;
+    }
+
+    HRESULT STDMETHODCALLTYPE SetMaximumFrameLatency(UINT max_latency) override {
+      if (!max_latency || max_latency > DXGI_MAX_SWAP_CHAIN_BUFFERS)
+        return E_INVALIDARG;
+      frame_latency_ = max_latency;
+      queue_->device_->GetDXMTDevice().queue().SetMaxLatency(max_latency);
+      return S_OK;
+    }
+
+    HRESULT STDMETHODCALLTYPE GetMaximumFrameLatency(UINT *max_latency) override {
+      if (max_latency)
+        *max_latency = frame_latency_;
+      return S_OK;
+    }
+
+    HANDLE STDMETHODCALLTYPE GetFrameLatencyWaitableObject() override {
+      return nullptr;
+    }
+
+    HRESULT STDMETHODCALLTYPE
+    SetMatrixTransform(const DXGI_MATRIX_3X2_F *matrix) override {
+      if (!matrix)
+        return E_INVALIDARG;
+      matrix_ = *matrix;
+      return S_OK;
+    }
+
+    HRESULT STDMETHODCALLTYPE
+    GetMatrixTransform(DXGI_MATRIX_3X2_F *matrix) override {
+      if (!matrix)
+        return E_INVALIDARG;
+      *matrix = matrix_;
+      return S_OK;
+    }
+
+    UINT STDMETHODCALLTYPE GetCurrentBackBufferIndex() override {
+      return current_backbuffer_;
+    }
+
+    HRESULT STDMETHODCALLTYPE CheckColorSpaceSupport(
+        DXGI_COLOR_SPACE_TYPE color_space, UINT *color_space_support) override {
+      if (!color_space_support)
+        return E_INVALIDARG;
+      *color_space_support = DXGI_SWAP_CHAIN_COLOR_SPACE_SUPPORT_FLAG_PRESENT;
+      return S_OK;
+    }
+
+    HRESULT STDMETHODCALLTYPE SetColorSpace1(
+        DXGI_COLOR_SPACE_TYPE color_space) override {
+      color_space_ = color_space;
+      return S_OK;
+    }
+
+    HRESULT STDMETHODCALLTYPE ResizeBuffers1(
+        UINT buffer_count, UINT width, UINT height, DXGI_FORMAT format,
+        UINT flags, const UINT *creation_node_mask,
+        IUnknown *const *present_queue) override {
+      return ResizeBuffers(buffer_count, width, height, format, flags);
+    }
+
+    HRESULT STDMETHODCALLTYPE SetHDRMetaData(DXGI_HDR_METADATA_TYPE type,
+                                             UINT size, void *metadata) override {
+      return S_OK;
+    }
+
+  private:
+    Com<CommandQueueImpl> queue_;
+    Com<IDXGIFactory1> factory_;
+    ComPrivateData private_data_;
+    HWND hWnd_ = nullptr;
+    DXGI_SWAP_CHAIN_DESC1 desc_ = {};
+    DXGI_SWAP_CHAIN_FULLSCREEN_DESC fullscreen_desc_ = {};
+    std::vector<Com<ID3D12Resource>> backbuffers_;
+    UINT current_backbuffer_ = 0;
+    UINT presentation_count_ = 0;
+    WMT::Object native_view_;
+    WMT::MetalLayer layer_;
+    Rc<Presenter> presenter_;
+    HUDState hud_;
+    Com<IDXGIOutput> target_;
+    UINT frame_latency_ = 1;
+    UINT source_width_ = 0;
+    UINT source_height_ = 0;
+    DXGI_RGBA background_color_ = {};
+    DXGI_MODE_ROTATION rotation_ = DXGI_MODE_ROTATION_IDENTITY;
+    DXGI_MATRIX_3X2_F matrix_ = {1.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f};
+    DXGI_COLOR_SPACE_TYPE color_space_ = DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709;
+  };
+
   struct ReplayState {
     Com<ID3D12PipelineState> pipeline_state;
     Com<ID3D12RootSignature> graphics_root_signature;
@@ -753,10 +1210,6 @@ private:
                              const ResourceBarrierRecord &record) {
     if (record.barriers.empty())
       return;
-
-    chunk->emitcc([](ArgumentEncodingContext &enc) {
-      enc.endPass();
-    });
   }
 
   void StoreRootDescriptor(ReplayState &state,
