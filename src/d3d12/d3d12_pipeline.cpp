@@ -587,8 +587,8 @@ CompileMetalFunction(IMTLD3D12Device *device, PipelineDxilShader &shader,
   SM50GetCompiledBitcode(bitcode_handle, &bitcode);
 
   WMT::Reference<WMT::Error> metal_error;
-  out.library = device->GetMTLDevice().newLibrary(bitcode.Data, bitcode.Size,
-                                                  metal_error);
+  auto lib_data = WMT::MakeDispatchData(bitcode.Data, bitcode.Size);
+  out.library = device->GetMTLDevice().newLibrary(lib_data, metal_error);
   SM50DestroyBitcode(bitcode_handle);
   if (metal_error || !out.library) {
     WARN("D3D12PipelineState: failed to create Metal library for ",
