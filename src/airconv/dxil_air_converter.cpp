@@ -1645,7 +1645,8 @@ ConvertDxilToAir(const dxil::Parser &parser, const char *name,
       name ? name : "main0", context, module, 0, false);
   dxil_ctx.function = function;
 
-  entry_block->removeFromParent();
+  if (entry_block->getParent())
+    entry_block->removeFromParent();
   delete entry_block;
 
   if (auto err = LowerFunction(*source, dxil_ctx))

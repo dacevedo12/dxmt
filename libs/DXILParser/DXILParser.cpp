@@ -5607,7 +5607,7 @@ BuildShaderReflection(const Parser &parser, ShaderReflectionInfo &info) {
 
 ParseStatus
 BuildDxilTranslationInfo(const Parser &parser, DxilTranslationInfo &info) {
-  info = {};
+  info = DxilTranslationInfo();
 
   const auto &reflection = parser.shaderReflection();
   if (!reflection)

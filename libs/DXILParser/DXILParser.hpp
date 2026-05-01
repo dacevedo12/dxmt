@@ -1042,6 +1042,12 @@ struct DxilTranslationFunctionInfo {
 };
 
 struct DxilTranslationInfo {
+  DxilTranslationInfo() = default;
+  DxilTranslationInfo(const DxilTranslationInfo &) = delete;
+  DxilTranslationInfo &operator=(const DxilTranslationInfo &) = delete;
+  DxilTranslationInfo(DxilTranslationInfo &&) noexcept = default;
+  DxilTranslationInfo &operator=(DxilTranslationInfo &&) noexcept = default;
+
   bool valid = false;
   std::string entry_point_name;
   std::string function_name;
