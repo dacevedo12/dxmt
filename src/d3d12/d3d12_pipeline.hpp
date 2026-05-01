@@ -7,6 +7,7 @@
 #include <d3d12.h>
 #include <cstdint>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -32,10 +33,21 @@ struct PipelineDxilShader {
   dxil::Parser parser;
   dxil_shader_t shader = nullptr;
   MTL_SHADER_REFLECTION reflection = {};
+  std::vector<MTL_SM50_SHADER_ARGUMENT> argument_info;
 
   const dxil::DxilTranslationInfo *translation() const {
     const auto &info = parser.dxilTranslation();
     return info ? &*info : nullptr;
+  }
+
+  const MTL_SM50_SHADER_ARGUMENT *constantBufferInfo() const {
+    return argument_info.empty() ? nullptr : argument_info.data();
+  }
+
+  const MTL_SM50_SHADER_ARGUMENT *resourceArgumentInfo() const {
+    return argument_info.size() <= reflection.NumConstantBuffers
+               ? nullptr
+               : argument_info.data() + reflection.NumConstantBuffers;
   }
 };
 
@@ -48,6 +60,8 @@ struct PipelineMetalGraphicsState {
   PipelineMetalShader vertex;
   PipelineMetalShader pixel;
   WMT::Reference<WMT::RenderPipelineState> pso;
+  WMT::Reference<WMT::DepthStencilState> depth_stencil;
+  wmtcmd_render_setrasterizerstate rasterizer = {};
 };
 
 struct PipelineMetalComputeState {

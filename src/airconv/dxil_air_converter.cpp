@@ -2,6 +2,7 @@
 
 #include "air_signature.hpp"
 #include "air_type.hpp"
+#include "air_operations.hpp"
 #include "airconv_context.hpp"
 #include "airconv_error.hpp"
 #include "dxbc_converter.hpp"
@@ -75,8 +76,15 @@ struct DxilAirContext {
   std::map<uint32_t, uint32_t> output_indices;
   std::map<uint32_t, const dxil::DxilTranslationSignatureElementInfo *> inputs;
   std::map<uint32_t, const dxil::DxilTranslationSignatureElementInfo *> outputs;
+  std::map<uint32_t, SM50_IA_INPUT_ELEMENT> vertex_inputs;
   dxbc::ShaderInfo shader_info;
   dxbc::io_binding_map resources;
+  uint32_t vertex_buffer_table_arg = UINT32_MAX;
+  uint32_t vertex_slot_mask = 0;
+  uint32_t vertex_id_arg = UINT32_MAX;
+  uint32_t base_vertex_arg = UINT32_MAX;
+  uint32_t instance_id_arg = UINT32_MAX;
+  uint32_t base_instance_arg = UINT32_MAX;
   AllocaInst *return_value = nullptr;
 };
 
@@ -749,6 +757,60 @@ Value *
 LoadSignatureInput(const CallBase &call, DxilAirContext &ctx) {
   const auto element_id = ConstantOperandU32(call, 1).value_or(0);
   const auto column = ConstantOperandU32(call, 3).value_or(0);
+  auto vertex_input = ctx.vertex_inputs.find(element_id);
+  if (vertex_input != ctx.vertex_inputs.end()) {
+    const auto &element = vertex_input->second;
+    if (ctx.vertex_buffer_table_arg == UINT32_MAX ||
+        ctx.vertex_id_arg == UINT32_MAX)
+      return UndefValue::get(MapType(call.getType(), ctx));
+
+    Value *index = ctx.function->getArg(ctx.vertex_id_arg);
+    if (element.step_function) {
+      if (ctx.instance_id_arg == UINT32_MAX ||
+          ctx.base_instance_arg == UINT32_MAX)
+        return UndefValue::get(MapType(call.getType(), ctx));
+      index = ctx.function->getArg(ctx.base_instance_arg);
+      if (element.step_rate) {
+        auto *instance = ctx.function->getArg(ctx.instance_id_arg);
+        index = ctx.builder.CreateAdd(
+            index, ctx.builder.CreateUDiv(instance,
+                                          ctx.builder.getInt32(element.step_rate)));
+      }
+    } else if (ctx.base_vertex_arg != UINT32_MAX) {
+      index = ctx.builder.CreateAdd(index,
+                                    ctx.function->getArg(ctx.base_vertex_arg));
+    }
+
+    auto *table = ctx.builder.CreatePointerCast(
+        ctx.function->getArg(ctx.vertex_buffer_table_arg),
+        ctx.types._dxmt_vertex_buffer_entry->getPointerTo(
+            uint32_t(air::AddressSpace::constant)));
+    const unsigned shift = 32u - std::min<uint32_t>(element.slot, 31u);
+    const unsigned table_index =
+        element.slot ? std::popcount((ctx.vertex_slot_mask << shift) >> shift)
+                     : 0;
+    auto *entry = ctx.builder.CreateLoad(
+        ctx.types._dxmt_vertex_buffer_entry,
+        ctx.builder.CreateConstGEP1_32(ctx.types._dxmt_vertex_buffer_entry,
+                                       table, table_index));
+    auto *base_addr = ctx.builder.CreateExtractValue(entry, {0});
+    auto *stride = ctx.builder.CreateExtractValue(entry, {1});
+    auto *byte_offset = ctx.builder.CreateAdd(
+        ctx.builder.CreateMul(stride, index),
+        ctx.builder.getInt32(element.aligned_byte_offset));
+    auto pulled = air::pull_vec4_from_addr(
+                      air::MTLAttributeFormat(element.format), base_addr,
+                      byte_offset)
+                      .build(air::AIRBuilderContext{
+                          ctx.llvm, ctx.module, ctx.builder, ctx.types,
+                          ctx.air});
+    if (auto err = pulled.takeError()) {
+      consumeError(std::move(err));
+      return UndefValue::get(MapType(call.getType(), ctx));
+    }
+    auto *vec4 = pulled.get();
+    return SplatOrExtract(vec4, column, ctx);
+  }
   auto arg = ctx.input_args.find(element_id);
   if (arg == ctx.input_args.end())
     return UndefValue::get(MapType(call.getType(), ctx));
@@ -1468,7 +1530,9 @@ BuildShaderInfo(const dxil::DxilTranslationInfo &translation,
 void
 BuildSignature(const dxil::DxilTranslationInfo &translation,
                air::FunctionSignatureBuilder &signature,
-               DxilAirContext &ctx) {
+               DxilAirContext &ctx,
+               SM50_SHADER_IA_INPUT_LAYOUT_DATA *ia_layout) {
+  uint32_t vertex_input_index = 0;
   for (const auto &sig : translation.signatures) {
     const auto mask = SignatureMask(sig);
     if (sig.kind == dxil::DxilTranslationSignatureKind::Input) {
@@ -1478,6 +1542,9 @@ BuildSignature(const dxil::DxilTranslationInfo &translation,
           ctx.input_args[sig.element_id] = signature.DefineInput(air::InputVertexID{});
         else if (IsSystemSemantic(sig, "SV_InstanceID"))
           ctx.input_args[sig.element_id] = signature.DefineInput(air::InputInstanceID{});
+        else if (ia_layout && vertex_input_index < ia_layout->num_elements)
+          ctx.vertex_inputs[sig.element_id] =
+              ia_layout->elements[vertex_input_index++];
         else
           ctx.input_args[sig.element_id] = signature.DefineInput(
               air::InputVertexStageIn{.attribute = sig.element_id,
@@ -1645,6 +1712,10 @@ ConvertDxilToAir(const dxil::Parser &parser, const char *name,
   dxbc::ShaderInfo shader_info;
   BuildShaderInfo(*translation, shader_info);
 
+  SM50_SHADER_IA_INPUT_LAYOUT_DATA *ia_layout = nullptr;
+  dxbc::args_get_data<SM50_SHADER_IA_INPUT_LAYOUT,
+                      SM50_SHADER_IA_INPUT_LAYOUT_DATA>(args, &ia_layout);
+
   air::FunctionSignatureBuilder signature;
   air::AirType types(context);
   llvm::raw_null_ostream null_debug;
@@ -1662,7 +1733,25 @@ ConvertDxilToAir(const dxil::Parser &parser, const char *name,
       .source_function = source,
       .shader_info = std::move(shader_info),
   };
-  BuildSignature(*translation, signature, dxil_ctx);
+  if (translation->shader_kind == uint32_t(DxilStage::Vertex) && ia_layout) {
+    dxil_ctx.vertex_slot_mask = ia_layout->slot_mask;
+    dxil_ctx.vertex_id_arg = signature.DefineInput(air::InputVertexID{});
+    dxil_ctx.base_vertex_arg = signature.DefineInput(air::InputBaseVertex{});
+    dxil_ctx.instance_id_arg = signature.DefineInput(air::InputInstanceID{});
+    dxil_ctx.base_instance_arg = signature.DefineInput(air::InputBaseInstance{});
+    dxil_ctx.vertex_buffer_table_arg = signature.DefineInput(
+        air::ArgumentBindingBuffer{
+            .buffer_size = {},
+            .location_index = 16,
+            .array_size = 0,
+            .memory_access = air::MemoryAccess::read,
+            .address_space = air::AddressSpace::constant,
+            .type = air::msl_uint,
+            .arg_name = "vertex_buffers",
+            .raster_order_group = {},
+        });
+  }
+  BuildSignature(*translation, signature, dxil_ctx, ia_layout);
 
   dxbc::setup_binding_table(&dxil_ctx.shader_info, dxil_ctx.resources,
                             signature, module);

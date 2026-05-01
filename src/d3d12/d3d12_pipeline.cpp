@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstring>
+#include <limits>
 #include <string_view>
 #include <span>
 #include <utility>
@@ -23,6 +24,109 @@ constexpr uint32_t kShaderKindGeometry = 2;
 constexpr uint32_t kShaderKindHull = 3;
 constexpr uint32_t kShaderKindDomain = 4;
 constexpr uint32_t kShaderKindCompute = 5;
+
+constexpr WMTCompareFunction kCompareFunctionMap[] = {
+    WMTCompareFunctionNever, WMTCompareFunctionNever, WMTCompareFunctionLess,
+    WMTCompareFunctionEqual, WMTCompareFunctionLessEqual,
+    WMTCompareFunctionGreater, WMTCompareFunctionNotEqual,
+    WMTCompareFunctionGreaterEqual, WMTCompareFunctionAlways};
+
+constexpr WMTStencilOperation kStencilOperationMap[] = {
+    WMTStencilOperationZero,
+    WMTStencilOperationKeep,
+    WMTStencilOperationZero,
+    WMTStencilOperationReplace,
+    WMTStencilOperationIncrementClamp,
+    WMTStencilOperationDecrementClamp,
+    WMTStencilOperationInvert,
+    WMTStencilOperationIncrementWrap,
+    WMTStencilOperationDecrementWrap,
+};
+
+constexpr WMTBlendOperation kBlendOpMap[] = {
+    WMTBlendOperationAdd,
+    WMTBlendOperationAdd,
+    WMTBlendOperationSubtract,
+    WMTBlendOperationReverseSubtract,
+    WMTBlendOperationMin,
+    WMTBlendOperationMax,
+};
+
+constexpr WMTBlendFactor kBlendFactorMap[] = {
+    WMTBlendFactorZero,
+    WMTBlendFactorZero,
+    WMTBlendFactorOne,
+    WMTBlendFactorSourceColor,
+    WMTBlendFactorOneMinusSourceColor,
+    WMTBlendFactorSourceAlpha,
+    WMTBlendFactorOneMinusSourceAlpha,
+    WMTBlendFactorDestinationAlpha,
+    WMTBlendFactorOneMinusDestinationAlpha,
+    WMTBlendFactorDestinationColor,
+    WMTBlendFactorOneMinusDestinationColor,
+    WMTBlendFactorSourceAlphaSaturated,
+    WMTBlendFactorZero,
+    WMTBlendFactorZero,
+    WMTBlendFactorBlendColor,
+    WMTBlendFactorOneMinusBlendColor,
+    WMTBlendFactorSource1Color,
+    WMTBlendFactorOneMinusSource1Color,
+    WMTBlendFactorSource1Alpha,
+    WMTBlendFactorOneMinusSource1Alpha,
+};
+
+constexpr WMTBlendFactor kBlendAlphaFactorMap[] = {
+    WMTBlendFactorZero,
+    WMTBlendFactorZero,
+    WMTBlendFactorOne,
+    WMTBlendFactorSourceColor,
+    WMTBlendFactorOneMinusSourceColor,
+    WMTBlendFactorSourceAlpha,
+    WMTBlendFactorOneMinusSourceAlpha,
+    WMTBlendFactorDestinationAlpha,
+    WMTBlendFactorOneMinusDestinationAlpha,
+    WMTBlendFactorDestinationColor,
+    WMTBlendFactorOneMinusDestinationColor,
+    WMTBlendFactorSourceAlphaSaturated,
+    WMTBlendFactorZero,
+    WMTBlendFactorZero,
+    WMTBlendFactorBlendAlpha,
+    WMTBlendFactorOneMinusBlendAlpha,
+    WMTBlendFactorSource1Color,
+    WMTBlendFactorOneMinusSource1Color,
+    WMTBlendFactorSource1Alpha,
+    WMTBlendFactorOneMinusSource1Alpha,
+};
+
+constexpr WMTColorWriteMask kColorWriteMaskMap[] = {
+    WMTColorWriteMaskNone,
+    WMTColorWriteMaskRed,
+    WMTColorWriteMaskGreen,
+    WMTColorWriteMaskRed | WMTColorWriteMaskGreen,
+    WMTColorWriteMaskBlue,
+    WMTColorWriteMaskBlue | WMTColorWriteMaskRed,
+    WMTColorWriteMaskBlue | WMTColorWriteMaskGreen,
+    WMTColorWriteMaskBlue | WMTColorWriteMaskRed | WMTColorWriteMaskGreen,
+    WMTColorWriteMaskAlpha,
+    WMTColorWriteMaskAlpha | WMTColorWriteMaskRed,
+    WMTColorWriteMaskAlpha | WMTColorWriteMaskGreen,
+    WMTColorWriteMaskAlpha | WMTColorWriteMaskRed | WMTColorWriteMaskGreen,
+    WMTColorWriteMaskAlpha | WMTColorWriteMaskBlue,
+    WMTColorWriteMaskAlpha | WMTColorWriteMaskBlue | WMTColorWriteMaskRed,
+    WMTColorWriteMaskAlpha | WMTColorWriteMaskBlue | WMTColorWriteMaskGreen,
+    WMTColorWriteMaskAll,
+};
+
+constexpr WMTLogicOperation kLogicOpMap[] = {
+    WMTLogicOperationClear,      WMTLogicOperationSet,
+    WMTLogicOperationCopy,       WMTLogicOperationCopyInverted,
+    WMTLogicOperationNoOp,       WMTLogicOperationInvert,
+    WMTLogicOperationAnd,        WMTLogicOperationNand,
+    WMTLogicOperationOr,         WMTLogicOperationNor,
+    WMTLogicOperationXor,        WMTLogicOperationEquiv,
+    WMTLogicOperationAndReverse, WMTLogicOperationAndInverted,
+    WMTLogicOperationOrReverse,  WMTLogicOperationOrInverted,
+};
 
 class BlobImpl final : public ComObjectWithInitialRef<ID3DBlob> {
 public:
@@ -155,6 +259,18 @@ ParseDxilShader(PipelineShaderStage stage,
          " DXIL shader: ", SM50GetErrorMessageString(error));
     SM50FreeError(error);
     return E_INVALIDARG;
+  }
+
+  const auto argument_count =
+      shader.reflection.NumConstantBuffers + shader.reflection.NumArguments;
+  shader.argument_info.resize(argument_count);
+  if (argument_count) {
+    DXILGetArgumentsInfo(
+        shader.shader,
+        shader.argument_info.empty() ? nullptr : shader.argument_info.data(),
+        shader.argument_info.size() <= shader.reflection.NumConstantBuffers
+            ? nullptr
+            : shader.argument_info.data() + shader.reflection.NumConstantBuffers);
   }
 
   return S_OK;
@@ -371,12 +487,38 @@ HashDxilShaders(Sha1HashState &hash,
 
 std::string
 BuildShaderCacheKey(PipelineStateType type,
-                    const std::vector<PipelineDxilShader> &shaders) {
+                    const std::vector<PipelineDxilShader> &shaders,
+                    const PipelineGraphicsState &graphics_state,
+                    const PipelineComputeState &compute_state,
+                    ID3D12RootSignature *root_signature) {
   Sha1HashState hash;
   HashString(hash, type == PipelineStateType::Graphics
-                       ? "dxmt-d3d12-graphics-shader-cache-v1"
-                       : "dxmt-d3d12-compute-shader-cache-v1");
+                       ? "dxmt-d3d12-graphics-pipeline-cache-v2"
+                       : "dxmt-d3d12-compute-pipeline-cache-v2");
   HashDxilShaders(hash, shaders);
+  if (type == PipelineStateType::Graphics) {
+    HashVector(hash, graphics_state.input_elements);
+    HashVector(hash, graphics_state.stream_output_entries);
+    HashVector(hash, graphics_state.stream_output_strides);
+    HashValue(hash, graphics_state.desc.BlendState);
+    HashValue(hash, graphics_state.desc.SampleMask);
+    HashValue(hash, graphics_state.desc.RasterizerState);
+    HashValue(hash, graphics_state.desc.DepthStencilState);
+    HashValue(hash, graphics_state.desc.PrimitiveTopologyType);
+    HashValue(hash, graphics_state.desc.NumRenderTargets);
+    HashBytes(hash, graphics_state.desc.RTVFormats,
+              sizeof(graphics_state.desc.RTVFormats));
+    HashValue(hash, graphics_state.desc.DSVFormat);
+    HashValue(hash, graphics_state.desc.SampleDesc);
+    HashValue(hash, graphics_state.desc.Flags);
+  } else {
+    HashValue(hash, compute_state.desc.Flags);
+  }
+  if (auto *root = dynamic_cast<RootSignature *>(root_signature)) {
+    const auto blob = root->GetSerializedBlob();
+    HashValue(hash, uint32_t(blob.size()));
+    HashBytes(hash, blob.data(), blob.size());
+  }
   return hash.final().string();
 }
 
@@ -515,6 +657,148 @@ BuildInputElements(IMTLD3D12Device *device,
   return true;
 }
 
+template <typename T, size_t N>
+const T &
+Lookup(const T (&table)[N], uint32_t index, const T &fallback) {
+  return index < N ? table[index] : fallback;
+}
+
+bool
+IsDualSourceBlend(const D3D12_RENDER_TARGET_BLEND_DESC &desc) {
+  return desc.BlendEnable &&
+         (desc.SrcBlend >= D3D12_BLEND_SRC1_COLOR ||
+          desc.DestBlend >= D3D12_BLEND_SRC1_COLOR ||
+          desc.SrcBlendAlpha >= D3D12_BLEND_SRC1_COLOR ||
+          desc.DestBlendAlpha >= D3D12_BLEND_SRC1_COLOR);
+}
+
+bool
+UsesDualSourceBlending(const D3D12_BLEND_DESC &desc) {
+  const auto count = desc.IndependentBlendEnable ? 8u : 1u;
+  for (UINT i = 0; i < count; i++) {
+    if (IsDualSourceBlend(desc.RenderTarget[i]))
+      return true;
+  }
+  return false;
+}
+
+void
+ApplyBlendState(WMTRenderPipelineInfo &info,
+                const D3D12_BLEND_DESC &blend_desc,
+                uint32_t render_target_count) {
+  for (UINT rt = 0; rt < render_target_count && rt < 8; rt++) {
+    const auto &src =
+        blend_desc.RenderTarget[blend_desc.IndependentBlendEnable ? rt : 0];
+    auto &dst = info.colors[rt];
+    dst.write_mask =
+        Lookup(kColorWriteMaskMap, uint32_t(src.RenderTargetWriteMask),
+               kColorWriteMaskMap[15]);
+    if (!src.BlendEnable || dst.pixel_format == WMTPixelFormatInvalid)
+      continue;
+
+    dst.blending_enabled = true;
+    dst.rgb_blend_operation =
+        Lookup(kBlendOpMap, uint32_t(src.BlendOp), WMTBlendOperationAdd);
+    dst.alpha_blend_operation =
+        Lookup(kBlendOpMap, uint32_t(src.BlendOpAlpha), WMTBlendOperationAdd);
+    dst.src_rgb_blend_factor =
+        Lookup(kBlendFactorMap, uint32_t(src.SrcBlend), WMTBlendFactorOne);
+    dst.dst_rgb_blend_factor =
+        Lookup(kBlendFactorMap, uint32_t(src.DestBlend), WMTBlendFactorZero);
+    dst.src_alpha_blend_factor =
+        Lookup(kBlendAlphaFactorMap, uint32_t(src.SrcBlendAlpha),
+               WMTBlendFactorOne);
+    dst.dst_alpha_blend_factor =
+        Lookup(kBlendAlphaFactorMap, uint32_t(src.DestBlendAlpha),
+               WMTBlendFactorZero);
+  }
+
+  info.alpha_to_coverage_enabled = blend_desc.AlphaToCoverageEnable;
+  if (!blend_desc.IndependentBlendEnable &&
+      blend_desc.RenderTarget[0].LogicOpEnable) {
+    info.logic_operation_enabled = true;
+    info.logic_operation =
+        Lookup(kLogicOpMap, uint32_t(blend_desc.RenderTarget[0].LogicOp),
+               WMTLogicOperationCopy);
+  }
+}
+
+void
+BuildRasterizerCommand(const D3D12_RASTERIZER_DESC &desc,
+                       wmtcmd_render_setrasterizerstate &cmd) {
+  cmd = {};
+  cmd.type = WMTRenderCommandSetRasterizerState;
+  cmd.fill_mode = desc.FillMode == D3D12_FILL_MODE_WIREFRAME
+                      ? WMTTriangleFillModeLines
+                      : WMTTriangleFillModeFill;
+  switch (desc.CullMode) {
+  case D3D12_CULL_MODE_FRONT:
+    cmd.cull_mode = WMTCullModeFront;
+    break;
+  case D3D12_CULL_MODE_BACK:
+    cmd.cull_mode = WMTCullModeBack;
+    break;
+  default:
+    cmd.cull_mode = WMTCullModeNone;
+    break;
+  }
+  cmd.depth_clip_mode =
+      desc.DepthClipEnable ? WMTDepthClipModeClip : WMTDepthClipModeClamp;
+  cmd.winding = desc.FrontCounterClockwise ? WMTWindingCounterClockwise
+                                           : WMTWindingClockwise;
+  cmd.depth_bias = float(desc.DepthBias);
+  cmd.scole_scale = desc.SlopeScaledDepthBias;
+  cmd.depth_bias_clamp = desc.DepthBiasClamp;
+}
+
+void
+FillStencilInfo(WMTStencilInfo &dst,
+                const D3D12_DEPTH_STENCILOP_DESC &src,
+                UINT8 read_mask, UINT8 write_mask) {
+  dst.enabled = true;
+  dst.depth_stencil_pass_op =
+      Lookup(kStencilOperationMap, uint32_t(src.StencilPassOp),
+             WMTStencilOperationKeep);
+  dst.stencil_fail_op =
+      Lookup(kStencilOperationMap, uint32_t(src.StencilFailOp),
+             WMTStencilOperationKeep);
+  dst.depth_fail_op =
+      Lookup(kStencilOperationMap, uint32_t(src.StencilDepthFailOp),
+             WMTStencilOperationKeep);
+  dst.stencil_compare_function =
+      Lookup(kCompareFunctionMap, uint32_t(src.StencilFunc),
+             WMTCompareFunctionAlways);
+  dst.read_mask = read_mask;
+  dst.write_mask = write_mask;
+}
+
+WMT::Reference<WMT::DepthStencilState>
+CreateDepthStencilState(IMTLD3D12Device *device,
+                        const D3D12_DEPTH_STENCIL_DESC &desc) {
+  WMTDepthStencilInfo info = {};
+  info.depth_compare_function = WMTCompareFunctionAlways;
+  info.depth_write_enabled = false;
+  info.front_stencil.enabled = false;
+  info.back_stencil.enabled = false;
+
+  if (desc.DepthEnable) {
+    info.depth_compare_function =
+        Lookup(kCompareFunctionMap, uint32_t(desc.DepthFunc),
+               WMTCompareFunctionAlways);
+    info.depth_write_enabled =
+        desc.DepthWriteMask == D3D12_DEPTH_WRITE_MASK_ALL;
+  }
+
+  if (desc.StencilEnable) {
+    FillStencilInfo(info.front_stencil, desc.FrontFace,
+                    desc.StencilReadMask, desc.StencilWriteMask);
+    FillStencilInfo(info.back_stencil, desc.BackFace,
+                    desc.StencilReadMask, desc.StencilWriteMask);
+  }
+
+  return device->GetMTLDevice().newDepthStencilState(info);
+}
+
 bool
 CreateMetalGraphicsPipeline(IMTLD3D12Device *device,
                             std::vector<PipelineDxilShader> &shaders,
@@ -567,7 +851,8 @@ CreateMetalGraphicsPipeline(IMTLD3D12Device *device,
     ps_args.type = SM50_SHADER_PSO_PIXEL_SHADER;
     ps_args.next = &common;
     ps_args.sample_mask = state.desc.SampleMask;
-    ps_args.dual_source_blending = false;
+    ps_args.dual_source_blending =
+        UsesDualSourceBlending(state.desc.BlendState);
     ps_args.disable_depth_output = state.desc.DSVFormat == DXGI_FORMAT_UNKNOWN;
     ps_args.unorm_output_reg_mask = unorm_output_reg_mask;
 
@@ -596,6 +881,7 @@ CreateMetalGraphicsPipeline(IMTLD3D12Device *device,
                                      state.desc.RTVFormats[i], format)))
       info.colors[i].pixel_format = format.PixelFormat;
   }
+  ApplyBlendState(info, state.desc.BlendState, state.desc.NumRenderTargets);
 
   if (state.desc.DSVFormat != DXGI_FORMAT_UNKNOWN) {
     MTL_DXGI_FORMAT_DESC format = {};
@@ -614,6 +900,10 @@ CreateMetalGraphicsPipeline(IMTLD3D12Device *device,
          error ? error.description().getUTF8String() : "unknown error");
     return false;
   }
+
+  BuildRasterizerCommand(state.desc.RasterizerState, out.rasterizer);
+  out.depth_stencil =
+      CreateDepthStencilState(device, state.desc.DepthStencilState);
 
   return true;
 }
@@ -796,7 +1086,9 @@ public:
         compute_state_(std::move(compute_state)) {
     FixGraphicsStatePointers(graphics_state_, shaders_);
     FixComputeStatePointers(compute_state_, shaders_);
-    shader_cache_key_ = BuildShaderCacheKey(type_, shaders_);
+    shader_cache_key_ = BuildShaderCacheKey(type_, shaders_, graphics_state_,
+                                            compute_state_,
+                                            root_signature_.ptr());
     cached_shader_blob_ =
         BuildCachedShaderBlob(type_, graphics_state_, compute_state_,
                               shader_cache_key_);

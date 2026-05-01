@@ -21,6 +21,7 @@ enum airconv_unixcalls {
   unix_dxil_initialize,
   unix_dxil_destroy,
   unix_dxil_compile,
+  unix_dxil_get_arguments_info,
 };
 
 struct sm50_initialize_params {

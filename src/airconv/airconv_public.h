@@ -351,6 +351,10 @@ AIRCONV_API int DXILCompile(
   dxil_shader_t pShader, struct SM50_SHADER_COMPILATION_ARGUMENT_DATA *pArgs,
   const char *FunctionName, sm50_bitcode_t *ppBitcode, sm50_error_t *ppError
 );
+AIRCONV_API void DXILGetArgumentsInfo(
+  dxil_shader_t pShader, struct MTL_SM50_SHADER_ARGUMENT *pConstantBuffers,
+  struct MTL_SM50_SHADER_ARGUMENT *pArguments
+);
 
 #ifdef __cplusplus
 };

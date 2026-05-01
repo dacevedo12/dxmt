@@ -234,6 +234,10 @@ public:
     return texture_allocation_.ptr();
   }
 
+  ID3D12Resource *GetD3D12Resource() override {
+    return static_cast<ID3D12Resource *>(this);
+  }
+
 private:
   void CreateBuffer() {
     buffer_ = new dxmt::Buffer(desc_.Width + heap_offset_,

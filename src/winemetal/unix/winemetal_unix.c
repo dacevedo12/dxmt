@@ -1866,6 +1866,13 @@ thunk_DXILCompile(void *args) {
   return STATUS_SUCCESS;
 }
 
+static NTSTATUS
+thunk_DXILGetArgumentsInfo(void *args) {
+  struct sm50_get_arguments_info_params *params = args;
+  DXILGetArgumentsInfo((dxil_shader_t)params->shader, params->constant_buffers, params->arguments);
+  return STATUS_SUCCESS;
+}
+
 static inline void *
 UInt32ToPtr(uint32_t v) {
   return (void *)(uint64_t)v;
@@ -2208,6 +2215,16 @@ thunk32_DXILCompile(void *args) {
 
   sm50_compilation_argument32_free(&first_arg);
 
+  return STATUS_SUCCESS;
+}
+
+static NTSTATUS
+thunk32_DXILGetArgumentsInfo(void *args) {
+  struct sm50_get_arguments_info_params32 *params = args;
+  DXILGetArgumentsInfo(
+      (dxil_shader_t)params->shader, UInt32ToPtr(params->constant_buffers),
+      UInt32ToPtr(params->arguments)
+  );
   return STATUS_SUCCESS;
 }
 #endif /* DXMT_NATIVE */
@@ -3067,6 +3084,7 @@ const void *__wine_unix_call_funcs[] = {
     &thunk_DXILInitialize,
     &thunk_DXILDestroy,
     &thunk_DXILCompile,
+    &thunk_DXILGetArgumentsInfo,
     &_MTLCommandBuffer_error,
     &_MTLCommandBuffer_logs,
     &_MTLLogContainer_enumerate,
@@ -3206,6 +3224,7 @@ const void *__wine_unix_call_wow64_funcs[] = {
     &thunk32_DXILInitialize,
     &thunk_DXILDestroy,
     &thunk32_DXILCompile,
+    &thunk32_DXILGetArgumentsInfo,
     &_MTLCommandBuffer_error,
     &_MTLCommandBuffer_logs,
     &_MTLLogContainer_enumerate,

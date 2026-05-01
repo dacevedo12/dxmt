@@ -6,8 +6,10 @@
 #include "d3d12_command_list.hpp"
 #include "d3d12_fence.hpp"
 #include "d3d12_resource.hpp"
+#include "d3d12_root_signature.hpp"
 #include "dxmt_context.hpp"
 #include "dxmt_format.hpp"
+#include "dxmt_sampler.hpp"
 #include "log/log.hpp"
 #include "util_string.hpp"
 #include <algorithm>
@@ -16,6 +18,7 @@
 #include <mutex>
 #include <optional>
 #include <type_traits>
+#include <unordered_map>
 #include <vector>
 
 namespace dxmt::d3d12 {
@@ -47,6 +50,29 @@ GetResource(ID3D12Resource *resource) {
 static PipelineState *
 GetPipelineState(ID3D12PipelineState *pipeline_state) {
   return dynamic_cast<PipelineState *>(pipeline_state);
+}
+
+static RootSignature *
+GetRootSignature(ID3D12RootSignature *root_signature) {
+  return dynamic_cast<RootSignature *>(root_signature);
+}
+
+static const DescriptorRecord *
+GetDescriptorRecordFromGpuHandle(D3D12_GPU_DESCRIPTOR_HANDLE handle) {
+  return reinterpret_cast<const DescriptorRecord *>(handle.ptr);
+}
+
+static PipelineStage
+PipelineStageFromShaderVisibility(D3D12_SHADER_VISIBILITY visibility,
+                                  bool compute) {
+  if (compute)
+    return PipelineStage::Compute;
+  switch (visibility) {
+  case D3D12_SHADER_VISIBILITY_PIXEL:
+    return PipelineStage::Pixel;
+  default:
+    return PipelineStage::Vertex;
+  }
 }
 
 static WMTPrimitiveType
@@ -217,6 +243,60 @@ GetDepthStencilArrayLength(const DescriptorRecord &descriptor) {
   default:
     return 1;
   }
+}
+
+static BufferSlice
+DefaultBufferSlice(Resource &resource, UINT64 offset = 0,
+                   UINT64 requested_size = 0) {
+  const auto width = resource.GetResourceDesc().Width;
+  const auto remaining = width > offset ? width - offset : 0;
+  const auto size = requested_size ? std::min<UINT64>(requested_size, remaining)
+                                  : remaining;
+  return {
+      .byteOffset = UINT32(offset),
+      .byteLength = UINT32(std::min<UINT64>(size, UINT32_MAX)),
+      .firstElement = UINT32(offset),
+      .elementCount = UINT32(std::min<UINT64>(size, UINT32_MAX)),
+  };
+}
+
+static BufferSlice
+StructuredBufferSlice(Resource &resource, UINT64 offset,
+                      UINT64 byte_size, UINT stride) {
+  auto slice = DefaultBufferSlice(resource, offset, byte_size);
+  if (stride) {
+    slice.firstElement = UINT32(offset / stride);
+    slice.elementCount = UINT32(slice.byteLength / stride);
+  }
+  return slice;
+}
+
+static UINT64
+ResolveBufferGpuAddress(D3D12_GPU_VIRTUAL_ADDRESS address,
+                        Resource *&resource) {
+  UINT64 offset = 0;
+  resource = LookupBufferResourceByGpuVirtualAddress(address, &offset);
+  return offset;
+}
+
+static uint64_t
+CreateBufferView(WMT::Device device, Resource &resource, DXGI_FORMAT format,
+                 UINT64 offset, UINT64 byte_size, WMTTextureUsage usage) {
+  if (!resource.GetBuffer())
+    return 0;
+
+  MTL_DXGI_FORMAT_DESC format_desc = {};
+  if (FAILED(MTLQueryDXGIFormat(device, format, format_desc)) ||
+      format_desc.PixelFormat == WMTPixelFormatInvalid)
+    return 0;
+
+  BufferViewDescriptor view = {};
+  view.format = format_desc.PixelFormat;
+  view.usage = usage;
+  view.type = WMTTextureTypeTextureBuffer;
+  view.byteOffset = UINT32(offset);
+  view.byteLength = UINT32(std::min<UINT64>(byte_size, UINT32_MAX));
+  return resource.GetBuffer()->createView(view);
 }
 
 static HRESULT
@@ -534,6 +614,8 @@ public:
 private:
   struct ReplayState {
     Com<ID3D12PipelineState> pipeline_state;
+    Com<ID3D12RootSignature> graphics_root_signature;
+    Com<ID3D12RootSignature> compute_root_signature;
     D3D12_PRIMITIVE_TOPOLOGY topology = D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
     std::vector<D3D12_VIEWPORT> viewports;
     std::vector<D3D12_RECT> scissors;
@@ -541,6 +623,14 @@ private:
     std::optional<DescriptorRecord> depth_stencil;
     std::array<std::optional<D3D12_VERTEX_BUFFER_VIEW>, 32> vertex_buffers = {};
     std::optional<D3D12_INDEX_BUFFER_VIEW> index_buffer;
+    std::unordered_map<UINT, D3D12_GPU_DESCRIPTOR_HANDLE> graphics_tables;
+    std::unordered_map<UINT, D3D12_GPU_DESCRIPTOR_HANDLE> compute_tables;
+    std::unordered_map<UINT, D3D12_GPU_VIRTUAL_ADDRESS> graphics_cbv_roots;
+    std::unordered_map<UINT, D3D12_GPU_VIRTUAL_ADDRESS> compute_cbv_roots;
+    std::unordered_map<UINT, D3D12_GPU_VIRTUAL_ADDRESS> graphics_srv_roots;
+    std::unordered_map<UINT, D3D12_GPU_VIRTUAL_ADDRESS> compute_srv_roots;
+    std::unordered_map<UINT, D3D12_GPU_VIRTUAL_ADDRESS> graphics_uav_roots;
+    std::unordered_map<UINT, D3D12_GPU_VIRTUAL_ADDRESS> compute_uav_roots;
   };
 
   struct ReplayRenderTargetAttachment {
@@ -608,6 +698,19 @@ private:
       state.index_buffer = record.view;
     } else if constexpr (std::is_same_v<T, ResourceBarrierRecord>) {
       ReplayResourceBarrier(chunk, record);
+    } else if constexpr (std::is_same_v<T, RootSignatureRecord>) {
+      if (record.compute)
+        state.compute_root_signature = record.root_signature;
+      else
+        state.graphics_root_signature = record.root_signature;
+    } else if constexpr (std::is_same_v<T, RootDescriptorTableRecord>) {
+      auto &tables = record.compute ? state.compute_tables
+                                    : state.graphics_tables;
+      tables[record.root_parameter_index] = record.base_descriptor;
+    } else if constexpr (std::is_same_v<T, RootDescriptorRecord>) {
+      StoreRootDescriptor(state, record);
+    } else if constexpr (std::is_same_v<T, RootConstantsRecord>) {
+      WARN("D3D12CommandQueue: root constants are recorded but not lowered yet");
     } else if constexpr (std::is_same_v<T, DrawInstancedRecord>) {
       ReplayDrawInstanced(chunk, state, record);
     } else if constexpr (std::is_same_v<T, DrawIndexedInstancedRecord>) {
@@ -656,6 +759,587 @@ private:
     });
   }
 
+  void StoreRootDescriptor(ReplayState &state,
+                           const RootDescriptorRecord &record) {
+    auto &map = [&]() -> std::unordered_map<UINT, D3D12_GPU_VIRTUAL_ADDRESS> & {
+      switch (record.parameter_type) {
+      case D3D12_ROOT_PARAMETER_TYPE_CBV:
+        return record.compute ? state.compute_cbv_roots
+                              : state.graphics_cbv_roots;
+      case D3D12_ROOT_PARAMETER_TYPE_UAV:
+        return record.compute ? state.compute_uav_roots
+                              : state.graphics_uav_roots;
+      case D3D12_ROOT_PARAMETER_TYPE_SRV:
+      default:
+        return record.compute ? state.compute_srv_roots
+                              : state.graphics_srv_roots;
+      }
+    }();
+    map[record.root_parameter_index] = record.address;
+  }
+
+  static D3D12_GPU_DESCRIPTOR_HANDLE
+  GetTableHandle(const ReplayState &state, bool compute,
+                 UINT root_parameter_index) {
+    const auto &tables = compute ? state.compute_tables : state.graphics_tables;
+    auto it = tables.find(root_parameter_index);
+    return it == tables.end() ? D3D12_GPU_DESCRIPTOR_HANDLE{} : it->second;
+  }
+
+  static UINT
+  DescriptorRangeOffset(const RootSignatureRange &range,
+                        UINT running_offset) {
+    return range.offset_in_descriptors_from_table_start == UINT_MAX
+               ? running_offset
+               : range.offset_in_descriptors_from_table_start;
+  }
+
+  void BindDescriptor(ArgumentEncodingContext &enc, PipelineStage stage,
+                      D3D12_DESCRIPTOR_RANGE_TYPE range_type, UINT slot,
+                      const DescriptorRecord &descriptor) {
+    switch (range_type) {
+    case D3D12_DESCRIPTOR_RANGE_TYPE_CBV:
+      BindConstantBufferDescriptor(enc, stage, slot, descriptor);
+      break;
+    case D3D12_DESCRIPTOR_RANGE_TYPE_SRV:
+      BindShaderResourceDescriptor(enc, stage, slot, descriptor);
+      break;
+    case D3D12_DESCRIPTOR_RANGE_TYPE_UAV:
+      BindUnorderedAccessDescriptor(enc, stage, slot, descriptor);
+      break;
+    case D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER:
+      BindSamplerDescriptor(enc, stage, slot, descriptor);
+      break;
+    }
+  }
+
+  void BindConstantBufferDescriptor(ArgumentEncodingContext &enc,
+                                    PipelineStage stage, UINT slot,
+                                    const DescriptorRecord &descriptor) {
+    if (descriptor.type != DescriptorRecordType::ConstantBufferView ||
+        !descriptor.has_desc)
+      return;
+
+    Resource *resource = nullptr;
+    const auto offset =
+        ResolveBufferGpuAddress(descriptor.desc.cbv.BufferLocation, resource);
+    if (!resource || !resource->GetBuffer())
+      return;
+
+    auto buffer = Rc<Buffer>(resource->GetBuffer());
+    switch (stage) {
+    case PipelineStage::Compute:
+      enc.bindConstantBuffer<PipelineStage::Compute>(slot, offset,
+                                                     std::move(buffer));
+      break;
+    case PipelineStage::Pixel:
+      enc.bindConstantBuffer<PipelineStage::Pixel>(slot, offset,
+                                                   std::move(buffer));
+      break;
+    default:
+      enc.bindConstantBuffer<PipelineStage::Vertex>(slot, offset,
+                                                    std::move(buffer));
+      break;
+    }
+  }
+
+  void BindShaderResourceDescriptor(ArgumentEncodingContext &enc,
+                                    PipelineStage stage, UINT slot,
+                                    const DescriptorRecord &descriptor) {
+    if (descriptor.type != DescriptorRecordType::ShaderResourceView)
+      return;
+
+    auto *resource = GetResource(descriptor.resource.ptr());
+    if (!resource)
+      return;
+
+    if (resource->GetBuffer()) {
+      UINT64 offset = 0;
+      if (!ResolveDescriptorBufferOffset(descriptor.resource.ptr(), offset))
+        offset = 0;
+      UINT64 byte_size = resource->GetResourceDesc().Width;
+      uint64_t view_id = 0;
+      BufferSlice slice = DefaultBufferSlice(*resource);
+      if (descriptor.has_desc) {
+        const auto &srv = descriptor.desc.srv;
+        if (srv.ViewDimension == D3D12_SRV_DIMENSION_BUFFER) {
+          const UINT64 first_element = srv.Buffer.FirstElement;
+          if (srv.Format != DXGI_FORMAT_UNKNOWN) {
+            MTL_DXGI_FORMAT_DESC format = {};
+            if (SUCCEEDED(MTLQueryDXGIFormat(device_->GetMTLDevice(),
+                                             srv.Format, format))) {
+              offset += first_element * format.BytesPerTexel;
+              byte_size = UINT64(srv.Buffer.NumElements) *
+                          format.BytesPerTexel;
+              view_id = CreateBufferView(device_->GetMTLDevice(), *resource,
+                                         srv.Format, offset, byte_size,
+                                         WMTTextureUsageShaderRead);
+              slice = StructuredBufferSlice(*resource, offset, byte_size,
+                                            format.BytesPerTexel);
+            }
+          } else {
+            offset += first_element * srv.Buffer.StructureByteStride;
+            byte_size = UINT64(srv.Buffer.NumElements) *
+                        srv.Buffer.StructureByteStride;
+            slice = StructuredBufferSlice(*resource, offset, byte_size,
+                                          srv.Buffer.StructureByteStride);
+          }
+        }
+      }
+      auto buffer = Rc<Buffer>(resource->GetBuffer());
+      if (stage == PipelineStage::Compute)
+        enc.bindBuffer<PipelineStage::Compute>(slot, std::move(buffer),
+                                               view_id, slice);
+      else if (stage == PipelineStage::Pixel)
+        enc.bindBuffer<PipelineStage::Pixel>(slot, std::move(buffer),
+                                             view_id, slice);
+      else
+        enc.bindBuffer<PipelineStage::Vertex>(slot, std::move(buffer),
+                                              view_id, slice);
+      return;
+    }
+
+    if (resource->GetTexture()) {
+      const auto view = resource->GetTexture()->fullView;
+      auto texture = Rc<Texture>(resource->GetTexture());
+      if (stage == PipelineStage::Compute)
+        enc.bindTexture<PipelineStage::Compute>(slot, std::move(texture), view);
+      else if (stage == PipelineStage::Pixel)
+        enc.bindTexture<PipelineStage::Pixel>(slot, std::move(texture), view);
+      else
+        enc.bindTexture<PipelineStage::Vertex>(slot, std::move(texture), view);
+    }
+  }
+
+  void BindUnorderedAccessDescriptor(ArgumentEncodingContext &enc,
+                                     PipelineStage stage, UINT slot,
+                                     const DescriptorRecord &descriptor) {
+    if (descriptor.type != DescriptorRecordType::UnorderedAccessView)
+      return;
+
+    auto *resource = GetResource(descriptor.resource.ptr());
+    if (!resource)
+      return;
+
+    Rc<Buffer> counter;
+    if (auto *counter_resource = GetResource(descriptor.counter_resource.ptr()))
+      counter = Rc<Buffer>(counter_resource->GetBuffer());
+
+    if (resource->GetBuffer()) {
+      UINT64 offset = 0;
+      if (!ResolveDescriptorBufferOffset(descriptor.resource.ptr(), offset))
+        offset = 0;
+      UINT64 byte_size = resource->GetResourceDesc().Width;
+      uint64_t view_id = 0;
+      BufferSlice slice = DefaultBufferSlice(*resource);
+      if (descriptor.has_desc) {
+        const auto &uav = descriptor.desc.uav;
+        if (uav.ViewDimension == D3D12_UAV_DIMENSION_BUFFER) {
+          const UINT64 first_element = uav.Buffer.FirstElement;
+          if (uav.Format != DXGI_FORMAT_UNKNOWN) {
+            MTL_DXGI_FORMAT_DESC format = {};
+            if (SUCCEEDED(MTLQueryDXGIFormat(device_->GetMTLDevice(),
+                                             uav.Format, format))) {
+              offset += first_element * format.BytesPerTexel;
+              byte_size = UINT64(uav.Buffer.NumElements) *
+                          format.BytesPerTexel;
+              view_id = CreateBufferView(device_->GetMTLDevice(), *resource,
+                                         uav.Format, offset, byte_size,
+                                         WMTTextureUsageShaderRead |
+                                             WMTTextureUsageShaderWrite);
+              slice = StructuredBufferSlice(*resource, offset, byte_size,
+                                            format.BytesPerTexel);
+            }
+          } else {
+            offset += first_element * uav.Buffer.StructureByteStride;
+            byte_size = UINT64(uav.Buffer.NumElements) *
+                        uav.Buffer.StructureByteStride;
+            slice = StructuredBufferSlice(*resource, offset, byte_size,
+                                          uav.Buffer.StructureByteStride);
+          }
+        }
+      }
+      auto buffer = Rc<Buffer>(resource->GetBuffer());
+      if (stage == PipelineStage::Compute)
+        enc.bindOutputBuffer<PipelineStage::Compute>(
+            slot, std::move(buffer), view_id, std::move(counter), slice);
+      else
+        enc.bindOutputBuffer<PipelineStage::Pixel>(
+            slot, std::move(buffer), view_id, std::move(counter), slice);
+      return;
+    }
+
+    if (resource->GetTexture()) {
+      const auto view = resource->GetTexture()->fullView;
+      auto texture = Rc<Texture>(resource->GetTexture());
+      if (stage == PipelineStage::Compute)
+        enc.bindOutputTexture<PipelineStage::Compute>(slot,
+                                                      std::move(texture), view);
+      else
+        enc.bindOutputTexture<PipelineStage::Pixel>(slot, std::move(texture),
+                                                   view);
+    }
+  }
+
+  static bool ResolveDescriptorBufferOffset(ID3D12Resource *d3d_resource,
+                                            UINT64 &offset) {
+    auto *resource = GetResource(d3d_resource);
+    if (!resource || !resource->GetBuffer())
+      return false;
+    const auto address = resource->GetGpuVirtualAddress();
+    if (!address)
+      return false;
+    Resource *resolved = nullptr;
+    offset = ResolveBufferGpuAddress(address, resolved);
+    return resolved == resource;
+  }
+
+  void BindSamplerDescriptor(ArgumentEncodingContext &enc, PipelineStage stage,
+                             UINT slot, const DescriptorRecord &descriptor) {
+    if (descriptor.type != DescriptorRecordType::Sampler ||
+        !descriptor.has_desc)
+      return;
+
+    auto sampler = CreateSampler(descriptor.desc.sampler);
+    if (!sampler)
+      return;
+
+    if (stage == PipelineStage::Compute)
+      enc.bindSampler<PipelineStage::Compute>(slot, std::move(sampler));
+    else if (stage == PipelineStage::Pixel)
+      enc.bindSampler<PipelineStage::Pixel>(slot, std::move(sampler));
+    else
+      enc.bindSampler<PipelineStage::Vertex>(slot, std::move(sampler));
+  }
+
+  Rc<Sampler> CreateSampler(const D3D12_SAMPLER_DESC &desc) {
+    WMTSamplerInfo info = {};
+    info.lod_average = false;
+    info.min_filter = D3D12_DECODE_MIN_FILTER(desc.Filter)
+                          ? WMTSamplerMinMagFilterLinear
+                          : WMTSamplerMinMagFilterNearest;
+    info.mag_filter = D3D12_DECODE_MAG_FILTER(desc.Filter)
+                          ? WMTSamplerMinMagFilterLinear
+                          : WMTSamplerMinMagFilterNearest;
+    info.mip_filter = D3D12_DECODE_MIP_FILTER(desc.Filter)
+                          ? WMTSamplerMipFilterLinear
+                          : WMTSamplerMipFilterNearest;
+    info.lod_min_clamp = desc.MinLOD;
+    info.lod_max_clamp = desc.MaxLOD;
+    info.max_anisotroy =
+        D3D12_DECODE_IS_ANISOTROPIC_FILTER(desc.Filter)
+            ? std::max<UINT>(1, desc.MaxAnisotropy)
+            : 1;
+    info.s_address_mode = AddressMode(desc.AddressU);
+    info.t_address_mode = AddressMode(desc.AddressV);
+    info.r_address_mode = AddressMode(desc.AddressW);
+    info.compare_function = WMTCompareFunctionNever;
+    if (D3D12_DECODE_IS_COMPARISON_FILTER(desc.Filter))
+      info.compare_function = CompareFunction(desc.ComparisonFunc);
+    info.border_color = BorderColor(desc.BorderColor);
+    info.support_argument_buffers = true;
+    info.normalized_coords = true;
+    return Sampler::createSampler(device_->GetMTLDevice(), info,
+                                  desc.MipLODBias);
+  }
+
+  static WMTSamplerAddressMode AddressMode(D3D12_TEXTURE_ADDRESS_MODE mode) {
+    switch (mode) {
+    case D3D12_TEXTURE_ADDRESS_MODE_MIRROR:
+      return WMTSamplerAddressModeMirrorRepeat;
+    case D3D12_TEXTURE_ADDRESS_MODE_CLAMP:
+      return WMTSamplerAddressModeClampToEdge;
+    case D3D12_TEXTURE_ADDRESS_MODE_BORDER:
+      return WMTSamplerAddressModeClampToBorderColor;
+    case D3D12_TEXTURE_ADDRESS_MODE_MIRROR_ONCE:
+      return WMTSamplerAddressModeMirrorClampToEdge;
+    default:
+      return WMTSamplerAddressModeRepeat;
+    }
+  }
+
+  static WMTCompareFunction CompareFunction(D3D12_COMPARISON_FUNC func) {
+    switch (func) {
+    case D3D12_COMPARISON_FUNC_LESS:
+      return WMTCompareFunctionLess;
+    case D3D12_COMPARISON_FUNC_EQUAL:
+      return WMTCompareFunctionEqual;
+    case D3D12_COMPARISON_FUNC_LESS_EQUAL:
+      return WMTCompareFunctionLessEqual;
+    case D3D12_COMPARISON_FUNC_GREATER:
+      return WMTCompareFunctionGreater;
+    case D3D12_COMPARISON_FUNC_NOT_EQUAL:
+      return WMTCompareFunctionNotEqual;
+    case D3D12_COMPARISON_FUNC_GREATER_EQUAL:
+      return WMTCompareFunctionGreaterEqual;
+    case D3D12_COMPARISON_FUNC_ALWAYS:
+      return WMTCompareFunctionAlways;
+    default:
+      return WMTCompareFunctionNever;
+    }
+  }
+
+  static WMTSamplerBorderColor BorderColor(const FLOAT color[4]) {
+    if (color[0] == 0.0f && color[1] == 0.0f && color[2] == 0.0f &&
+        color[3] == 0.0f)
+      return WMTSamplerBorderColorTransparentBlack;
+    if (color[0] == 0.0f && color[1] == 0.0f && color[2] == 0.0f &&
+        color[3] == 1.0f)
+      return WMTSamplerBorderColorOpaqueBlack;
+    return WMTSamplerBorderColorOpaqueWhite;
+  }
+
+  void ApplyRootDescriptorTables(ArgumentEncodingContext &enc,
+                                 const ReplayState &state, bool compute) {
+    auto *root = GetRootSignature(compute ? state.compute_root_signature.ptr()
+                                          : state.graphics_root_signature.ptr());
+    if (!root)
+      return;
+
+    const auto parameters = root->GetParameters();
+    for (UINT root_index = 0; root_index < parameters.size(); root_index++) {
+      const auto &parameter = parameters[root_index];
+      const auto stage =
+          PipelineStageFromShaderVisibility(parameter.visibility, compute);
+      if (parameter.parameter_type == D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE) {
+        const auto base = GetTableHandle(state, compute, root_index);
+        if (!base.ptr)
+          continue;
+        UINT running_offset = 0;
+        for (const auto &range : parameter.ranges) {
+          const auto range_offset = DescriptorRangeOffset(range, running_offset);
+          const auto count =
+              range.descriptor_count == UINT_MAX ? 1u : range.descriptor_count;
+          for (UINT i = 0; i < count; i++) {
+            auto *descriptor = GetDescriptorRecordFromGpuHandle(
+                {base.ptr + sizeof(DescriptorRecord) * (range_offset + i)});
+            if (!descriptor)
+              continue;
+            BindDescriptor(enc, stage, range.range_type,
+                           range.base_shader_register + i, *descriptor);
+          }
+          if (range.descriptor_count != UINT_MAX)
+            running_offset = range_offset + range.descriptor_count;
+        }
+      } else if (parameter.parameter_type == D3D12_ROOT_PARAMETER_TYPE_CBV) {
+        ApplyRootBufferDescriptor(enc, state, compute, root_index, parameter,
+                                  DescriptorRecordType::ConstantBufferView);
+      } else if (parameter.parameter_type == D3D12_ROOT_PARAMETER_TYPE_SRV) {
+        ApplyRootBufferDescriptor(enc, state, compute, root_index, parameter,
+                                  DescriptorRecordType::ShaderResourceView);
+      } else if (parameter.parameter_type == D3D12_ROOT_PARAMETER_TYPE_UAV) {
+        ApplyRootBufferDescriptor(enc, state, compute, root_index, parameter,
+                                  DescriptorRecordType::UnorderedAccessView);
+      }
+    }
+  }
+
+  void ApplyRootBufferDescriptor(ArgumentEncodingContext &enc,
+                                 const ReplayState &state, bool compute,
+                                 UINT root_index,
+                                 const RootSignatureParameter &parameter,
+                                 DescriptorRecordType type) {
+    const auto &map =
+        type == DescriptorRecordType::ConstantBufferView
+            ? (compute ? state.compute_cbv_roots : state.graphics_cbv_roots)
+            : type == DescriptorRecordType::ShaderResourceView
+                  ? (compute ? state.compute_srv_roots
+                             : state.graphics_srv_roots)
+                  : (compute ? state.compute_uav_roots
+                             : state.graphics_uav_roots);
+    auto it = map.find(root_index);
+    if (it == map.end())
+      return;
+
+    Resource *resource = nullptr;
+    const auto offset = ResolveBufferGpuAddress(it->second, resource);
+    if (!resource || !resource->GetBuffer())
+      return;
+
+    DescriptorRecord descriptor = {};
+    descriptor.type = type;
+    descriptor.resource = resource->GetD3D12Resource();
+    descriptor.has_desc = true;
+    if (type == DescriptorRecordType::ConstantBufferView) {
+      descriptor.desc.cbv.BufferLocation = it->second;
+      descriptor.desc.cbv.SizeInBytes =
+          UINT(std::min<UINT64>(resource->GetResourceDesc().Width - offset,
+                                UINT_MAX));
+    } else if (type == DescriptorRecordType::ShaderResourceView) {
+      descriptor.desc.srv.Format = DXGI_FORMAT_UNKNOWN;
+      descriptor.desc.srv.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+      descriptor.desc.srv.Shader4ComponentMapping =
+          D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+      descriptor.desc.srv.Buffer.FirstElement = 0;
+      descriptor.desc.srv.Buffer.NumElements =
+          UINT(std::min<UINT64>(resource->GetResourceDesc().Width - offset,
+                                UINT_MAX));
+      descriptor.desc.srv.Buffer.StructureByteStride = 1;
+    } else {
+      descriptor.desc.uav.Format = DXGI_FORMAT_UNKNOWN;
+      descriptor.desc.uav.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+      descriptor.desc.uav.Buffer.FirstElement = 0;
+      descriptor.desc.uav.Buffer.NumElements =
+          UINT(std::min<UINT64>(resource->GetResourceDesc().Width - offset,
+                                UINT_MAX));
+      descriptor.desc.uav.Buffer.StructureByteStride = 1;
+    }
+
+    BindDescriptor(enc, PipelineStageFromShaderVisibility(parameter.visibility,
+                                                          compute),
+                   type == DescriptorRecordType::ConstantBufferView
+                       ? D3D12_DESCRIPTOR_RANGE_TYPE_CBV
+                       : type == DescriptorRecordType::ShaderResourceView
+                             ? D3D12_DESCRIPTOR_RANGE_TYPE_SRV
+                             : D3D12_DESCRIPTOR_RANGE_TYPE_UAV,
+                   parameter.descriptor.ShaderRegister, descriptor);
+  }
+
+  template <PipelineStage Stage>
+  void EncodeShaderBindingsForStage(ArgumentEncodingContext &enc,
+                                    const PipelineDxilShader &shader,
+                                    const std::string &shader_key,
+                                    uint64_t &argbuf_offset) {
+    const auto &reflection = shader.reflection;
+    if (reflection.NumConstantBuffers && shader.constantBufferInfo()) {
+      const auto offset =
+          AllocateArgumentBuffer(argbuf_offset,
+                                 reflection.NumConstantBuffers << 3);
+      enc.encodeConstantBuffers<Stage, PipelineKind::Ordinary>(
+          &reflection, shader.constantBufferInfo(), offset);
+    }
+    if (reflection.NumArguments && shader.resourceArgumentInfo()) {
+      const auto offset =
+          AllocateArgumentBuffer(argbuf_offset,
+                                 reflection.ArgumentTableQwords << 3);
+      enc.encodeShaderResources<Stage, PipelineKind::Ordinary>(
+          &reflection, shader.resourceArgumentInfo(), offset, shader_key,
+          nullptr);
+    }
+  }
+
+  static uint64_t AllocateArgumentBuffer(uint64_t &cursor, uint64_t size) {
+    const auto alignment = 32ull;
+    const auto aligned = (cursor + alignment - 1) & ~(alignment - 1);
+    cursor = aligned + std::max<uint64_t>(size, 8);
+    return aligned;
+  }
+
+  void EncodeVertexBuffers(ArgumentEncodingContext &enc,
+                           const ReplayState &state,
+                           const PipelineGraphicsState *graphics_state,
+                           uint64_t &argbuf_offset) {
+    if (!graphics_state)
+      return;
+
+    uint32_t slot_mask = 0;
+    for (const auto &element : graphics_state->input_elements) {
+      if (element.InputSlot < 32)
+        slot_mask |= 1u << element.InputSlot;
+    }
+    if (!slot_mask)
+      return;
+
+    const auto max_slot = 32u - __builtin_clz(slot_mask);
+    for (UINT slot = 0; slot < max_slot; slot++) {
+      if (!(slot_mask & (1u << slot)) || !state.vertex_buffers[slot])
+        continue;
+      const auto &view = *state.vertex_buffers[slot];
+      UINT64 resource_offset = 0;
+      auto *resource =
+          LookupBufferResourceByGpuVirtualAddress(view.BufferLocation,
+                                                  &resource_offset);
+      if (!resource || !resource->GetBuffer())
+        continue;
+      enc.bindVertexBuffer(slot, resource_offset, view.StrideInBytes,
+                           Rc<Buffer>(resource->GetBuffer()));
+    }
+
+    const auto table_size = uint64_t(__builtin_popcount(slot_mask)) * 16u;
+    const auto offset = AllocateArgumentBuffer(argbuf_offset, table_size);
+    enc.encodeVertexBuffers<PipelineKind::Ordinary>(slot_mask, offset);
+  }
+
+  void EncodeGraphicsBindings(ArgumentEncodingContext &enc,
+                              const ReplayState &state,
+                              PipelineState &pipeline,
+                              uint64_t &argbuf_offset) {
+    ApplyRootDescriptorTables(enc, state, false);
+    EncodeVertexBuffers(enc, state, pipeline.GetGraphicsState(),
+                        argbuf_offset);
+    const auto &shaders = pipeline.GetDxilShaders();
+    const auto &key = pipeline.GetShaderCacheKey();
+    for (const auto &shader : shaders) {
+      if (shader.stage == PipelineShaderStage::Vertex)
+        EncodeShaderBindingsForStage<PipelineStage::Vertex>(
+            enc, shader, key, argbuf_offset);
+      else if (shader.stage == PipelineShaderStage::Pixel)
+        EncodeShaderBindingsForStage<PipelineStage::Pixel>(
+            enc, shader, key, argbuf_offset);
+    }
+  }
+
+  void EncodeComputeBindings(ArgumentEncodingContext &enc,
+                             const ReplayState &state,
+                             PipelineState &pipeline,
+                             uint64_t &argbuf_offset) {
+    ApplyRootDescriptorTables(enc, state, true);
+    const auto &shaders = pipeline.GetDxilShaders();
+    const auto &key = pipeline.GetShaderCacheKey();
+    for (const auto &shader : shaders) {
+      if (shader.stage == PipelineShaderStage::Compute)
+        EncodeShaderBindingsForStage<PipelineStage::Compute>(
+            enc, shader, key, argbuf_offset);
+    }
+  }
+
+  static uint64_t AlignArgumentBufferSize(uint64_t size) {
+    return (size + 31ull) & ~31ull;
+  }
+
+  static uint64_t EstimateShaderArgumentBufferSize(
+      const PipelineDxilShader &shader) {
+    uint64_t size = 0;
+    if (shader.reflection.NumConstantBuffers)
+      size = AlignArgumentBufferSize(size) +
+             (uint64_t(shader.reflection.NumConstantBuffers) << 3);
+    if (shader.reflection.NumArguments)
+      size = AlignArgumentBufferSize(size) +
+             (uint64_t(shader.reflection.ArgumentTableQwords) << 3);
+    return AlignArgumentBufferSize(size);
+  }
+
+  static uint64_t EstimateGraphicsArgumentBufferSize(PipelineState &pipeline) {
+    uint64_t size = 0;
+    if (const auto *graphics = pipeline.GetGraphicsState()) {
+      uint32_t slot_mask = 0;
+      for (const auto &element : graphics->input_elements) {
+        if (element.InputSlot < 32)
+          slot_mask |= 1u << element.InputSlot;
+      }
+      if (slot_mask)
+        size = AlignArgumentBufferSize(size) +
+               uint64_t(__builtin_popcount(slot_mask)) * 16u;
+    }
+    for (const auto &shader : pipeline.GetDxilShaders()) {
+      if (shader.stage == PipelineShaderStage::Vertex ||
+          shader.stage == PipelineShaderStage::Pixel)
+        size = AlignArgumentBufferSize(size) +
+               EstimateShaderArgumentBufferSize(shader);
+    }
+    return AlignArgumentBufferSize(size);
+  }
+
+  static uint64_t EstimateComputeArgumentBufferSize(PipelineState &pipeline) {
+    uint64_t size = 0;
+    for (const auto &shader : pipeline.GetDxilShaders()) {
+      if (shader.stage == PipelineShaderStage::Compute)
+        size = AlignArgumentBufferSize(size) +
+               EstimateShaderArgumentBufferSize(shader);
+    }
+    return AlignArgumentBufferSize(size);
+  }
+
   ReplayRenderPassAttachments BuildRenderPassAttachments(
       const ReplayState &state) {
     ReplayRenderPassAttachments attachments = {};
@@ -700,7 +1384,8 @@ private:
   }
 
   static bool BeginRenderPass(ArgumentEncodingContext &enc,
-                              ReplayRenderPassAttachments &attachments) {
+                              ReplayRenderPassAttachments &attachments,
+                              uint64_t argument_buffer_size) {
     if (attachments.colors.empty() && !attachments.depth_stencil)
       return false;
 
@@ -725,7 +1410,8 @@ private:
                                 ? attachments.depth_stencil->format
                                 : WMTPixelFormatInvalid;
     auto &info = *enc.startRenderPass(DepthStencilPlanarFlags(dsv_format), 0,
-                                      render_target_count, 0);
+                                      render_target_count,
+                                      argument_buffer_size);
     for (auto &rtv : attachments.colors) {
       auto &color = info.colors[rtv.slot];
       color.attachment = enc.access<PipelineStage::Pixel>(
@@ -785,7 +1471,12 @@ private:
     auto viewports = state.viewports;
     auto scissors = state.scissors;
     auto attachments = BuildRenderPassAttachments(state);
-    chunk->emitcc([metal_pso = metal->pso, primitive,
+    const auto argument_buffer_size = EstimateGraphicsArgumentBufferSize(*pipeline);
+    chunk->emitcc([this, metal_pso = metal->pso,
+                   depth_stencil = metal->depth_stencil,
+                   rasterizer = metal->rasterizer,
+                   pipeline, replay_state = state, primitive,
+                   argument_buffer_size,
                    vertex_start = record.start_vertex_location,
                    vertex_count = record.vertex_count_per_instance,
                    instance_count = record.instance_count,
@@ -793,12 +1484,23 @@ private:
                    viewports = std::move(viewports),
                    scissors = std::move(scissors),
                    attachments = std::move(attachments)](ArgumentEncodingContext &enc) mutable {
-      if (!BeginRenderPass(enc, attachments))
+      if (!BeginRenderPass(enc, attachments, argument_buffer_size))
         return;
 
       auto &set_pso = enc.encodeRenderCommand<wmtcmd_render_setpso>();
       set_pso.type = WMTRenderCommandSetPSO;
       set_pso.pso = metal_pso;
+      if (depth_stencil) {
+        auto &cmd = enc.encodeRenderCommand<wmtcmd_render_setdsso>();
+        cmd.type = WMTRenderCommandSetDSSO;
+        cmd.dsso = depth_stencil;
+        cmd.stencil_ref = 0;
+      }
+      auto &rs = enc.encodeRenderCommand<wmtcmd_render_setrasterizerstate>();
+      rs = rasterizer;
+
+      uint64_t argbuf_offset = 0;
+      EncodeGraphicsBindings(enc, replay_state, *pipeline, argbuf_offset);
 
       if (!viewports.empty()) {
         auto &cmd = enc.encodeRenderCommand<wmtcmd_render_setviewports>();
@@ -877,19 +1579,36 @@ private:
                                 record.start_index_location *
                                     GetIndexSize(state.index_buffer->Format);
     auto attachments = BuildRenderPassAttachments(state);
-    chunk->emitcc([metal_pso = metal->pso, index_allocation, primitive,
+    const auto argument_buffer_size = EstimateGraphicsArgumentBufferSize(*pipeline);
+    chunk->emitcc([this, metal_pso = metal->pso,
+                   depth_stencil = metal->depth_stencil,
+                   rasterizer = metal->rasterizer,
+                   pipeline, replay_state = state,
+                   index_allocation, primitive,
                    index_type, index_offset,
+                   argument_buffer_size,
                    index_count = record.index_count_per_instance,
                    instance_count = record.instance_count,
                    base_vertex = record.base_vertex_location,
                    base_instance = record.start_instance_location,
                    attachments = std::move(attachments)](ArgumentEncodingContext &enc) mutable {
       enc.retainAllocation(index_allocation.ptr());
-      if (!BeginRenderPass(enc, attachments))
+      if (!BeginRenderPass(enc, attachments, argument_buffer_size))
         return;
       auto &set_pso = enc.encodeRenderCommand<wmtcmd_render_setpso>();
       set_pso.type = WMTRenderCommandSetPSO;
       set_pso.pso = metal_pso;
+      if (depth_stencil) {
+        auto &cmd = enc.encodeRenderCommand<wmtcmd_render_setdsso>();
+        cmd.type = WMTRenderCommandSetDSSO;
+        cmd.dsso = depth_stencil;
+        cmd.stencil_ref = 0;
+      }
+      auto &rs = enc.encodeRenderCommand<wmtcmd_render_setrasterizerstate>();
+      rs = rasterizer;
+
+      uint64_t argbuf_offset = 0;
+      EncodeGraphicsBindings(enc, replay_state, *pipeline, argbuf_offset);
 
       auto &draw = enc.encodeRenderCommand<wmtcmd_render_draw_indexed>();
       draw.type = WMTRenderCommandDrawIndexed;
@@ -922,14 +1641,20 @@ private:
       return;
     }
 
-    chunk->emitcc([metal_pso = metal->pso,
+    const auto argument_buffer_size = EstimateComputeArgumentBufferSize(*pipeline);
+    chunk->emitcc([this, metal_pso = metal->pso,
                    threadgroup_size = metal->threadgroup_size,
+                   pipeline, replay_state = state,
+                   argument_buffer_size,
                    x = record.x, y = record.y, z = record.z](ArgumentEncodingContext &enc) {
-      enc.startComputePass(0);
+      enc.startComputePass(argument_buffer_size);
       auto &set_pso = enc.encodeComputeCommand<wmtcmd_compute_setpso>();
       set_pso.type = WMTComputeCommandSetPSO;
       set_pso.pso = metal_pso;
       set_pso.threadgroup_size = threadgroup_size;
+
+      uint64_t argbuf_offset = 0;
+      EncodeComputeBindings(enc, replay_state, *pipeline, argbuf_offset);
 
       auto &dispatch = enc.encodeComputeCommand<wmtcmd_compute_dispatch>();
       dispatch.type = WMTComputeCommandDispatch;

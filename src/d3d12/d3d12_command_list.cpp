@@ -283,25 +283,77 @@ public:
         false, root_parameter_index, base_descriptor});
   }
   void STDMETHODCALLTYPE SetComputeRoot32BitConstant(UINT root_parameter_index, UINT data,
-                                                     UINT dst_offset) override {}
+                                                     UINT dst_offset) override {
+    RootConstantsRecord record = {};
+    record.compute = true;
+    record.root_parameter_index = root_parameter_index;
+    record.dst_offset = dst_offset;
+    record.values.push_back(data);
+    AddRecord(std::move(record));
+  }
   void STDMETHODCALLTYPE SetGraphicsRoot32BitConstant(UINT root_parameter_index, UINT data,
-                                                      UINT dst_offset) override {}
+                                                      UINT dst_offset) override {
+    RootConstantsRecord record = {};
+    record.compute = false;
+    record.root_parameter_index = root_parameter_index;
+    record.dst_offset = dst_offset;
+    record.values.push_back(data);
+    AddRecord(std::move(record));
+  }
   void STDMETHODCALLTYPE SetComputeRoot32BitConstants(UINT root_parameter_index, UINT constant_count,
-                                                      const void *data, UINT dst_offset) override {}
+                                                      const void *data, UINT dst_offset) override {
+    RootConstantsRecord record = {};
+    record.compute = true;
+    record.root_parameter_index = root_parameter_index;
+    record.dst_offset = dst_offset;
+    if (data && constant_count) {
+      const auto *values = static_cast<const UINT *>(data);
+      record.values.assign(values, values + constant_count);
+    }
+    AddRecord(std::move(record));
+  }
   void STDMETHODCALLTYPE SetGraphicsRoot32BitConstants(UINT root_parameter_index, UINT constant_count,
-                                                       const void *data, UINT dst_offset) override {}
+                                                       const void *data, UINT dst_offset) override {
+    RootConstantsRecord record = {};
+    record.compute = false;
+    record.root_parameter_index = root_parameter_index;
+    record.dst_offset = dst_offset;
+    if (data && constant_count) {
+      const auto *values = static_cast<const UINT *>(data);
+      record.values.assign(values, values + constant_count);
+    }
+    AddRecord(std::move(record));
+  }
   void STDMETHODCALLTYPE SetComputeRootConstantBufferView(UINT root_parameter_index,
-                                                          D3D12_GPU_VIRTUAL_ADDRESS address) override {}
+                                                          D3D12_GPU_VIRTUAL_ADDRESS address) override {
+    AddRecord(RootDescriptorRecord{
+        true, D3D12_ROOT_PARAMETER_TYPE_CBV, root_parameter_index, address});
+  }
   void STDMETHODCALLTYPE SetGraphicsRootConstantBufferView(UINT root_parameter_index,
-                                                           D3D12_GPU_VIRTUAL_ADDRESS address) override {}
+                                                           D3D12_GPU_VIRTUAL_ADDRESS address) override {
+    AddRecord(RootDescriptorRecord{
+        false, D3D12_ROOT_PARAMETER_TYPE_CBV, root_parameter_index, address});
+  }
   void STDMETHODCALLTYPE SetComputeRootShaderResourceView(UINT root_parameter_index,
-                                                          D3D12_GPU_VIRTUAL_ADDRESS address) override {}
+                                                          D3D12_GPU_VIRTUAL_ADDRESS address) override {
+    AddRecord(RootDescriptorRecord{
+        true, D3D12_ROOT_PARAMETER_TYPE_SRV, root_parameter_index, address});
+  }
   void STDMETHODCALLTYPE SetGraphicsRootShaderResourceView(UINT root_parameter_index,
-                                                           D3D12_GPU_VIRTUAL_ADDRESS address) override {}
+                                                           D3D12_GPU_VIRTUAL_ADDRESS address) override {
+    AddRecord(RootDescriptorRecord{
+        false, D3D12_ROOT_PARAMETER_TYPE_SRV, root_parameter_index, address});
+  }
   void STDMETHODCALLTYPE SetComputeRootUnorderedAccessView(UINT root_parameter_index,
-                                                           D3D12_GPU_VIRTUAL_ADDRESS address) override {}
+                                                           D3D12_GPU_VIRTUAL_ADDRESS address) override {
+    AddRecord(RootDescriptorRecord{
+        true, D3D12_ROOT_PARAMETER_TYPE_UAV, root_parameter_index, address});
+  }
   void STDMETHODCALLTYPE SetGraphicsRootUnorderedAccessView(UINT root_parameter_index,
-                                                            D3D12_GPU_VIRTUAL_ADDRESS address) override {}
+                                                            D3D12_GPU_VIRTUAL_ADDRESS address) override {
+    AddRecord(RootDescriptorRecord{
+        false, D3D12_ROOT_PARAMETER_TYPE_UAV, root_parameter_index, address});
+  }
   void STDMETHODCALLTYPE IASetIndexBuffer(const D3D12_INDEX_BUFFER_VIEW *view) override {
     IndexBufferRecord record = {};
     if (view)

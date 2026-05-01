@@ -5,8 +5,27 @@
 #include <d3d12.h>
 #include <cstddef>
 #include <span>
+#include <vector>
 
 namespace dxmt::d3d12 {
+
+struct RootSignatureRange {
+  D3D12_DESCRIPTOR_RANGE_TYPE range_type = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+  UINT base_shader_register = 0;
+  UINT register_space = 0;
+  UINT descriptor_count = 0;
+  UINT offset_in_descriptors_from_table_start = 0;
+  D3D12_DESCRIPTOR_RANGE_FLAGS flags = D3D12_DESCRIPTOR_RANGE_FLAG_NONE;
+};
+
+struct RootSignatureParameter {
+  D3D12_ROOT_PARAMETER_TYPE parameter_type = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+  D3D12_SHADER_VISIBILITY visibility = D3D12_SHADER_VISIBILITY_ALL;
+  std::vector<RootSignatureRange> ranges;
+  D3D12_ROOT_DESCRIPTOR1 descriptor = {};
+  D3D12_ROOT_CONSTANTS constants = {};
+  D3D12_ROOT_DESCRIPTOR_FLAGS descriptor_flags = D3D12_ROOT_DESCRIPTOR_FLAG_NONE;
+};
 
 class RootSignature {
 public:
@@ -14,6 +33,7 @@ public:
 
   virtual const D3D12_VERSIONED_ROOT_SIGNATURE_DESC &GetVersionedDesc() const = 0;
   virtual std::span<const std::byte> GetSerializedBlob() const = 0;
+  virtual std::span<const RootSignatureParameter> GetParameters() const = 0;
 };
 
 Com<ID3D12RootSignature> CreateRootSignatureFromBlob(IMTLD3D12Device *device,

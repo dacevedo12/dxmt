@@ -133,6 +133,20 @@ struct RootDescriptorTableRecord {
   D3D12_GPU_DESCRIPTOR_HANDLE base_descriptor = {};
 };
 
+struct RootConstantsRecord {
+  bool compute = false;
+  UINT root_parameter_index = 0;
+  UINT dst_offset = 0;
+  std::vector<UINT> values;
+};
+
+struct RootDescriptorRecord {
+  bool compute = false;
+  D3D12_ROOT_PARAMETER_TYPE parameter_type = D3D12_ROOT_PARAMETER_TYPE_CBV;
+  UINT root_parameter_index = 0;
+  D3D12_GPU_VIRTUAL_ADDRESS address = 0;
+};
+
 using CommandRecordPayload = std::variant<
     DrawInstancedRecord, DrawIndexedInstancedRecord, DispatchRecord,
     PipelineStateRecord, CopyBufferRegionRecord, CopyTextureRegionRecord,
@@ -140,7 +154,7 @@ using CommandRecordPayload = std::variant<
     ClearDepthStencilRecord, ViewportRecord, ScissorRecord,
     PrimitiveTopologyRecord, RenderTargetsRecord, VertexBuffersRecord,
     IndexBufferRecord, RootSignatureRecord, DescriptorHeapsRecord,
-    RootDescriptorTableRecord>;
+    RootDescriptorTableRecord, RootConstantsRecord, RootDescriptorRecord>;
 
 struct CommandRecord {
   CommandRecordPayload payload;

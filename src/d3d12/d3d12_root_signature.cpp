@@ -98,6 +98,7 @@ struct RootSignatureStorage {
   std::vector<std::vector<D3D12_DESCRIPTOR_RANGE>> ranges_1_0;
   std::vector<std::vector<D3D12_DESCRIPTOR_RANGE1>> ranges_1_1;
   std::vector<D3D12_STATIC_SAMPLER_DESC> static_samplers;
+  std::vector<RootSignatureParameter> parameters;
 
   void fixPointers() {
     ranges_1_0.resize(parameters_1_0.size());
@@ -144,6 +145,84 @@ struct RootSignatureStorage {
       versioned_desc.Desc_1_0 = desc_1_0;
   }
 };
+
+UINT
+NormalizeDescriptorCount(UINT count) {
+  return count == UINT_MAX ? UINT_MAX : count;
+}
+
+void
+BuildBindingParameters(RootSignatureStorage &storage) {
+  storage.parameters.clear();
+  const auto count = storage.version == D3D_ROOT_SIGNATURE_VERSION_1_1
+                         ? storage.parameters_1_1.size()
+                         : storage.parameters_1_0.size();
+  storage.parameters.resize(count);
+
+  for (size_t i = 0; i < count; i++) {
+    auto &dst = storage.parameters[i];
+    if (storage.version == D3D_ROOT_SIGNATURE_VERSION_1_1) {
+      const auto &src = storage.parameters_1_1[i];
+      dst.parameter_type = src.ParameterType;
+      dst.visibility = src.ShaderVisibility;
+      switch (src.ParameterType) {
+      case D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE:
+        dst.ranges.reserve(storage.ranges_1_1[i].size());
+        for (const auto &range : storage.ranges_1_1[i]) {
+          dst.ranges.push_back({
+              .range_type = range.RangeType,
+              .base_shader_register = range.BaseShaderRegister,
+              .register_space = range.RegisterSpace,
+              .descriptor_count = NormalizeDescriptorCount(range.NumDescriptors),
+              .offset_in_descriptors_from_table_start =
+                  range.OffsetInDescriptorsFromTableStart,
+              .flags = range.Flags,
+          });
+        }
+        break;
+      case D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS:
+        dst.constants = src.Constants;
+        break;
+      case D3D12_ROOT_PARAMETER_TYPE_CBV:
+      case D3D12_ROOT_PARAMETER_TYPE_SRV:
+      case D3D12_ROOT_PARAMETER_TYPE_UAV:
+        dst.descriptor = src.Descriptor;
+        dst.descriptor_flags = src.Descriptor.Flags;
+        break;
+      }
+    } else {
+      const auto &src = storage.parameters_1_0[i];
+      dst.parameter_type = src.ParameterType;
+      dst.visibility = src.ShaderVisibility;
+      switch (src.ParameterType) {
+      case D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE:
+        dst.ranges.reserve(storage.ranges_1_0[i].size());
+        for (const auto &range : storage.ranges_1_0[i]) {
+          dst.ranges.push_back({
+              .range_type = range.RangeType,
+              .base_shader_register = range.BaseShaderRegister,
+              .register_space = range.RegisterSpace,
+              .descriptor_count = NormalizeDescriptorCount(range.NumDescriptors),
+              .offset_in_descriptors_from_table_start =
+                  range.OffsetInDescriptorsFromTableStart,
+              .flags = D3D12_DESCRIPTOR_RANGE_FLAG_NONE,
+          });
+        }
+        break;
+      case D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS:
+        dst.constants = src.Constants;
+        break;
+      case D3D12_ROOT_PARAMETER_TYPE_CBV:
+      case D3D12_ROOT_PARAMETER_TYPE_SRV:
+      case D3D12_ROOT_PARAMETER_TYPE_UAV:
+        dst.descriptor.ShaderRegister = src.Descriptor.ShaderRegister;
+        dst.descriptor.RegisterSpace = src.Descriptor.RegisterSpace;
+        dst.descriptor.Flags = D3D12_ROOT_DESCRIPTOR_FLAG_NONE;
+        break;
+      }
+    }
+  }
+}
 
 bool
 ValidateDesc0(const D3D12_ROOT_SIGNATURE_DESC &desc) {
@@ -242,6 +321,7 @@ CloneFromDesc0(const D3D12_ROOT_SIGNATURE_DESC &desc) {
   }
 
   storage.fixPointers();
+  BuildBindingParameters(storage);
   return storage;
 }
 
@@ -305,6 +385,7 @@ CloneFromDesc1(const D3D12_ROOT_SIGNATURE_DESC1 &desc,
   }
 
   storage.fixPointers();
+  BuildBindingParameters(storage);
   return storage;
 }
 
@@ -500,6 +581,7 @@ ParseRts0(std::span<const std::byte> rts0, RootSignatureStorage &storage) {
   }
 
   storage.fixPointers();
+  BuildBindingParameters(storage);
   return true;
 }
 
@@ -758,6 +840,10 @@ public:
 
   std::span<const std::byte> GetSerializedBlob() const override {
     return serialized_blob_;
+  }
+
+  std::span<const RootSignatureParameter> GetParameters() const override {
+    return storage_.parameters;
   }
 
 private:

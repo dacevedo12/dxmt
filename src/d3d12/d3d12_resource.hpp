@@ -23,6 +23,7 @@ public:
   virtual dxmt::BufferAllocation *GetBufferAllocation() const = 0;
   virtual dxmt::Texture *GetTexture() const = 0;
   virtual dxmt::TextureAllocation *GetTextureAllocation() const = 0;
+  virtual ID3D12Resource *GetD3D12Resource() = 0;
 };
 
 Com<ID3D12Resource>
