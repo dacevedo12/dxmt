@@ -11,6 +11,7 @@
 #include "d3d12_heap.hpp"
 #include "d3d12_pipeline.hpp"
 #include "d3d12_query.hpp"
+#include "d3d12_resource.hpp"
 #include "d3d12_root_signature.hpp"
 #include "log/log.hpp"
 #include "util_string.hpp"
@@ -564,7 +565,16 @@ public:
                           const D3D12_CLEAR_VALUE *optimized_clear_value,
                           REFIID riid, void **resource) override {
     InitReturnPtr(resource);
-    return E_NOTIMPL;
+    if (!resource)
+      return E_POINTER;
+    if (!IsValidCommittedResourceDesc(heap_properties, heap_flags, desc,
+                                      initial_state))
+      return E_INVALIDARG;
+
+    auto resource_object = d3d12::CreateResource(
+        static_cast<IMTLD3D12Device *>(this), heap_properties, heap_flags,
+        desc, initial_state, 0);
+    return resource_object->QueryInterface(riid, resource);
   }
 
   HRESULT STDMETHODCALLTYPE CreateHeap(const D3D12_HEAP_DESC *desc, REFIID riid,
@@ -785,6 +795,50 @@ private:
     default:
       return false;
     }
+  }
+
+  bool IsValidHeapProperties(const D3D12_HEAP_PROPERTIES *properties) const {
+    if (!properties)
+      return false;
+
+    D3D12_HEAP_DESC heap_desc = {};
+    heap_desc.SizeInBytes = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;
+    heap_desc.Properties = *properties;
+    return IsValidHeapDesc(&heap_desc);
+  }
+
+  bool IsValidInitialState(const D3D12_HEAP_PROPERTIES &properties,
+                           D3D12_RESOURCE_STATES initial_state) const {
+    const auto heap_type = d3d12::GetHeapType(properties);
+    if (heap_type == D3D12_HEAP_TYPE_UPLOAD)
+      return initial_state == D3D12_RESOURCE_STATE_GENERIC_READ;
+    if (heap_type == D3D12_HEAP_TYPE_READBACK)
+      return initial_state == D3D12_RESOURCE_STATE_COPY_DEST;
+    return true;
+  }
+
+  bool IsValidCommittedResourceDesc(
+      const D3D12_HEAP_PROPERTIES *heap_properties,
+      D3D12_HEAP_FLAGS heap_flags, const D3D12_RESOURCE_DESC *desc,
+      D3D12_RESOURCE_STATES initial_state) const {
+    if (!IsValidHeapProperties(heap_properties) || !desc)
+      return false;
+    if (!d3d12::IsSupportedResourceDesc(*desc))
+      return false;
+    if (!IsValidInitialState(*heap_properties, initial_state))
+      return false;
+
+    const auto heap_type = d3d12::GetHeapType(*heap_properties);
+    if (heap_type == D3D12_HEAP_TYPE_UPLOAD ||
+        heap_type == D3D12_HEAP_TYPE_READBACK) {
+      if (desc->Dimension != D3D12_RESOURCE_DIMENSION_BUFFER)
+        return false;
+    }
+    if (desc->Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
+        desc->Layout == D3D12_TEXTURE_LAYOUT_ROW_MAJOR)
+      return false;
+
+    return true;
   }
 
   Com<IMTLDXGIAdapter> adapter_;
