@@ -596,7 +596,24 @@ public:
                                                  const D3D12_CLEAR_VALUE *optimized_clear_value,
                                                  REFIID riid, void **resource) override {
     InitReturnPtr(resource);
-    return E_NOTIMPL;
+    if (!resource)
+      return E_POINTER;
+    if (!heap || !desc)
+      return E_INVALIDARG;
+
+    auto *heap_object = dynamic_cast<d3d12::Heap *>(heap);
+    if (!heap_object)
+      return E_INVALIDARG;
+
+    if (!IsValidPlacedResourceDesc(*heap_object, heap_offset, desc,
+                                   initial_state))
+      return E_INVALIDARG;
+
+    const auto &heap_desc = heap_object->GetHeapDesc();
+    auto resource_object = d3d12::CreateResource(
+        static_cast<IMTLD3D12Device *>(this), &heap_desc.Properties,
+        heap_desc.Flags, desc, initial_state, heap_offset);
+    return resource_object->QueryInterface(riid, resource);
   }
 
   HRESULT STDMETHODCALLTYPE CreateReservedResource(const D3D12_RESOURCE_DESC *desc,
@@ -836,6 +853,46 @@ private:
     }
     if (desc->Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
         desc->Layout == D3D12_TEXTURE_LAYOUT_ROW_MAJOR)
+      return false;
+
+    return true;
+  }
+
+  bool IsValidPlacedResourceDesc(const d3d12::Heap &heap, UINT64 heap_offset,
+                                 const D3D12_RESOURCE_DESC *desc,
+                                 D3D12_RESOURCE_STATES initial_state) const {
+    if (!desc || !d3d12::IsSupportedResourceDesc(*desc))
+      return false;
+    if (!IsValidInitialState(heap.GetHeapDesc().Properties, initial_state))
+      return false;
+
+    const auto allocation_info = GetResourceAllocationInfoImpl(1, 1, desc);
+    if (allocation_info.SizeInBytes == 0)
+      return false;
+    if (heap_offset % allocation_info.Alignment)
+      return false;
+    if (heap_offset > heap.GetHeapDesc().SizeInBytes ||
+        allocation_info.SizeInBytes > heap.GetHeapDesc().SizeInBytes - heap_offset)
+      return false;
+
+    const auto heap_type = heap.GetHeapType();
+    if ((heap_type == D3D12_HEAP_TYPE_UPLOAD ||
+         heap_type == D3D12_HEAP_TYPE_READBACK) &&
+        desc->Dimension != D3D12_RESOURCE_DIMENSION_BUFFER)
+      return false;
+
+    const auto heap_flags = heap.GetHeapDesc().Flags;
+    if ((heap_flags & D3D12_HEAP_FLAG_DENY_BUFFERS) &&
+        desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER)
+      return false;
+    if ((heap_flags & D3D12_HEAP_FLAG_DENY_RT_DS_TEXTURES) &&
+        (desc->Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET |
+                        D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL)))
+      return false;
+    if ((heap_flags & D3D12_HEAP_FLAG_DENY_NON_RT_DS_TEXTURES) &&
+        desc->Dimension != D3D12_RESOURCE_DIMENSION_BUFFER &&
+        !(desc->Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET |
+                         D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL)))
       return false;
 
     return true;
