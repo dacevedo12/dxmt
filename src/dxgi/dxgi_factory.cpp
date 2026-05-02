@@ -13,6 +13,25 @@ namespace dxmt {
 Com<IMTLDXGIAdapter> CreateAdapter(WMT::Device Device,
                                    IDXGIFactory2 *pFactory, Config &config);
 
+static constexpr UINT SupportedSwapChainFlags =
+    DXGI_SWAP_CHAIN_FLAG_NONPREROTATED |
+    DXGI_SWAP_CHAIN_FLAG_ALLOW_MODE_SWITCH |
+    DXGI_SWAP_CHAIN_FLAG_GDI_COMPATIBLE |
+    DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT |
+    DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING;
+
+static bool IsKnownSwapEffect(DXGI_SWAP_EFFECT swap_effect) {
+  switch (swap_effect) {
+  case DXGI_SWAP_EFFECT_DISCARD:
+  case DXGI_SWAP_EFFECT_SEQUENTIAL:
+  case DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL:
+  case DXGI_SWAP_EFFECT_FLIP_DISCARD:
+    return true;
+  default:
+    return false;
+  }
+}
+
 class MTLDXGIFactory : public MTLDXGIObject<IDXGIFactory6> {
 
 public:
@@ -112,11 +131,44 @@ public:
       return DXGI_ERROR_UNSUPPORTED;
     }
 
-    // Make sure the back buffer size is not zero
     DXGI_SWAP_CHAIN_DESC1 desc = *pDesc;
 
     wsi::getWindowSize(hWnd, desc.Width ? nullptr : &desc.Width,
                        desc.Height ? nullptr : &desc.Height);
+    if (!desc.Width || !desc.Height) {
+      WARN("CreateSwapChainForHwnd: using fallback swapchain size ",
+           desc.Width ? desc.Width : 1, "x", desc.Height ? desc.Height : 1);
+      desc.Width = desc.Width ? desc.Width : 1;
+      desc.Height = desc.Height ? desc.Height : 1;
+    }
+    if (desc.Format == DXGI_FORMAT_UNKNOWN) {
+      WARN("CreateSwapChainForHwnd: swapchain format must not be UNKNOWN");
+      return DXGI_ERROR_INVALID_CALL;
+    }
+    if (!desc.BufferCount) {
+      WARN("CreateSwapChainForHwnd: defaulting zero buffer count to 2");
+      desc.BufferCount = 2;
+    }
+    if (desc.BufferCount > DXGI_MAX_SWAP_CHAIN_BUFFERS) {
+      WARN("CreateSwapChainForHwnd: invalid buffer count ", desc.BufferCount);
+      return DXGI_ERROR_INVALID_CALL;
+    }
+    if (!desc.SampleDesc.Count)
+      desc.SampleDesc.Count = 1;
+    if (desc.Flags & ~SupportedSwapChainFlags) {
+      WARN("CreateSwapChainForHwnd: unsupported swapchain flags ",
+           desc.Flags & ~SupportedSwapChainFlags);
+    }
+    if (!IsKnownSwapEffect(desc.SwapEffect)) {
+      WARN("CreateSwapChainForHwnd: unknown swap effect ", desc.SwapEffect);
+      return DXGI_ERROR_INVALID_CALL;
+    }
+    if ((desc.SwapEffect == DXGI_SWAP_EFFECT_FLIP_DISCARD ||
+         desc.SwapEffect == DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL) &&
+        desc.BufferCount < 2) {
+      WARN("CreateSwapChainForHwnd: flip swapchains usually require at least "
+           "two buffers");
+    }
 
     // If necessary, set up a default set of
     // fullscreen parameters for the swap chain

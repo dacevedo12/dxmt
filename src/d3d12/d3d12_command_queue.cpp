@@ -180,6 +180,41 @@ GetSwapChainColorSpace(DXGI_FORMAT format) {
                                                   : WMTColorSpaceSRGB;
 }
 
+static bool
+IsSupportedD3D12SwapChainColorSpace(DXGI_COLOR_SPACE_TYPE color_space) {
+  switch (color_space) {
+  case DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709:
+  case DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709:
+    return true;
+  default:
+    return false;
+  }
+}
+
+static WMTColorSpace
+GetD3D12SwapChainColorSpace(DXGI_COLOR_SPACE_TYPE color_space) {
+  return color_space == DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709
+           ? WMTColorSpaceSRGBLinear
+           : WMTColorSpaceSRGB;
+}
+
+static WMTColorSpace
+GetD3D12SwapChainLayerColorSpace(DXGI_FORMAT format,
+                                 DXGI_COLOR_SPACE_TYPE color_space) {
+  return color_space == DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709
+             ? GetSwapChainColorSpace(format)
+             : GetD3D12SwapChainColorSpace(color_space);
+}
+
+static constexpr UINT D3D12SupportedPresentFlags =
+    DXGI_PRESENT_TEST | DXGI_PRESENT_DO_NOT_SEQUENCE | DXGI_PRESENT_RESTART |
+    DXGI_PRESENT_DO_NOT_WAIT | DXGI_PRESENT_ALLOW_TEARING;
+
+static constexpr UINT D3D12SupportedSwapChainFlags =
+    DXGI_SWAP_CHAIN_FLAG_ALLOW_MODE_SWITCH |
+    DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT |
+    DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING;
+
 static WMTIndexType
 GetIndexType(DXGI_FORMAT format) {
   return format == DXGI_FORMAT_R32_UINT ? WMTIndexTypeUInt32
@@ -1161,26 +1196,53 @@ private:
     HRESULT STDMETHODCALLTYPE ResizeBuffers(UINT buffer_count, UINT width,
                                             UINT height, DXGI_FORMAT format,
                                             UINT flags) override {
+      UINT old_width = desc_.Width;
+      UINT old_height = desc_.Height;
       if (buffer_count == 0)
         buffer_count = desc_.BufferCount ? desc_.BufferCount : 2;
-      if (buffer_count > DXGI_MAX_SWAP_CHAIN_BUFFERS)
+      if (!buffer_count || buffer_count > DXGI_MAX_SWAP_CHAIN_BUFFERS) {
+        WARN("D3D12SwapChain::ResizeBuffers: invalid buffer count ",
+             buffer_count);
         return DXGI_ERROR_INVALID_CALL;
+      }
+      UINT new_width = width;
+      UINT new_height = height;
+      if (new_width == 0 || new_height == 0)
+        wsi::getWindowSize(hWnd_, new_width ? nullptr : &new_width,
+                           new_height ? nullptr : &new_height);
+      new_width = new_width ? new_width : 1;
+      new_height = new_height ? new_height : 1;
+      DXGI_FORMAT new_format =
+          format == DXGI_FORMAT_UNKNOWN ? desc_.Format : format;
+      if (GetSwapChainPixelFormat(new_format) == WMTPixelFormatInvalid) {
+        WARN("D3D12SwapChain::ResizeBuffers: unsupported format ",
+             new_format);
+        return DXGI_ERROR_UNSUPPORTED;
+      }
+      if (HasExternalBackBufferReferences()) {
+        WARN("D3D12SwapChain::ResizeBuffers: backbuffer references are still "
+             "held by the application");
+        return DXGI_ERROR_INVALID_CALL;
+      }
+      if (flags & ~D3D12SupportedSwapChainFlags) {
+        WARN("D3D12SwapChain::ResizeBuffers: ignoring unsupported flags ",
+             flags & ~D3D12SupportedSwapChainFlags);
+      }
 
       desc_.BufferCount = buffer_count;
-      if (width == 0 || height == 0)
-        wsi::getWindowSize(hWnd_, width ? nullptr : &width,
-                           height ? nullptr : &height);
-      desc_.Width = width ? width : 1;
-      desc_.Height = height ? height : 1;
-      if (format != DXGI_FORMAT_UNKNOWN)
-        desc_.Format = format;
+      desc_.Width = new_width;
+      desc_.Height = new_height;
+      desc_.Format = new_format;
       desc_.Flags = flags;
 
-      if (GetSwapChainPixelFormat(desc_.Format) == WMTPixelFormatInvalid)
-        return DXGI_ERROR_UNSUPPORTED;
+      if (!width || !height) {
+        WARN("D3D12SwapChain::ResizeBuffers: resolved zero size request to ",
+             desc_.Width, "x", desc_.Height);
+      }
 
       presenter_->changeLayerProperties(GetSwapChainPixelFormat(desc_.Format),
-                                        GetSwapChainColorSpace(desc_.Format),
+                                        GetD3D12SwapChainLayerColorSpace(
+                                            desc_.Format, color_space_),
                                         desc_.Width, desc_.Height,
                                         desc_.SampleDesc.Count
                                             ? desc_.SampleDesc.Count
@@ -1218,6 +1280,10 @@ private:
       }
 
       current_backbuffer_ = 0;
+      if (!source_width_ || source_width_ == old_width)
+        source_width_ = desc_.Width;
+      if (!source_height_ || source_height_ == old_height)
+        source_height_ = desc_.Height;
       return S_OK;
     }
 
@@ -1281,6 +1347,24 @@ private:
         const DXGI_PRESENT_PARAMETERS *present_parameters) override {
       if (sync_interval > 4)
         return DXGI_ERROR_INVALID_CALL;
+      if (flags & ~D3D12SupportedPresentFlags) {
+        WARN("D3D12SwapChain::Present1: ignoring unsupported flags ",
+             flags & ~D3D12SupportedPresentFlags);
+      }
+      if ((flags & DXGI_PRESENT_ALLOW_TEARING) &&
+          !(desc_.Flags & DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING)) {
+        WARN("D3D12SwapChain::Present1: ALLOW_TEARING used without swapchain "
+             "tearing support");
+      }
+      if ((flags & DXGI_PRESENT_ALLOW_TEARING) && sync_interval) {
+        WARN("D3D12SwapChain::Present1: ALLOW_TEARING requires sync interval 0");
+      }
+      if (present_parameters &&
+          (present_parameters->DirtyRectsCount || present_parameters->pDirtyRects ||
+           present_parameters->pScrollRect || present_parameters->pScrollOffset)) {
+        WARN("D3D12SwapChain::Present1: dirty rect and scroll parameters are "
+             "not implemented");
+      }
 
       bool occluded = wsi::isMinimized(hWnd_);
       HRESULT hr = occluded ? DXGI_STATUS_OCCLUDED : S_OK;
@@ -1379,6 +1463,9 @@ private:
     }
 
     HANDLE STDMETHODCALLTYPE GetFrameLatencyWaitableObject() override {
+      if (desc_.Flags & DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT)
+        WARN("D3D12SwapChain::GetFrameLatencyWaitableObject: waitable object "
+             "is not implemented");
       return nullptr;
     }
 
@@ -1406,13 +1493,23 @@ private:
         DXGI_COLOR_SPACE_TYPE color_space, UINT *color_space_support) override {
       if (!color_space_support)
         return E_INVALIDARG;
-      *color_space_support = DXGI_SWAP_CHAIN_COLOR_SPACE_SUPPORT_FLAG_PRESENT;
+      *color_space_support =
+          IsSupportedD3D12SwapChainColorSpace(color_space)
+              ? DXGI_SWAP_CHAIN_COLOR_SPACE_SUPPORT_FLAG_PRESENT
+              : 0;
       return S_OK;
     }
 
     HRESULT STDMETHODCALLTYPE SetColorSpace1(
         DXGI_COLOR_SPACE_TYPE color_space) override {
+      if (!IsSupportedD3D12SwapChainColorSpace(color_space)) {
+        WARN("D3D12SwapChain::SetColorSpace1: unsupported color space ",
+             color_space);
+        return DXGI_ERROR_UNSUPPORTED;
+      }
       color_space_ = color_space;
+      presenter_->changeLayerColorSpace(
+          GetD3D12SwapChainLayerColorSpace(desc_.Format, color_space_));
       return S_OK;
     }
 
@@ -1425,10 +1522,25 @@ private:
 
     HRESULT STDMETHODCALLTYPE SetHDRMetaData(DXGI_HDR_METADATA_TYPE type,
                                              UINT size, void *metadata) override {
-      return S_OK;
+      if (type == DXGI_HDR_METADATA_TYPE_NONE)
+        return S_OK;
+      WARN("D3D12SwapChain::SetHDRMetaData: HDR metadata is not supported");
+      return DXGI_ERROR_UNSUPPORTED;
     }
 
   private:
+    bool HasExternalBackBufferReferences() {
+      for (auto &backbuffer : backbuffers_) {
+        if (!backbuffer)
+          continue;
+        ULONG ref_count = backbuffer->AddRef();
+        backbuffer->Release();
+        if (ref_count > 2)
+          return true;
+      }
+      return false;
+    }
+
     Com<CommandQueueImpl> queue_;
     Com<IDXGIFactory1> factory_;
     ComPrivateData private_data_;
