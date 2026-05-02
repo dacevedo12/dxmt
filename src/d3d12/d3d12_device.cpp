@@ -182,7 +182,8 @@ static DescriptorRecord *
 GetDescriptorRecordForWrite(D3D12_CPU_DESCRIPTOR_HANDLE handle,
                             D3D12_DESCRIPTOR_HEAP_TYPE expected_type,
                             const char *context) {
-  auto *record = d3d12::GetDescriptorRecordFromCpuHandle(handle, expected_type);
+  auto *record = d3d12::GetDescriptorRecordRangeFromCpuHandle(
+      handle, expected_type, 1, context);
   if (!record)
     WARN("D3D12Device: invalid descriptor handle for ", context);
   return record;
@@ -194,11 +195,120 @@ ResetDescriptorRecord(DescriptorRecord &record) {
   const auto heap_type = record.heap_type;
   const auto shader_visible = record.shader_visible;
   const auto cpu_handle = record.cpu_handle;
+  const auto heap_index = record.heap_index;
+  const auto heap_count = record.heap_count;
   record = {};
   record.magic = magic;
   record.heap_type = heap_type;
   record.shader_visible = shader_visible;
   record.cpu_handle = cpu_handle;
+  record.heap_index = heap_index;
+  record.heap_count = heap_count;
+}
+
+static bool
+IsBufferResource(ID3D12Resource *resource) {
+  auto *d3d12_resource = dynamic_cast<Resource *>(resource);
+  return d3d12_resource &&
+         d3d12_resource->GetResourceDesc().Dimension ==
+             D3D12_RESOURCE_DIMENSION_BUFFER;
+}
+
+static bool
+IsTextureResource(ID3D12Resource *resource) {
+  auto *d3d12_resource = dynamic_cast<Resource *>(resource);
+  if (!d3d12_resource)
+    return false;
+  const auto dimension = d3d12_resource->GetResourceDesc().Dimension;
+  return dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D ||
+         dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D ||
+         dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D;
+}
+
+static bool
+IsSupportedSrvDimension(D3D12_SRV_DIMENSION dimension) {
+  switch (dimension) {
+  case D3D12_SRV_DIMENSION_BUFFER:
+  case D3D12_SRV_DIMENSION_TEXTURE1D:
+  case D3D12_SRV_DIMENSION_TEXTURE1DARRAY:
+  case D3D12_SRV_DIMENSION_TEXTURE2D:
+  case D3D12_SRV_DIMENSION_TEXTURE2DARRAY:
+  case D3D12_SRV_DIMENSION_TEXTURE2DMS:
+  case D3D12_SRV_DIMENSION_TEXTURE2DMSARRAY:
+  case D3D12_SRV_DIMENSION_TEXTURE3D:
+  case D3D12_SRV_DIMENSION_TEXTURECUBE:
+  case D3D12_SRV_DIMENSION_TEXTURECUBEARRAY:
+    return true;
+  default:
+    return false;
+  }
+}
+
+static bool
+IsSupportedUavDimension(D3D12_UAV_DIMENSION dimension) {
+  switch (dimension) {
+  case D3D12_UAV_DIMENSION_BUFFER:
+  case D3D12_UAV_DIMENSION_TEXTURE1D:
+  case D3D12_UAV_DIMENSION_TEXTURE1DARRAY:
+  case D3D12_UAV_DIMENSION_TEXTURE2D:
+  case D3D12_UAV_DIMENSION_TEXTURE2DARRAY:
+  case D3D12_UAV_DIMENSION_TEXTURE3D:
+    return true;
+  default:
+    return false;
+  }
+}
+
+static void
+ValidateShaderResourceView(ID3D12Resource *resource,
+                           const D3D12_SHADER_RESOURCE_VIEW_DESC &desc) {
+  if (!IsSupportedSrvDimension(desc.ViewDimension)) {
+    WARN("D3D12Device: unsupported SRV dimension ",
+         uint32_t(desc.ViewDimension));
+    return;
+  }
+  if (desc.ViewDimension == D3D12_SRV_DIMENSION_BUFFER) {
+    if (resource && !IsBufferResource(resource))
+      WARN("D3D12Device: buffer SRV created for non-buffer resource");
+    const auto raw = (desc.Buffer.Flags & D3D12_BUFFER_SRV_FLAG_RAW) != 0;
+    const auto structured = desc.Buffer.StructureByteStride != 0;
+    const auto typed = desc.Format != DXGI_FORMAT_UNKNOWN;
+    if ((raw && structured) || (raw && typed) || (structured && typed))
+      WARN("D3D12Device: ambiguous buffer SRV typed/raw/structured descriptor");
+    if (raw && desc.Format != DXGI_FORMAT_R32_TYPELESS &&
+        desc.Format != DXGI_FORMAT_UNKNOWN)
+      WARN("D3D12Device: raw buffer SRV should use R32_TYPELESS/UNKNOWN format");
+    return;
+  }
+  if (resource && !IsTextureResource(resource))
+    WARN("D3D12Device: texture SRV created for non-texture resource");
+}
+
+static void
+ValidateUnorderedAccessView(ID3D12Resource *resource,
+                            ID3D12Resource *counter_resource,
+                            const D3D12_UNORDERED_ACCESS_VIEW_DESC &desc) {
+  if (!IsSupportedUavDimension(desc.ViewDimension)) {
+    WARN("D3D12Device: unsupported UAV dimension ",
+         uint32_t(desc.ViewDimension));
+    return;
+  }
+  if (desc.ViewDimension == D3D12_UAV_DIMENSION_BUFFER) {
+    if (resource && !IsBufferResource(resource))
+      WARN("D3D12Device: buffer UAV created for non-buffer resource");
+    const auto raw = (desc.Buffer.Flags & D3D12_BUFFER_UAV_FLAG_RAW) != 0;
+    const auto structured = desc.Buffer.StructureByteStride != 0;
+    const auto typed = desc.Format != DXGI_FORMAT_UNKNOWN;
+    if ((raw && structured) || (raw && typed) || (structured && typed))
+      WARN("D3D12Device: ambiguous buffer UAV typed/raw/structured descriptor");
+    if (counter_resource && !structured)
+      WARN("D3D12Device: UAV counter resource is only valid for structured buffer UAVs");
+    return;
+  }
+  if (resource && !IsTextureResource(resource))
+    WARN("D3D12Device: texture UAV created for non-texture resource");
+  if (counter_resource)
+    WARN("D3D12Device: UAV counter resource is ignored for texture UAVs");
 }
 
 static void
@@ -207,11 +317,15 @@ CopyDescriptorRecord(DescriptorRecord &dst, const DescriptorRecord &src) {
   const auto heap_type = dst.heap_type;
   const auto shader_visible = dst.shader_visible;
   const auto cpu_handle = dst.cpu_handle;
+  const auto heap_index = dst.heap_index;
+  const auto heap_count = dst.heap_count;
   dst = src;
   dst.magic = magic;
   dst.heap_type = heap_type;
   dst.shader_visible = shader_visible;
   dst.cpu_handle = cpu_handle;
+  dst.heap_index = heap_index;
+  dst.heap_count = heap_count;
 }
 
 #ifdef __ID3D12Device2_INTERFACE_DEFINED__
@@ -906,6 +1020,7 @@ public:
     record->type = DescriptorRecordType::ShaderResourceView;
     record->resource = resource;
     if (desc) {
+      ValidateShaderResourceView(resource, *desc);
       record->desc.srv = *desc;
       record->has_desc = true;
     }
@@ -925,6 +1040,7 @@ public:
     record->resource = resource;
     record->counter_resource = counter_resource;
     if (desc) {
+      ValidateUnorderedAccessView(resource, counter_resource, *desc);
       record->desc.uav = *desc;
       record->has_desc = true;
     }
@@ -985,15 +1101,27 @@ public:
                                          const D3D12_CPU_DESCRIPTOR_HANDLE *src_descriptor_range_offsets,
                                          const UINT *src_descriptor_range_sizes,
                                          D3D12_DESCRIPTOR_HEAP_TYPE descriptor_heap_type) override {
+    if ((dst_descriptor_range_count && !dst_descriptor_range_offsets) ||
+        (src_descriptor_range_count && !src_descriptor_range_offsets)) {
+      WARN("D3D12Device: CopyDescriptors called with null range offsets");
+      return;
+    }
+
+    std::vector<DescriptorRecord> copied;
     UINT src_range = 0;
     UINT src_index = 0;
     for (UINT dst_range = 0; dst_range < dst_descriptor_range_count; dst_range++) {
       const UINT dst_count = dst_descriptor_range_sizes
                                  ? dst_descriptor_range_sizes[dst_range]
                                  : 1;
-      auto *dst = d3d12::GetDescriptorRecordFromCpuHandle(
-          dst_descriptor_range_offsets[dst_range], descriptor_heap_type);
-      for (UINT i = 0; i < dst_count && dst; i++) {
+      auto *dst = d3d12::GetDescriptorRecordRangeFromCpuHandle(
+          dst_descriptor_range_offsets[dst_range], descriptor_heap_type,
+          dst_count, "CopyDescriptors destination");
+      if (!dst)
+        return;
+      copied.clear();
+      copied.reserve(dst_count);
+      for (UINT i = 0; i < dst_count; i++) {
         while (src_range < src_descriptor_range_count) {
           const UINT src_count = src_descriptor_range_sizes
                                      ? src_descriptor_range_sizes[src_range]
@@ -1006,12 +1134,19 @@ public:
         if (src_range >= src_descriptor_range_count)
           return;
 
-        auto *src = d3d12::GetDescriptorRecordFromCpuHandle(
-            src_descriptor_range_offsets[src_range], descriptor_heap_type);
-        if (src)
-          CopyDescriptorRecord(dst[i], src[src_index]);
+        const UINT src_count = src_descriptor_range_sizes
+                                   ? src_descriptor_range_sizes[src_range]
+                                   : 1;
+        auto *src = d3d12::GetDescriptorRecordRangeFromCpuHandle(
+            src_descriptor_range_offsets[src_range], descriptor_heap_type,
+            src_count, "CopyDescriptors source");
+        if (!src)
+          return;
+        copied.push_back(src[src_index]);
         src_index++;
       }
+      for (UINT i = 0; i < copied.size(); i++)
+        CopyDescriptorRecord(dst[i], copied[i]);
     }
   }
 
@@ -1019,14 +1154,17 @@ public:
                                                const D3D12_CPU_DESCRIPTOR_HANDLE dst_descriptor_range_offset,
                                                const D3D12_CPU_DESCRIPTOR_HANDLE src_descriptor_range_offset,
                                                D3D12_DESCRIPTOR_HEAP_TYPE descriptor_heap_type) override {
-    auto *dst = d3d12::GetDescriptorRecordFromCpuHandle(
-        dst_descriptor_range_offset, descriptor_heap_type);
-    auto *src = d3d12::GetDescriptorRecordFromCpuHandle(
-        src_descriptor_range_offset, descriptor_heap_type);
+    auto *dst = d3d12::GetDescriptorRecordRangeFromCpuHandle(
+        dst_descriptor_range_offset, descriptor_heap_type, descriptor_count,
+        "CopyDescriptorsSimple destination");
+    auto *src = d3d12::GetDescriptorRecordRangeFromCpuHandle(
+        src_descriptor_range_offset, descriptor_heap_type, descriptor_count,
+        "CopyDescriptorsSimple source");
     if (!dst || !src)
       return;
-    for (UINT i = 0; i < descriptor_count; i++)
-      CopyDescriptorRecord(dst[i], src[i]);
+    std::vector<DescriptorRecord> copied(src, src + descriptor_count);
+    for (UINT i = 0; i < copied.size(); i++)
+      CopyDescriptorRecord(dst[i], copied[i]);
   }
 
 #ifdef WIDL_EXPLICIT_AGGREGATE_RETURNS

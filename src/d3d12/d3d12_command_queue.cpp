@@ -242,6 +242,25 @@ GetIndexSize(DXGI_FORMAT format) {
   return format == DXGI_FORMAT_R32_UINT ? 4 : 2;
 }
 
+static const char *
+PipelineStageName(PipelineStage stage) {
+  switch (stage) {
+  case PipelineStage::Pixel:
+    return "pixel";
+  case PipelineStage::Compute:
+    return "compute";
+  case PipelineStage::Geometry:
+    return "geometry";
+  case PipelineStage::Hull:
+    return "hull";
+  case PipelineStage::Domain:
+    return "domain";
+  case PipelineStage::Vertex:
+  default:
+    return "vertex";
+  }
+}
+
 static UINT
 GetMipLevel(const Resource &resource, UINT subresource) {
   const auto &desc = resource.GetResourceDesc();
@@ -2900,6 +2919,36 @@ private:
     return descriptor;
   }
 
+  const DescriptorRecord *
+  GetBoundDescriptorRecordInRange(const ReplayState &state,
+                                  D3D12_GPU_DESCRIPTOR_HANDLE base,
+                                  UINT range_offset, UINT descriptor_index,
+                                  UINT descriptor_count,
+                                  D3D12_DESCRIPTOR_HEAP_TYPE heap_type) {
+    const auto total_offset = range_offset + descriptor_index;
+    if (total_offset < range_offset) {
+      WARN("D3D12CommandQueue: descriptor table offset overflow");
+      return nullptr;
+    }
+
+    const auto handle =
+        D3D12_GPU_DESCRIPTOR_HANDLE{base.ptr +
+                                    sizeof(DescriptorRecord) * total_offset};
+    const auto *descriptor = GetBoundDescriptorRecord(state, handle, heap_type);
+    if (!descriptor)
+      return nullptr;
+    if (descriptor_count &&
+        (descriptor->heap_index >= descriptor->heap_count ||
+         descriptor_count - descriptor_index >
+             descriptor->heap_count - descriptor->heap_index)) {
+      WARN("D3D12CommandQueue: descriptor table range exceeds heap start=",
+           descriptor->heap_index, " index=", descriptor_index,
+           " count=", descriptor_count, " heap_count=", descriptor->heap_count);
+      return nullptr;
+    }
+    return descriptor;
+  }
+
   void BindDescriptor(ArgumentEncodingContext &enc, PipelineStage stage,
                       D3D12_DESCRIPTOR_RANGE_TYPE range_type, UINT slot,
                       const DescriptorRecord &descriptor) {
@@ -2929,6 +2978,12 @@ private:
       WARN("D3D12CommandQueue: CBV slot b", slot, " is unsupported");
       return;
     }
+    if (descriptor.desc.cbv.BufferLocation &
+        (D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT - 1))
+      WARN("D3D12CommandQueue: root/table CBV BufferLocation is not 256-byte aligned");
+    if (descriptor.desc.cbv.SizeInBytes &
+        (D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT - 1))
+      WARN("D3D12CommandQueue: root/table CBV SizeInBytes is not 256-byte aligned");
 
     Resource *resource = nullptr;
     const auto offset =
@@ -2958,6 +3013,11 @@ private:
                                     const DescriptorRecord &descriptor) {
     if (descriptor.type != DescriptorRecordType::ShaderResourceView)
       return;
+    if (slot >= kSRVBindings) {
+      WARN("D3D12CommandQueue: SRV slot t", slot, " is unsupported for ",
+           PipelineStageName(stage), " stage");
+      return;
+    }
 
     auto *resource = GetResource(descriptor.resource.ptr());
     if (!resource)
@@ -3013,6 +3073,10 @@ private:
             byte_size = srv.Buffer.NumElements;
             slice = DefaultBufferSlice(*resource, offset, byte_size);
           }
+        } else {
+          WARN("D3D12CommandQueue: buffer SRV has unsupported view dimension ",
+               uint32_t(srv.ViewDimension));
+          return;
         }
       }
       auto buffer = Rc<Buffer>(resource->GetBuffer());
@@ -3029,6 +3093,11 @@ private:
     }
 
     if (resource->GetTexture()) {
+      if (descriptor.has_desc &&
+          descriptor.desc.srv.ViewDimension == D3D12_SRV_DIMENSION_BUFFER) {
+        WARN("D3D12CommandQueue: texture SRV cannot use BUFFER view dimension");
+        return;
+      }
       const auto view =
           CreateShaderResourceTextureView(device_->GetMTLDevice(), *resource,
                                           descriptor);
@@ -3049,6 +3118,11 @@ private:
                                      const DescriptorRecord &descriptor) {
     if (descriptor.type != DescriptorRecordType::UnorderedAccessView)
       return;
+    if (slot >= kUAVBindings) {
+      WARN("D3D12CommandQueue: UAV slot u", slot, " is unsupported for ",
+           PipelineStageName(stage), " stage");
+      return;
+    }
 
     auto *resource = GetResource(descriptor.resource.ptr());
     if (!resource)
@@ -3116,6 +3190,10 @@ private:
             byte_size = uav.Buffer.NumElements;
             slice = DefaultBufferSlice(*resource, offset, byte_size);
           }
+        } else {
+          WARN("D3D12CommandQueue: buffer UAV has unsupported view dimension ",
+               uint32_t(uav.ViewDimension));
+          return;
         }
       }
       auto buffer = Rc<Buffer>(resource->GetBuffer());
@@ -3129,6 +3207,11 @@ private:
     }
 
     if (resource->GetTexture()) {
+      if (descriptor.has_desc &&
+          descriptor.desc.uav.ViewDimension == D3D12_UAV_DIMENSION_BUFFER) {
+        WARN("D3D12CommandQueue: texture UAV cannot use BUFFER view dimension");
+        return;
+      }
       const auto view =
           CreateUnorderedAccessTextureView(device_->GetMTLDevice(), *resource,
                                            descriptor);
@@ -3162,6 +3245,11 @@ private:
     if (descriptor.type != DescriptorRecordType::Sampler ||
         !descriptor.has_desc)
       return;
+    if (slot >= 16) {
+      WARN("D3D12CommandQueue: sampler slot s", slot, " is unsupported for ",
+           PipelineStageName(stage), " stage");
+      return;
+    }
 
     auto sampler = CreateSampler(descriptor.desc.sampler);
     if (!sampler)
@@ -3378,9 +3466,8 @@ private:
                         pipeline, range, parameter.visibility, compute)
                   : range.descriptor_count;
           for (UINT i = 0; i < count; i++) {
-            auto *descriptor = GetBoundDescriptorRecord(
-                state,
-                {base.ptr + sizeof(DescriptorRecord) * (range_offset + i)},
+            auto *descriptor = GetBoundDescriptorRecordInRange(
+                state, base, range_offset, i, count,
                 DescriptorHeapTypeForRange(range.range_type));
             if (!descriptor)
               continue;
@@ -3439,6 +3526,10 @@ private:
     const auto offset = ResolveBufferGpuAddress(it->second, resource);
     if (!resource || !resource->GetBuffer())
       return;
+    if (type == DescriptorRecordType::ConstantBufferView &&
+        (it->second & (D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT - 1))) {
+      WARN("D3D12CommandQueue: root CBV address is not 256-byte aligned");
+    }
 
     DescriptorRecord descriptor = {};
     descriptor.type = type;

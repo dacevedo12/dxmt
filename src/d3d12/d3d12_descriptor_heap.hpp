@@ -29,6 +29,8 @@ struct DescriptorRecord {
   bool shader_visible = false;
   DescriptorRecordType type = DescriptorRecordType::Empty;
   D3D12_CPU_DESCRIPTOR_HANDLE cpu_handle = {};
+  UINT heap_index = 0;
+  UINT heap_count = 0;
   Com<ID3D12Resource> resource;
   Com<ID3D12Resource> counter_resource;
   union {
@@ -57,6 +59,10 @@ CreateDescriptorHeap(IMTLD3D12Device *device,
 DescriptorRecord *GetDescriptorRecordFromCpuHandle(D3D12_CPU_DESCRIPTOR_HANDLE handle);
 DescriptorRecord *GetDescriptorRecordFromCpuHandle(D3D12_CPU_DESCRIPTOR_HANDLE handle,
                                                    D3D12_DESCRIPTOR_HEAP_TYPE expected_type);
+DescriptorRecord *GetDescriptorRecordRangeFromCpuHandle(D3D12_CPU_DESCRIPTOR_HANDLE handle,
+                                                        D3D12_DESCRIPTOR_HEAP_TYPE expected_type,
+                                                        UINT descriptor_count,
+                                                        const char *context);
 const DescriptorRecord *GetDescriptorRecordFromGpuHandle(D3D12_GPU_DESCRIPTOR_HANDLE handle,
                                                          D3D12_DESCRIPTOR_HEAP_TYPE expected_type);
 
