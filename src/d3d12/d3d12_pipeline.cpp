@@ -696,6 +696,50 @@ UsesDualSourceBlending(const D3D12_BLEND_DESC &desc) {
   return false;
 }
 
+bool
+ValidateGraphicsRenderFormats(IMTLD3D12Device *device,
+                              const PipelineGraphicsState &state,
+                              std::array<WMTPixelFormat, 8> &rtv_formats,
+                              WMTPixelFormat &depth_format,
+                              WMTPixelFormat &stencil_format) {
+  rtv_formats.fill(WMTPixelFormatInvalid);
+  depth_format = WMTPixelFormatInvalid;
+  stencil_format = WMTPixelFormatInvalid;
+
+  for (UINT i = 0; i < state.desc.NumRenderTargets; i++) {
+    const auto format = state.desc.RTVFormats[i];
+    if (format == DXGI_FORMAT_UNKNOWN)
+      continue;
+    const auto pixel_format =
+        GetRenderTargetPixelFormat(device->GetMTLDevice(), format);
+    if (pixel_format == WMTPixelFormatInvalid ||
+        DepthStencilPlanarFlags(pixel_format)) {
+      WARN("D3D12PipelineState: unsupported RTV format slot=", i,
+           " format=", uint32_t(format));
+      return false;
+    }
+    rtv_formats[i] = pixel_format;
+  }
+
+  if (state.desc.DSVFormat != DXGI_FORMAT_UNKNOWN) {
+    MTL_DXGI_FORMAT_DESC format = {};
+    if (FAILED(MTLQueryDXGIFormat(device->GetMTLDevice(),
+                                  state.desc.DSVFormat, format)) ||
+        format.PixelFormat == WMTPixelFormatInvalid ||
+        !DepthStencilPlanarFlags(format.PixelFormat)) {
+      WARN("D3D12PipelineState: unsupported DSV format format=",
+           uint32_t(state.desc.DSVFormat));
+      return false;
+    }
+    if (DepthStencilPlanarFlags(format.PixelFormat) & 1)
+      depth_format = format.PixelFormat;
+    if (DepthStencilPlanarFlags(format.PixelFormat) & 2)
+      stencil_format = format.PixelFormat;
+  }
+
+  return true;
+}
+
 void
 ApplyBlendState(WMTRenderPipelineInfo &info,
                 const D3D12_BLEND_DESC &blend_desc,
@@ -837,6 +881,13 @@ CreateMetalGraphicsPipeline(IMTLD3D12Device *device,
   if (!BuildInputElements(device, state, input_elements, slot_mask))
     return false;
 
+  std::array<WMTPixelFormat, 8> rtv_formats = {};
+  WMTPixelFormat depth_format = WMTPixelFormatInvalid;
+  WMTPixelFormat stencil_format = WMTPixelFormatInvalid;
+  if (!ValidateGraphicsRenderFormats(device, state, rtv_formats,
+                                     depth_format, stencil_format))
+    return false;
+
   SM50_SHADER_IA_INPUT_LAYOUT_DATA ia_layout = {};
   ia_layout.type = SM50_SHADER_IA_INPUT_LAYOUT;
   ia_layout.next = &common;
@@ -854,9 +905,7 @@ CreateMetalGraphicsPipeline(IMTLD3D12Device *device,
   if (ps) {
     uint32_t unorm_output_reg_mask = 0;
     for (UINT i = 0; i < state.desc.NumRenderTargets; i++) {
-      const auto format = GetRenderTargetPixelFormat(device->GetMTLDevice(),
-                                                     state.desc.RTVFormats[i]);
-      if (IsUnorm8RenderTargetFormat(format))
+      if (IsUnorm8RenderTargetFormat(rtv_formats[i]))
         unorm_output_reg_mask |= 1u << i;
     }
 
@@ -889,19 +938,13 @@ CreateMetalGraphicsPipeline(IMTLD3D12Device *device,
 
   for (UINT i = 0; i < state.desc.NumRenderTargets; i++) {
     if (state.desc.RTVFormats[i] != DXGI_FORMAT_UNKNOWN)
-      info.colors[i].pixel_format = GetRenderTargetPixelFormat(
-          device->GetMTLDevice(), state.desc.RTVFormats[i]);
+      info.colors[i].pixel_format = rtv_formats[i];
   }
   ApplyBlendState(info, state.desc.BlendState, state.desc.NumRenderTargets);
 
   if (state.desc.DSVFormat != DXGI_FORMAT_UNKNOWN) {
-    MTL_DXGI_FORMAT_DESC format = {};
-    if (SUCCEEDED(MTLQueryDXGIFormat(device->GetMTLDevice(),
-                                     state.desc.DSVFormat, format))) {
-      info.depth_pixel_format = format.PixelFormat;
-      if (DepthStencilPlanarFlags(format.PixelFormat) & 2)
-        info.stencil_pixel_format = format.PixelFormat;
-    }
+    info.depth_pixel_format = depth_format;
+    info.stencil_pixel_format = stencil_format;
   }
 
   WMT::Reference<WMT::Error> error;
