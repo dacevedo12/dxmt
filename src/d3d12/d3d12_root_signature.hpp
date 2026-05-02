@@ -34,6 +34,7 @@ public:
   virtual const D3D12_VERSIONED_ROOT_SIGNATURE_DESC &GetVersionedDesc() const = 0;
   virtual std::span<const std::byte> GetSerializedBlob() const = 0;
   virtual std::span<const RootSignatureParameter> GetParameters() const = 0;
+  virtual std::span<const D3D12_STATIC_SAMPLER_DESC> GetStaticSamplers() const = 0;
 };
 
 Com<ID3D12RootSignature> CreateRootSignatureFromBlob(IMTLD3D12Device *device,

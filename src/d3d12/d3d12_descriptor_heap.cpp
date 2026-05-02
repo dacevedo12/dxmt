@@ -117,6 +117,11 @@ public:
     return DescriptorRecordFromHandle(handle);
   }
 
+  const DescriptorRecord *
+  GetDescriptorRecord(D3D12_GPU_DESCRIPTOR_HANDLE handle) const override {
+    return DescriptorRecordFromHandle({static_cast<SIZE_T>(handle.ptr)});
+  }
+
 private:
   D3D12_CPU_DESCRIPTOR_HANDLE GetCPUDescriptorHandleForHeapStartImpl() const {
     if (records_.empty())

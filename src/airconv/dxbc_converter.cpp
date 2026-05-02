@@ -1270,6 +1270,9 @@ AIRCONV_API int SM50Initialize(
       .Flags =
         MTL_SM50_SHADER_ARGUMENT_BUFFER | MTL_SM50_SHADER_ARGUMENT_READ_ACCESS,
       .StructurePtrOffset = cbv.arg_index,
+      .RegisterSpace = cbv.range.space,
+      .RegisterLowerBound = cbv.range.lower_bound,
+      .RegisterCount = cbv.range.size ? cbv.range.size : 1,
     });
     binding_cbuffer_mask |= (1 << range_id);
   }
@@ -1288,6 +1291,9 @@ AIRCONV_API int SM50Initialize(
       .SM50BindingSlot = range_id,
       .Flags = (MTL_SM50_SHADER_ARGUMENT_FLAG)0,
       .StructurePtrOffset = sampler.arg_index,
+      .RegisterSpace = sampler.range.space,
+      .RegisterLowerBound = sampler.range.lower_bound,
+      .RegisterCount = sampler.range.size ? sampler.range.size : 1,
     });
     binding_sampler_mask |= (1 << range_id);
   }
@@ -1343,6 +1349,9 @@ AIRCONV_API int SM50Initialize(
       .SM50BindingSlot = range_id,
       .Flags = flags,
       .StructurePtrOffset = srv.arg_index,
+      .RegisterSpace = srv.range.space,
+      .RegisterLowerBound = srv.range.lower_bound,
+      .RegisterCount = srv.range.size ? srv.range.size : 1,
     });
     if (range_id & 64) {
       binding_srv_hi_mask |= (1ULL << (range_id - 64));
@@ -1414,6 +1423,9 @@ AIRCONV_API int SM50Initialize(
       .SM50BindingSlot = range_id,
       .Flags = flags,
       .StructurePtrOffset = uav.arg_index,
+      .RegisterSpace = uav.range.space,
+      .RegisterLowerBound = uav.range.lower_bound,
+      .RegisterCount = uav.range.size ? uav.range.size : 1,
     });
     binding_uav_mask |= (1ULL << range_id);
   }

@@ -150,6 +150,9 @@ BuildDxilArgumentInfo(DXILShaderInternal &shader) {
               MTL_SM50_SHADER_ARGUMENT_BUFFER |
               MTL_SM50_SHADER_ARGUMENT_READ_ACCESS),
           .StructurePtrOffset = it->second.arg_index,
+          .RegisterSpace = resource.space,
+          .RegisterLowerBound = resource.lower_bound,
+          .RegisterCount = resource.bind_count ? resource.bind_count : 1,
       });
       break;
     }
@@ -162,6 +165,9 @@ BuildDxilArgumentInfo(DXILShaderInternal &shader) {
           .SM50BindingSlot = resource.id,
           .Flags = MTL_SM50_SHADER_ARGUMENT_FLAG(0),
           .StructurePtrOffset = it->second.arg_index,
+          .RegisterSpace = resource.space,
+          .RegisterLowerBound = resource.lower_bound,
+          .RegisterCount = resource.bind_count ? resource.bind_count : 1,
       });
       break;
     }
@@ -176,6 +182,9 @@ BuildDxilArgumentInfo(DXILShaderInternal &shader) {
                        ? BufferArgumentFlags(resource, false)
                        : TextureArgumentFlags(resource, false),
           .StructurePtrOffset = it->second.arg_index,
+          .RegisterSpace = resource.space,
+          .RegisterLowerBound = resource.lower_bound,
+          .RegisterCount = resource.bind_count ? resource.bind_count : 1,
       });
       break;
     }
@@ -190,6 +199,9 @@ BuildDxilArgumentInfo(DXILShaderInternal &shader) {
                        ? BufferArgumentFlags(resource, true)
                        : TextureArgumentFlags(resource, true),
           .StructurePtrOffset = it->second.arg_index,
+          .RegisterSpace = resource.space,
+          .RegisterLowerBound = resource.lower_bound,
+          .RegisterCount = resource.bind_count ? resource.bind_count : 1,
       });
       break;
     }

@@ -149,19 +149,6 @@ GetRootSignature(ID3D12RootSignature *root_signature) {
   return dynamic_cast<RootSignature *>(root_signature);
 }
 
-static PipelineStage
-PipelineStageFromShaderVisibility(D3D12_SHADER_VISIBILITY visibility,
-                                  bool compute) {
-  if (compute)
-    return PipelineStage::Compute;
-  switch (visibility) {
-  case D3D12_SHADER_VISIBILITY_PIXEL:
-    return PipelineStage::Pixel;
-  default:
-    return PipelineStage::Vertex;
-  }
-}
-
 static WMTPrimitiveType
 GetPrimitiveType(D3D12_PRIMITIVE_TOPOLOGY topology) {
   switch (topology) {
@@ -1602,6 +1589,8 @@ private:
     std::optional<DescriptorRecord> depth_stencil;
     std::array<std::optional<D3D12_VERTEX_BUFFER_VIEW>, 32> vertex_buffers = {};
     std::optional<D3D12_INDEX_BUFFER_VIEW> index_buffer;
+    Com<ID3D12DescriptorHeap> cbv_srv_uav_heap;
+    Com<ID3D12DescriptorHeap> sampler_heap;
     std::unordered_map<UINT, D3D12_GPU_DESCRIPTOR_HANDLE> graphics_tables;
     std::unordered_map<UINT, D3D12_GPU_DESCRIPTOR_HANDLE> compute_tables;
     std::unordered_map<UINT, std::vector<UINT>> graphics_root_constants;
@@ -1685,6 +1674,21 @@ private:
     } else if constexpr (std::is_same_v<T, RenderTargetsRecord>) {
       state.render_targets = record.render_targets;
       state.depth_stencil = record.depth_stencil;
+    } else if constexpr (std::is_same_v<T, DescriptorHeapsRecord>) {
+      state.cbv_srv_uav_heap = nullptr;
+      state.sampler_heap = nullptr;
+      for (const auto &heap : record.heaps) {
+        auto *descriptor_heap = dynamic_cast<DescriptorHeap *>(heap.ptr());
+        if (!descriptor_heap)
+          continue;
+        const auto &desc = descriptor_heap->GetDescriptorHeapDesc();
+        if (!(desc.Flags & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE))
+          continue;
+        if (desc.Type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV)
+          state.cbv_srv_uav_heap = heap;
+        else if (desc.Type == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER)
+          state.sampler_heap = heap;
+      }
     } else if constexpr (std::is_same_v<T, VertexBuffersRecord>) {
       for (UINT i = 0; i < record.views.size() &&
                        record.start_slot + i < state.vertex_buffers.size();
@@ -2622,8 +2626,93 @@ private:
     }
   }
 
+  static const PipelineDxilShader *
+  FindShaderForStage(const PipelineState &pipeline, PipelineStage stage) {
+    PipelineShaderStage shader_stage = PipelineShaderStage::Vertex;
+    switch (stage) {
+    case PipelineStage::Compute:
+      shader_stage = PipelineShaderStage::Compute;
+      break;
+    case PipelineStage::Pixel:
+      shader_stage = PipelineShaderStage::Pixel;
+      break;
+    case PipelineStage::Geometry:
+      shader_stage = PipelineShaderStage::Geometry;
+      break;
+    case PipelineStage::Hull:
+      shader_stage = PipelineShaderStage::Hull;
+      break;
+    case PipelineStage::Domain:
+      shader_stage = PipelineShaderStage::Domain;
+      break;
+    case PipelineStage::Vertex:
+    default:
+      shader_stage = PipelineShaderStage::Vertex;
+      break;
+    }
+
+    for (const auto &shader : pipeline.GetDxilShaders()) {
+      if (shader.stage == shader_stage)
+        return &shader;
+    }
+    return nullptr;
+  }
+
+  static SM50BindingType
+  BindingTypeForRange(D3D12_DESCRIPTOR_RANGE_TYPE range_type) {
+    switch (range_type) {
+    case D3D12_DESCRIPTOR_RANGE_TYPE_CBV:
+      return SM50BindingType::ConstantBuffer;
+    case D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER:
+      return SM50BindingType::Sampler;
+    case D3D12_DESCRIPTOR_RANGE_TYPE_UAV:
+      return SM50BindingType::UAV;
+    case D3D12_DESCRIPTOR_RANGE_TYPE_SRV:
+    default:
+      return SM50BindingType::SRV;
+    }
+  }
+
+  static std::optional<UINT>
+  ResolveShaderBindingSlot(const PipelineState &pipeline, PipelineStage stage,
+                           SM50BindingType binding_type, UINT shader_register,
+                           UINT register_space) {
+    const auto *shader = FindShaderForStage(pipeline, stage);
+    if (!shader)
+      return std::nullopt;
+
+    const auto *arguments =
+        binding_type == SM50BindingType::ConstantBuffer
+            ? shader->constantBufferInfo()
+            : shader->resourceArgumentInfo();
+    const auto argument_count =
+        binding_type == SM50BindingType::ConstantBuffer
+            ? shader->reflection.NumConstantBuffers
+            : shader->reflection.NumArguments;
+    if (!arguments)
+      return std::nullopt;
+
+    for (UINT i = 0; i < argument_count; i++) {
+      const auto &argument = arguments[i];
+      if (argument.Type != binding_type)
+        continue;
+      const auto lower = argument.RegisterCount ? argument.RegisterLowerBound
+                                                : argument.SM50BindingSlot;
+      const auto space = argument.RegisterCount ? argument.RegisterSpace : 0;
+      const auto count = argument.RegisterCount ? argument.RegisterCount : 1;
+      if (space != register_space || shader_register < lower)
+        continue;
+      const auto index = shader_register - lower;
+      if (count != UINT_MAX && index >= count)
+        continue;
+      return argument.SM50BindingSlot + index;
+    }
+    return std::nullopt;
+  }
+
   void BindRootConstants(ArgumentEncodingContext &enc, const ReplayState &state,
-                         bool compute, UINT root_index,
+                         const PipelineState &pipeline, bool compute,
+                         UINT root_index,
                          const RootSignatureParameter &parameter) {
     const auto &map = compute ? state.compute_root_constants
                               : state.graphics_root_constants;
@@ -2636,11 +2725,6 @@ private:
         std::max<uint32_t>(declared_count, uint32_t(it->second.size()));
     if (!actual_count)
       return;
-
-    if (parameter.constants.RegisterSpace != 0) {
-      WARN("D3D12CommandQueue: root constants use unsupported register space %u",
-           parameter.constants.RegisterSpace);
-    }
 
     auto buffer = Rc<Buffer>(new Buffer(uint64_t(actual_count) * sizeof(UINT),
                                         device_->GetMTLDevice()));
@@ -2656,37 +2740,42 @@ private:
                                uint64_t(packed.size()) * sizeof(UINT));
     buffer->rename(std::move(allocation));
 
-    const auto slot = parameter.constants.ShaderRegister;
-    if (slot >= 14) {
-      WARN("D3D12CommandQueue: root constants target unsupported CBV slot b%u",
-           slot);
-      return;
-    }
     ForEachVisibleStage(parameter.visibility, compute, [&](PipelineStage stage) {
+      auto slot = ResolveShaderBindingSlot(
+          pipeline, stage, SM50BindingType::ConstantBuffer,
+          parameter.constants.ShaderRegister,
+          parameter.constants.RegisterSpace);
+      if (!slot)
+        return;
+      if (*slot >= 14) {
+        WARN("D3D12CommandQueue: root constants target unsupported CBV slot b",
+             *slot);
+        return;
+      }
       switch (stage) {
       case PipelineStage::Compute:
-        enc.bindConstantBuffer<PipelineStage::Compute>(slot, 0,
+        enc.bindConstantBuffer<PipelineStage::Compute>(*slot, 0,
                                                        Rc<Buffer>(buffer));
         break;
       case PipelineStage::Pixel:
-        enc.bindConstantBuffer<PipelineStage::Pixel>(slot, 0,
+        enc.bindConstantBuffer<PipelineStage::Pixel>(*slot, 0,
                                                      Rc<Buffer>(buffer));
         break;
       case PipelineStage::Geometry:
-        enc.bindConstantBuffer<PipelineStage::Geometry>(slot, 0,
+        enc.bindConstantBuffer<PipelineStage::Geometry>(*slot, 0,
                                                         Rc<Buffer>(buffer));
         break;
       case PipelineStage::Hull:
-        enc.bindConstantBuffer<PipelineStage::Hull>(slot, 0,
+        enc.bindConstantBuffer<PipelineStage::Hull>(*slot, 0,
                                                     Rc<Buffer>(buffer));
         break;
       case PipelineStage::Domain:
-        enc.bindConstantBuffer<PipelineStage::Domain>(slot, 0,
+        enc.bindConstantBuffer<PipelineStage::Domain>(*slot, 0,
                                                       Rc<Buffer>(buffer));
         break;
       case PipelineStage::Vertex:
       default:
-        enc.bindConstantBuffer<PipelineStage::Vertex>(slot, 0,
+        enc.bindConstantBuffer<PipelineStage::Vertex>(*slot, 0,
                                                       Rc<Buffer>(buffer));
         break;
       }
@@ -2707,6 +2796,33 @@ private:
     return range.offset_in_descriptors_from_table_start == UINT_MAX
                ? running_offset
                : range.offset_in_descriptors_from_table_start;
+  }
+
+  const DescriptorRecord *
+  GetBoundDescriptorRecord(const ReplayState &state,
+                           D3D12_GPU_DESCRIPTOR_HANDLE handle,
+                           D3D12_DESCRIPTOR_HEAP_TYPE heap_type) {
+    const auto &heap = heap_type == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER
+                           ? state.sampler_heap
+                           : state.cbv_srv_uav_heap;
+    auto *descriptor_heap = dynamic_cast<DescriptorHeap *>(heap.ptr());
+    if (!descriptor_heap) {
+      WARN("D3D12CommandQueue: GPU descriptor handle used without bound heap type=",
+           uint32_t(heap_type));
+      return nullptr;
+    }
+
+    const auto *descriptor = descriptor_heap->GetDescriptorRecord(handle);
+    if (!descriptor) {
+      WARN("D3D12CommandQueue: GPU descriptor handle does not belong to the currently bound heap type=",
+           uint32_t(heap_type));
+      return nullptr;
+    }
+    if (!descriptor->shader_visible || descriptor->heap_type != heap_type) {
+      WARN("D3D12CommandQueue: invalid GPU descriptor heap visibility/type");
+      return nullptr;
+    }
+    return descriptor;
   }
 
   void BindDescriptor(ArgumentEncodingContext &enc, PipelineStage stage,
@@ -3015,6 +3131,34 @@ private:
                                   desc.MipLODBias);
   }
 
+  Rc<Sampler> CreateStaticSampler(const D3D12_STATIC_SAMPLER_DESC &desc) {
+    D3D12_SAMPLER_DESC sampler = {};
+    sampler.Filter = desc.Filter;
+    sampler.AddressU = desc.AddressU;
+    sampler.AddressV = desc.AddressV;
+    sampler.AddressW = desc.AddressW;
+    sampler.MipLODBias = desc.MipLODBias;
+    sampler.MaxAnisotropy = desc.MaxAnisotropy;
+    sampler.ComparisonFunc = desc.ComparisonFunc;
+    sampler.MinLOD = desc.MinLOD;
+    sampler.MaxLOD = desc.MaxLOD;
+    switch (desc.BorderColor) {
+    case D3D12_STATIC_BORDER_COLOR_OPAQUE_BLACK:
+      sampler.BorderColor[3] = 1.0f;
+      break;
+    case D3D12_STATIC_BORDER_COLOR_OPAQUE_WHITE:
+      sampler.BorderColor[0] = 1.0f;
+      sampler.BorderColor[1] = 1.0f;
+      sampler.BorderColor[2] = 1.0f;
+      sampler.BorderColor[3] = 1.0f;
+      break;
+    case D3D12_STATIC_BORDER_COLOR_TRANSPARENT_BLACK:
+    default:
+      break;
+    }
+    return CreateSampler(sampler);
+  }
+
   static WMTSamplerAddressMode AddressMode(D3D12_TEXTURE_ADDRESS_MODE mode) {
     switch (mode) {
     case D3D12_TEXTURE_ADDRESS_MODE_MIRROR:
@@ -3061,18 +3205,91 @@ private:
     return WMTSamplerBorderColorOpaqueWhite;
   }
 
+  UINT ReflectedDescriptorRangeCount(const PipelineState &pipeline,
+                                     const RootSignatureRange &range,
+                                     D3D12_SHADER_VISIBILITY visibility,
+                                     bool compute) {
+    UINT count = 0;
+    const auto binding_type = BindingTypeForRange(range.range_type);
+    ForEachVisibleStage(
+        visibility, compute, [&](PipelineStage stage) {
+          const auto *shader = FindShaderForStage(pipeline, stage);
+          if (!shader)
+            return;
+          const auto *arguments =
+              binding_type == SM50BindingType::ConstantBuffer
+                  ? shader->constantBufferInfo()
+                  : shader->resourceArgumentInfo();
+          const auto argument_count =
+              binding_type == SM50BindingType::ConstantBuffer
+                  ? shader->reflection.NumConstantBuffers
+                  : shader->reflection.NumArguments;
+          if (!arguments)
+            return;
+          for (UINT i = 0; i < argument_count; i++) {
+            const auto &argument = arguments[i];
+            if (argument.Type != binding_type)
+              continue;
+            const auto space =
+                argument.RegisterCount ? argument.RegisterSpace : 0;
+            const auto lower = argument.RegisterCount
+                                   ? argument.RegisterLowerBound
+                                   : argument.SM50BindingSlot;
+            const auto arg_count =
+                argument.RegisterCount ? argument.RegisterCount : 1;
+            if (space != range.register_space ||
+                lower < range.base_shader_register)
+              continue;
+            const auto first = lower - range.base_shader_register;
+            const auto size =
+                arg_count == UINT_MAX ? 1u : std::max<UINT>(arg_count, 1u);
+            count = std::max(count, first + size);
+          }
+        });
+    return count ? std::min<UINT>(count, 4096u) : 1u;
+  }
+
+  void ApplyStaticSamplers(ArgumentEncodingContext &enc,
+                           const PipelineState &pipeline,
+                           const RootSignature &root, bool compute) {
+    for (const auto &sampler_desc : root.GetStaticSamplers()) {
+      ForEachVisibleStage(
+          sampler_desc.ShaderVisibility, compute, [&](PipelineStage stage) {
+            auto slot = ResolveShaderBindingSlot(
+                pipeline, stage, SM50BindingType::Sampler,
+                sampler_desc.ShaderRegister, sampler_desc.RegisterSpace);
+            if (!slot)
+              return;
+
+            auto sampler = CreateStaticSampler(sampler_desc);
+            if (!sampler)
+              return;
+            if (stage == PipelineStage::Compute)
+              enc.bindSampler<PipelineStage::Compute>(*slot,
+                                                       std::move(sampler));
+            else if (stage == PipelineStage::Pixel)
+              enc.bindSampler<PipelineStage::Pixel>(*slot,
+                                                     std::move(sampler));
+            else
+              enc.bindSampler<PipelineStage::Vertex>(*slot,
+                                                      std::move(sampler));
+          });
+    }
+  }
+
   void ApplyRootDescriptorTables(ArgumentEncodingContext &enc,
-                                 const ReplayState &state, bool compute) {
+                                 const ReplayState &state,
+                                 const PipelineState &pipeline, bool compute) {
     auto *root = GetRootSignature(compute ? state.compute_root_signature.ptr()
                                           : state.graphics_root_signature.ptr());
     if (!root)
       return;
 
+    ApplyStaticSamplers(enc, pipeline, *root, compute);
+
     const auto parameters = root->GetParameters();
     for (UINT root_index = 0; root_index < parameters.size(); root_index++) {
       const auto &parameter = parameters[root_index];
-      const auto stage =
-          PipelineStageFromShaderVisibility(parameter.visibility, compute);
       if (parameter.parameter_type == D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE) {
         const auto base = GetTableHandle(state, compute, root_index);
         if (!base.ptr)
@@ -3081,37 +3298,53 @@ private:
         for (const auto &range : parameter.ranges) {
           const auto range_offset = DescriptorRangeOffset(range, running_offset);
           const auto count =
-              range.descriptor_count == UINT_MAX ? 1u : range.descriptor_count;
+              range.descriptor_count == UINT_MAX
+                  ? ReflectedDescriptorRangeCount(
+                        pipeline, range, parameter.visibility, compute)
+                  : range.descriptor_count;
           for (UINT i = 0; i < count; i++) {
-            auto *descriptor = GetDescriptorRecordFromGpuHandle(
+            auto *descriptor = GetBoundDescriptorRecord(
+                state,
                 {base.ptr + sizeof(DescriptorRecord) * (range_offset + i)},
                 DescriptorHeapTypeForRange(range.range_type));
             if (!descriptor)
               continue;
-            BindDescriptor(enc, stage, range.range_type,
-                           range.base_shader_register + i, *descriptor);
+            ForEachVisibleStage(
+                parameter.visibility, compute, [&](PipelineStage stage) {
+                  auto slot = ResolveShaderBindingSlot(
+                      pipeline, stage, BindingTypeForRange(range.range_type),
+                      range.base_shader_register + i, range.register_space);
+                  if (!slot)
+                    return;
+                  BindDescriptor(enc, stage, range.range_type, *slot,
+                                 *descriptor);
+                });
           }
           if (range.descriptor_count != UINT_MAX)
             running_offset = range_offset + range.descriptor_count;
         }
       } else if (parameter.parameter_type ==
                  D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS) {
-        BindRootConstants(enc, state, compute, root_index, parameter);
+        BindRootConstants(enc, state, pipeline, compute, root_index, parameter);
       } else if (parameter.parameter_type == D3D12_ROOT_PARAMETER_TYPE_CBV) {
-        ApplyRootBufferDescriptor(enc, state, compute, root_index, parameter,
+        ApplyRootBufferDescriptor(enc, state, pipeline, compute, root_index,
+                                  parameter,
                                   DescriptorRecordType::ConstantBufferView);
       } else if (parameter.parameter_type == D3D12_ROOT_PARAMETER_TYPE_SRV) {
-        ApplyRootBufferDescriptor(enc, state, compute, root_index, parameter,
+        ApplyRootBufferDescriptor(enc, state, pipeline, compute, root_index,
+                                  parameter,
                                   DescriptorRecordType::ShaderResourceView);
       } else if (parameter.parameter_type == D3D12_ROOT_PARAMETER_TYPE_UAV) {
-        ApplyRootBufferDescriptor(enc, state, compute, root_index, parameter,
+        ApplyRootBufferDescriptor(enc, state, pipeline, compute, root_index,
+                                  parameter,
                                   DescriptorRecordType::UnorderedAccessView);
       }
     }
   }
 
   void ApplyRootBufferDescriptor(ArgumentEncodingContext &enc,
-                                 const ReplayState &state, bool compute,
+                                 const ReplayState &state,
+                                 const PipelineState &pipeline, bool compute,
                                  UINT root_index,
                                  const RootSignatureParameter &parameter,
                                  DescriptorRecordType type) {
@@ -3161,14 +3394,21 @@ private:
       descriptor.desc.uav.Buffer.StructureByteStride = 1;
     }
 
-    BindDescriptor(enc, PipelineStageFromShaderVisibility(parameter.visibility,
-                                                          compute),
-                   type == DescriptorRecordType::ConstantBufferView
-                       ? D3D12_DESCRIPTOR_RANGE_TYPE_CBV
-                       : type == DescriptorRecordType::ShaderResourceView
-                             ? D3D12_DESCRIPTOR_RANGE_TYPE_SRV
-                             : D3D12_DESCRIPTOR_RANGE_TYPE_UAV,
-                   parameter.descriptor.ShaderRegister, descriptor);
+    const auto range_type =
+        type == DescriptorRecordType::ConstantBufferView
+            ? D3D12_DESCRIPTOR_RANGE_TYPE_CBV
+            : type == DescriptorRecordType::ShaderResourceView
+                  ? D3D12_DESCRIPTOR_RANGE_TYPE_SRV
+                  : D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+    ForEachVisibleStage(parameter.visibility, compute, [&](PipelineStage stage) {
+      auto slot = ResolveShaderBindingSlot(
+          pipeline, stage, BindingTypeForRange(range_type),
+          parameter.descriptor.ShaderRegister,
+          parameter.descriptor.RegisterSpace);
+      if (!slot)
+        return;
+      BindDescriptor(enc, stage, range_type, *slot, descriptor);
+    });
   }
 
   template <PipelineStage Stage>
@@ -3240,7 +3480,7 @@ private:
                               const ReplayState &state,
                               PipelineState &pipeline,
                               uint64_t &argbuf_offset) {
-    ApplyRootDescriptorTables(enc, state, false);
+    ApplyRootDescriptorTables(enc, state, pipeline, false);
     EncodeVertexBuffers(enc, state, pipeline.GetGraphicsState(),
                         argbuf_offset);
     const auto &shaders = pipeline.GetDxilShaders();
@@ -3259,7 +3499,7 @@ private:
                              const ReplayState &state,
                              PipelineState &pipeline,
                              uint64_t &argbuf_offset) {
-    ApplyRootDescriptorTables(enc, state, true);
+    ApplyRootDescriptorTables(enc, state, pipeline, true);
     const auto &shaders = pipeline.GetDxilShaders();
     const auto &key = pipeline.GetShaderCacheKey();
     for (const auto &shader : shaders) {

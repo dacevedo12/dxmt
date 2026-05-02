@@ -852,6 +852,11 @@ public:
     return storage_.parameters;
   }
 
+  std::span<const D3D12_STATIC_SAMPLER_DESC>
+  GetStaticSamplers() const override {
+    return storage_.static_samplers;
+  }
+
 private:
   Com<IMTLD3D12Device> device_;
   RootSignatureStorage storage_;

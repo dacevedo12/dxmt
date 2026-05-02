@@ -65,6 +65,9 @@ struct MTL_SM50_SHADER_ARGUMENT {
   uint32_t SM50BindingSlot;
   enum MTL_SM50_SHADER_ARGUMENT_FLAG Flags;
   uint32_t StructurePtrOffset;
+  uint32_t RegisterSpace;
+  uint32_t RegisterLowerBound;
+  uint32_t RegisterCount;
 };
 
 enum MTL_TESSELLATOR_OUTPUT_PRIMITIVE {
