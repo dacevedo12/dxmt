@@ -740,6 +740,79 @@ public:
       data->RaytracingTier = D3D12_RAYTRACING_TIER_NOT_SUPPORTED;
       return S_OK;
     }
+#ifdef __ID3D12GraphicsCommandList4_INTERFACE_DEFINED__
+    case D3D12_FEATURE_D3D12_OPTIONS6: {
+      if (feature_data_size < sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS6))
+        return E_INVALIDARG;
+
+      auto *data = static_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS6 *>(feature_data);
+      std::memset(data, 0, sizeof(*data));
+      data->VariableShadingRateTier =
+          D3D12_VARIABLE_SHADING_RATE_TIER_NOT_SUPPORTED;
+      return S_OK;
+    }
+    case D3D12_FEATURE_D3D12_OPTIONS7: {
+      if (feature_data_size < sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS7))
+        return E_INVALIDARG;
+
+      auto *data = static_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS7 *>(feature_data);
+      std::memset(data, 0, sizeof(*data));
+      data->MeshShaderTier = D3D12_MESH_SHADER_TIER_NOT_SUPPORTED;
+      data->SamplerFeedbackTier = D3D12_SAMPLER_FEEDBACK_TIER_NOT_SUPPORTED;
+      return S_OK;
+    }
+    case D3D12_FEATURE_D3D12_OPTIONS8: {
+      if (feature_data_size < sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS8))
+        return E_INVALIDARG;
+
+      auto *data = static_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS8 *>(feature_data);
+      std::memset(data, 0, sizeof(*data));
+      return S_OK;
+    }
+    case D3D12_FEATURE_D3D12_OPTIONS9: {
+      if (feature_data_size < sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS9))
+        return E_INVALIDARG;
+
+      auto *data = static_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS9 *>(feature_data);
+      std::memset(data, 0, sizeof(*data));
+      data->WaveMMATier = D3D12_WAVE_MMA_TIER_NOT_SUPPORTED;
+      return S_OK;
+    }
+    case D3D12_FEATURE_D3D12_OPTIONS10: {
+      if (feature_data_size < sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS10))
+        return E_INVALIDARG;
+
+      auto *data = static_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS10 *>(feature_data);
+      std::memset(data, 0, sizeof(*data));
+      return S_OK;
+    }
+    case D3D12_FEATURE_D3D12_OPTIONS11: {
+      if (feature_data_size < sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS11))
+        return E_INVALIDARG;
+
+      auto *data = static_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS11 *>(feature_data);
+      std::memset(data, 0, sizeof(*data));
+      return S_OK;
+    }
+    case D3D12_FEATURE_D3D12_OPTIONS12: {
+      if (feature_data_size < sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS12))
+        return E_INVALIDARG;
+
+      auto *data = static_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS12 *>(feature_data);
+      std::memset(data, 0, sizeof(*data));
+      data->MSPrimitivesPipelineStatisticIncludesCulledPrimitives =
+          D3D12_TRI_STATE_UNKNOWN;
+      return S_OK;
+    }
+    case D3D12_FEATURE_D3D12_OPTIONS13: {
+      if (feature_data_size < sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS13))
+        return E_INVALIDARG;
+
+      auto *data = static_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS13 *>(feature_data);
+      std::memset(data, 0, sizeof(*data));
+      return S_OK;
+    }
+#endif
     default:
       WARN("D3D12Device: CheckFeatureSupport unsupported feature ", feature);
       return DXGI_ERROR_UNSUPPORTED;
