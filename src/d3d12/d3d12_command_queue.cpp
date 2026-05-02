@@ -242,6 +242,11 @@ GetIndexSize(DXGI_FORMAT format) {
   return format == DXGI_FORMAT_R32_UINT ? 4 : 2;
 }
 
+static bool
+IsSupportedIndexBufferFormat(DXGI_FORMAT format) {
+  return format == DXGI_FORMAT_R16_UINT || format == DXGI_FORMAT_R32_UINT;
+}
+
 static const char *
 PipelineStageName(PipelineStage stage) {
   switch (stage) {
@@ -2546,6 +2551,11 @@ private:
       WARN("D3D12CommandQueue: indirect indexed draw skipped because index buffer binding is unavailable");
       return;
     }
+    if (!IsSupportedIndexBufferFormat(state.index_buffer->Format)) {
+      WARN("D3D12CommandQueue: indirect indexed draw skipped because index buffer format is unsupported format=",
+           uint32_t(state.index_buffer->Format));
+      return;
+    }
 
     Rc<BufferAllocation> index_allocation = index_resource->GetBufferAllocation();
     const auto primitive = GetPrimitiveType(state.topology);
@@ -4024,6 +4034,11 @@ private:
         state.index_buffer->BufferLocation, &index_resource_offset);
     if (!index_resource || !index_resource->GetBufferAllocation()) {
       WARN("D3D12CommandQueue: indexed draw skipped because index buffer binding is unavailable");
+      return;
+    }
+    if (!IsSupportedIndexBufferFormat(state.index_buffer->Format)) {
+      WARN("D3D12CommandQueue: indexed draw skipped because index buffer format is unsupported format=",
+           uint32_t(state.index_buffer->Format));
       return;
     }
 
