@@ -74,6 +74,13 @@ IndirectArgumentByteSize(const D3D12_INDIRECT_ARGUMENT_DESC &argument) {
 }
 
 static bool
+IsIndirectOperationArgument(D3D12_INDIRECT_ARGUMENT_TYPE type) {
+  return type == D3D12_INDIRECT_ARGUMENT_TYPE_DRAW ||
+         type == D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED ||
+         type == D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH;
+}
+
+static bool
 HasFormatCapability(FormatCapability caps, FormatCapability cap) {
   return (static_cast<int>(caps) & static_cast<int>(cap)) != 0;
 }
@@ -1400,6 +1407,10 @@ public:
   HRESULT STDMETHODCALLTYPE CreateFence(UINT64 initial_value, D3D12_FENCE_FLAGS flags,
                                         REFIID riid, void **fence) override {
     InitReturnPtr(fence);
+    if (flags != D3D12_FENCE_FLAG_NONE) {
+      WARN("D3D12Device::CreateFence: unsupported fence flags ", flags);
+      return E_NOTIMPL;
+    }
 
     auto fence_object = d3d12::CreateFence(static_cast<IMTLD3D12Device *>(this), initial_value, flags);
     return fence_object->QueryInterface(riid, fence);
@@ -1458,12 +1469,20 @@ public:
       return E_INVALIDARG;
 
     UINT min_stride = 0;
+    UINT operation_count = 0;
     for (UINT i = 0; i < desc->NumArgumentDescs; i++) {
       const auto &argument = desc->pArgumentDescs[i];
       const auto argument_size = IndirectArgumentByteSize(argument);
       if (!argument_size)
         return E_NOTIMPL;
       min_stride += argument_size;
+      if (IsIndirectOperationArgument(argument.Type)) {
+        if (++operation_count > 1 || i + 1 != desc->NumArgumentDescs) {
+          WARN("D3D12Device::CreateCommandSignature: unsupported indirect "
+               "operation layout");
+          return E_INVALIDARG;
+        }
+      }
       switch (argument.Type) {
       case D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT:
       case D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT_BUFFER_VIEW:
@@ -1475,6 +1494,10 @@ public:
       default:
         break;
       }
+    }
+    if (!operation_count) {
+      WARN("D3D12Device::CreateCommandSignature: missing indirect operation");
+      return E_INVALIDARG;
     }
     if (desc->ByteStride < min_stride)
       return E_INVALIDARG;

@@ -110,6 +110,40 @@ public:
     return query.timestamp;
   }
 
+  bool BeginStatistics(D3D12_QUERY_TYPE type, UINT index) override {
+    if (!ValidateAccess(type, index))
+      return false;
+    if (desc_.Type != D3D12_QUERY_HEAP_TYPE_PIPELINE_STATISTICS &&
+        desc_.Type != D3D12_QUERY_HEAP_TYPE_SO_STATISTICS) {
+      WARN("D3D12QueryHeap: BeginQuery statistics unsupported for heap type ",
+           desc_.Type);
+      return false;
+    }
+    auto &query = queries_[index];
+    query.began = true;
+    query.valid = false;
+    return true;
+  }
+
+  bool EndStatistics(D3D12_QUERY_TYPE type, UINT index) override {
+    if (!ValidateAccess(type, index))
+      return false;
+    if (desc_.Type != D3D12_QUERY_HEAP_TYPE_PIPELINE_STATISTICS &&
+        desc_.Type != D3D12_QUERY_HEAP_TYPE_SO_STATISTICS) {
+      WARN("D3D12QueryHeap: EndQuery statistics unsupported for heap type ",
+           desc_.Type);
+      return false;
+    }
+    auto &query = queries_[index];
+    if (!query.began) {
+      WARN("D3D12QueryHeap: EndQuery statistics without matching BeginQuery");
+      return false;
+    }
+    query.began = false;
+    query.valid = true;
+    return true;
+  }
+
   bool Resolve(D3D12_QUERY_TYPE type, UINT start_index, UINT query_count,
                std::vector<uint8_t> &data) const override {
     const auto stride = ResolveStride(type);

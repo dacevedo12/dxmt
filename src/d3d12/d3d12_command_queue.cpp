@@ -20,6 +20,7 @@
 #include "wsi_window.hpp"
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstring>
 #include <cfloat>
 #include <mutex>
@@ -1011,8 +1012,12 @@ public:
     if (!gpu_timestamp || !cpu_timestamp)
       return E_INVALIDARG;
 
-    *gpu_timestamp = 0;
-    *cpu_timestamp = 0;
+    const auto now = std::chrono::steady_clock::now().time_since_epoch();
+    const auto timestamp =
+        std::chrono::duration_cast<std::chrono::nanoseconds>(now).count();
+    const auto monotonic = timestamp < 0 ? 0 : static_cast<UINT64>(timestamp);
+    *gpu_timestamp = monotonic;
+    *cpu_timestamp = monotonic;
     return S_OK;
   }
 
@@ -2073,8 +2078,8 @@ private:
     if (!ReadBufferBytes(state.predication_buffer.ptr(),
                          state.predication_buffer_offset, &value,
                          sizeof(value), "predication")) {
-      WARN("D3D12CommandQueue: predication buffer is unavailable; command will run");
-      return true;
+      WARN("D3D12CommandQueue: predication buffer is unavailable; command will be skipped");
+      return false;
     }
 
     switch (state.predication_operation) {
@@ -2085,7 +2090,7 @@ private:
     default:
       WARN("D3D12CommandQueue: unsupported predication operation ",
            state.predication_operation);
-      return true;
+      return false;
     }
   }
 
@@ -2093,6 +2098,14 @@ private:
     auto *heap = dynamic_cast<QueryHeap *>(record.heap.ptr());
     if (!heap) {
       WARN("D3D12CommandQueue: BeginQuery skipped for foreign query heap");
+      return;
+    }
+    if (record.type == D3D12_QUERY_TYPE_PIPELINE_STATISTICS ||
+        record.type == D3D12_QUERY_TYPE_SO_STATISTICS_STREAM0 ||
+        record.type == D3D12_QUERY_TYPE_SO_STATISTICS_STREAM1 ||
+        record.type == D3D12_QUERY_TYPE_SO_STATISTICS_STREAM2 ||
+        record.type == D3D12_QUERY_TYPE_SO_STATISTICS_STREAM3) {
+      heap->BeginStatistics(record.type, record.index);
       return;
     }
     auto query = heap->BeginVisibility(record.type, record.index);
@@ -2119,7 +2132,14 @@ private:
       });
       return;
     }
-
+    if (record.type == D3D12_QUERY_TYPE_PIPELINE_STATISTICS ||
+        record.type == D3D12_QUERY_TYPE_SO_STATISTICS_STREAM0 ||
+        record.type == D3D12_QUERY_TYPE_SO_STATISTICS_STREAM1 ||
+        record.type == D3D12_QUERY_TYPE_SO_STATISTICS_STREAM2 ||
+        record.type == D3D12_QUERY_TYPE_SO_STATISTICS_STREAM3) {
+      heap->EndStatistics(record.type, record.index);
+      return;
+    }
     auto query = heap->EndVisibility(record.type, record.index);
     if (!query)
       return;
