@@ -72,6 +72,7 @@ public:
     }
     auto &query = queries_[index];
     query.visibility = new VisibilityResultQuery();
+    query.visibility->begin(0, 0);
     query.began = true;
     query.valid = false;
     return query.visibility;
@@ -93,6 +94,9 @@ public:
     }
     query.began = false;
     query.valid = true;
+    uint64_t visible = 1;
+    query.visibility->end(0, 1);
+    query.visibility->issue(0, &visible, 1);
     return query.visibility;
   }
 
@@ -106,6 +110,7 @@ public:
     }
     auto &query = queries_[index];
     query.timestamp = new TimestampQuery();
+    query.timestamp->issue(++timestamp_value_);
     query.valid = true;
     return query.timestamp;
   }
@@ -252,6 +257,7 @@ private:
   ComPrivateData private_data_;
   D3D12_QUERY_HEAP_DESC desc_ = {};
   std::vector<QueryData> queries_;
+  uint64_t timestamp_value_ = 0;
   std::string name_;
 };
 
