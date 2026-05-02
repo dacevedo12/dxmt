@@ -352,6 +352,8 @@ struct DxilTypedOperationInfo {
   bool is_atomic = false;
   uint32_t resource_class = 0;
   uint32_t resource_range_id = 0;
+  uint32_t resource_space = 0;
+  uint32_t resource_lower_bound = 0;
   uint32_t resource_index = 0;
   uint32_t signature_element_id = 0;
   uint32_t row_index = 0;
@@ -363,6 +365,7 @@ struct DxilTypedOperationInfo {
   bool non_uniform = false;
   bool has_resource_class = false;
   bool has_resource_range_id = false;
+  bool has_resource_binding = false;
   bool has_resource_index = false;
   bool has_signature_element_id = false;
   bool has_row_index = false;

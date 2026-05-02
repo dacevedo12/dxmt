@@ -484,6 +484,18 @@ ConstantOperandU32(const CallBase &call, uint32_t index) {
   return std::nullopt;
 }
 
+std::optional<uint32_t>
+ConstantAggregateElementU32(const Value *value, uint32_t index) {
+  const auto *constant = dyn_cast_or_null<Constant>(value);
+  if (!constant)
+    return std::nullopt;
+  const auto *element = constant->getAggregateElement(index);
+  const auto *integer = dyn_cast_or_null<ConstantInt>(element);
+  if (!integer)
+    return std::nullopt;
+  return uint32_t(integer->getZExtValue());
+}
+
 Value *
 OperandValue(const CallBase &call, uint32_t index, DxilAirContext &ctx) {
   if (index >= call.arg_size())
@@ -499,6 +511,17 @@ FindResource(const dxil::DxilTranslationInfo &translation,
       translation.resources.begin(), translation.resources.end(),
       [&](const dxil::DxilTranslationResourceInfo &resource) {
         return resource.resource_class == resource_class && resource.id == id;
+      });
+  return found == translation.resources.end() ? nullptr : &*found;
+}
+
+const dxil::DxilTranslationResourceInfo *
+FindResourceByBinding(const dxil::DxilTranslationInfo &translation,
+                      uint32_t space, uint32_t lower_bound) {
+  auto found = std::find_if(
+      translation.resources.begin(), translation.resources.end(),
+      [&](const dxil::DxilTranslationResourceInfo &resource) {
+        return resource.space == space && resource.lower_bound == lower_bound;
       });
   return found == translation.resources.end() ? nullptr : &*found;
 }
@@ -940,8 +963,28 @@ LowerDxilCall(const CallBase &call, DxilAirContext &ctx,
     ctx.handles[&call] = handle;
     return Error::success();
   }
-  if (name == "CreateHandleFromBinding" || name == "CreateHandleFromHeap") {
-    return Unsupported("DXIL " + name + " requires root descriptor heap lowering");
+  if (name == "CreateHandleFromBinding") {
+    const auto lower_bound =
+        ConstantAggregateElementU32(call.getArgOperand(1), 0);
+    const auto space = ConstantAggregateElementU32(call.getArgOperand(1), 2);
+    if (!lower_bound || !space)
+      return Unsupported("DXIL CreateHandleFromBinding requires a constant ResBind");
+    const auto *resource =
+        FindResourceByBinding(ctx.translation, *space, *lower_bound);
+    if (!resource)
+      return Unsupported("DXIL CreateHandleFromBinding unresolved binding space" +
+                         std::to_string(*space) + " register" +
+                         std::to_string(*lower_bound));
+    DxilResourceHandle handle = {};
+    handle.resource_class = resource->resource_class;
+    handle.range_id = resource->id;
+    handle.index = OperandValue(call, 2, ctx);
+    handle.non_uniform = ConstantOperandU32(call, 3).value_or(0) != 0;
+    ctx.handles[&call] = handle;
+    return Error::success();
+  }
+  if (name == "CreateHandleFromHeap") {
+    return Unsupported("DXIL CreateHandleFromHeap bindless descriptor heap is unsupported");
   }
   if (name == "AnnotateHandle") {
     ctx.handles[&call] = ResolveHandle(call.getArgOperand(1), ctx);

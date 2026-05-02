@@ -325,6 +325,14 @@ IntegerOperandUInt32(const std::vector<LlvmOperandInfo> &operands,
   return uint32_t(operands[index].integer_value);
 }
 
+std::optional<uint64_t>
+IntegerOperandUInt64(const std::vector<LlvmOperandInfo> &operands,
+                     size_t index) {
+  if (index >= operands.size() || !operands[index].is_integer)
+    return std::nullopt;
+  return operands[index].integer_value;
+}
+
 void
 AppendTypedOperand(DxilTypedOperationInfo &typed,
                    const std::vector<LlvmOperandInfo> &operands,
@@ -475,6 +483,11 @@ ParseDxilTypedOperation(std::string_view name,
     typed.kind = DxilTypedOperationKind::CreateHandleFromBinding;
     AppendTypedOperands(typed, operands,
                         {"binding", "index", "non_uniform_index"});
+    if (auto binding = IntegerOperandUInt64(operands, 1)) {
+      typed.resource_lower_bound = uint32_t(*binding & 0xffffffffu);
+      typed.resource_space = uint32_t((*binding >> 32) & 0xffffffffu);
+      typed.has_resource_binding = true;
+    }
     SetTypedUInt32(operands, 2, typed.resource_index,
                    typed.has_resource_index);
     SetTypedBool(operands, 3, typed.non_uniform, typed.has_non_uniform);
