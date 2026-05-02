@@ -281,7 +281,9 @@ ValidateShaderResourceView(ID3D12Resource *resource,
     }
     const auto raw = (desc.Buffer.Flags & D3D12_BUFFER_SRV_FLAG_RAW) != 0;
     const auto structured = desc.Buffer.StructureByteStride != 0;
-    const auto typed = desc.Format != DXGI_FORMAT_UNKNOWN;
+    const auto typed =
+        desc.Format != DXGI_FORMAT_UNKNOWN &&
+        !(raw && desc.Format == DXGI_FORMAT_R32_TYPELESS);
     if ((raw && structured) || (raw && typed) || (structured && typed)) {
       WARN("D3D12Device: ambiguous buffer SRV typed/raw/structured descriptor");
       return false;
@@ -316,7 +318,9 @@ ValidateUnorderedAccessView(ID3D12Resource *resource,
     }
     const auto raw = (desc.Buffer.Flags & D3D12_BUFFER_UAV_FLAG_RAW) != 0;
     const auto structured = desc.Buffer.StructureByteStride != 0;
-    const auto typed = desc.Format != DXGI_FORMAT_UNKNOWN;
+    const auto typed =
+        desc.Format != DXGI_FORMAT_UNKNOWN &&
+        !(raw && desc.Format == DXGI_FORMAT_R32_TYPELESS);
     if ((raw && structured) || (raw && typed) || (structured && typed)) {
       WARN("D3D12Device: ambiguous buffer UAV typed/raw/structured descriptor");
       return false;

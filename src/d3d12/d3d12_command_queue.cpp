@@ -1634,7 +1634,7 @@ private:
           continue;
         ULONG ref_count = backbuffer->AddRef();
         backbuffer->Release();
-        if (ref_count > 2)
+        if (ref_count > 3)
           return true;
       }
       return false;
@@ -2126,9 +2126,6 @@ private:
     auto query = heap->BeginVisibility(record.type, record.index);
     if (!query)
       return;
-    chunk->emitcc([query = std::move(query)](ArgumentEncodingContext &enc) mutable {
-      enc.beginVisibilityResultQuery(std::move(query));
-    });
   }
 
   void ReplayEndQuery(CommandChunk *chunk, const EndQueryRecord &record) {
@@ -2141,10 +2138,6 @@ private:
       auto query = heap->EndTimestamp(record.type, record.index);
       if (!query)
         return;
-      chunk->emitcc([query = std::move(query)](ArgumentEncodingContext &enc) mutable {
-        enc.endPass();
-        enc.sampleTimestamp(std::move(query));
-      });
       return;
     }
     if (record.type == D3D12_QUERY_TYPE_PIPELINE_STATISTICS ||
@@ -2158,9 +2151,6 @@ private:
     auto query = heap->EndVisibility(record.type, record.index);
     if (!query)
       return;
-    chunk->emitcc([query = std::move(query)](ArgumentEncodingContext &enc) mutable {
-      enc.endVisibilityResultQuery(std::move(query));
-    });
   }
 
   void ReplayResolveQueryData(CommandChunk *chunk,
