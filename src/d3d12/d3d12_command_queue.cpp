@@ -107,19 +107,41 @@ ReadBufferBytes(ID3D12Resource *resource, UINT64 offset, void *dst,
 }
 
 static bool
-WriteBufferBytes(ID3D12Resource *resource, UINT64 offset, const void *src,
-                 UINT64 size, const char *context) {
-  auto *d3d12_resource = GetResource(resource);
-  if (!d3d12_resource || !d3d12_resource->GetBufferAllocation() || !src)
+ValidateBufferRange(Resource *resource, UINT64 offset, UINT64 size,
+                    const char *context) {
+  if (!resource || !resource->GetBufferAllocation())
     return false;
-  if (offset > d3d12_resource->GetResourceDesc().Width ||
-      size > d3d12_resource->GetResourceDesc().Width - offset) {
-    WARN("D3D12CommandQueue: ", context, " write exceeds buffer bounds");
+  const UINT64 width = resource->GetResourceDesc().Width;
+  if (offset > width || size > width - offset) {
+    WARN("D3D12CommandQueue: ", context, " exceeds buffer bounds");
     return false;
   }
-  d3d12_resource->GetBufferAllocation()->updateContents(
-      d3d12_resource->GetHeapOffset() + offset, src, size);
   return true;
+}
+
+enum class DirectIndirectOperation {
+  None,
+  Draw,
+  DrawIndexed,
+  Dispatch,
+};
+
+static DirectIndirectOperation
+GetDirectIndirectOperation(
+    const std::vector<D3D12_INDIRECT_ARGUMENT_DESC> &arguments) {
+  if (arguments.size() != 1)
+    return DirectIndirectOperation::None;
+
+  switch (arguments[0].Type) {
+  case D3D12_INDIRECT_ARGUMENT_TYPE_DRAW:
+    return DirectIndirectOperation::Draw;
+  case D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED:
+    return DirectIndirectOperation::DrawIndexed;
+  case D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH:
+    return DirectIndirectOperation::Dispatch;
+  default:
+    return DirectIndirectOperation::None;
+  }
 }
 
 static RootSignature *
@@ -1690,7 +1712,7 @@ private:
     } else if constexpr (std::is_same_v<T, EndQueryRecord>) {
       ReplayEndQuery(record);
     } else if constexpr (std::is_same_v<T, ResolveQueryDataRecord>) {
-      ReplayResolveQueryData(record);
+      ReplayResolveQueryData(chunk, record);
     } else if constexpr (std::is_same_v<T, PredicationRecord>) {
       ReplaySetPredication(state, record);
     } else if constexpr (std::is_same_v<T, ExecuteIndirectRecord>) {
@@ -1976,7 +1998,8 @@ private:
     heap->End(record.type, record.index);
   }
 
-  void ReplayResolveQueryData(const ResolveQueryDataRecord &record) {
+  void ReplayResolveQueryData(CommandChunk *chunk,
+                              const ResolveQueryDataRecord &record) {
     auto *heap = dynamic_cast<QueryHeap *>(record.heap.ptr());
     if (!heap) {
       WARN("D3D12CommandQueue: ResolveQueryData skipped for foreign query heap");
@@ -1988,8 +2011,39 @@ private:
                        data))
       return;
     if (!data.empty()) {
-      WriteBufferBytes(record.dst_buffer.ptr(), record.dst_buffer_offset,
-                       data.data(), data.size(), "query resolve");
+      auto *dst = GetResource(record.dst_buffer.ptr());
+      if (!ValidateBufferRange(dst, record.dst_buffer_offset, data.size(),
+                               "query resolve"))
+        return;
+
+      WMTBufferInfo staging_info = {};
+      staging_info.length = data.size();
+      staging_info.options = WMTResourceStorageModeShared |
+                             WMTResourceOptionCPUCacheModeWriteCombined;
+      auto staging = device_->GetDXMTDevice().device().newBuffer(staging_info);
+      if (!staging || !staging_info.memory.get()) {
+        WARN("D3D12CommandQueue: ResolveQueryData failed to allocate staging buffer");
+        return;
+      }
+      std::memcpy(staging_info.memory.get(), data.data(), data.size());
+
+      Rc<BufferAllocation> dst_allocation = dst->GetBufferAllocation();
+      const UINT64 dst_offset = dst->GetHeapOffset() + record.dst_buffer_offset;
+      const UINT64 copy_size = data.size();
+      chunk->emitcc([staging, dst_allocation, dst_offset,
+                     copy_size](ArgumentEncodingContext &enc) {
+        enc.retainAllocation(dst_allocation.ptr());
+        enc.startBlitPass();
+        auto &copy =
+            enc.encodeBlitCommand<wmtcmd_blit_copy_from_buffer_to_buffer>();
+        copy.type = WMTBlitCommandCopyFromBufferToBuffer;
+        copy.src = staging;
+        copy.src_offset = 0;
+        copy.dst = dst_allocation->buffer();
+        copy.dst_offset = dst_offset;
+        copy.copy_length = copy_size;
+        enc.endPass();
+      });
     }
   }
 
@@ -2012,21 +2066,119 @@ private:
       return;
     }
 
+    const auto &desc = signature->GetDesc();
+    const auto &arguments = signature->GetArguments();
+    if (!desc.ByteStride || arguments.empty())
+      return;
+
+    const auto direct_operation = GetDirectIndirectOperation(arguments);
+    if (direct_operation != DirectIndirectOperation::None &&
+        ReplayExecuteIndirectDirect(chunk, state, record, desc, arguments[0],
+                                    direct_operation))
+      return;
+
+    ReplayExecuteIndirectCpuFallback(chunk, state, record, *signature);
+  }
+
+  bool ReplayExecuteIndirectDirect(
+      CommandChunk *chunk, ReplayState &state,
+      const ExecuteIndirectRecord &record,
+      const D3D12_COMMAND_SIGNATURE_DESC &desc,
+      const D3D12_INDIRECT_ARGUMENT_DESC &argument,
+      DirectIndirectOperation operation) {
+    const UINT command_count = record.max_command_count;
+    if (!command_count)
+      return true;
+
+    const UINT argument_size = IndirectArgumentByteSize(argument);
+    if (!argument_size || desc.ByteStride < argument_size) {
+      WARN("D3D12CommandQueue: ExecuteIndirect argument layout exceeds stride");
+      return true;
+    }
+
+    auto *arg_resource = GetResource(record.arg_buffer.ptr());
+    if (!ValidateBufferRange(
+            arg_resource, record.arg_buffer_offset,
+            UINT64(command_count - 1) * desc.ByteStride + argument_size,
+            "indirect argument buffer"))
+      return true;
+
+    Rc<Buffer> arg_buffer = arg_resource->GetBuffer();
+    const UINT64 arg_base_offset =
+        arg_resource->GetHeapOffset() + record.arg_buffer_offset;
+
+    Rc<Buffer> count_buffer;
+    UINT64 count_offset = 0;
+    WMT::Reference<WMT::Buffer> counted_args;
+    if (record.count_buffer) {
+      auto *count_resource = GetResource(record.count_buffer.ptr());
+      if (!ValidateBufferRange(count_resource, record.count_buffer_offset,
+                               sizeof(UINT), "indirect count buffer"))
+        return true;
+
+      count_buffer = count_resource->GetBuffer();
+      count_offset = count_resource->GetHeapOffset() + record.count_buffer_offset;
+
+      WMTBufferInfo counted_info = {};
+      counted_info.length = UINT64(command_count) * argument_size;
+      counted_info.options = WMTResourceStorageModePrivate |
+                             WMTResourceHazardTrackingModeTracked;
+      counted_args =
+          device_->GetDXMTDevice().device().newBuffer(counted_info);
+      if (!counted_args) {
+        WARN("D3D12CommandQueue: ExecuteIndirect failed to allocate counted argument buffer");
+        return true;
+      }
+    }
+
+    for (UINT command_index = 0; command_index < command_count;
+         command_index++) {
+      const UINT64 arg_offset =
+          arg_base_offset + UINT64(command_index) * desc.ByteStride;
+      const UINT64 counted_offset = UINT64(command_index) * argument_size;
+
+      switch (operation) {
+      case DirectIndirectOperation::Draw:
+        ReplayDrawInstancedIndirect(chunk, state, arg_buffer, arg_offset,
+                                    count_buffer, count_offset, counted_args,
+                                    counted_offset, argument_size,
+                                    command_index);
+        break;
+      case DirectIndirectOperation::DrawIndexed:
+        ReplayDrawIndexedInstancedIndirect(
+            chunk, state, arg_buffer, arg_offset, count_buffer, count_offset,
+            counted_args, counted_offset, argument_size, command_index);
+        break;
+      case DirectIndirectOperation::Dispatch:
+        ReplayDispatchIndirect(chunk, state, arg_buffer, arg_offset,
+                               count_buffer, count_offset, counted_args,
+                               counted_offset, argument_size, command_index);
+        break;
+      default:
+        return false;
+      }
+    }
+    return true;
+  }
+
+  void ReplayExecuteIndirectCpuFallback(CommandChunk *chunk, ReplayState &state,
+                                        const ExecuteIndirectRecord &record,
+                                        const CommandSignature &signature) {
     UINT command_count = record.max_command_count;
     if (record.count_buffer) {
       UINT count = 0;
       if (!ReadBufferBytes(record.count_buffer.ptr(), record.count_buffer_offset,
-                           &count, sizeof(count), "indirect count buffer"))
+                           &count, sizeof(count), "indirect count buffer")) {
+        WARN("D3D12CommandQueue: ExecuteIndirect complex command signature requires CPU-visible buffers until GPU state-command lowering is implemented");
         return;
+      }
       command_count = std::min(command_count, count);
     }
     if (!command_count)
       return;
 
-    const auto &desc = signature->GetDesc();
-    const auto &arguments = signature->GetArguments();
-    if (!desc.ByteStride || arguments.empty())
-      return;
+    const auto &desc = signature.GetDesc();
+    const auto &arguments = signature.GetArguments();
 
     std::vector<uint8_t> command(desc.ByteStride);
     for (UINT command_index = 0; command_index < command_count;
@@ -2035,8 +2187,10 @@ private:
           record.arg_buffer_offset + UINT64(command_index) * desc.ByteStride;
       if (!ReadBufferBytes(record.arg_buffer.ptr(), command_offset,
                            command.data(), command.size(),
-                           "indirect argument buffer"))
+                           "indirect argument buffer")) {
+        WARN("D3D12CommandQueue: ExecuteIndirect complex command signature requires CPU-visible buffers until GPU state-command lowering is implemented");
         return;
+      }
 
       size_t argument_offset = 0;
       for (const auto &argument : arguments) {
@@ -2145,6 +2299,274 @@ private:
         argument_offset += argument_size;
       }
     }
+  }
+
+  void PrepareCountedIndirectArguments(
+      ArgumentEncodingContext &enc, const Rc<Buffer> &arg_buffer,
+      UINT64 arg_offset, const Rc<Buffer> &count_buffer, UINT64 count_offset,
+      WMT::Buffer counted_args, UINT64 counted_offset, UINT argument_size,
+      UINT command_index) {
+    enc.startComputePass(0);
+    auto [arg_allocation, arg_sub_offset] =
+        enc.access<PipelineStage::Compute>(arg_buffer, arg_offset,
+                                           argument_size, ResourceAccess::Read);
+    auto [count_allocation, count_sub_offset] =
+        enc.access<PipelineStage::Compute>(count_buffer, count_offset,
+                                           sizeof(UINT), ResourceAccess::Read);
+    enc.emulated_cmd.PrepareCountedIndirectArguments(
+        count_allocation->buffer(), count_sub_offset + count_offset,
+        arg_allocation->buffer(), arg_sub_offset + arg_offset, counted_args,
+        counted_offset, argument_size, command_index);
+    enc.endPass();
+  }
+
+  void ReplayDrawInstancedIndirect(
+      CommandChunk *chunk, ReplayState &state, Rc<Buffer> arg_buffer,
+      UINT64 arg_offset, Rc<Buffer> count_buffer, UINT64 count_offset,
+      WMT::Reference<WMT::Buffer> counted_args, UINT64 counted_offset,
+      UINT argument_size, UINT command_index) {
+    auto *pipeline = GetPipelineState(state.pipeline_state.ptr());
+    if (!pipeline) {
+      WARN("D3D12CommandQueue: indirect draw skipped without graphics pipeline state");
+      return;
+    }
+
+    auto *metal = pipeline->GetMetalGraphicsState();
+    if (!metal || !metal->pso) {
+      WARN("D3D12CommandQueue: indirect draw skipped because Metal graphics PSO is unavailable");
+      return;
+    }
+
+    const auto primitive = GetPrimitiveType(state.topology);
+    auto viewports = state.viewports;
+    auto scissors = state.scissors;
+    auto attachments = BuildRenderPassAttachments(state);
+    if (!ResolveDynamicRasterRects(viewports, scissors, "indirect draw"))
+      return;
+    const auto argument_buffer_size = EstimateGraphicsArgumentBufferSize(*pipeline);
+    chunk->emitcc([this, metal_pso = metal->pso,
+                   depth_stencil = metal->depth_stencil,
+                   rasterizer = metal->rasterizer, pipeline,
+                   replay_state = state, primitive, argument_buffer_size,
+                   blend_factor = state.blend_factor,
+                   stencil_ref = state.stencil_ref, arg_buffer, arg_offset,
+                   count_buffer, count_offset, counted_args, counted_offset,
+                   argument_size, command_index,
+                   viewports = std::move(viewports),
+                   scissors = std::move(scissors),
+                   attachments = std::move(attachments)](ArgumentEncodingContext &enc) mutable {
+      const bool has_count = count_buffer.ptr();
+      if (has_count) {
+        PrepareCountedIndirectArguments(
+            enc, arg_buffer, arg_offset, count_buffer, count_offset,
+            counted_args, counted_offset, argument_size, command_index);
+      }
+
+      if (!BeginRenderPass(enc, attachments, argument_buffer_size))
+        return;
+
+      auto &set_pso = enc.encodeRenderCommand<wmtcmd_render_setpso>();
+      set_pso.type = WMTRenderCommandSetPSO;
+      set_pso.pso = metal_pso;
+      if (depth_stencil) {
+        auto &cmd = enc.encodeRenderCommand<wmtcmd_render_setdsso>();
+        cmd.type = WMTRenderCommandSetDSSO;
+        cmd.dsso = depth_stencil;
+        cmd.stencil_ref = static_cast<uint8_t>(stencil_ref);
+      }
+      auto &rs = enc.encodeRenderCommand<wmtcmd_render_setrasterizerstate>();
+      rs = rasterizer;
+
+      uint64_t argbuf_offset = 0;
+      EncodeGraphicsBindings(enc, replay_state, *pipeline, argbuf_offset);
+      EncodeDynamicRenderState(enc, viewports, scissors, blend_factor,
+                               stencil_ref);
+
+      WMT::Buffer indirect_buffer = counted_args;
+      UINT64 indirect_offset = counted_offset;
+      if (!has_count) {
+        auto [arg_allocation, arg_sub_offset] =
+            enc.access<PipelineStage::Vertex>(arg_buffer, arg_offset,
+                                              argument_size,
+                                              ResourceAccess::Read);
+        indirect_buffer = arg_allocation->buffer();
+        indirect_offset = arg_sub_offset + arg_offset;
+      }
+
+      auto &draw = enc.encodeRenderCommand<wmtcmd_render_draw_indirect>();
+      draw.type = WMTRenderCommandDrawIndirect;
+      draw.primitive_type = primitive;
+      draw.indirect_args_buffer = indirect_buffer;
+      draw.indirect_args_offset = indirect_offset;
+      enc.endPass();
+    });
+  }
+
+  void ReplayDrawIndexedInstancedIndirect(
+      CommandChunk *chunk, ReplayState &state, Rc<Buffer> arg_buffer,
+      UINT64 arg_offset, Rc<Buffer> count_buffer, UINT64 count_offset,
+      WMT::Reference<WMT::Buffer> counted_args, UINT64 counted_offset,
+      UINT argument_size, UINT command_index) {
+    if (!state.index_buffer)
+      return;
+
+    auto *pipeline = GetPipelineState(state.pipeline_state.ptr());
+    if (!pipeline) {
+      WARN("D3D12CommandQueue: indirect indexed draw skipped without graphics pipeline state");
+      return;
+    }
+
+    auto *metal = pipeline->GetMetalGraphicsState();
+    if (!metal || !metal->pso) {
+      WARN("D3D12CommandQueue: indirect indexed draw skipped because Metal graphics PSO is unavailable");
+      return;
+    }
+
+    UINT64 index_resource_offset = 0;
+    auto *index_resource = LookupBufferResourceByGpuVirtualAddress(
+        state.index_buffer->BufferLocation, &index_resource_offset);
+    if (!index_resource || !index_resource->GetBufferAllocation()) {
+      WARN("D3D12CommandQueue: indirect indexed draw skipped because index buffer binding is unavailable");
+      return;
+    }
+
+    Rc<BufferAllocation> index_allocation = index_resource->GetBufferAllocation();
+    const auto primitive = GetPrimitiveType(state.topology);
+    const auto index_type = GetIndexType(state.index_buffer->Format);
+    const UINT64 index_offset =
+        index_resource->GetHeapOffset() + index_resource_offset;
+    auto attachments = BuildRenderPassAttachments(state);
+    auto viewports = state.viewports;
+    auto scissors = state.scissors;
+    if (!ResolveDynamicRasterRects(viewports, scissors, "indirect indexed draw"))
+      return;
+    const auto argument_buffer_size = EstimateGraphicsArgumentBufferSize(*pipeline);
+    chunk->emitcc([this, metal_pso = metal->pso,
+                   depth_stencil = metal->depth_stencil,
+                   rasterizer = metal->rasterizer, pipeline,
+                   replay_state = state, index_allocation, primitive,
+                   index_type, index_offset, argument_buffer_size,
+                   blend_factor = state.blend_factor,
+                   stencil_ref = state.stencil_ref, arg_buffer, arg_offset,
+                   count_buffer, count_offset, counted_args, counted_offset,
+                   argument_size, command_index,
+                   viewports = std::move(viewports),
+                   scissors = std::move(scissors),
+                   attachments = std::move(attachments)](ArgumentEncodingContext &enc) mutable {
+      const bool has_count = count_buffer.ptr();
+      if (has_count) {
+        PrepareCountedIndirectArguments(
+            enc, arg_buffer, arg_offset, count_buffer, count_offset,
+            counted_args, counted_offset, argument_size, command_index);
+      }
+
+      enc.retainAllocation(index_allocation.ptr());
+      if (!BeginRenderPass(enc, attachments, argument_buffer_size))
+        return;
+
+      auto &set_pso = enc.encodeRenderCommand<wmtcmd_render_setpso>();
+      set_pso.type = WMTRenderCommandSetPSO;
+      set_pso.pso = metal_pso;
+      if (depth_stencil) {
+        auto &cmd = enc.encodeRenderCommand<wmtcmd_render_setdsso>();
+        cmd.type = WMTRenderCommandSetDSSO;
+        cmd.dsso = depth_stencil;
+        cmd.stencil_ref = static_cast<uint8_t>(stencil_ref);
+      }
+      auto &rs = enc.encodeRenderCommand<wmtcmd_render_setrasterizerstate>();
+      rs = rasterizer;
+
+      uint64_t argbuf_offset = 0;
+      EncodeGraphicsBindings(enc, replay_state, *pipeline, argbuf_offset);
+      EncodeDynamicRenderState(enc, viewports, scissors, blend_factor,
+                               stencil_ref);
+
+      WMT::Buffer indirect_buffer = counted_args;
+      UINT64 indirect_offset = counted_offset;
+      if (!has_count) {
+        auto [arg_allocation, arg_sub_offset] =
+            enc.access<PipelineStage::Vertex>(arg_buffer, arg_offset,
+                                              argument_size,
+                                              ResourceAccess::Read);
+        indirect_buffer = arg_allocation->buffer();
+        indirect_offset = arg_sub_offset + arg_offset;
+      }
+
+      auto &draw =
+          enc.encodeRenderCommand<wmtcmd_render_draw_indexed_indirect>();
+      draw.type = WMTRenderCommandDrawIndexedIndirect;
+      draw.primitive_type = primitive;
+      draw.index_type = index_type;
+      draw.index_buffer = index_allocation->buffer();
+      draw.index_buffer_offset = index_offset;
+      draw.indirect_args_buffer = indirect_buffer;
+      draw.indirect_args_offset = indirect_offset;
+      enc.endPass();
+    });
+  }
+
+  void ReplayDispatchIndirect(
+      CommandChunk *chunk, ReplayState &state, Rc<Buffer> arg_buffer,
+      UINT64 arg_offset, Rc<Buffer> count_buffer, UINT64 count_offset,
+      WMT::Reference<WMT::Buffer> counted_args, UINT64 counted_offset,
+      UINT argument_size, UINT command_index) {
+    auto *pipeline = GetPipelineState(state.pipeline_state.ptr());
+    if (!pipeline) {
+      WARN("D3D12CommandQueue: indirect dispatch skipped without compute pipeline state");
+      return;
+    }
+
+    auto *metal = pipeline->GetMetalComputeState();
+    if (!metal || !metal->pso) {
+      WARN("D3D12CommandQueue: indirect dispatch skipped because Metal compute PSO is unavailable");
+      return;
+    }
+
+    const auto argument_buffer_size = EstimateComputeArgumentBufferSize(*pipeline);
+    chunk->emitcc([this, metal_pso = metal->pso,
+                   threadgroup_size = metal->threadgroup_size, pipeline,
+                   replay_state = state, argument_buffer_size, arg_buffer,
+                   arg_offset, count_buffer, count_offset, counted_args,
+                   counted_offset, argument_size,
+                   command_index](ArgumentEncodingContext &enc) {
+      const bool has_count = count_buffer.ptr();
+      if (has_count) {
+        PrepareCountedIndirectArguments(
+            enc, arg_buffer, arg_offset, count_buffer, count_offset,
+            counted_args, counted_offset, argument_size, command_index);
+      }
+
+      enc.startComputePass(argument_buffer_size);
+      auto &set_pso = enc.encodeComputeCommand<wmtcmd_compute_setpso>();
+      set_pso.type = WMTComputeCommandSetPSO;
+      set_pso.pso = metal_pso;
+      set_pso.threadgroup_size = threadgroup_size;
+
+      uint64_t argbuf_offset = 0;
+      EncodeComputeBindings(enc, replay_state, *pipeline, argbuf_offset);
+      if (argbuf_offset > argument_buffer_size) {
+        WARN("D3D12CommandQueue: compute argument buffer estimate was too small estimated=",
+             argument_buffer_size, " actual=", argbuf_offset);
+      }
+
+      WMT::Buffer indirect_buffer = counted_args;
+      UINT64 indirect_offset = counted_offset;
+      if (!has_count) {
+        auto [arg_allocation, arg_sub_offset] =
+            enc.access<PipelineStage::Compute>(arg_buffer, arg_offset,
+                                               argument_size,
+                                               ResourceAccess::Read);
+        indirect_buffer = arg_allocation->buffer();
+        indirect_offset = arg_sub_offset + arg_offset;
+      }
+
+      auto &dispatch =
+          enc.encodeComputeCommand<wmtcmd_compute_dispatch_indirect>();
+      dispatch.type = WMTComputeCommandDispatchIndirect;
+      dispatch.indirect_args_buffer = indirect_buffer;
+      dispatch.indirect_args_offset = indirect_offset;
+      enc.endPass();
+    });
   }
 
   static void ForEachVisibleStage(D3D12_SHADER_VISIBILITY visibility,
