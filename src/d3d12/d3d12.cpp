@@ -141,3 +141,25 @@ D3D12CreateDevice(IUnknown *adapter, D3D_FEATURE_LEVEL minimum_feature_level, RE
     return E_FAIL;
   }
 }
+
+extern "C" HRESULT __stdcall
+D3D12GetDebugInterface(REFIID riid, void **debug) {
+  dxmt::InitReturnPtr(debug);
+  dxmt::Logger::warn(dxmt::str::format(
+      "D3D12GetDebugInterface: debug layer is not supported for riid ",
+      dxmt::str::format(riid)));
+  return E_NOINTERFACE;
+}
+
+extern "C" HRESULT __stdcall
+D3D12EnableExperimentalFeatures(UINT feature_count, const IID *iids,
+                                void *configurations,
+                                UINT *configuration_sizes) {
+  if (feature_count && !iids)
+    return E_INVALIDARG;
+
+  dxmt::Logger::warn(dxmt::str::format(
+      "D3D12EnableExperimentalFeatures: experimental features are not "
+      "supported, requested count ", feature_count));
+  return DXGI_ERROR_UNSUPPORTED;
+}

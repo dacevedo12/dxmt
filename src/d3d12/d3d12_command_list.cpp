@@ -78,6 +78,13 @@ public:
       return S_OK;
     }
 
+    if (riid == __uuidof(ID3D12GraphicsCommandList1) ||
+        riid == __uuidof(ID3D12GraphicsCommandList2)) {
+      WARN("D3D12GraphicsCommandList: higher command list interfaces are not "
+           "exposed until their extra methods are implemented");
+      return E_NOINTERFACE;
+    }
+
     if (logQueryInterfaceError(__uuidof(ID3D12GraphicsCommandList), riid))
       WARN("D3D12GraphicsCommandList: unknown interface query ", str::format(riid));
 

@@ -70,6 +70,111 @@ IndirectArgumentByteSize(const D3D12_INDIRECT_ARGUMENT_DESC &argument) {
   }
 }
 
+static bool
+HasFormatCapability(FormatCapability caps, FormatCapability cap) {
+  return (static_cast<int>(caps) & static_cast<int>(cap)) != 0;
+}
+
+static FormatCapability
+GetD3D12FormatCapability(WMT::Device device,
+                         const MTL_DXGI_FORMAT_DESC &format) {
+  FormatCapabilityInspector inspector;
+  inspector.Inspect(device);
+  auto entry = inspector.textureCapabilities.find(format.PixelFormat);
+  return entry == inspector.textureCapabilities.end()
+             ? FormatCapability::None
+             : entry->second;
+}
+
+static D3D12_FORMAT_SUPPORT1
+GetD3D12FormatSupport1(FormatCapability caps,
+                       const MTL_DXGI_FORMAT_DESC &format) {
+  D3D12_FORMAT_SUPPORT1 support = D3D12_FORMAT_SUPPORT1_NONE;
+  if (HasFormatCapability(caps, FormatCapability::TextureBufferRead) ||
+      HasFormatCapability(caps, FormatCapability::TextureBufferWrite) ||
+      HasFormatCapability(caps, FormatCapability::TextureBufferReadWrite))
+    support |= D3D12_FORMAT_SUPPORT1_BUFFER;
+
+  support |= D3D12_FORMAT_SUPPORT1_TEXTURE1D |
+             D3D12_FORMAT_SUPPORT1_TEXTURE2D |
+             D3D12_FORMAT_SUPPORT1_SHADER_LOAD |
+             D3D12_FORMAT_SUPPORT1_CAST_WITHIN_BIT_LAYOUT;
+
+  if (!(format.Flag & (MTL_DXGI_FORMAT_DEPTH_PLANER |
+                       MTL_DXGI_FORMAT_STENCIL_PLANER))) {
+    support |= D3D12_FORMAT_SUPPORT1_TEXTURE3D |
+               D3D12_FORMAT_SUPPORT1_TEXTURECUBE;
+  }
+  if (HasFormatCapability(caps, FormatCapability::Filter))
+    support |= D3D12_FORMAT_SUPPORT1_SHADER_SAMPLE |
+               D3D12_FORMAT_SUPPORT1_SHADER_GATHER;
+  if (HasFormatCapability(caps, FormatCapability::Color))
+    support |= D3D12_FORMAT_SUPPORT1_RENDER_TARGET;
+  if (HasFormatCapability(caps, FormatCapability::Blend))
+    support |= D3D12_FORMAT_SUPPORT1_BLENDABLE;
+  if (HasFormatCapability(caps, FormatCapability::DepthStencil))
+    support |= D3D12_FORMAT_SUPPORT1_DEPTH_STENCIL;
+  if (HasFormatCapability(caps, FormatCapability::MSAA))
+    support |= D3D12_FORMAT_SUPPORT1_MULTISAMPLE_RENDERTARGET |
+               D3D12_FORMAT_SUPPORT1_MULTISAMPLE_LOAD;
+  if (HasFormatCapability(caps, FormatCapability::Resolve))
+    support |= D3D12_FORMAT_SUPPORT1_MULTISAMPLE_RESOLVE;
+  if (HasFormatCapability(caps, FormatCapability::Write))
+    support |= D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW;
+  if (format.Flag & MTL_DXGI_FORMAT_BACKBUFFER)
+    support |= D3D12_FORMAT_SUPPORT1_DISPLAY |
+               D3D12_FORMAT_SUPPORT1_BACK_BUFFER_CAST;
+
+  return support;
+}
+
+static D3D12_FORMAT_SUPPORT2
+GetD3D12FormatSupport2(FormatCapability caps) {
+  D3D12_FORMAT_SUPPORT2 support = D3D12_FORMAT_SUPPORT2_NONE;
+  if (HasFormatCapability(caps, FormatCapability::TextureBufferRead) ||
+      HasFormatCapability(caps, FormatCapability::TextureBufferReadWrite))
+    support |= D3D12_FORMAT_SUPPORT2_UAV_TYPED_LOAD;
+  if (HasFormatCapability(caps, FormatCapability::Write) ||
+      HasFormatCapability(caps, FormatCapability::TextureBufferWrite) ||
+      HasFormatCapability(caps, FormatCapability::TextureBufferReadWrite))
+    support |= D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE;
+  if (HasFormatCapability(caps, FormatCapability::Atomic))
+    support |= D3D12_FORMAT_SUPPORT2_UAV_ATOMIC_ADD |
+               D3D12_FORMAT_SUPPORT2_UAV_ATOMIC_BITWISE_OPS |
+               D3D12_FORMAT_SUPPORT2_UAV_ATOMIC_COMPARE_STORE_OR_COMPARE_EXCHANGE |
+               D3D12_FORMAT_SUPPORT2_UAV_ATOMIC_EXCHANGE |
+               D3D12_FORMAT_SUPPORT2_UAV_ATOMIC_SIGNED_MIN_OR_MAX |
+               D3D12_FORMAT_SUPPORT2_UAV_ATOMIC_UNSIGNED_MIN_OR_MAX;
+  if (HasFormatCapability(caps, FormatCapability::Sparse))
+    support |= D3D12_FORMAT_SUPPORT2_TILED;
+  return support;
+}
+
+static UINT8
+GetD3D12FormatPlaneCount(const MTL_DXGI_FORMAT_DESC &format) {
+  const uint32_t planes = DepthStencilPlanarFlags(format.PixelFormat);
+  return planes == 3 ? 2 : 1;
+}
+
+static bool
+IsSupportedD3D12SampleCount(UINT sample_count) {
+  return sample_count == 1 || sample_count == 2 || sample_count == 4 ||
+         sample_count == 8;
+}
+
+static bool
+IsSupportedCommandListType(D3D12_COMMAND_LIST_TYPE type) {
+  return type == D3D12_COMMAND_LIST_TYPE_DIRECT ||
+         type == D3D12_COMMAND_LIST_TYPE_COMPUTE ||
+         type == D3D12_COMMAND_LIST_TYPE_COPY;
+}
+
+static bool
+IsSupportedCommandQueuePriority(UINT priority) {
+  return priority == D3D12_COMMAND_QUEUE_PRIORITY_NORMAL ||
+         priority == D3D12_COMMAND_QUEUE_PRIORITY_HIGH;
+}
+
 static DescriptorRecord *
 GetDescriptorRecordForWrite(D3D12_CPU_DESCRIPTOR_HANDLE handle,
                             D3D12_DESCRIPTOR_HEAP_TYPE expected_type,
@@ -150,6 +255,12 @@ public:
         riid == __uuidof(IMTLD3D12Device)) {
       *ppvObject = ref(static_cast<IMTLD3D12Device *>(this));
       return S_OK;
+    }
+
+    if (riid == __uuidof(ID3D12Device1)) {
+      WARN("D3D12Device: ID3D12Device1 is not exposed until its extra "
+           "methods are implemented");
+      return E_NOINTERFACE;
     }
 
     if (logQueryInterfaceError(__uuidof(ID3D12Device), riid))
@@ -388,6 +499,94 @@ public:
       data->MaxGPUVirtualAddressBitsPerResource = 40;
       return S_OK;
     }
+    case D3D12_FEATURE_FORMAT_SUPPORT: {
+      if (feature_data_size < sizeof(D3D12_FEATURE_DATA_FORMAT_SUPPORT))
+        return E_INVALIDARG;
+
+      auto *data = static_cast<D3D12_FEATURE_DATA_FORMAT_SUPPORT *>(feature_data);
+      data->Support1 = D3D12_FORMAT_SUPPORT1_NONE;
+      data->Support2 = D3D12_FORMAT_SUPPORT2_NONE;
+
+      MTL_DXGI_FORMAT_DESC format = {};
+      if (FAILED(MTLQueryDXGIFormat(device_->device(), data->Format, format))) {
+        WARN("D3D12Device: CheckFeatureSupport(FORMAT_SUPPORT) unsupported format ",
+             data->Format);
+        return S_OK;
+      }
+
+      const auto caps = GetD3D12FormatCapability(device_->device(), format);
+      data->Support1 = GetD3D12FormatSupport1(caps, format);
+      data->Support2 = GetD3D12FormatSupport2(caps);
+      return S_OK;
+    }
+    case D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS: {
+      if (feature_data_size < sizeof(D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS))
+        return E_INVALIDARG;
+
+      auto *data = static_cast<D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS *>(feature_data);
+      data->NumQualityLevels = 0;
+      if (data->Flags & ~D3D12_MULTISAMPLE_QUALITY_LEVELS_FLAG_TILED_RESOURCE)
+        return E_INVALIDARG;
+
+      MTL_DXGI_FORMAT_DESC format = {};
+      if (FAILED(MTLQueryDXGIFormat(device_->device(), data->Format, format))) {
+        WARN("D3D12Device: CheckFeatureSupport(MSAA) unsupported format ",
+             data->Format);
+        return S_OK;
+      }
+
+      const auto caps = GetD3D12FormatCapability(device_->device(), format);
+      if (IsSupportedD3D12SampleCount(data->SampleCount) &&
+          (data->SampleCount == 1 || HasFormatCapability(caps, FormatCapability::MSAA)))
+        data->NumQualityLevels = 1;
+      return S_OK;
+    }
+    case D3D12_FEATURE_FORMAT_INFO: {
+      if (feature_data_size < sizeof(D3D12_FEATURE_DATA_FORMAT_INFO))
+        return E_INVALIDARG;
+
+      auto *data = static_cast<D3D12_FEATURE_DATA_FORMAT_INFO *>(feature_data);
+      data->PlaneCount = 0;
+
+      MTL_DXGI_FORMAT_DESC format = {};
+      if (FAILED(MTLQueryDXGIFormat(device_->device(), data->Format, format))) {
+        WARN("D3D12Device: CheckFeatureSupport(FORMAT_INFO) unsupported format ",
+             data->Format);
+        return S_OK;
+      }
+
+      data->PlaneCount = GetD3D12FormatPlaneCount(format);
+      return S_OK;
+    }
+    case D3D12_FEATURE_GPU_VIRTUAL_ADDRESS_SUPPORT: {
+      if (feature_data_size < sizeof(D3D12_FEATURE_DATA_GPU_VIRTUAL_ADDRESS_SUPPORT))
+        return E_INVALIDARG;
+
+      auto *data = static_cast<D3D12_FEATURE_DATA_GPU_VIRTUAL_ADDRESS_SUPPORT *>(feature_data);
+      data->MaxGPUVirtualAddressBitsPerResource = 40;
+      data->MaxGPUVirtualAddressBitsPerProcess = 40;
+      return S_OK;
+    }
+    case D3D12_FEATURE_SHADER_MODEL: {
+      if (feature_data_size < sizeof(D3D12_FEATURE_DATA_SHADER_MODEL))
+        return E_INVALIDARG;
+
+      auto *data = static_cast<D3D12_FEATURE_DATA_SHADER_MODEL *>(feature_data);
+      if (data->HighestShaderModel >= D3D_SHADER_MODEL_6_0)
+        data->HighestShaderModel = D3D_SHADER_MODEL_6_0;
+      else
+        data->HighestShaderModel = D3D_SHADER_MODEL_5_1;
+      return S_OK;
+    }
+    case D3D12_FEATURE_D3D12_OPTIONS1: {
+      if (feature_data_size < sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS1))
+        return E_INVALIDARG;
+
+      auto *data = static_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS1 *>(feature_data);
+      std::memset(data, 0, sizeof(*data));
+      data->ExpandedComputeResourceStates = TRUE;
+      return S_OK;
+    }
     case D3D12_FEATURE_ROOT_SIGNATURE: {
       if (feature_data_size < sizeof(D3D12_FEATURE_DATA_ROOT_SIGNATURE))
         return E_INVALIDARG;
@@ -396,8 +595,109 @@ public:
       data->HighestVersion = D3D_ROOT_SIGNATURE_VERSION_1_1;
       return S_OK;
     }
+    case D3D12_FEATURE_ARCHITECTURE1: {
+      if (feature_data_size < sizeof(D3D12_FEATURE_DATA_ARCHITECTURE1))
+        return E_INVALIDARG;
+
+      auto *data = static_cast<D3D12_FEATURE_DATA_ARCHITECTURE1 *>(feature_data);
+      if (data->NodeIndex != 0)
+        return E_INVALIDARG;
+
+      const bool unified_memory = GetMTLDevice().hasUnifiedMemory();
+      data->TileBasedRenderer = TRUE;
+      data->UMA = unified_memory;
+      data->CacheCoherentUMA = unified_memory;
+      data->IsolatedMMU = FALSE;
+      return S_OK;
+    }
+    case D3D12_FEATURE_D3D12_OPTIONS2: {
+      if (feature_data_size < sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS2))
+        return E_INVALIDARG;
+
+      auto *data = static_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS2 *>(feature_data);
+      std::memset(data, 0, sizeof(*data));
+      data->ProgrammableSamplePositionsTier =
+          D3D12_PROGRAMMABLE_SAMPLE_POSITIONS_TIER_NOT_SUPPORTED;
+      return S_OK;
+    }
+    case D3D12_FEATURE_SHADER_CACHE: {
+      if (feature_data_size < sizeof(D3D12_FEATURE_DATA_SHADER_CACHE))
+        return E_INVALIDARG;
+
+      auto *data = static_cast<D3D12_FEATURE_DATA_SHADER_CACHE *>(feature_data);
+      data->SupportFlags = D3D12_SHADER_CACHE_SUPPORT_NONE;
+      return S_OK;
+    }
+    case D3D12_FEATURE_COMMAND_QUEUE_PRIORITY: {
+      if (feature_data_size < sizeof(D3D12_FEATURE_DATA_COMMAND_QUEUE_PRIORITY))
+        return E_INVALIDARG;
+
+      auto *data = static_cast<D3D12_FEATURE_DATA_COMMAND_QUEUE_PRIORITY *>(feature_data);
+      data->PriorityForTypeIsSupported =
+          IsSupportedCommandListType(data->CommandListType) &&
+          IsSupportedCommandQueuePriority(data->Priority);
+      return S_OK;
+    }
+    case D3D12_FEATURE_D3D12_OPTIONS3: {
+      if (feature_data_size < sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS3))
+        return E_INVALIDARG;
+
+      auto *data = static_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS3 *>(feature_data);
+      std::memset(data, 0, sizeof(*data));
+      data->CopyQueueTimestampQueriesSupported = TRUE;
+      data->ViewInstancingTier = D3D12_VIEW_INSTANCING_TIER_NOT_SUPPORTED;
+      return S_OK;
+    }
+    case D3D12_FEATURE_EXISTING_HEAPS: {
+      if (feature_data_size < sizeof(D3D12_FEATURE_DATA_EXISTING_HEAPS))
+        return E_INVALIDARG;
+
+      auto *data = static_cast<D3D12_FEATURE_DATA_EXISTING_HEAPS *>(feature_data);
+      data->Supported = FALSE;
+      return S_OK;
+    }
+    case D3D12_FEATURE_D3D12_OPTIONS4: {
+      if (feature_data_size < sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS4))
+        return E_INVALIDARG;
+
+      auto *data = static_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS4 *>(feature_data);
+      std::memset(data, 0, sizeof(*data));
+      data->SharedResourceCompatibilityTier =
+          D3D12_SHARED_RESOURCE_COMPATIBILITY_TIER_0;
+      return S_OK;
+    }
+    case D3D12_FEATURE_SERIALIZATION: {
+      if (feature_data_size < sizeof(D3D12_FEATURE_DATA_SERIALIZATION))
+        return E_INVALIDARG;
+
+      auto *data = static_cast<D3D12_FEATURE_DATA_SERIALIZATION *>(feature_data);
+      if (data->NodeIndex != 0)
+        return E_INVALIDARG;
+      data->HeapSerializationTier = D3D12_HEAP_SERIALIZATION_TIER_0;
+      return S_OK;
+    }
+    case D3D12_FEATURE_CROSS_NODE: {
+      if (feature_data_size < sizeof(D3D12_FEATURE_DATA_CROSS_NODE))
+        return E_INVALIDARG;
+
+      auto *data = static_cast<D3D12_FEATURE_DATA_CROSS_NODE *>(feature_data);
+      data->SharingTier = D3D12_CROSS_NODE_SHARING_TIER_NOT_SUPPORTED;
+      data->AtomicShaderInstructions = FALSE;
+      return S_OK;
+    }
+    case D3D12_FEATURE_D3D12_OPTIONS5: {
+      if (feature_data_size < sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS5))
+        return E_INVALIDARG;
+
+      auto *data = static_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS5 *>(feature_data);
+      std::memset(data, 0, sizeof(*data));
+      data->RenderPassesTier = D3D12_RENDER_PASS_TIER_0;
+      data->RaytracingTier = D3D12_RAYTRACING_TIER_NOT_SUPPORTED;
+      return S_OK;
+    }
     default:
-      return E_NOTIMPL;
+      WARN("D3D12Device: CheckFeatureSupport unsupported feature ", feature);
+      return DXGI_ERROR_UNSUPPORTED;
     }
   }
 
