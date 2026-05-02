@@ -46,6 +46,30 @@ IsCpuVisibleHeap(D3D12_HEAP_TYPE heap_type) {
          heap_type == D3D12_HEAP_TYPE_READBACK;
 }
 
+static UINT
+IndirectArgumentByteSize(const D3D12_INDIRECT_ARGUMENT_DESC &argument) {
+  switch (argument.Type) {
+  case D3D12_INDIRECT_ARGUMENT_TYPE_DRAW:
+    return sizeof(D3D12_DRAW_ARGUMENTS);
+  case D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED:
+    return sizeof(D3D12_DRAW_INDEXED_ARGUMENTS);
+  case D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH:
+    return sizeof(D3D12_DISPATCH_ARGUMENTS);
+  case D3D12_INDIRECT_ARGUMENT_TYPE_VERTEX_BUFFER_VIEW:
+    return sizeof(D3D12_VERTEX_BUFFER_VIEW);
+  case D3D12_INDIRECT_ARGUMENT_TYPE_INDEX_BUFFER_VIEW:
+    return sizeof(D3D12_INDEX_BUFFER_VIEW);
+  case D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT:
+    return sizeof(UINT) * argument.Constant.Num32BitValuesToSet;
+  case D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT_BUFFER_VIEW:
+  case D3D12_INDIRECT_ARGUMENT_TYPE_SHADER_RESOURCE_VIEW:
+  case D3D12_INDIRECT_ARGUMENT_TYPE_UNORDERED_ACCESS_VIEW:
+    return sizeof(D3D12_GPU_VIRTUAL_ADDRESS);
+  default:
+    return 0;
+  }
+}
+
 static DescriptorRecord *
 GetDescriptorRecordForWrite(D3D12_CPU_DESCRIPTOR_HANDLE handle,
                             D3D12_DESCRIPTOR_HEAP_TYPE expected_type,
@@ -765,7 +789,37 @@ public:
                                                    ID3D12RootSignature *root_signature,
                                                    REFIID riid, void **command_signature) override {
     InitReturnPtr(command_signature);
-    return E_NOTIMPL;
+    if (!command_signature)
+      return E_POINTER;
+    if (!desc || !desc->NumArgumentDescs || !desc->pArgumentDescs ||
+        !desc->ByteStride || desc->NodeMask > 1)
+      return E_INVALIDARG;
+
+    UINT min_stride = 0;
+    for (UINT i = 0; i < desc->NumArgumentDescs; i++) {
+      const auto &argument = desc->pArgumentDescs[i];
+      const auto argument_size = IndirectArgumentByteSize(argument);
+      if (!argument_size)
+        return E_NOTIMPL;
+      min_stride += argument_size;
+      switch (argument.Type) {
+      case D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT:
+      case D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT_BUFFER_VIEW:
+      case D3D12_INDIRECT_ARGUMENT_TYPE_SHADER_RESOURCE_VIEW:
+      case D3D12_INDIRECT_ARGUMENT_TYPE_UNORDERED_ACCESS_VIEW:
+        if (!root_signature)
+          return E_INVALIDARG;
+        break;
+      default:
+        break;
+      }
+    }
+    if (desc->ByteStride < min_stride)
+      return E_INVALIDARG;
+
+    auto signature = d3d12::CreateCommandSignature(
+        static_cast<IMTLD3D12Device *>(this), desc, root_signature);
+    return signature->QueryInterface(riid, command_signature);
   }
 
   void STDMETHODCALLTYPE GetResourceTiling(ID3D12Resource *resource, UINT *total_tile_count,

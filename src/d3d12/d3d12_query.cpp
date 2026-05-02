@@ -5,14 +5,17 @@
 #include "com/com_private_data.hpp"
 #include "log/log.hpp"
 #include "util_string.hpp"
+#include <atomic>
+#include <cstring>
 
 namespace dxmt::d3d12 {
 namespace {
 
-class QueryHeapImpl final : public ComObjectWithInitialRef<ID3D12QueryHeap> {
+class QueryHeapImpl final : public ComObjectWithInitialRef<ID3D12QueryHeap>,
+                            public QueryHeap {
 public:
   QueryHeapImpl(IMTLD3D12Device *device, const D3D12_QUERY_HEAP_DESC &desc)
-      : device_(device), desc_(desc) {}
+      : device_(device), desc_(desc), queries_(desc.Count) {}
 
   HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid,
                                            void **ppvObject) override {
@@ -57,10 +60,161 @@ public:
     return device_->QueryInterface(riid, device);
   }
 
+  const D3D12_QUERY_HEAP_DESC &GetDesc() const override { return desc_; }
+
+  bool Begin(D3D12_QUERY_TYPE type, UINT index) override {
+    if (!ValidateAccess(type, index))
+      return false;
+    switch (desc_.Type) {
+    case D3D12_QUERY_HEAP_TYPE_OCCLUSION:
+      if (type != D3D12_QUERY_TYPE_OCCLUSION &&
+          type != D3D12_QUERY_TYPE_BINARY_OCCLUSION) {
+        WARN("D3D12QueryHeap: unsupported begin query type ", type);
+        return false;
+      }
+      queries_[index].began = true;
+      queries_[index].value = 0;
+      queries_[index].valid = true;
+      return true;
+    case D3D12_QUERY_HEAP_TYPE_TIMESTAMP:
+      WARN("D3D12QueryHeap: begin query is ignored for timestamp heap");
+      return true;
+    default:
+      WARN("D3D12QueryHeap: unsupported begin query heap type ", desc_.Type);
+      return false;
+    }
+  }
+
+  bool End(D3D12_QUERY_TYPE type, UINT index) override {
+    if (!ValidateAccess(type, index))
+      return false;
+    switch (desc_.Type) {
+    case D3D12_QUERY_HEAP_TYPE_OCCLUSION:
+      if (type != D3D12_QUERY_TYPE_OCCLUSION &&
+          type != D3D12_QUERY_TYPE_BINARY_OCCLUSION) {
+        WARN("D3D12QueryHeap: unsupported end query type ", type);
+        return false;
+      }
+      queries_[index].began = false;
+      queries_[index].value = 1;
+      queries_[index].valid = true;
+      return true;
+    case D3D12_QUERY_HEAP_TYPE_TIMESTAMP:
+      if (type != D3D12_QUERY_TYPE_TIMESTAMP) {
+        WARN("D3D12QueryHeap: unsupported timestamp end query type ", type);
+        return false;
+      }
+      queries_[index].value = nextTimestamp_.fetch_add(1, std::memory_order_relaxed);
+      queries_[index].valid = true;
+      return true;
+    default:
+      WARN("D3D12QueryHeap: unsupported end query heap type ", desc_.Type);
+      return false;
+    }
+  }
+
+  bool Resolve(D3D12_QUERY_TYPE type, UINT start_index, UINT query_count,
+               std::vector<uint8_t> &data) const override {
+    const auto stride = ResolveStride(type);
+    if (!stride)
+      return false;
+    if (!query_count)
+      return true;
+    if (start_index >= queries_.size() || query_count > queries_.size() - start_index) {
+      WARN("D3D12QueryHeap: resolve range exceeds heap size");
+      return false;
+    }
+    data.resize(size_t(query_count) * stride);
+    for (UINT i = 0; i < query_count; i++) {
+      const auto &query = queries_[start_index + i];
+      const auto offset = size_t(i) * stride;
+      switch (type) {
+      case D3D12_QUERY_TYPE_OCCLUSION:
+      case D3D12_QUERY_TYPE_BINARY_OCCLUSION: {
+        const uint64_t value = query.valid ? query.value : 0;
+        std::memcpy(data.data() + offset, &value, sizeof(value));
+        break;
+      }
+      case D3D12_QUERY_TYPE_TIMESTAMP: {
+        const uint64_t value = query.valid ? query.value : 0;
+        std::memcpy(data.data() + offset, &value, sizeof(value));
+        break;
+      }
+      case D3D12_QUERY_TYPE_PIPELINE_STATISTICS: {
+        D3D12_QUERY_DATA_PIPELINE_STATISTICS stats = {};
+        std::memcpy(data.data() + offset, &stats, sizeof(stats));
+        break;
+      }
+      case D3D12_QUERY_TYPE_SO_STATISTICS_STREAM0:
+      case D3D12_QUERY_TYPE_SO_STATISTICS_STREAM1:
+      case D3D12_QUERY_TYPE_SO_STATISTICS_STREAM2:
+      case D3D12_QUERY_TYPE_SO_STATISTICS_STREAM3: {
+        D3D12_QUERY_DATA_SO_STATISTICS stats = {};
+        std::memcpy(data.data() + offset, &stats, sizeof(stats));
+        break;
+      }
+      default:
+        WARN("D3D12QueryHeap: unsupported resolve query type ", type);
+        return false;
+      }
+    }
+    return true;
+  }
+
 private:
+  struct QueryData {
+    bool began = false;
+    bool valid = false;
+    uint64_t value = 0;
+  };
+
+  bool ValidateAccess(D3D12_QUERY_TYPE type, UINT index) const {
+    if (index >= desc_.Count) {
+      WARN("D3D12QueryHeap: query index out of range index=", index,
+           " count=", desc_.Count);
+      return false;
+    }
+    switch (desc_.Type) {
+    case D3D12_QUERY_HEAP_TYPE_OCCLUSION:
+      return type == D3D12_QUERY_TYPE_OCCLUSION ||
+             type == D3D12_QUERY_TYPE_BINARY_OCCLUSION;
+    case D3D12_QUERY_HEAP_TYPE_TIMESTAMP:
+      return type == D3D12_QUERY_TYPE_TIMESTAMP;
+    case D3D12_QUERY_HEAP_TYPE_PIPELINE_STATISTICS:
+      return type == D3D12_QUERY_TYPE_PIPELINE_STATISTICS;
+    case D3D12_QUERY_HEAP_TYPE_SO_STATISTICS:
+      return type == D3D12_QUERY_TYPE_SO_STATISTICS_STREAM0 ||
+             type == D3D12_QUERY_TYPE_SO_STATISTICS_STREAM1 ||
+             type == D3D12_QUERY_TYPE_SO_STATISTICS_STREAM2 ||
+             type == D3D12_QUERY_TYPE_SO_STATISTICS_STREAM3;
+    default:
+      return false;
+    }
+  }
+
+  static size_t ResolveStride(D3D12_QUERY_TYPE type) {
+    switch (type) {
+    case D3D12_QUERY_TYPE_OCCLUSION:
+    case D3D12_QUERY_TYPE_BINARY_OCCLUSION:
+    case D3D12_QUERY_TYPE_TIMESTAMP:
+      return sizeof(uint64_t);
+    case D3D12_QUERY_TYPE_PIPELINE_STATISTICS:
+      return sizeof(D3D12_QUERY_DATA_PIPELINE_STATISTICS);
+    case D3D12_QUERY_TYPE_SO_STATISTICS_STREAM0:
+    case D3D12_QUERY_TYPE_SO_STATISTICS_STREAM1:
+    case D3D12_QUERY_TYPE_SO_STATISTICS_STREAM2:
+    case D3D12_QUERY_TYPE_SO_STATISTICS_STREAM3:
+      return sizeof(D3D12_QUERY_DATA_SO_STATISTICS);
+    default:
+      return 0;
+    }
+  }
+
   Com<IMTLD3D12Device> device_;
   ComPrivateData private_data_;
   D3D12_QUERY_HEAP_DESC desc_ = {};
+  std::vector<QueryData> queries_;
+  mutable std::atomic<uint64_t> nextTimestamp_ = 1;
   std::string name_;
 };
 

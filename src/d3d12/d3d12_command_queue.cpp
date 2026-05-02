@@ -5,6 +5,7 @@
 #include "com/com_private_data.hpp"
 #include "d3d12_command_list.hpp"
 #include "d3d12_fence.hpp"
+#include "d3d12_query.hpp"
 #include "d3d12_resource.hpp"
 #include "d3d12_root_signature.hpp"
 #include "dxmt_context.hpp"
@@ -55,6 +56,70 @@ GetResource(ID3D12Resource *resource) {
 static PipelineState *
 GetPipelineState(ID3D12PipelineState *pipeline_state) {
   return dynamic_cast<PipelineState *>(pipeline_state);
+}
+
+static UINT
+IndirectArgumentByteSize(const D3D12_INDIRECT_ARGUMENT_DESC &argument) {
+  switch (argument.Type) {
+  case D3D12_INDIRECT_ARGUMENT_TYPE_DRAW:
+    return sizeof(D3D12_DRAW_ARGUMENTS);
+  case D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED:
+    return sizeof(D3D12_DRAW_INDEXED_ARGUMENTS);
+  case D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH:
+    return sizeof(D3D12_DISPATCH_ARGUMENTS);
+  case D3D12_INDIRECT_ARGUMENT_TYPE_VERTEX_BUFFER_VIEW:
+    return sizeof(D3D12_VERTEX_BUFFER_VIEW);
+  case D3D12_INDIRECT_ARGUMENT_TYPE_INDEX_BUFFER_VIEW:
+    return sizeof(D3D12_INDEX_BUFFER_VIEW);
+  case D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT:
+    return sizeof(UINT) * argument.Constant.Num32BitValuesToSet;
+  case D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT_BUFFER_VIEW:
+  case D3D12_INDIRECT_ARGUMENT_TYPE_SHADER_RESOURCE_VIEW:
+  case D3D12_INDIRECT_ARGUMENT_TYPE_UNORDERED_ACCESS_VIEW:
+    return sizeof(D3D12_GPU_VIRTUAL_ADDRESS);
+  default:
+    return 0;
+  }
+}
+
+static bool
+ReadBufferBytes(ID3D12Resource *resource, UINT64 offset, void *dst,
+                UINT64 size, const char *context) {
+  auto *d3d12_resource = GetResource(resource);
+  if (!d3d12_resource || !d3d12_resource->GetBufferAllocation() || !dst)
+    return false;
+  if (offset > d3d12_resource->GetResourceDesc().Width ||
+      size > d3d12_resource->GetResourceDesc().Width - offset) {
+    WARN("D3D12CommandQueue: ", context, " read exceeds buffer bounds");
+    return false;
+  }
+  auto *mapped = d3d12_resource->GetBufferAllocation()->mappedMemory(0);
+  if (!mapped) {
+    WARN("D3D12CommandQueue: ", context,
+         " requires a CPU-visible buffer for initial support");
+    return false;
+  }
+  std::memcpy(dst,
+              static_cast<const char *>(mapped) +
+                  d3d12_resource->GetHeapOffset() + offset,
+              size);
+  return true;
+}
+
+static bool
+WriteBufferBytes(ID3D12Resource *resource, UINT64 offset, const void *src,
+                 UINT64 size, const char *context) {
+  auto *d3d12_resource = GetResource(resource);
+  if (!d3d12_resource || !d3d12_resource->GetBufferAllocation() || !src)
+    return false;
+  if (offset > d3d12_resource->GetResourceDesc().Width ||
+      size > d3d12_resource->GetResourceDesc().Width - offset) {
+    WARN("D3D12CommandQueue: ", context, " write exceeds buffer bounds");
+    return false;
+  }
+  d3d12_resource->GetBufferAllocation()->updateContents(
+      d3d12_resource->GetHeapOffset() + offset, src, size);
+  return true;
 }
 
 static RootSignature *
@@ -1413,6 +1478,10 @@ private:
     std::unordered_map<UINT, D3D12_GPU_VIRTUAL_ADDRESS> compute_srv_roots;
     std::unordered_map<UINT, D3D12_GPU_VIRTUAL_ADDRESS> graphics_uav_roots;
     std::unordered_map<UINT, D3D12_GPU_VIRTUAL_ADDRESS> compute_uav_roots;
+    Com<ID3D12Resource> predication_buffer;
+    UINT64 predication_buffer_offset = 0;
+    D3D12_PREDICATION_OP predication_operation =
+        D3D12_PREDICATION_OP_EQUAL_ZERO;
   };
 
   struct ReplayRenderTargetAttachment {
@@ -1504,6 +1573,16 @@ private:
       StoreRootDescriptor(state, record);
     } else if constexpr (std::is_same_v<T, RootConstantsRecord>) {
       StoreRootConstants(state, record);
+    } else if constexpr (std::is_same_v<T, BeginQueryRecord>) {
+      ReplayBeginQuery(record);
+    } else if constexpr (std::is_same_v<T, EndQueryRecord>) {
+      ReplayEndQuery(record);
+    } else if constexpr (std::is_same_v<T, ResolveQueryDataRecord>) {
+      ReplayResolveQueryData(record);
+    } else if constexpr (std::is_same_v<T, PredicationRecord>) {
+      ReplaySetPredication(state, record);
+    } else if constexpr (std::is_same_v<T, ExecuteIndirectRecord>) {
+      ReplayExecuteIndirect(chunk, state, record);
     } else if constexpr (std::is_same_v<T, DrawInstancedRecord>) {
       ReplayDrawInstanced(chunk, state, record);
     } else if constexpr (std::is_same_v<T, DrawIndexedInstancedRecord>) {
@@ -1736,6 +1815,224 @@ private:
       values.resize(required_size, 0);
     std::copy(record.values.begin(), record.values.end(),
               values.begin() + record.dst_offset);
+  }
+
+  bool CurrentPipelineIsCompute(const ReplayState &state) const {
+    auto *pipeline = GetPipelineState(state.pipeline_state.ptr());
+    return pipeline && pipeline->GetType() == PipelineStateType::Compute;
+  }
+
+  bool PredicationAllows(const ReplayState &state) const {
+    if (!state.predication_buffer)
+      return true;
+
+    uint64_t value = 0;
+    if (!ReadBufferBytes(state.predication_buffer.ptr(),
+                         state.predication_buffer_offset, &value,
+                         sizeof(value), "predication")) {
+      WARN("D3D12CommandQueue: predication buffer is unavailable; command will run");
+      return true;
+    }
+
+    switch (state.predication_operation) {
+    case D3D12_PREDICATION_OP_EQUAL_ZERO:
+      return value == 0;
+    case D3D12_PREDICATION_OP_NOT_EQUAL_ZERO:
+      return value != 0;
+    default:
+      WARN("D3D12CommandQueue: unsupported predication operation ",
+           state.predication_operation);
+      return true;
+    }
+  }
+
+  void ReplayBeginQuery(const BeginQueryRecord &record) {
+    auto *heap = dynamic_cast<QueryHeap *>(record.heap.ptr());
+    if (!heap) {
+      WARN("D3D12CommandQueue: BeginQuery skipped for foreign query heap");
+      return;
+    }
+    heap->Begin(record.type, record.index);
+  }
+
+  void ReplayEndQuery(const EndQueryRecord &record) {
+    auto *heap = dynamic_cast<QueryHeap *>(record.heap.ptr());
+    if (!heap) {
+      WARN("D3D12CommandQueue: EndQuery skipped for foreign query heap");
+      return;
+    }
+    heap->End(record.type, record.index);
+  }
+
+  void ReplayResolveQueryData(const ResolveQueryDataRecord &record) {
+    auto *heap = dynamic_cast<QueryHeap *>(record.heap.ptr());
+    if (!heap) {
+      WARN("D3D12CommandQueue: ResolveQueryData skipped for foreign query heap");
+      return;
+    }
+
+    std::vector<uint8_t> data;
+    if (!heap->Resolve(record.type, record.start_index, record.query_count,
+                       data))
+      return;
+    if (!data.empty()) {
+      WriteBufferBytes(record.dst_buffer.ptr(), record.dst_buffer_offset,
+                       data.data(), data.size(), "query resolve");
+    }
+  }
+
+  void ReplaySetPredication(ReplayState &state,
+                            const PredicationRecord &record) {
+    state.predication_buffer = record.buffer;
+    state.predication_buffer_offset = record.buffer_offset;
+    state.predication_operation = record.operation;
+  }
+
+  void ReplayExecuteIndirect(CommandChunk *chunk, ReplayState &state,
+                             const ExecuteIndirectRecord &record) {
+    if (!PredicationAllows(state))
+      return;
+
+    auto *signature =
+        dynamic_cast<CommandSignature *>(record.command_signature.ptr());
+    if (!signature) {
+      WARN("D3D12CommandQueue: ExecuteIndirect skipped for foreign command signature");
+      return;
+    }
+
+    UINT command_count = record.max_command_count;
+    if (record.count_buffer) {
+      UINT count = 0;
+      if (!ReadBufferBytes(record.count_buffer.ptr(), record.count_buffer_offset,
+                           &count, sizeof(count), "indirect count buffer"))
+        return;
+      command_count = std::min(command_count, count);
+    }
+    if (!command_count)
+      return;
+
+    const auto &desc = signature->GetDesc();
+    const auto &arguments = signature->GetArguments();
+    if (!desc.ByteStride || arguments.empty())
+      return;
+
+    std::vector<uint8_t> command(desc.ByteStride);
+    for (UINT command_index = 0; command_index < command_count;
+         command_index++) {
+      const UINT64 command_offset =
+          record.arg_buffer_offset + UINT64(command_index) * desc.ByteStride;
+      if (!ReadBufferBytes(record.arg_buffer.ptr(), command_offset,
+                           command.data(), command.size(),
+                           "indirect argument buffer"))
+        return;
+
+      size_t argument_offset = 0;
+      for (const auto &argument : arguments) {
+        const auto argument_size = IndirectArgumentByteSize(argument);
+        if (!argument_size || argument_offset + argument_size > command.size()) {
+          WARN("D3D12CommandQueue: ExecuteIndirect argument layout exceeds stride");
+          return;
+        }
+
+        const auto *bytes = command.data() + argument_offset;
+        const bool compute = CurrentPipelineIsCompute(state);
+        switch (argument.Type) {
+        case D3D12_INDIRECT_ARGUMENT_TYPE_DRAW: {
+          D3D12_DRAW_ARGUMENTS args = {};
+          std::memcpy(&args, bytes, sizeof(args));
+          ReplayDrawInstanced(chunk, state,
+                              DrawInstancedRecord{
+                                  args.VertexCountPerInstance,
+                                  args.InstanceCount,
+                                  args.StartVertexLocation,
+                                  args.StartInstanceLocation});
+          break;
+        }
+        case D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED: {
+          D3D12_DRAW_INDEXED_ARGUMENTS args = {};
+          std::memcpy(&args, bytes, sizeof(args));
+          ReplayDrawIndexedInstanced(
+              chunk, state,
+              DrawIndexedInstancedRecord{
+                  args.IndexCountPerInstance, args.InstanceCount,
+                  args.StartIndexLocation, args.BaseVertexLocation,
+                  args.StartInstanceLocation});
+          break;
+        }
+        case D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH: {
+          D3D12_DISPATCH_ARGUMENTS args = {};
+          std::memcpy(&args, bytes, sizeof(args));
+          ReplayDispatch(chunk, state,
+                         DispatchRecord{args.ThreadGroupCountX,
+                                        args.ThreadGroupCountY,
+                                        args.ThreadGroupCountZ});
+          break;
+        }
+        case D3D12_INDIRECT_ARGUMENT_TYPE_VERTEX_BUFFER_VIEW: {
+          D3D12_VERTEX_BUFFER_VIEW view = {};
+          std::memcpy(&view, bytes, sizeof(view));
+          if (argument.VertexBuffer.Slot < state.vertex_buffers.size())
+            state.vertex_buffers[argument.VertexBuffer.Slot] = view;
+          break;
+        }
+        case D3D12_INDIRECT_ARGUMENT_TYPE_INDEX_BUFFER_VIEW: {
+          D3D12_INDEX_BUFFER_VIEW view = {};
+          std::memcpy(&view, bytes, sizeof(view));
+          state.index_buffer = view;
+          break;
+        }
+        case D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT: {
+          RootConstantsRecord constants = {};
+          constants.compute = compute;
+          constants.root_parameter_index =
+              argument.Constant.RootParameterIndex;
+          constants.dst_offset =
+              argument.Constant.DestOffsetIn32BitValues;
+          constants.values.resize(argument.Constant.Num32BitValuesToSet);
+          if (!constants.values.empty())
+            std::memcpy(constants.values.data(), bytes,
+                        constants.values.size() * sizeof(UINT));
+          StoreRootConstants(state, constants);
+          break;
+        }
+        case D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT_BUFFER_VIEW: {
+          D3D12_GPU_VIRTUAL_ADDRESS address = 0;
+          std::memcpy(&address, bytes, sizeof(address));
+          StoreRootDescriptor(
+              state, RootDescriptorRecord{
+                         compute, D3D12_ROOT_PARAMETER_TYPE_CBV,
+                         argument.ConstantBufferView.RootParameterIndex,
+                         address});
+          break;
+        }
+        case D3D12_INDIRECT_ARGUMENT_TYPE_SHADER_RESOURCE_VIEW: {
+          D3D12_GPU_VIRTUAL_ADDRESS address = 0;
+          std::memcpy(&address, bytes, sizeof(address));
+          StoreRootDescriptor(
+              state, RootDescriptorRecord{
+                         compute, D3D12_ROOT_PARAMETER_TYPE_SRV,
+                         argument.ShaderResourceView.RootParameterIndex,
+                         address});
+          break;
+        }
+        case D3D12_INDIRECT_ARGUMENT_TYPE_UNORDERED_ACCESS_VIEW: {
+          D3D12_GPU_VIRTUAL_ADDRESS address = 0;
+          std::memcpy(&address, bytes, sizeof(address));
+          StoreRootDescriptor(
+              state, RootDescriptorRecord{
+                         compute, D3D12_ROOT_PARAMETER_TYPE_UAV,
+                         argument.UnorderedAccessView.RootParameterIndex,
+                         address});
+          break;
+        }
+        default:
+          WARN("D3D12CommandQueue: unsupported ExecuteIndirect argument type ",
+               argument.Type);
+          return;
+        }
+        argument_offset += argument_size;
+      }
+    }
   }
 
   static void ForEachVisibleStage(D3D12_SHADER_VISIBILITY visibility,
@@ -2676,6 +2973,8 @@ private:
                            const DrawInstancedRecord &record) {
     if (!record.vertex_count_per_instance || !record.instance_count)
       return;
+    if (!PredicationAllows(state))
+      return;
 
     auto *pipeline = GetPipelineState(state.pipeline_state.ptr());
     if (!pipeline) {
@@ -2745,6 +3044,8 @@ private:
                                   const DrawIndexedInstancedRecord &record) {
     if (!record.index_count_per_instance || !record.instance_count ||
         !state.index_buffer)
+      return;
+    if (!PredicationAllows(state))
       return;
 
     auto *pipeline = GetPipelineState(state.pipeline_state.ptr());
@@ -2833,6 +3134,8 @@ private:
   void ReplayDispatch(CommandChunk *chunk, ReplayState &state,
                       const DispatchRecord &record) {
     if (!record.x || !record.y || !record.z)
+      return;
+    if (!PredicationAllows(state))
       return;
 
     auto *pipeline = GetPipelineState(state.pipeline_state.ptr());

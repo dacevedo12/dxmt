@@ -489,21 +489,43 @@ public:
     }
     AddRecord(std::move(record));
   }
-  void STDMETHODCALLTYPE BeginQuery(ID3D12QueryHeap *heap, D3D12_QUERY_TYPE type, UINT index) override {}
-  void STDMETHODCALLTYPE EndQuery(ID3D12QueryHeap *heap, D3D12_QUERY_TYPE type, UINT index) override {}
+  void STDMETHODCALLTYPE BeginQuery(ID3D12QueryHeap *heap, D3D12_QUERY_TYPE type, UINT index) override {
+    if (!heap)
+      return;
+    AddRecord(BeginQueryRecord{heap, type, index});
+  }
+  void STDMETHODCALLTYPE EndQuery(ID3D12QueryHeap *heap, D3D12_QUERY_TYPE type, UINT index) override {
+    if (!heap)
+      return;
+    AddRecord(EndQueryRecord{heap, type, index});
+  }
   void STDMETHODCALLTYPE ResolveQueryData(ID3D12QueryHeap *heap, D3D12_QUERY_TYPE type,
                                           UINT start_index, UINT query_count,
                                           ID3D12Resource *dst_buffer,
-                                          UINT64 aligned_dst_buffer_offset) override {}
+                                          UINT64 aligned_dst_buffer_offset) override {
+    if (!heap || !dst_buffer || !query_count)
+      return;
+    AddRecord(ResolveQueryDataRecord{
+        heap, type, start_index, query_count, dst_buffer,
+        aligned_dst_buffer_offset});
+  }
   void STDMETHODCALLTYPE SetPredication(ID3D12Resource *buffer, UINT64 aligned_buffer_offset,
-                                        D3D12_PREDICATION_OP operation) override {}
+                                        D3D12_PREDICATION_OP operation) override {
+    AddRecord(PredicationRecord{buffer, aligned_buffer_offset, operation});
+  }
   void STDMETHODCALLTYPE SetMarker(UINT metadata, const void *data, UINT size) override {}
   void STDMETHODCALLTYPE BeginEvent(UINT metadata, const void *data, UINT size) override {}
   void STDMETHODCALLTYPE EndEvent() override {}
   void STDMETHODCALLTYPE ExecuteIndirect(ID3D12CommandSignature *command_signature,
                                          UINT max_command_count, ID3D12Resource *arg_buffer,
                                          UINT64 arg_buffer_offset, ID3D12Resource *count_buffer,
-                                         UINT64 count_buffer_offset) override {}
+                                         UINT64 count_buffer_offset) override {
+    if (!command_signature || !arg_buffer || !max_command_count)
+      return;
+    AddRecord(ExecuteIndirectRecord{
+        command_signature, max_command_count, arg_buffer, arg_buffer_offset,
+        count_buffer, count_buffer_offset});
+  }
 
 private:
   bool IsPipelineStateCompatible(ID3D12PipelineState *pipeline_state) const {
@@ -547,6 +569,80 @@ private:
   std::string name_;
 };
 
+class CommandSignatureImpl final
+    : public ComObjectWithInitialRef<ID3D12CommandSignature>,
+      public CommandSignature {
+public:
+  CommandSignatureImpl(IMTLD3D12Device *device,
+                       const D3D12_COMMAND_SIGNATURE_DESC &desc,
+                       ID3D12RootSignature *root_signature)
+      : device_(device), root_signature_(root_signature), desc_(desc) {
+    arguments_.assign(desc.pArgumentDescs,
+                      desc.pArgumentDescs + desc.NumArgumentDescs);
+    desc_.pArgumentDescs = arguments_.empty() ? nullptr : arguments_.data();
+  }
+
+  HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid,
+                                           void **ppvObject) override {
+    if (!ppvObject)
+      return E_POINTER;
+
+    *ppvObject = nullptr;
+    if (riid == __uuidof(IUnknown) || riid == __uuidof(ID3D12Object) ||
+        riid == __uuidof(ID3D12DeviceChild) ||
+        riid == __uuidof(ID3D12Pageable) ||
+        riid == __uuidof(ID3D12CommandSignature)) {
+      *ppvObject = ref(this);
+      return S_OK;
+    }
+
+    if (logQueryInterfaceError(__uuidof(ID3D12CommandSignature), riid))
+      WARN("D3D12CommandSignature: unknown interface query ",
+           str::format(riid));
+    return E_NOINTERFACE;
+  }
+
+  HRESULT STDMETHODCALLTYPE GetPrivateData(REFGUID guid, UINT *data_size,
+                                           void *data) override {
+    return private_data_.getData(guid, data_size, data);
+  }
+
+  HRESULT STDMETHODCALLTYPE SetPrivateData(REFGUID guid, UINT data_size,
+                                           const void *data) override {
+    return private_data_.setData(guid, data_size, data);
+  }
+
+  HRESULT STDMETHODCALLTYPE SetPrivateDataInterface(REFGUID guid,
+                                                   const IUnknown *data) override {
+    return private_data_.setInterface(guid, data);
+  }
+
+  HRESULT STDMETHODCALLTYPE SetName(const WCHAR *name) override {
+    name_ = name ? str::fromws(name) : std::string();
+    return S_OK;
+  }
+
+  HRESULT STDMETHODCALLTYPE GetDevice(REFIID riid, void **device) override {
+    return device_->QueryInterface(riid, device);
+  }
+
+  const D3D12_COMMAND_SIGNATURE_DESC &GetDesc() const override {
+    return desc_;
+  }
+
+  const std::vector<D3D12_INDIRECT_ARGUMENT_DESC> &GetArguments() const override {
+    return arguments_;
+  }
+
+private:
+  Com<IMTLD3D12Device> device_;
+  Com<ID3D12RootSignature> root_signature_;
+  ComPrivateData private_data_;
+  D3D12_COMMAND_SIGNATURE_DESC desc_ = {};
+  std::vector<D3D12_INDIRECT_ARGUMENT_DESC> arguments_;
+  std::string name_;
+};
+
 } // namespace
 
 Com<ID3D12GraphicsCommandList>
@@ -556,6 +652,14 @@ CreateGraphicsCommandList(IMTLD3D12Device *device, UINT node_mask,
                           ID3D12PipelineState *initial_pipeline_state) {
   return Com<ID3D12GraphicsCommandList>::transfer(new GraphicsCommandListImpl(
       device, node_mask, type, command_allocator, initial_pipeline_state));
+}
+
+Com<ID3D12CommandSignature>
+CreateCommandSignature(IMTLD3D12Device *device,
+                       const D3D12_COMMAND_SIGNATURE_DESC *desc,
+                       ID3D12RootSignature *root_signature) {
+  return Com<ID3D12CommandSignature>::transfer(
+      new CommandSignatureImpl(device, *desc, root_signature));
 }
 
 } // namespace dxmt::d3d12

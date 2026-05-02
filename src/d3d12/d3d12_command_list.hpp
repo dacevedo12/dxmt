@@ -179,6 +179,42 @@ struct RootDescriptorRecord {
   D3D12_GPU_VIRTUAL_ADDRESS address = 0;
 };
 
+struct BeginQueryRecord {
+  Com<ID3D12QueryHeap> heap;
+  D3D12_QUERY_TYPE type = D3D12_QUERY_TYPE_OCCLUSION;
+  UINT index = 0;
+};
+
+struct EndQueryRecord {
+  Com<ID3D12QueryHeap> heap;
+  D3D12_QUERY_TYPE type = D3D12_QUERY_TYPE_OCCLUSION;
+  UINT index = 0;
+};
+
+struct ResolveQueryDataRecord {
+  Com<ID3D12QueryHeap> heap;
+  D3D12_QUERY_TYPE type = D3D12_QUERY_TYPE_OCCLUSION;
+  UINT start_index = 0;
+  UINT query_count = 0;
+  Com<ID3D12Resource> dst_buffer;
+  UINT64 dst_buffer_offset = 0;
+};
+
+struct PredicationRecord {
+  Com<ID3D12Resource> buffer;
+  UINT64 buffer_offset = 0;
+  D3D12_PREDICATION_OP operation = D3D12_PREDICATION_OP_EQUAL_ZERO;
+};
+
+struct ExecuteIndirectRecord {
+  Com<ID3D12CommandSignature> command_signature;
+  UINT max_command_count = 0;
+  Com<ID3D12Resource> arg_buffer;
+  UINT64 arg_buffer_offset = 0;
+  Com<ID3D12Resource> count_buffer;
+  UINT64 count_buffer_offset = 0;
+};
+
 using CommandRecordPayload = std::variant<
     DrawInstancedRecord, DrawIndexedInstancedRecord, DispatchRecord,
     PipelineStateRecord, CopyBufferRegionRecord, CopyTextureRegionRecord,
@@ -188,7 +224,9 @@ using CommandRecordPayload = std::variant<
     ScissorRecord, BlendFactorRecord, StencilRefRecord, PrimitiveTopologyRecord,
     RenderTargetsRecord, VertexBuffersRecord, IndexBufferRecord,
     RootSignatureRecord, DescriptorHeapsRecord, RootDescriptorTableRecord,
-    RootConstantsRecord, RootDescriptorRecord>;
+    RootConstantsRecord, RootDescriptorRecord, BeginQueryRecord,
+    EndQueryRecord, ResolveQueryDataRecord, PredicationRecord,
+    ExecuteIndirectRecord>;
 
 struct CommandRecord {
   CommandRecordPayload payload;
@@ -204,10 +242,22 @@ public:
   virtual HRESULT MarkSubmittedToQueue(D3D12_COMMAND_LIST_TYPE queue_type) = 0;
 };
 
+class CommandSignature {
+public:
+  virtual ~CommandSignature() = default;
+  virtual const D3D12_COMMAND_SIGNATURE_DESC &GetDesc() const = 0;
+  virtual const std::vector<D3D12_INDIRECT_ARGUMENT_DESC> &GetArguments() const = 0;
+};
+
 Com<ID3D12GraphicsCommandList>
 CreateGraphicsCommandList(IMTLD3D12Device *device, UINT node_mask,
                           D3D12_COMMAND_LIST_TYPE type,
                           ID3D12CommandAllocator *command_allocator,
                           ID3D12PipelineState *initial_pipeline_state);
+
+Com<ID3D12CommandSignature>
+CreateCommandSignature(IMTLD3D12Device *device,
+                       const D3D12_COMMAND_SIGNATURE_DESC *desc,
+                       ID3D12RootSignature *root_signature);
 
 } // namespace dxmt::d3d12
