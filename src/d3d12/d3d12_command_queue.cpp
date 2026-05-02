@@ -2190,21 +2190,26 @@ private:
       const UINT dst_level = GetMipLevel(*dst, dst_subresource);
       const UINT src_slice = GetArraySlice(*src, src_subresource);
       const UINT src_level = GetMipLevel(*src, src_subresource);
-      chunk->emitcc([dst_allocation, src_allocation, dst_slice, dst_level,
+      Rc<Texture> dst_texture = dst->GetTexture();
+      Rc<Texture> src_texture = src->GetTexture();
+      chunk->emitcc([dst_texture = std::move(dst_texture),
+                     src_texture = std::move(src_texture), dst_slice, dst_level,
                      src_slice, src_level, src_origin, dst_origin,
                      size](ArgumentEncodingContext &enc) {
-        enc.retainAllocation(dst_allocation.ptr());
-        enc.retainAllocation(src_allocation.ptr());
         enc.startBlitPass();
+        auto src = enc.access(src_texture, src_level, src_slice,
+                              ResourceAccess::Read);
+        auto dst = enc.access(dst_texture, dst_level, dst_slice,
+                              ResourceAccess::Write);
         auto &copy =
             enc.encodeBlitCommand<wmtcmd_blit_copy_from_texture_to_texture>();
         copy.type = WMTBlitCommandCopyFromTextureToTexture;
-        copy.src = src_allocation->texture();
+        copy.src = src;
         copy.src_slice = src_slice;
         copy.src_level = src_level;
         copy.src_origin = src_origin;
         copy.src_size = size;
-        copy.dst = dst_allocation->texture();
+        copy.dst = dst;
         copy.dst_slice = dst_slice;
         copy.dst_level = dst_level;
         copy.dst_origin = dst_origin;
@@ -2226,9 +2231,9 @@ private:
 
     auto &buffer_resource = dst_is_buffer ? dst : src;
     auto &texture_resource = dst_is_buffer ? src : dst;
-    Rc<BufferAllocation> buffer_allocation = buffer_resource.GetBufferAllocation();
-    Rc<TextureAllocation> texture_allocation = texture_resource.GetTextureAllocation();
-    if (!buffer_allocation || !texture_allocation)
+    Rc<Buffer> buffer = buffer_resource.GetBuffer();
+    Rc<Texture> texture = texture_resource.GetTexture();
+    if (!buffer || !texture)
       return;
 
     const auto &buffer_location = dst_is_buffer ? record.dst : record.src;
@@ -2257,35 +2262,40 @@ private:
     const UINT row_pitch = footprint.RowPitch;
     const UINT image_pitch = footprint.RowPitch * footprint.Height;
 
-    chunk->emitcc([dst_is_buffer, buffer_allocation, texture_allocation,
+    chunk->emitcc([dst_is_buffer, buffer = std::move(buffer),
+                   texture = std::move(texture),
                    buffer_offset, row_pitch, image_pitch, size, origin, slice,
                    level](ArgumentEncodingContext &enc) {
-      enc.retainAllocation(buffer_allocation.ptr());
-      enc.retainAllocation(texture_allocation.ptr());
       enc.startBlitPass();
       if (dst_is_buffer) {
+        auto src = enc.access(texture, level, slice, ResourceAccess::Read);
+        auto [dst, dst_offset] =
+            enc.access(buffer, buffer_offset, image_pitch, ResourceAccess::Write);
         auto &copy =
             enc.encodeBlitCommand<wmtcmd_blit_copy_from_texture_to_buffer>();
         copy.type = WMTBlitCommandCopyFromTextureToBuffer;
-        copy.src = texture_allocation->texture();
+        copy.src = src;
         copy.slice = slice;
         copy.level = level;
         copy.origin = origin;
         copy.size = size;
-        copy.dst = buffer_allocation->buffer();
-        copy.offset = buffer_offset;
+        copy.dst = dst->buffer();
+        copy.offset = dst_offset + buffer_offset;
         copy.bytes_per_row = row_pitch;
         copy.bytes_per_image = image_pitch;
       } else {
+        auto [src, src_offset] =
+            enc.access(buffer, buffer_offset, image_pitch, ResourceAccess::Read);
+        auto dst = enc.access(texture, level, slice, ResourceAccess::Write);
         auto &copy =
             enc.encodeBlitCommand<wmtcmd_blit_copy_from_buffer_to_texture>();
         copy.type = WMTBlitCommandCopyFromBufferToTexture;
-        copy.src = buffer_allocation->buffer();
-        copy.src_offset = buffer_offset;
+        copy.src = src->buffer();
+        copy.src_offset = src_offset + buffer_offset;
         copy.bytes_per_row = row_pitch;
         copy.bytes_per_image = image_pitch;
         copy.size = size;
-        copy.dst = texture_allocation->texture();
+        copy.dst = dst;
         copy.slice = slice;
         copy.level = level;
         copy.origin = origin;
