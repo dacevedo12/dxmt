@@ -1280,8 +1280,9 @@ private:
         return DXGI_ERROR_INVALID_CALL;
       }
       if (flags & ~D3D12SupportedSwapChainFlags) {
-        WARN("D3D12SwapChain::ResizeBuffers: ignoring unsupported flags ",
+        WARN("D3D12SwapChain::ResizeBuffers: unsupported flags ",
              flags & ~D3D12SupportedSwapChainFlags);
+        return DXGI_ERROR_UNSUPPORTED;
       }
 
       desc_.BufferCount = buffer_count;
@@ -1411,8 +1412,9 @@ private:
       if (sync_interval > 4)
         return DXGI_ERROR_INVALID_CALL;
       if (flags & ~D3D12SupportedPresentFlags) {
-        WARN("D3D12SwapChain::Present1: ignoring unsupported flags ",
+        WARN("D3D12SwapChain::Present1: unsupported flags ",
              flags & ~D3D12SupportedPresentFlags);
+        return DXGI_ERROR_UNSUPPORTED;
       }
       if ((flags & DXGI_PRESENT_ALLOW_TEARING) &&
           !(desc_.Flags & DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING)) {
@@ -1601,6 +1603,19 @@ private:
         UINT buffer_count, UINT width, UINT height, DXGI_FORMAT format,
         UINT flags, const UINT *creation_node_mask,
         IUnknown *const *present_queue) override {
+      if (creation_node_mask) {
+        for (UINT i = 0; i < buffer_count; i++) {
+          if (creation_node_mask[i] > 1) {
+            WARN("D3D12SwapChain::ResizeBuffers1: unsupported creation node mask ",
+                 creation_node_mask[i]);
+            return DXGI_ERROR_UNSUPPORTED;
+          }
+        }
+      }
+      if (present_queue) {
+        WARN("D3D12SwapChain::ResizeBuffers1: present queues are not supported");
+        return DXGI_ERROR_UNSUPPORTED;
+      }
       return ResizeBuffers(buffer_count, width, height, format, flags);
     }
 

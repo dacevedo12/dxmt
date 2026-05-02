@@ -158,6 +158,7 @@ public:
     if (desc.Flags & ~SupportedSwapChainFlags) {
       WARN("CreateSwapChainForHwnd: unsupported swapchain flags ",
            desc.Flags & ~SupportedSwapChainFlags);
+      return DXGI_ERROR_UNSUPPORTED;
     }
     if (!IsKnownSwapEffect(desc.SwapEffect)) {
       WARN("CreateSwapChainForHwnd: unknown swap effect ", desc.SwapEffect);
