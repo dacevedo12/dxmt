@@ -243,14 +243,8 @@ public:
 
     ResourceBarrierRecord record = {};
     record.barriers.reserve(barrier_count);
-    for (UINT i = 0; i < barrier_count; i++) {
+    for (UINT i = 0; i < barrier_count; i++)
       record.barriers.push_back(StoreResourceBarrier(barriers[i]));
-      if (barriers[i].Type == D3D12_RESOURCE_BARRIER_TYPE_TRANSITION &&
-          barriers[i].Transition.pResource) {
-        resource_states_[barriers[i].Transition.pResource] =
-            barriers[i].Transition.StateAfter;
-      }
-    }
     AddRecord(std::move(record));
   }
   void STDMETHODCALLTYPE ExecuteBundle(ID3D12GraphicsCommandList *command_list) override {}
@@ -482,7 +476,6 @@ private:
   Com<ID3D12RootSignature> graphics_root_signature_;
   ComPrivateData private_data_;
   std::vector<CommandRecord> records_;
-  std::unordered_map<ID3D12Resource *, D3D12_RESOURCE_STATES> resource_states_;
   bool closed_ = false;
   bool submitted_ = false;
   std::string name_;

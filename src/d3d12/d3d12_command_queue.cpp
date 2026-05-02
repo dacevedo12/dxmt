@@ -147,6 +147,18 @@ GetArraySlice(const Resource &resource, UINT subresource) {
              : subresource / mip_levels;
 }
 
+static UINT
+GetSubresourceCount(const Resource &resource) {
+  const auto &desc = resource.GetResourceDesc();
+  const UINT mip_levels = desc.MipLevels ? desc.MipLevels : 1;
+  if (desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER)
+    return 1;
+  return mip_levels *
+         (desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D
+              ? 1
+              : desc.DepthOrArraySize);
+}
+
 static WMTSize
 GetSubresourceSize(const Resource &resource, UINT subresource,
                    const D3D12_BOX *box) {
@@ -162,6 +174,87 @@ GetSubresourceSize(const Resource &resource, UINT subresource,
           desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D
               ? std::max<UINT64>(1, desc.DepthOrArraySize >> mip)
               : 1};
+}
+
+static bool
+StateHasWriteAccess(D3D12_RESOURCE_STATES state) {
+  constexpr D3D12_RESOURCE_STATES kWriteStates =
+      D3D12_RESOURCE_STATE_UNORDERED_ACCESS |
+      D3D12_RESOURCE_STATE_RENDER_TARGET |
+      D3D12_RESOURCE_STATE_DEPTH_WRITE |
+      D3D12_RESOURCE_STATE_STREAM_OUT |
+      D3D12_RESOURCE_STATE_COPY_DEST |
+      D3D12_RESOURCE_STATE_RESOLVE_DEST;
+  return (state & kWriteStates) != 0;
+}
+
+static bool
+StateHasReadAccess(D3D12_RESOURCE_STATES state) {
+  constexpr D3D12_RESOURCE_STATES kReadStates =
+      D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER |
+      D3D12_RESOURCE_STATE_INDEX_BUFFER |
+      D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE |
+      D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE |
+      D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT |
+      D3D12_RESOURCE_STATE_COPY_SOURCE |
+      D3D12_RESOURCE_STATE_DEPTH_READ |
+      D3D12_RESOURCE_STATE_RESOLVE_SOURCE |
+      D3D12_RESOURCE_STATE_PREDICATION;
+  return (state & kReadStates) != 0;
+}
+
+static int
+ResourceAccessForState(D3D12_RESOURCE_STATES state) {
+  int access = 0;
+  if (StateHasReadAccess(state))
+    access |= ResourceAccess::Read;
+  if (StateHasWriteAccess(state))
+    access |= ResourceAccess::Write;
+  if (state & D3D12_RESOURCE_STATE_UNORDERED_ACCESS)
+    access |= ResourceAccess::UAV;
+  return access;
+}
+
+static bool
+IsKnownResourceState(D3D12_RESOURCE_STATES state) {
+  constexpr D3D12_RESOURCE_STATES kKnownStates =
+      D3D12_RESOURCE_STATE_COMMON |
+      D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER |
+      D3D12_RESOURCE_STATE_INDEX_BUFFER |
+      D3D12_RESOURCE_STATE_RENDER_TARGET |
+      D3D12_RESOURCE_STATE_UNORDERED_ACCESS |
+      D3D12_RESOURCE_STATE_DEPTH_WRITE |
+      D3D12_RESOURCE_STATE_DEPTH_READ |
+      D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE |
+      D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE |
+      D3D12_RESOURCE_STATE_STREAM_OUT |
+      D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT |
+      D3D12_RESOURCE_STATE_COPY_DEST |
+      D3D12_RESOURCE_STATE_COPY_SOURCE |
+      D3D12_RESOURCE_STATE_RESOLVE_DEST |
+      D3D12_RESOURCE_STATE_RESOLVE_SOURCE |
+      D3D12_RESOURCE_STATE_PREDICATION;
+  return (state & ~kKnownStates) == 0;
+}
+
+static void
+WarnUnsupportedResourceState(D3D12_RESOURCE_STATES state, const char *context) {
+  constexpr D3D12_RESOURCE_STATES kWriteStates =
+      D3D12_RESOURCE_STATE_UNORDERED_ACCESS |
+      D3D12_RESOURCE_STATE_RENDER_TARGET |
+      D3D12_RESOURCE_STATE_DEPTH_WRITE |
+      D3D12_RESOURCE_STATE_STREAM_OUT |
+      D3D12_RESOURCE_STATE_COPY_DEST |
+      D3D12_RESOURCE_STATE_RESOLVE_DEST;
+  if (!IsKnownResourceState(state)) {
+    WARN("D3D12CommandQueue: unsupported resource state bits in ", context,
+         " state=", uint32_t(state));
+  }
+  const auto writes = uint32_t(state & kWriteStates);
+  if (writes && (StateHasReadAccess(state) || (writes & (writes - 1)))) {
+    WARN("D3D12CommandQueue: conservative handling for combined write state in ",
+         context, " state=", uint32_t(state));
+  }
 }
 
 static TextureViewKey
@@ -1070,6 +1163,9 @@ private:
   };
 
   struct ReplayState {
+    std::unordered_map<ID3D12Resource *,
+                       std::vector<D3D12_RESOURCE_STATES>> *resource_states =
+        nullptr;
     Com<ID3D12PipelineState> pipeline_state;
     Com<ID3D12RootSignature> graphics_root_signature;
     Com<ID3D12RootSignature> compute_root_signature;
@@ -1117,6 +1213,7 @@ private:
   void ReplayCommandRecords(const std::vector<CommandRecord> &records) {
     auto *chunk = device_->GetDXMTDevice().queue().CurrentChunk();
     ReplayState state = {};
+    state.resource_states = &resource_states_;
     for (const auto &record : records) {
       std::visit([&](const auto &payload) { ReplayRecord(chunk, state, payload); },
                  record.payload);
@@ -1154,7 +1251,7 @@ private:
     } else if constexpr (std::is_same_v<T, IndexBufferRecord>) {
       state.index_buffer = record.view;
     } else if constexpr (std::is_same_v<T, ResourceBarrierRecord>) {
-      ReplayResourceBarrier(chunk, record);
+      ReplayResourceBarrier(chunk, state, record);
     } else if constexpr (std::is_same_v<T, RootSignatureRecord>) {
       if (record.compute)
         state.compute_root_signature = record.root_signature;
@@ -1206,10 +1303,169 @@ private:
     });
   }
 
-  void ReplayResourceBarrier(CommandChunk *chunk,
+  void ReplayResourceBarrier(CommandChunk *chunk, ReplayState &state,
                              const ResourceBarrierRecord &record) {
     if (record.barriers.empty())
       return;
+
+    for (const auto &barrier : record.barriers) {
+      switch (barrier.barrier.Type) {
+      case D3D12_RESOURCE_BARRIER_TYPE_TRANSITION:
+        ReplayTransitionBarrier(chunk, state, barrier);
+        break;
+      case D3D12_RESOURCE_BARRIER_TYPE_UAV:
+        ReplayUavBarrier(chunk, barrier);
+        break;
+      case D3D12_RESOURCE_BARRIER_TYPE_ALIASING:
+        ReplayAliasingBarrier(chunk, barrier);
+        break;
+      default:
+        WARN("D3D12CommandQueue: unsupported resource barrier type ",
+             barrier.barrier.Type);
+        EmitPassSeparator(chunk);
+        break;
+      }
+    }
+  }
+
+  std::vector<D3D12_RESOURCE_STATES> &
+  GetReplayResourceStates(ReplayState &state, Resource &resource) {
+    auto &states = (*state.resource_states)[resource.GetD3D12Resource()];
+    const UINT subresource_count = GetSubresourceCount(resource);
+    if (states.size() != subresource_count)
+      states.assign(subresource_count, resource.GetInitialState());
+    return states;
+  }
+
+  void ReplayTransitionBarrier(CommandChunk *chunk, ReplayState &state,
+                               const StoredResourceBarrier &barrier) {
+    auto *resource = GetResource(barrier.resource.ptr());
+    if (!resource) {
+      WARN("D3D12CommandQueue: transition barrier skipped for foreign resource");
+      EmitPassSeparator(chunk);
+      return;
+    }
+
+    const auto &transition = barrier.barrier.Transition;
+    WarnUnsupportedResourceState(transition.StateBefore, "transition before");
+    WarnUnsupportedResourceState(transition.StateAfter, "transition after");
+
+    auto &states = GetReplayResourceStates(state, *resource);
+    const UINT subresource_count = states.size();
+    const bool all_subresources =
+        transition.Subresource == D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    if (!all_subresources && transition.Subresource >= subresource_count) {
+      WARN("D3D12CommandQueue: transition barrier subresource out of range ",
+           transition.Subresource, " count=", subresource_count);
+      EmitPassSeparator(chunk);
+      return;
+    }
+
+    const UINT first = all_subresources ? 0 : transition.Subresource;
+    const UINT count = all_subresources ? subresource_count : 1;
+    for (UINT i = 0; i < count; i++) {
+      const UINT subresource = first + i;
+      if (states[subresource] != transition.StateBefore) {
+        WARN("D3D12CommandQueue: transition barrier state mismatch subresource=",
+             subresource, " expected=", uint32_t(states[subresource]),
+             " before=", uint32_t(transition.StateBefore));
+      }
+      states[subresource] = transition.StateAfter;
+    }
+
+    const int before_access = ResourceAccessForState(transition.StateBefore);
+    const int after_access = ResourceAccessForState(transition.StateAfter);
+    int access = before_access | after_access;
+    if (!access)
+      access = ResourceAccess::All;
+    EmitResourceAccessBarrier(chunk, *resource, first, count, access);
+  }
+
+  void ReplayUavBarrier(CommandChunk *chunk,
+                        const StoredResourceBarrier &barrier) {
+    if (barrier.resource) {
+      auto *resource = GetResource(barrier.resource.ptr());
+      if (!resource) {
+        WARN("D3D12CommandQueue: UAV barrier skipped for foreign resource");
+        EmitPassSeparator(chunk);
+        return;
+      }
+      EmitResourceAccessBarrier(chunk, *resource, 0,
+                                GetSubresourceCount(*resource),
+                                ResourceAccess::All);
+      return;
+    }
+
+    EmitPassSeparator(chunk);
+  }
+
+  void ReplayAliasingBarrier(CommandChunk *chunk,
+                             const StoredResourceBarrier &barrier) {
+    bool touched = false;
+    if (auto *before = GetResource(barrier.resource_before.ptr())) {
+      EmitResourceAccessBarrier(chunk, *before, 0,
+                                GetSubresourceCount(*before),
+                                ResourceAccess::All);
+      touched = true;
+    } else if (barrier.resource_before) {
+      WARN("D3D12CommandQueue: aliasing barrier has foreign before resource");
+    }
+
+    if (auto *after = GetResource(barrier.resource_after.ptr())) {
+      EmitResourceAccessBarrier(chunk, *after, 0, GetSubresourceCount(*after),
+                                ResourceAccess::All);
+      touched = true;
+    } else if (barrier.resource_after) {
+      WARN("D3D12CommandQueue: aliasing barrier has foreign after resource");
+    }
+
+    if (!touched)
+      EmitPassSeparator(chunk);
+  }
+
+  void EmitResourceAccessBarrier(CommandChunk *chunk, Resource &resource,
+                                 UINT first_subresource,
+                                 UINT subresource_count, int access) {
+    if (resource.GetBuffer()) {
+      Rc<Buffer> buffer = resource.GetBuffer();
+      const UINT length =
+          UINT(std::min<UINT64>(resource.GetResourceDesc().Width, UINT_MAX));
+      chunk->emitcc([buffer = std::move(buffer), length, access](ArgumentEncodingContext &enc) {
+        enc.startBlitPass();
+        enc.access(buffer, 0, length, access);
+        enc.endPass();
+      });
+      return;
+    }
+
+    if (resource.GetTexture()) {
+      Rc<Texture> texture = resource.GetTexture();
+      std::vector<std::pair<UINT, UINT>> subresources;
+      subresources.reserve(subresource_count);
+      for (UINT i = 0; i < subresource_count; i++) {
+        const UINT subresource = first_subresource + i;
+        subresources.push_back({GetMipLevel(resource, subresource),
+                                GetArraySlice(resource, subresource)});
+      }
+      chunk->emitcc([texture = std::move(texture),
+                     subresources = std::move(subresources),
+                     access](ArgumentEncodingContext &enc) mutable {
+        enc.startBlitPass();
+        for (const auto &[level, slice] : subresources)
+          enc.access(texture, level, slice, access);
+        enc.endPass();
+      });
+      return;
+    }
+
+    EmitPassSeparator(chunk);
+  }
+
+  void EmitPassSeparator(CommandChunk *chunk) {
+    chunk->emitcc([](ArgumentEncodingContext &enc) {
+      enc.startBlitPass();
+      enc.endPass();
+    });
   }
 
   void StoreRootDescriptor(ReplayState &state,
@@ -2350,6 +2606,8 @@ private:
   UINT64 signal_count_ = 0;
   UINT64 last_signal_value_ = 0;
   std::vector<UINT64> wait_values_;
+  std::unordered_map<ID3D12Resource *,
+                     std::vector<D3D12_RESOURCE_STATES>> resource_states_;
   std::mutex mutex_;
   std::string name_;
 };
