@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <cstring>
 #include <mutex>
+#include <utility>
 #include <vector>
 
 namespace dxmt::d3d12 {
@@ -592,21 +593,26 @@ private:
       std::memcpy(mapped + row * layout.row_pitch, src + row * src_row_pitch,
                   static_cast<size_t>(row_size));
 
-    wmtcmd_blit_copy_from_buffer_to_texture copy = {};
-    copy.type = WMTBlitCommandCopyFromBufferToTexture;
-    copy.next.set(nullptr);
-    copy.src = buffer;
-    copy.src_offset = 0;
-    copy.bytes_per_row = layout.row_pitch;
-    copy.bytes_per_image = 0;
-    copy.size = {box.right - box.left, box.bottom - box.top, 1};
-    copy.dst = texture_allocation_->texture();
-    copy.slice = 0;
-    copy.level = 0;
-    copy.origin = {box.left, box.top, 0};
-
-    return SubmitSynchronousBlit(
-        reinterpret_cast<const wmtcmd_blit_nop *>(&copy));
+    Rc<dxmt::Texture> texture = texture_;
+    return SubmitSynchronousDxmtBlit(
+        [buffer, texture, box, row_pitch = layout.row_pitch](
+            ArgumentEncodingContext &enc) {
+          enc.startBlitPass();
+          auto dst = enc.access(texture, 0, 0, ResourceAccess::Write);
+          auto &copy =
+              enc.encodeBlitCommand<wmtcmd_blit_copy_from_buffer_to_texture>();
+          copy.type = WMTBlitCommandCopyFromBufferToTexture;
+          copy.src = buffer;
+          copy.src_offset = 0;
+          copy.bytes_per_row = row_pitch;
+          copy.bytes_per_image = 0;
+          copy.size = {box.right - box.left, box.bottom - box.top, 1};
+          copy.dst = dst;
+          copy.slice = 0;
+          copy.level = 0;
+          copy.origin = {box.left, box.top, 0};
+          enc.endPass();
+        });
   }
 
   HRESULT ReadTextureRowsViaBlit(void *dst_data, UINT dst_row_pitch,
@@ -620,21 +626,26 @@ private:
     if (!buffer || !buffer_info.memory.get())
       return E_FAIL;
 
-    wmtcmd_blit_copy_from_texture_to_buffer copy = {};
-    copy.type = WMTBlitCommandCopyFromTextureToBuffer;
-    copy.next.set(nullptr);
-    copy.src = texture_allocation_->texture();
-    copy.slice = 0;
-    copy.level = 0;
-    copy.origin = {box.left, box.top, 0};
-    copy.size = {box.right - box.left, box.bottom - box.top, 1};
-    copy.dst = buffer;
-    copy.offset = 0;
-    copy.bytes_per_row = layout.row_pitch;
-    copy.bytes_per_image = 0;
-
-    HRESULT hr = SubmitSynchronousBlit(
-        reinterpret_cast<const wmtcmd_blit_nop *>(&copy));
+    Rc<dxmt::Texture> texture = texture_;
+    HRESULT hr = SubmitSynchronousDxmtBlit(
+        [buffer, texture, box, row_pitch = layout.row_pitch](
+            ArgumentEncodingContext &enc) {
+          enc.startBlitPass();
+          auto src = enc.access(texture, 0, 0, ResourceAccess::Read);
+          auto &copy =
+              enc.encodeBlitCommand<wmtcmd_blit_copy_from_texture_to_buffer>();
+          copy.type = WMTBlitCommandCopyFromTextureToBuffer;
+          copy.src = src;
+          copy.slice = 0;
+          copy.level = 0;
+          copy.origin = {box.left, box.top, 0};
+          copy.size = {box.right - box.left, box.bottom - box.top, 1};
+          copy.dst = buffer;
+          copy.offset = 0;
+          copy.bytes_per_row = row_pitch;
+          copy.bytes_per_image = 0;
+          enc.endPass();
+        });
     if (FAILED(hr))
       return hr;
 
@@ -643,17 +654,15 @@ private:
                                    0, row_size, row_count);
   }
 
-  HRESULT SubmitSynchronousBlit(const wmtcmd_blit_nop *cmd) {
-    auto queue = device_->GetDXMTDevice().device().newCommandQueue(1);
-    if (!queue)
-      return E_FAIL;
-    auto cmdbuf = queue.commandBuffer();
-    auto encoder = cmdbuf.blitCommandEncoder();
-    encoder.encodeCommands(cmd);
-    encoder.endEncoding();
-    cmdbuf.commit();
-    cmdbuf.waitUntilCompleted();
-    return cmdbuf.status() == WMTCommandBufferStatusCompleted ? S_OK : E_FAIL;
+  template <typename Encode>
+  HRESULT SubmitSynchronousDxmtBlit(Encode &&encode) {
+    auto &queue = device_->GetDXMTDevice().queue();
+    const auto seq = queue.CurrentSeqId();
+    auto *chunk = queue.CurrentChunk();
+    chunk->emitcc(std::forward<Encode>(encode));
+    queue.CommitCurrentChunk();
+    queue.WaitCPUFence(seq);
+    return S_OK;
   }
 
   void CreateBuffer() {

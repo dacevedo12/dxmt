@@ -41,6 +41,7 @@ EmulatedCommandContext::EmulatedCommandContext(WMT::Device device, InternalComma
   CREATE_PIPELINE(clear_texture_2d_array_float);
   CREATE_PIPELINE(clear_texture_3d_float);
   CREATE_PIPELINE(clear_texture_buffer_float);
+  CREATE_PIPELINE(cs_prepare_counted_indirect_args);
 
 
   auto gs_draw_arguments_marshal_vs = library.newFunction("gs_draw_arguments_marshal");
@@ -102,6 +103,24 @@ EmulatedCommandContext::setComputeBytes(const void *buf, uint64_t length, uint8_
   cmd.bytes.set(temp);
   cmd.length = length;
   cmd.index = index;
+}
+
+void
+EmulatedCommandContext::PrepareCountedIndirectArguments(
+    WMT::Buffer count_buffer, uint64_t count_offset, WMT::Buffer src,
+    uint64_t src_offset, WMT::Buffer dst, uint64_t dst_offset,
+    uint32_t argument_bytes, uint32_t command_index) {
+  struct Metadata {
+    uint32_t argument_bytes;
+    uint32_t command_index;
+  } metadata = {argument_bytes, command_index};
+
+  setComputePipelineState(cs_prepare_counted_indirect_args_pipeline, {32, 1, 1});
+  setComputeBuffer(count_buffer, count_offset, 0);
+  setComputeBuffer(src, src_offset, 1);
+  setComputeBuffer(dst, dst_offset, 2);
+  setComputeBytes(&metadata, sizeof(metadata), 3);
+  dispatchThreads({argument_bytes, 1, 1});
 }
 
 ClearRenderTargetContext::ClearRenderTargetContext(

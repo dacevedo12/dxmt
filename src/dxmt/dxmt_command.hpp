@@ -153,6 +153,11 @@ public:
     dispatchThreads({texture.width(), texture.height(), texture.depth()});
   }
 
+  void PrepareCountedIndirectArguments(
+      WMT::Buffer count_buffer, uint64_t count_offset, WMT::Buffer src,
+      uint64_t src_offset, WMT::Buffer dst, uint64_t dst_offset,
+      uint32_t argument_bytes, uint32_t command_index);
+
   void
   MarshalGSDispatchArguments(WMT::RenderCommandEncoder encoder, WMT::Buffer commands, uint32_t commands_offset) {
     encoder.setRenderPipelineState(gs_draw_arguments_marshal);
@@ -196,6 +201,7 @@ private:
   WMT::Reference<WMT::ComputePipelineState> clear_texture_2d_array_float_pipeline;
   WMT::Reference<WMT::ComputePipelineState> clear_texture_3d_float_pipeline;
   WMT::Reference<WMT::ComputePipelineState> clear_texture_buffer_float_pipeline;
+  WMT::Reference<WMT::ComputePipelineState> cs_prepare_counted_indirect_args_pipeline;
 
   WMT::Reference<WMT::RenderPipelineState> gs_draw_arguments_marshal;
   WMT::Reference<WMT::RenderPipelineState> ts_draw_arguments_marshal;

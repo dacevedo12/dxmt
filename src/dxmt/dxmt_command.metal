@@ -591,6 +591,24 @@ struct DXMTClearUintMetadata {
   buffer[meta.offset.x + pos] = meta.value.x;
 }
 
+struct DXMTIndirectCountedCopyMetadata {
+  uint argument_bytes;
+  uint command_index;
+};
+
+[[kernel]] void cs_prepare_counted_indirect_args(
+    device const uint& command_count [[buffer(0)]],
+    device const uchar* src [[buffer(1)]],
+    device uchar* dst [[buffer(2)]],
+    constant DXMTIndirectCountedCopyMetadata& meta [[buffer(3)]],
+    uint pos [[thread_position_in_grid]]
+) {
+  if (pos >= meta.argument_bytes)
+    return;
+
+  dst[pos] = command_count > meta.command_index ? src[pos] : 0;
+}
+
 [[kernel]] void cs_downscale_dilated_mv(
   uint2 pos [[thread_position_in_grid]],
   constant float2& mv_scale [[buffer(0)]],
