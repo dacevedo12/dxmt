@@ -94,6 +94,23 @@ Unsupported(std::string message) {
 }
 
 const char *
+ResourceClassName(dxil::DxilTranslationResourceClass resource_class) {
+  switch (resource_class) {
+  case dxil::DxilTranslationResourceClass::Srv:
+    return "SRV";
+  case dxil::DxilTranslationResourceClass::Uav:
+    return "UAV";
+  case dxil::DxilTranslationResourceClass::Cbv:
+    return "CBV";
+  case dxil::DxilTranslationResourceClass::Sampler:
+    return "Sampler";
+  case dxil::DxilTranslationResourceClass::Unknown:
+  default:
+    return "Unknown";
+  }
+}
+
+const char *
 StageName(uint32_t kind) {
   switch (kind) {
   case uint32_t(DxilStage::Vertex):
@@ -110,6 +127,23 @@ StageName(uint32_t kind) {
     return "geometry";
   default:
     return "unknown";
+  }
+}
+
+std::string
+BindingPrefix(dxil::DxilTranslationResourceClass resource_class) {
+  switch (resource_class) {
+  case dxil::DxilTranslationResourceClass::Cbv:
+    return "b";
+  case dxil::DxilTranslationResourceClass::Sampler:
+    return "s";
+  case dxil::DxilTranslationResourceClass::Uav:
+    return "u";
+  case dxil::DxilTranslationResourceClass::Srv:
+    return "t";
+  case dxil::DxilTranslationResourceClass::Unknown:
+  default:
+    return "?";
   }
 }
 
@@ -526,6 +560,9 @@ FindResourceByBinding(const dxil::DxilTranslationInfo &translation,
   return found == translation.resources.end() ? nullptr : &*found;
 }
 
+std::string
+DxilCallName(const CallBase &call);
+
 DxilResourceHandle
 ResolveHandle(const Value *value, DxilAirContext &ctx) {
   if (!value)
@@ -534,6 +571,52 @@ ResolveHandle(const Value *value, DxilAirContext &ctx) {
   if (found != ctx.handles.end())
     return found->second;
   return {};
+}
+
+std::string
+FormatResourceBinding(const dxil::DxilTranslationResourceInfo &resource) {
+  const auto upper_bound =
+      resource.unbounded ? std::string("unbounded")
+                         : std::to_string(resource.upper_bound);
+  return std::string(ResourceClassName(resource.resource_class)) +
+         " id=" + std::to_string(resource.id) + " binding=" +
+         BindingPrefix(resource.resource_class) +
+         std::to_string(resource.lower_bound) + ".." + upper_bound +
+         " space" + std::to_string(resource.space);
+}
+
+std::string
+FormatHandleBinding(const DxilResourceHandle &handle,
+                    const DxilAirContext &ctx) {
+  const auto *resource =
+      FindResource(ctx.translation, handle.resource_class, handle.range_id);
+  if (resource)
+    return FormatResourceBinding(*resource);
+  return std::string(ResourceClassName(handle.resource_class)) +
+         " id=" + std::to_string(handle.range_id);
+}
+
+llvm::Error
+UnsupportedDxilCall(const CallBase &call, std::string_view reason,
+                    DxilAirContext &ctx) {
+  std::string message = "unsupported DXIL opcode ";
+  message += DxilCallName(call);
+  message += " stage=";
+  message += StageName(ctx.translation.shader_kind);
+  if (!reason.empty()) {
+    message += ": ";
+    message += reason;
+  }
+
+  if (call.arg_size() > 1) {
+    const auto handle = ResolveHandle(call.getArgOperand(1), ctx);
+    if (handle.resource_class != dxil::DxilTranslationResourceClass::Unknown) {
+      message += " resource={";
+      message += FormatHandleBinding(handle, ctx);
+      message += "}";
+    }
+  }
+  return Unsupported(std::move(message));
 }
 
 std::string
@@ -949,8 +1032,8 @@ LowerDxilCall(const CallBase &call, DxilAirContext &ctx,
               Value *&current_return) {
   auto *called = call.getCalledFunction();
   if (!called || !called->getName().startswith("dx.op."))
-    return Unsupported("unsupported DXIL call: " +
-                       (called ? called->getName().str() : std::string("<indirect>")));
+    return UnsupportedDxilCall(
+        call, "call target is not a direct dx.op function", ctx);
 
   std::string name = DxilCallName(call);
 
@@ -968,13 +1051,15 @@ LowerDxilCall(const CallBase &call, DxilAirContext &ctx,
         ConstantAggregateElementU32(call.getArgOperand(1), 0);
     const auto space = ConstantAggregateElementU32(call.getArgOperand(1), 2);
     if (!lower_bound || !space)
-      return Unsupported("DXIL CreateHandleFromBinding requires a constant ResBind");
+      return UnsupportedDxilCall(call, "requires a constant ResBind", ctx);
     const auto *resource =
         FindResourceByBinding(ctx.translation, *space, *lower_bound);
     if (!resource)
-      return Unsupported("DXIL CreateHandleFromBinding unresolved binding space" +
-                         std::to_string(*space) + " register" +
-                         std::to_string(*lower_bound));
+      return UnsupportedDxilCall(
+          call,
+          "unresolved binding space" + std::to_string(*space) + " register" +
+              std::to_string(*lower_bound),
+          ctx);
     DxilResourceHandle handle = {};
     handle.resource_class = resource->resource_class;
     handle.range_id = resource->id;
@@ -984,7 +1069,8 @@ LowerDxilCall(const CallBase &call, DxilAirContext &ctx,
     return Error::success();
   }
   if (name == "CreateHandleFromHeap") {
-    return Unsupported("DXIL CreateHandleFromHeap bindless descriptor heap is unsupported");
+    return UnsupportedDxilCall(
+        call, "bindless descriptor heap is unsupported", ctx);
   }
   if (name == "AnnotateHandle") {
     ctx.handles[&call] = ResolveHandle(call.getArgOperand(1), ctx);
@@ -1010,7 +1096,7 @@ LowerDxilCall(const CallBase &call, DxilAirContext &ctx,
     auto *ptr = GetCBufferPointer(handle, ctx);
     auto *index = OperandValue(call, 2, ctx);
     if (!ptr)
-      return Unsupported("DXIL cbuffer load without resolved CBV handle");
+      return UnsupportedDxilCall(call, "cbuffer load without resolved CBV handle", ctx);
     auto *pointee = cast<PointerType>(ptr->getType())->getNonOpaquePointerElementType();
     auto *gep = ctx.builder.CreateGEP(pointee, ptr, index ? index : ctx.builder.getInt32(0));
     ctx.values[&call] =
@@ -1025,7 +1111,7 @@ LowerDxilCall(const CallBase &call, DxilAirContext &ctx,
                                  handle.resource_class == dxil::DxilTranslationResourceClass::Uav,
                                  ctx);
     if (!ptr || !resource)
-      return Unsupported("DXIL buffer load without resolved buffer handle");
+      return UnsupportedDxilCall(call, "buffer load without resolved buffer handle", ctx);
     auto *word_index = BufferWordIndex(*resource, call, 2, 3, ctx);
     auto *pointee = cast<PointerType>(ptr->getType())->getNonOpaquePointerElementType();
     auto *gep = ctx.builder.CreateGEP(pointee, ptr, word_index);
@@ -1040,7 +1126,7 @@ LowerDxilCall(const CallBase &call, DxilAirContext &ctx,
         FindResource(ctx.translation, handle.resource_class, handle.range_id);
     auto *ptr = GetBufferPointer(handle, true, ctx);
     if (!ptr || !resource)
-      return Unsupported("DXIL buffer store without resolved UAV handle");
+      return UnsupportedDxilCall(call, "buffer store without resolved UAV handle", ctx);
     const uint32_t value_base = name == "RawBufferStore" ? 4 : 4;
     const uint32_t mask_index = name == "RawBufferStore" ? 8 : 8;
     const uint32_t mask = ConstantOperandU32(call, mask_index).value_or(0xfu);
@@ -1062,7 +1148,7 @@ LowerDxilCall(const CallBase &call, DxilAirContext &ctx,
     auto handle = ResolveHandle(call.getArgOperand(1), ctx);
     auto [texture_handle, resource] = GetTextureHandle(handle, ctx);
     if (!texture_handle || !resource)
-      return Unsupported("DXIL texture load without resolved texture handle");
+      return UnsupportedDxilCall(call, "texture load without resolved texture handle", ctx);
     auto texture = BuildTexture(*resource, air::MemoryAccess::read);
     auto *coord = TextureCoord(*resource, call, 3, false, ctx);
     auto *array_index = TextureArrayIndex(*resource, call, 3, false, ctx);
@@ -1076,7 +1162,7 @@ LowerDxilCall(const CallBase &call, DxilAirContext &ctx,
     auto handle = ResolveHandle(call.getArgOperand(1), ctx);
     auto [texture_handle, resource] = GetTextureHandle(handle, ctx);
     if (!texture_handle || !resource)
-      return Unsupported("DXIL texture store without resolved texture handle");
+      return UnsupportedDxilCall(call, "texture store without resolved texture handle", ctx);
     auto texture = BuildTexture(*resource, air::MemoryAccess::write);
     auto *coord = TextureCoord(*resource, call, 2, false, ctx);
     auto *array_index = TextureArrayIndex(*resource, call, 2, false, ctx);
@@ -1095,7 +1181,7 @@ LowerDxilCall(const CallBase &call, DxilAirContext &ctx,
     auto [texture, resource] = GetTextureHandle(texture_handle, ctx);
     auto *sampler = GetSamplerHandle(sampler_handle, ctx);
     if (!texture || !sampler || !resource)
-      return Unsupported("DXIL sample without resolved texture/sampler handle");
+      return UnsupportedDxilCall(call, "sample without resolved texture/sampler handle", ctx);
     int32_t offset[3] = {};
     auto air_texture = BuildTexture(*resource, air::MemoryAccess::sample);
     auto *coord = TextureCoord(*resource, call, 3, true, ctx);
@@ -1134,7 +1220,7 @@ LowerDxilCall(const CallBase &call, DxilAirContext &ctx,
     auto [texture, resource] = GetTextureHandle(texture_handle, ctx);
     auto *sampler = GetSamplerHandle(sampler_handle, ctx);
     if (!texture || !sampler || !resource)
-      return Unsupported("DXIL gather without resolved texture/sampler handle");
+      return UnsupportedDxilCall(call, "gather without resolved texture/sampler handle", ctx);
     auto air_texture = BuildTexture(*resource, air::MemoryAccess::sample);
     auto *coord = TextureCoord(*resource, call, 3, true, ctx);
     auto *array_index = TextureArrayIndex(*resource, call, 3, true, ctx);
@@ -1184,7 +1270,7 @@ LowerDxilCall(const CallBase &call, DxilAirContext &ctx,
 
     auto *ptr = GetBufferPointer(handle, true, ctx);
     if (!ptr)
-      return Unsupported("DXIL atomic without resolved UAV handle");
+      return UnsupportedDxilCall(call, "atomic without resolved UAV handle", ctx);
     auto *offset = name == "AtomicBinOp" ? OperandValue(call, 3, ctx)
                                          : OperandValue(call, 2, ctx);
     auto *pointee = cast<PointerType>(ptr->getType())->getNonOpaquePointerElementType();
@@ -1218,7 +1304,7 @@ LowerDxilCall(const CallBase &call, DxilAirContext &ctx,
     return Error::success();
   }
 
-  return Unsupported("unsupported DXIL opcode: " + name);
+  return UnsupportedDxilCall(call, "lowering is not implemented", ctx);
 }
 
 llvm::Error
