@@ -1178,6 +1178,8 @@ private:
     std::optional<D3D12_INDEX_BUFFER_VIEW> index_buffer;
     std::unordered_map<UINT, D3D12_GPU_DESCRIPTOR_HANDLE> graphics_tables;
     std::unordered_map<UINT, D3D12_GPU_DESCRIPTOR_HANDLE> compute_tables;
+    std::unordered_map<UINT, std::vector<UINT>> graphics_root_constants;
+    std::unordered_map<UINT, std::vector<UINT>> compute_root_constants;
     std::unordered_map<UINT, D3D12_GPU_VIRTUAL_ADDRESS> graphics_cbv_roots;
     std::unordered_map<UINT, D3D12_GPU_VIRTUAL_ADDRESS> compute_cbv_roots;
     std::unordered_map<UINT, D3D12_GPU_VIRTUAL_ADDRESS> graphics_srv_roots;
@@ -1264,7 +1266,7 @@ private:
     } else if constexpr (std::is_same_v<T, RootDescriptorRecord>) {
       StoreRootDescriptor(state, record);
     } else if constexpr (std::is_same_v<T, RootConstantsRecord>) {
-      WARN("D3D12CommandQueue: root constants are recorded but not lowered yet");
+      StoreRootConstants(state, record);
     } else if constexpr (std::is_same_v<T, DrawInstancedRecord>) {
       ReplayDrawInstanced(chunk, state, record);
     } else if constexpr (std::is_same_v<T, DrawIndexedInstancedRecord>) {
@@ -1485,6 +1487,123 @@ private:
       }
     }();
     map[record.root_parameter_index] = record.address;
+  }
+
+  void StoreRootConstants(ReplayState &state, const RootConstantsRecord &record) {
+    auto &map = record.compute ? state.compute_root_constants
+                               : state.graphics_root_constants;
+    auto &values = map[record.root_parameter_index];
+    const auto required_size =
+        record.dst_offset + static_cast<UINT>(record.values.size());
+    if (values.size() < required_size)
+      values.resize(required_size, 0);
+    std::copy(record.values.begin(), record.values.end(),
+              values.begin() + record.dst_offset);
+  }
+
+  static void ForEachVisibleStage(D3D12_SHADER_VISIBILITY visibility,
+                                  bool compute, const auto &fn) {
+    if (compute) {
+      fn(PipelineStage::Compute);
+      return;
+    }
+
+    switch (visibility) {
+    case D3D12_SHADER_VISIBILITY_VERTEX:
+      fn(PipelineStage::Vertex);
+      break;
+    case D3D12_SHADER_VISIBILITY_PIXEL:
+      fn(PipelineStage::Pixel);
+      break;
+    case D3D12_SHADER_VISIBILITY_GEOMETRY:
+      fn(PipelineStage::Geometry);
+      break;
+    case D3D12_SHADER_VISIBILITY_HULL:
+      fn(PipelineStage::Hull);
+      break;
+    case D3D12_SHADER_VISIBILITY_DOMAIN:
+      fn(PipelineStage::Domain);
+      break;
+    case D3D12_SHADER_VISIBILITY_ALL:
+    default:
+      fn(PipelineStage::Vertex);
+      fn(PipelineStage::Pixel);
+      fn(PipelineStage::Geometry);
+      fn(PipelineStage::Hull);
+      fn(PipelineStage::Domain);
+      break;
+    }
+  }
+
+  void BindRootConstants(ArgumentEncodingContext &enc, const ReplayState &state,
+                         bool compute, UINT root_index,
+                         const RootSignatureParameter &parameter) {
+    const auto &map = compute ? state.compute_root_constants
+                              : state.graphics_root_constants;
+    auto it = map.find(root_index);
+    if (it == map.end() || it->second.empty())
+      return;
+
+    const auto declared_count = parameter.constants.Num32BitValues;
+    const auto actual_count =
+        std::max<uint32_t>(declared_count, uint32_t(it->second.size()));
+    if (!actual_count)
+      return;
+
+    if (parameter.constants.RegisterSpace != 0) {
+      WARN("D3D12CommandQueue: root constants use unsupported register space %u",
+           parameter.constants.RegisterSpace);
+    }
+
+    auto buffer = Rc<Buffer>(new Buffer(uint64_t(actual_count) * sizeof(UINT),
+                                        device_->GetMTLDevice()));
+    Flags<BufferAllocationFlag> flags;
+    flags.set(BufferAllocationFlag::GpuReadonly);
+    auto allocation = buffer->allocate(flags);
+    std::vector<UINT> packed(actual_count, 0);
+    std::copy(it->second.begin(),
+              it->second.begin() +
+                  std::min<size_t>(it->second.size(), packed.size()),
+              packed.begin());
+    allocation->updateContents(0, packed.data(),
+                               uint64_t(packed.size()) * sizeof(UINT));
+    buffer->rename(std::move(allocation));
+
+    const auto slot = parameter.constants.ShaderRegister;
+    if (slot >= 14) {
+      WARN("D3D12CommandQueue: root constants target unsupported CBV slot b%u",
+           slot);
+      return;
+    }
+    ForEachVisibleStage(parameter.visibility, compute, [&](PipelineStage stage) {
+      switch (stage) {
+      case PipelineStage::Compute:
+        enc.bindConstantBuffer<PipelineStage::Compute>(slot, 0,
+                                                       Rc<Buffer>(buffer));
+        break;
+      case PipelineStage::Pixel:
+        enc.bindConstantBuffer<PipelineStage::Pixel>(slot, 0,
+                                                     Rc<Buffer>(buffer));
+        break;
+      case PipelineStage::Geometry:
+        enc.bindConstantBuffer<PipelineStage::Geometry>(slot, 0,
+                                                        Rc<Buffer>(buffer));
+        break;
+      case PipelineStage::Hull:
+        enc.bindConstantBuffer<PipelineStage::Hull>(slot, 0,
+                                                    Rc<Buffer>(buffer));
+        break;
+      case PipelineStage::Domain:
+        enc.bindConstantBuffer<PipelineStage::Domain>(slot, 0,
+                                                      Rc<Buffer>(buffer));
+        break;
+      case PipelineStage::Vertex:
+      default:
+        enc.bindConstantBuffer<PipelineStage::Vertex>(slot, 0,
+                                                      Rc<Buffer>(buffer));
+        break;
+      }
+    });
   }
 
   static D3D12_GPU_DESCRIPTOR_HANDLE
@@ -1830,6 +1949,9 @@ private:
           if (range.descriptor_count != UINT_MAX)
             running_offset = range_offset + range.descriptor_count;
         }
+      } else if (parameter.parameter_type ==
+                 D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS) {
+        BindRootConstants(enc, state, compute, root_index, parameter);
       } else if (parameter.parameter_type == D3D12_ROOT_PARAMETER_TYPE_CBV) {
         ApplyRootBufferDescriptor(enc, state, compute, root_index, parameter,
                                   DescriptorRecordType::ConstantBufferView);
