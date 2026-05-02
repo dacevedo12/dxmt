@@ -23,6 +23,8 @@ public:
           (desc.Flags & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE) != 0;
       records_[i].cpu_handle.ptr =
           reinterpret_cast<SIZE_T>(&records_[i]);
+      records_[i].heap_index = i;
+      records_[i].heap_count = desc.NumDescriptors;
     }
   }
 
@@ -204,6 +206,25 @@ GetDescriptorRecordFromGpuHandle(D3D12_GPU_DESCRIPTOR_HANDLE handle,
   if (!record || !record->shader_visible) {
     if (record)
       WARN("D3D12DescriptorHeap: non shader-visible descriptor used as GPU handle");
+    return nullptr;
+  }
+  return record;
+}
+
+DescriptorRecord *
+GetDescriptorRecordRangeFromCpuHandle(D3D12_CPU_DESCRIPTOR_HANDLE handle,
+                                      D3D12_DESCRIPTOR_HEAP_TYPE expected_type,
+                                      UINT descriptor_count,
+                                      const char *context) {
+  auto *record = GetDescriptorRecordFromCpuHandle(handle, expected_type);
+  if (!record)
+    return nullptr;
+  if (descriptor_count &&
+      (record->heap_index >= record->heap_count ||
+       descriptor_count > record->heap_count - record->heap_index)) {
+    WARN("D3D12DescriptorHeap: descriptor range exceeds heap for ",
+         context ? context : "<unknown>", " start=", record->heap_index,
+         " count=", descriptor_count, " heap_count=", record->heap_count);
     return nullptr;
   }
   return record;
