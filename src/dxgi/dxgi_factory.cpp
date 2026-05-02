@@ -265,8 +265,10 @@ public:
 
   HRESULT STDMETHODCALLTYPE MakeWindowAssociation(HWND WindowHandle,
                                                   UINT Flags) final {
-    if (Flags) {
-      WARN("MakeWindowAssociation: Ignoring flags ", Flags);
+    if (Flags & ~DXGI_MWA_VALID) {
+      WARN("MakeWindowAssociation: unsupported flags ",
+           Flags & ~DXGI_MWA_VALID);
+      return DXGI_ERROR_INVALID_CALL;
     }
     associated_window_ = WindowHandle;
     return S_OK;

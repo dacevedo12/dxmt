@@ -217,12 +217,15 @@ public:
   HRESULT STDMETHODCALLTYPE
   RegisterHardwareContentProtectionTeardownStatusEvent(HANDLE event,
                                                        DWORD *cookie) override {
-    assert(0 && "TODO");
+    if (cookie)
+      *cookie = 0;
+    WARN("DXGIAdapter: hardware content protection teardown notifications are unsupported");
+    return DXGI_ERROR_UNSUPPORTED;
   }
 
   void STDMETHODCALLTYPE
   UnregisterHardwareContentProtectionTeardownStatus(DWORD cookie) override {
-    assert(0 && "TODO");
+    WARN("DXGIAdapter: hardware content protection teardown notifications are unsupported");
   }
 
   HRESULT STDMETHODCALLTYPE QueryVideoMemoryInfo(
@@ -260,12 +263,15 @@ public:
 
   HRESULT STDMETHODCALLTYPE RegisterVideoMemoryBudgetChangeNotificationEvent(
       HANDLE event, DWORD *cookie) override {
-    assert(0 && "TODO");
+    if (cookie)
+      *cookie = 0;
+    WARN("DXGIAdapter: video memory budget change notifications are unsupported");
+    return DXGI_ERROR_UNSUPPORTED;
   }
 
   void STDMETHODCALLTYPE
   UnregisterVideoMemoryBudgetChangeNotification(DWORD cookie) override {
-    assert(0 && "TODO");
+    WARN("DXGIAdapter: video memory budget change notifications are unsupported");
   }
 
   WMT::Device STDMETHODCALLTYPE GetMTLDevice() final { return device_; }
