@@ -120,4 +120,16 @@ CreateComputePipelineState(IMTLD3D12Device *device,
                            const D3D12_COMPUTE_PIPELINE_STATE_DESC *desc,
                            HRESULT *status = nullptr);
 
+#ifdef __ID3D12Device2_INTERFACE_DEFINED__
+Com<ID3D12PipelineState>
+CreatePipelineStateFromStream(IMTLD3D12Device *device,
+                              const D3D12_PIPELINE_STATE_STREAM_DESC *desc,
+                              HRESULT *status = nullptr);
+#endif
+
+#ifdef __ID3D12PipelineLibrary_INTERFACE_DEFINED__
+Com<ID3D12PipelineLibrary>
+CreatePipelineLibrary(IMTLD3D12Device *device);
+#endif
+
 } // namespace dxmt::d3d12

@@ -13,6 +13,7 @@
 #include <limits>
 #include <string_view>
 #include <span>
+#include <unordered_map>
 #include <utility>
 
 namespace dxmt::d3d12 {
@@ -1080,6 +1081,429 @@ CloneComputeState(const D3D12_COMPUTE_PIPELINE_STATE_DESC &desc,
   return S_OK;
 }
 
+#ifdef __ID3D12Device2_INTERFACE_DEFINED__
+size_t
+AlignStreamOffset(size_t value) {
+  const size_t alignment = sizeof(void *);
+  return (value + alignment - 1) & ~(alignment - 1);
+}
+
+size_t
+PipelineStreamPayloadSize(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE type) {
+  switch (type) {
+  case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE:
+    return sizeof(ID3D12RootSignature *);
+  case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS:
+  case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS:
+  case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DS:
+  case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_HS:
+  case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_GS:
+  case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CS:
+    return sizeof(D3D12_SHADER_BYTECODE);
+  case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_STREAM_OUTPUT:
+    return sizeof(D3D12_STREAM_OUTPUT_DESC);
+  case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND:
+    return sizeof(D3D12_BLEND_DESC);
+  case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK:
+    return sizeof(UINT);
+  case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER:
+    return sizeof(D3D12_RASTERIZER_DESC);
+  case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL:
+    return sizeof(D3D12_DEPTH_STENCIL_DESC);
+  case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL1:
+    return sizeof(D3D12_DEPTH_STENCIL_DESC1);
+  case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_INPUT_LAYOUT:
+    return sizeof(D3D12_INPUT_LAYOUT_DESC);
+  case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_IB_STRIP_CUT_VALUE:
+    return sizeof(D3D12_INDEX_BUFFER_STRIP_CUT_VALUE);
+  case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY:
+    return sizeof(D3D12_PRIMITIVE_TOPOLOGY_TYPE);
+  case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS:
+    return sizeof(D3D12_RT_FORMAT_ARRAY);
+  case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL_FORMAT:
+    return sizeof(DXGI_FORMAT);
+  case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_DESC:
+    return sizeof(DXGI_SAMPLE_DESC);
+  case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_NODE_MASK:
+    return sizeof(UINT);
+  case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CACHED_PSO:
+    return sizeof(D3D12_CACHED_PIPELINE_STATE);
+  case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_FLAGS:
+    return sizeof(D3D12_PIPELINE_STATE_FLAGS);
+  case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VIEW_INSTANCING:
+    return sizeof(D3D12_VIEW_INSTANCING_DESC);
+  default:
+    return 0;
+  }
+}
+
+HRESULT
+ParsePipelineStateStream(const D3D12_PIPELINE_STATE_STREAM_DESC &stream,
+                         D3D12_GRAPHICS_PIPELINE_STATE_DESC &graphics,
+                         D3D12_COMPUTE_PIPELINE_STATE_DESC &compute,
+                         bool &has_compute_shader) {
+  if (!stream.pPipelineStateSubobjectStream || !stream.SizeInBytes)
+    return E_INVALIDARG;
+
+  graphics = {};
+  graphics.SampleMask = UINT_MAX;
+  graphics.SampleDesc.Count = 1;
+  graphics.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+  compute = {};
+  has_compute_shader = false;
+
+  const auto *bytes =
+      static_cast<const uint8_t *>(stream.pPipelineStateSubobjectStream);
+  size_t offset = 0;
+  while (offset < stream.SizeInBytes) {
+    if (stream.SizeInBytes - offset < sizeof(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE))
+      return E_INVALIDARG;
+
+    auto type = *reinterpret_cast<const D3D12_PIPELINE_STATE_SUBOBJECT_TYPE *>(
+        bytes + offset);
+    offset += sizeof(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE);
+    offset = AlignStreamOffset(offset);
+
+    const size_t payload_size = PipelineStreamPayloadSize(type);
+    if (!payload_size || stream.SizeInBytes - offset < payload_size)
+      return E_INVALIDARG;
+
+    const void *payload = bytes + offset;
+    switch (type) {
+    case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE:
+      graphics.pRootSignature =
+          *static_cast<ID3D12RootSignature *const *>(payload);
+      compute.pRootSignature = graphics.pRootSignature;
+      break;
+    case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS:
+      graphics.VS = *static_cast<const D3D12_SHADER_BYTECODE *>(payload);
+      break;
+    case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS:
+      graphics.PS = *static_cast<const D3D12_SHADER_BYTECODE *>(payload);
+      break;
+    case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DS:
+      graphics.DS = *static_cast<const D3D12_SHADER_BYTECODE *>(payload);
+      break;
+    case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_HS:
+      graphics.HS = *static_cast<const D3D12_SHADER_BYTECODE *>(payload);
+      break;
+    case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_GS:
+      graphics.GS = *static_cast<const D3D12_SHADER_BYTECODE *>(payload);
+      break;
+    case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CS:
+      compute.CS = *static_cast<const D3D12_SHADER_BYTECODE *>(payload);
+      has_compute_shader = HasBytecode(compute.CS);
+      break;
+    case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_STREAM_OUTPUT:
+      graphics.StreamOutput =
+          *static_cast<const D3D12_STREAM_OUTPUT_DESC *>(payload);
+      break;
+    case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND:
+      graphics.BlendState = *static_cast<const D3D12_BLEND_DESC *>(payload);
+      break;
+    case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK:
+      graphics.SampleMask = *static_cast<const UINT *>(payload);
+      break;
+    case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER:
+      graphics.RasterizerState =
+          *static_cast<const D3D12_RASTERIZER_DESC *>(payload);
+      break;
+    case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL:
+      graphics.DepthStencilState =
+          *static_cast<const D3D12_DEPTH_STENCIL_DESC *>(payload);
+      break;
+    case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL1: {
+      const auto &depth_stencil =
+          *static_cast<const D3D12_DEPTH_STENCIL_DESC1 *>(payload);
+      graphics.DepthStencilState.DepthEnable = depth_stencil.DepthEnable;
+      graphics.DepthStencilState.DepthWriteMask =
+          depth_stencil.DepthWriteMask;
+      graphics.DepthStencilState.DepthFunc = depth_stencil.DepthFunc;
+      graphics.DepthStencilState.StencilEnable = depth_stencil.StencilEnable;
+      graphics.DepthStencilState.StencilReadMask =
+          depth_stencil.StencilReadMask;
+      graphics.DepthStencilState.StencilWriteMask =
+          depth_stencil.StencilWriteMask;
+      graphics.DepthStencilState.FrontFace = depth_stencil.FrontFace;
+      graphics.DepthStencilState.BackFace = depth_stencil.BackFace;
+      if (depth_stencil.DepthBoundsTestEnable)
+        WARN("D3D12PipelineState: depth bounds in PSO stream is ignored");
+      break;
+    }
+    case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_INPUT_LAYOUT:
+      graphics.InputLayout =
+          *static_cast<const D3D12_INPUT_LAYOUT_DESC *>(payload);
+      break;
+    case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_IB_STRIP_CUT_VALUE:
+      graphics.IBStripCutValue =
+          *static_cast<const D3D12_INDEX_BUFFER_STRIP_CUT_VALUE *>(payload);
+      break;
+    case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY:
+      graphics.PrimitiveTopologyType =
+          *static_cast<const D3D12_PRIMITIVE_TOPOLOGY_TYPE *>(payload);
+      break;
+    case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS: {
+      const auto &formats = *static_cast<const D3D12_RT_FORMAT_ARRAY *>(payload);
+      if (formats.NumRenderTargets > D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT)
+        return E_INVALIDARG;
+      graphics.NumRenderTargets = formats.NumRenderTargets;
+      for (UINT i = 0; i < formats.NumRenderTargets; i++)
+        graphics.RTVFormats[i] = formats.RTFormats[i];
+      break;
+    }
+    case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL_FORMAT:
+      graphics.DSVFormat = *static_cast<const DXGI_FORMAT *>(payload);
+      break;
+    case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_DESC:
+      graphics.SampleDesc = *static_cast<const DXGI_SAMPLE_DESC *>(payload);
+      break;
+    case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_NODE_MASK:
+      graphics.NodeMask = *static_cast<const UINT *>(payload);
+      compute.NodeMask = graphics.NodeMask;
+      break;
+    case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CACHED_PSO:
+      graphics.CachedPSO =
+          *static_cast<const D3D12_CACHED_PIPELINE_STATE *>(payload);
+      compute.CachedPSO = graphics.CachedPSO;
+      break;
+    case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_FLAGS:
+      graphics.Flags = *static_cast<const D3D12_PIPELINE_STATE_FLAGS *>(payload);
+      compute.Flags = graphics.Flags;
+      break;
+    case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VIEW_INSTANCING: {
+      const auto &view_instancing =
+          *static_cast<const D3D12_VIEW_INSTANCING_DESC *>(payload);
+      if (view_instancing.ViewInstanceCount)
+        return E_NOTIMPL;
+      break;
+    }
+    default:
+      return E_INVALIDARG;
+    }
+
+    offset = AlignStreamOffset(offset + payload_size);
+  }
+
+  if (has_compute_shader &&
+      (HasBytecode(graphics.VS) || HasBytecode(graphics.PS) ||
+       HasBytecode(graphics.DS) || HasBytecode(graphics.HS) ||
+       HasBytecode(graphics.GS)))
+    return E_INVALIDARG;
+
+  return S_OK;
+}
+#endif
+
+#ifdef __ID3D12PipelineLibrary_INTERFACE_DEFINED__
+#ifdef __ID3D12PipelineLibrary1_INTERFACE_DEFINED__
+using PipelineLibraryBase = ID3D12PipelineLibrary1;
+#else
+using PipelineLibraryBase = ID3D12PipelineLibrary;
+#endif
+
+using PipelineLibraryKey = std::string;
+
+PipelineLibraryKey
+PipelineLibraryNameKey(const WCHAR *name) {
+  return name ? str::fromws(name) : PipelineLibraryKey();
+}
+
+class PipelineLibraryImpl final
+    : public ComObjectWithInitialRef<PipelineLibraryBase> {
+public:
+  PipelineLibraryImpl(IMTLD3D12Device *device) : device_(device) {}
+
+  HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void **object) override {
+    if (!object)
+      return E_POINTER;
+
+    *object = nullptr;
+    if (riid == __uuidof(IUnknown) || riid == __uuidof(ID3D12Object) ||
+        riid == __uuidof(ID3D12DeviceChild) ||
+        riid == __uuidof(ID3D12PipelineLibrary)) {
+      *object = ref(static_cast<ID3D12PipelineLibrary *>(
+          static_cast<PipelineLibraryBase *>(this)));
+      return S_OK;
+    }
+#ifdef __ID3D12PipelineLibrary1_INTERFACE_DEFINED__
+    if (riid == __uuidof(ID3D12PipelineLibrary1)) {
+      *object = ref(static_cast<ID3D12PipelineLibrary1 *>(this));
+      return S_OK;
+    }
+#endif
+
+    if (logQueryInterfaceError(__uuidof(ID3D12PipelineLibrary), riid))
+      WARN("D3D12PipelineLibrary: unknown interface query ",
+           str::format(riid));
+
+    return E_NOINTERFACE;
+  }
+
+  HRESULT STDMETHODCALLTYPE GetPrivateData(REFGUID guid, UINT *data_size,
+                                           void *data) override {
+    return private_data_.getData(guid, data_size, data);
+  }
+
+  HRESULT STDMETHODCALLTYPE SetPrivateData(REFGUID guid, UINT data_size,
+                                           const void *data) override {
+    return private_data_.setData(guid, data_size, data);
+  }
+
+  HRESULT STDMETHODCALLTYPE
+  SetPrivateDataInterface(REFGUID guid, const IUnknown *data) override {
+    return private_data_.setInterface(guid, data);
+  }
+
+  HRESULT STDMETHODCALLTYPE SetName(const WCHAR *name) override {
+    name_ = name ? str::fromws(name) : std::string();
+    return S_OK;
+  }
+
+  HRESULT STDMETHODCALLTYPE GetDevice(REFIID riid, void **device) override {
+    return device_->QueryInterface(riid, device);
+  }
+
+  HRESULT STDMETHODCALLTYPE StorePipeline(const WCHAR *name,
+                                          ID3D12PipelineState *pipeline) override {
+    if (!name || !pipeline)
+      return E_INVALIDARG;
+
+    auto *state = dynamic_cast<PipelineState *>(pipeline);
+    if (!state)
+      return E_INVALIDARG;
+
+    std::lock_guard lock(mutex_);
+    pipelines_[PipelineLibraryNameKey(name)] = {
+        .type = state->GetType(),
+        .pipeline = pipeline,
+    };
+    return S_OK;
+  }
+
+  HRESULT STDMETHODCALLTYPE
+  LoadGraphicsPipeline(const WCHAR *name,
+                       const D3D12_GRAPHICS_PIPELINE_STATE_DESC *desc,
+                       REFIID riid, void **pipeline_state) override {
+    InitReturnPtr(pipeline_state);
+    if (!pipeline_state)
+      return E_POINTER;
+    if (!name)
+      return E_INVALIDARG;
+
+    auto key = PipelineLibraryNameKey(name);
+    {
+      std::lock_guard lock(mutex_);
+      auto entry = pipelines_.find(key);
+      if (entry != pipelines_.end()) {
+        if (entry->second.type != PipelineStateType::Graphics)
+          return E_INVALIDARG;
+        return entry->second.pipeline->QueryInterface(riid, pipeline_state);
+      }
+    }
+
+    HRESULT status = S_OK;
+    auto pipeline = CreateGraphicsPipelineState(device_.ptr(), desc, &status);
+    if (!pipeline)
+      return status;
+
+    std::lock_guard lock(mutex_);
+    pipelines_[std::move(key)] = {
+        .type = PipelineStateType::Graphics,
+        .pipeline = pipeline,
+    };
+    return pipeline->QueryInterface(riid, pipeline_state);
+  }
+
+  HRESULT STDMETHODCALLTYPE
+  LoadComputePipeline(const WCHAR *name,
+                      const D3D12_COMPUTE_PIPELINE_STATE_DESC *desc,
+                      REFIID riid, void **pipeline_state) override {
+    InitReturnPtr(pipeline_state);
+    if (!pipeline_state)
+      return E_POINTER;
+    if (!name)
+      return E_INVALIDARG;
+
+    auto key = PipelineLibraryNameKey(name);
+    {
+      std::lock_guard lock(mutex_);
+      auto entry = pipelines_.find(key);
+      if (entry != pipelines_.end()) {
+        if (entry->second.type != PipelineStateType::Compute)
+          return E_INVALIDARG;
+        return entry->second.pipeline->QueryInterface(riid, pipeline_state);
+      }
+    }
+
+    HRESULT status = S_OK;
+    auto pipeline = CreateComputePipelineState(device_.ptr(), desc, &status);
+    if (!pipeline)
+      return status;
+
+    std::lock_guard lock(mutex_);
+    pipelines_[std::move(key)] = {
+        .type = PipelineStateType::Compute,
+        .pipeline = pipeline,
+    };
+    return pipeline->QueryInterface(riid, pipeline_state);
+  }
+
+  SIZE_T STDMETHODCALLTYPE GetSerializedSize() override {
+    return 0;
+  }
+
+  HRESULT STDMETHODCALLTYPE Serialize(void *data,
+                                      SIZE_T data_size_in_bytes) override {
+    return data || data_size_in_bytes == 0 ? S_OK : E_INVALIDARG;
+  }
+
+#ifdef __ID3D12PipelineLibrary1_INTERFACE_DEFINED__
+  HRESULT STDMETHODCALLTYPE LoadPipeline(
+      const WCHAR *name, const D3D12_PIPELINE_STATE_STREAM_DESC *desc,
+      REFIID riid, void **pipeline_state) override {
+    InitReturnPtr(pipeline_state);
+    if (!pipeline_state)
+      return E_POINTER;
+    if (!name)
+      return E_INVALIDARG;
+
+    auto key = PipelineLibraryNameKey(name);
+    {
+      std::lock_guard lock(mutex_);
+      auto entry = pipelines_.find(key);
+      if (entry != pipelines_.end())
+        return entry->second.pipeline->QueryInterface(riid, pipeline_state);
+    }
+
+    HRESULT status = S_OK;
+    auto pipeline = CreatePipelineStateFromStream(device_.ptr(), desc, &status);
+    if (!pipeline)
+      return status;
+
+    auto *state = dynamic_cast<PipelineState *>(pipeline.ptr());
+    std::lock_guard lock(mutex_);
+    pipelines_[std::move(key)] = {
+        .type = state ? state->GetType() : PipelineStateType::Graphics,
+        .pipeline = pipeline,
+    };
+    return pipeline->QueryInterface(riid, pipeline_state);
+  }
+#endif
+
+private:
+  struct Entry {
+    PipelineStateType type = PipelineStateType::Graphics;
+    Com<ID3D12PipelineState> pipeline;
+  };
+
+  Com<IMTLD3D12Device> device_;
+  ComPrivateData private_data_;
+  std::string name_;
+  std::mutex mutex_;
+  std::unordered_map<PipelineLibraryKey, Entry> pipelines_;
+};
+#endif
+
 class PipelineStateImpl final : public ComObjectWithInitialRef<ID3D12PipelineState>,
                                 public PipelineState {
 public:
@@ -1363,5 +1787,39 @@ CreateComputePipelineState(IMTLD3D12Device *device,
   StoreStatus(status, pso ? S_OK : E_OUTOFMEMORY);
   return pso;
 }
+
+#ifdef __ID3D12Device2_INTERFACE_DEFINED__
+Com<ID3D12PipelineState>
+CreatePipelineStateFromStream(IMTLD3D12Device *device,
+                              const D3D12_PIPELINE_STATE_STREAM_DESC *desc,
+                              HRESULT *status) {
+  if (!device || !desc) {
+    StoreStatus(status, E_INVALIDARG);
+    return nullptr;
+  }
+
+  D3D12_GRAPHICS_PIPELINE_STATE_DESC graphics = {};
+  D3D12_COMPUTE_PIPELINE_STATE_DESC compute = {};
+  bool has_compute_shader = false;
+  HRESULT hr = ParsePipelineStateStream(*desc, graphics, compute,
+                                        has_compute_shader);
+  if (FAILED(hr)) {
+    StoreStatus(status, hr);
+    return nullptr;
+  }
+
+  if (has_compute_shader)
+    return CreateComputePipelineState(device, &compute, status);
+  return CreateGraphicsPipelineState(device, &graphics, status);
+}
+#endif
+
+#ifdef __ID3D12PipelineLibrary_INTERFACE_DEFINED__
+Com<ID3D12PipelineLibrary>
+CreatePipelineLibrary(IMTLD3D12Device *device) {
+  return Com<ID3D12PipelineLibrary>::transfer(
+      new PipelineLibraryImpl(device));
+}
+#endif
 
 } // namespace dxmt::d3d12

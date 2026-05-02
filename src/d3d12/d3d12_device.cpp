@@ -15,9 +15,12 @@
 #include "d3d12_root_signature.hpp"
 #include "dxmt_format.hpp"
 #include "log/log.hpp"
+#include "thread.hpp"
 #include "util_string.hpp"
 #include <algorithm>
+#include <chrono>
 #include <cstring>
+#include <vector>
 
 namespace dxmt::d3d12 {
 
@@ -211,7 +214,25 @@ CopyDescriptorRecord(DescriptorRecord &dst, const DescriptorRecord &src) {
   dst.cpu_handle = cpu_handle;
 }
 
-class DeviceImpl final : public ComObjectWithInitialRef<IMTLD3D12Device, ID3D12Device> {
+#ifdef __ID3D12Device2_INTERFACE_DEFINED__
+using DeviceComBase = ID3D12Device2;
+#else
+using DeviceComBase = ID3D12Device1;
+#endif
+
+static void
+SignalWin32Event(HANDLE event) {
+  if (!event)
+    return;
+#ifdef _WIN32
+  ::SetEvent(event);
+#else
+  WARN("D3D12Device: SetEventOnMultipleFenceCompletion cannot signal native "
+       "Win32 event handles");
+#endif
+}
+
+class DeviceImpl final : public ComObjectWithInitialRef<IMTLD3D12Device, DeviceComBase> {
 public:
   DeviceImpl(std::unique_ptr<dxmt::Device> &&device, IMTLDXGIAdapter *adapter)
       : adapter_(adapter), device_(std::move(device)) {
@@ -245,9 +266,22 @@ public:
 
     if (riid == __uuidof(IUnknown) || riid == __uuidof(ID3D12Object) ||
         riid == __uuidof(ID3D12Device)) {
-      *ppvObject = ref(static_cast<ID3D12Device *>(this));
+      *ppvObject = ref(AsD3D12Device());
       return S_OK;
     }
+
+    if (riid == __uuidof(ID3D12Device1)) {
+      *ppvObject = ref(static_cast<ID3D12Device1 *>(
+          static_cast<DeviceComBase *>(this)));
+      return S_OK;
+    }
+
+#ifdef __ID3D12Device2_INTERFACE_DEFINED__
+    if (riid == __uuidof(ID3D12Device2)) {
+      *ppvObject = ref(static_cast<ID3D12Device2 *>(this));
+      return S_OK;
+    }
+#endif
 
     if (riid == __uuidof(IDXGIObject) || riid == __uuidof(IDXGIDevice) ||
         riid == __uuidof(IDXGIDevice1) || riid == __uuidof(IDXGIDevice2) ||
@@ -255,12 +289,6 @@ public:
         riid == __uuidof(IMTLD3D12Device)) {
       *ppvObject = ref(static_cast<IMTLD3D12Device *>(this));
       return S_OK;
-    }
-
-    if (riid == __uuidof(ID3D12Device1)) {
-      WARN("D3D12Device: ID3D12Device1 is not exposed until its extra "
-           "methods are implemented");
-      return E_NOINTERFACE;
     }
 
     if (logQueryInterfaceError(__uuidof(ID3D12Device), riid))
@@ -426,6 +454,23 @@ public:
       return status;
     return state->QueryInterface(riid, pipeline_state);
   }
+
+#ifdef __ID3D12Device2_INTERFACE_DEFINED__
+  HRESULT STDMETHODCALLTYPE
+  CreatePipelineState(const D3D12_PIPELINE_STATE_STREAM_DESC *desc,
+                      REFIID riid, void **pipeline_state) override {
+    InitReturnPtr(pipeline_state);
+    if (!pipeline_state)
+      return E_POINTER;
+
+    HRESULT status = S_OK;
+    auto state = d3d12::CreatePipelineStateFromStream(
+        static_cast<IMTLD3D12Device *>(this), desc, &status);
+    if (!state)
+      return status;
+    return state->QueryInterface(riid, pipeline_state);
+  }
+#endif
 
   HRESULT STDMETHODCALLTYPE CreateCommandList(UINT node_mask, D3D12_COMMAND_LIST_TYPE type,
                                               ID3D12CommandAllocator *command_allocator,
@@ -1035,6 +1080,112 @@ public:
     return S_OK;
   }
 
+  HRESULT STDMETHODCALLTYPE CreatePipelineLibrary(const void *blob,
+                                                  SIZE_T blob_size,
+                                                  REFIID iid,
+                                                  void **lib) override {
+    InitReturnPtr(lib);
+    if (!lib)
+      return E_POINTER;
+    if (!blob && blob_size)
+      return E_INVALIDARG;
+
+    if (blob_size)
+      WARN("D3D12Device: ignoring serialized pipeline library blob");
+
+#ifdef __ID3D12PipelineLibrary_INTERFACE_DEFINED__
+    auto library = d3d12::CreatePipelineLibrary(
+        static_cast<IMTLD3D12Device *>(this));
+    return library->QueryInterface(iid, lib);
+#else
+    return E_NOINTERFACE;
+#endif
+  }
+
+  HRESULT STDMETHODCALLTYPE SetEventOnMultipleFenceCompletion(
+      ID3D12Fence *const *fences, const UINT64 *values, UINT fence_count,
+      D3D12_MULTIPLE_FENCE_WAIT_FLAGS flags, HANDLE event) override {
+    if (!fence_count || !fences || !values)
+      return E_INVALIDARG;
+    if (static_cast<UINT>(flags) &
+        ~static_cast<UINT>(D3D12_MULTIPLE_FENCE_WAIT_FLAG_ANY))
+      return E_INVALIDARG;
+
+    std::vector<Com<ID3D12Fence>> wait_fences;
+    wait_fences.reserve(fence_count);
+    std::vector<UINT64> wait_values(values, values + fence_count);
+    for (UINT i = 0; i < fence_count; i++) {
+      if (!fences[i])
+        return E_INVALIDARG;
+      wait_fences.emplace_back(fences[i]);
+    }
+
+    auto completed = [wait_fences = wait_fences,
+                      wait_values = wait_values, flags]() {
+      if (flags & D3D12_MULTIPLE_FENCE_WAIT_FLAG_ANY) {
+        for (size_t i = 0; i < wait_fences.size(); i++) {
+          if (wait_fences[i]->GetCompletedValue() >= wait_values[i])
+            return true;
+        }
+        return false;
+      }
+
+      for (size_t i = 0; i < wait_fences.size(); i++) {
+        if (wait_fences[i]->GetCompletedValue() < wait_values[i])
+          return false;
+      }
+      return true;
+    };
+
+    if (completed()) {
+      SignalWin32Event(event);
+      return S_OK;
+    }
+
+    if (!event) {
+      while (!completed())
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      return S_OK;
+    }
+
+    dxmt::thread([wait_fences = std::move(wait_fences),
+                  wait_values = std::move(wait_values), flags, event]() {
+      auto completed = [&]() {
+        if (flags & D3D12_MULTIPLE_FENCE_WAIT_FLAG_ANY) {
+          for (size_t i = 0; i < wait_fences.size(); i++) {
+            if (wait_fences[i]->GetCompletedValue() >= wait_values[i])
+              return true;
+          }
+          return false;
+        }
+
+        for (size_t i = 0; i < wait_fences.size(); i++) {
+          if (wait_fences[i]->GetCompletedValue() < wait_values[i])
+            return false;
+        }
+        return true;
+      };
+
+      while (!completed())
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      SignalWin32Event(event);
+    }).detach();
+
+    return S_OK;
+  }
+
+  HRESULT STDMETHODCALLTYPE
+  SetResidencyPriority(UINT object_count, ID3D12Pageable *const *objects,
+                       const D3D12_RESIDENCY_PRIORITY *priorities) override {
+    if (object_count && (!objects || !priorities))
+      return E_INVALIDARG;
+    for (UINT i = 0; i < object_count; i++) {
+      if (!objects[i])
+        return E_INVALIDARG;
+    }
+    return S_OK;
+  }
+
   HRESULT STDMETHODCALLTYPE CreateFence(UINT64 initial_value, D3D12_FENCE_FLAGS flags,
                                         REFIID riid, void **fence) override {
     InitReturnPtr(fence);
@@ -1146,6 +1297,10 @@ public:
 #endif
 
 private:
+  ID3D12Device *AsD3D12Device() {
+    return static_cast<ID3D12Device *>(static_cast<DeviceComBase *>(this));
+  }
+
   D3D12_RESOURCE_ALLOCATION_INFO
   GetResourceAllocationInfoImpl(UINT visible_mask, UINT resource_desc_count,
                                 const D3D12_RESOURCE_DESC *resource_descs) const {
