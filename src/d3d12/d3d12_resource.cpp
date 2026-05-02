@@ -61,6 +61,11 @@ GetTextureUsage(D3D12_RESOURCE_FLAGS flags) {
 
 WMTTextureType
 GetTextureType(const D3D12_RESOURCE_DESC &desc) {
+  if (desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D)
+    return desc.DepthOrArraySize > 1 ? WMTTextureType1DArray
+                                     : WMTTextureType1D;
+  if (desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D)
+    return WMTTextureType3D;
   if (desc.SampleDesc.Count > 1)
     return desc.DepthOrArraySize > 1 ? WMTTextureType2DMultisampleArray
                                      : WMTTextureType2DMultisample;
@@ -80,25 +85,79 @@ struct TextureSubresourceLayout {
   UINT element_size = 0;
 };
 
+static UINT
+GetMipLevels(const D3D12_RESOURCE_DESC &desc) {
+  if (desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER || desc.MipLevels)
+    return desc.MipLevels ? desc.MipLevels : 1;
+
+  UINT64 width = std::max<UINT64>(1, desc.Width);
+  UINT height = desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D
+                    ? 1
+                    : std::max<UINT>(1, desc.Height);
+  UINT depth = desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D
+                   ? std::max<UINT>(1, desc.DepthOrArraySize)
+                   : 1;
+  UINT levels = 1;
+  while (width > 1 || height > 1 || depth > 1) {
+    width = std::max<UINT64>(1, width >> 1);
+    height = std::max<UINT>(1, height >> 1);
+    depth = std::max<UINT>(1, depth >> 1);
+    levels++;
+  }
+  return levels;
+}
+
+static UINT
+GetTextureSubresourceCount(const D3D12_RESOURCE_DESC &desc) {
+  const UINT mip_levels = GetMipLevels(desc);
+  return mip_levels *
+         (desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D
+              ? 1
+              : desc.DepthOrArraySize);
+}
+
+static UINT
+GetTextureSubresourceMipLevel(const D3D12_RESOURCE_DESC &desc,
+                              UINT sub_resource) {
+  return sub_resource % GetMipLevels(desc);
+}
+
+static UINT
+GetTextureSubresourceArraySlice(const D3D12_RESOURCE_DESC &desc,
+                                UINT sub_resource) {
+  if (desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D)
+    return 0;
+  return sub_resource / GetMipLevels(desc);
+}
+
 static bool
-IsSingleSubresourceTexture2D(const D3D12_RESOURCE_DESC &desc,
-                             UINT sub_resource) {
+IsCpuLinearTextureSubresource(const D3D12_RESOURCE_DESC &desc,
+                              UINT sub_resource) {
   return desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
-         sub_resource == 0 && (desc.MipLevels == 0 || desc.MipLevels == 1) &&
+         sub_resource == 0 && GetMipLevels(desc) == 1 &&
          desc.DepthOrArraySize == 1 && desc.SampleDesc.Count == 1;
 }
 
 static HRESULT
 GetTextureSubresourceLayout(WMT::Device device,
                             const D3D12_RESOURCE_DESC &desc,
+                            UINT sub_resource,
                             TextureSubresourceLayout &layout) {
+  if (sub_resource >= GetTextureSubresourceCount(desc))
+    return E_INVALIDARG;
+
   MTL_DXGI_FORMAT_DESC format = {};
   if (FAILED(MTLQueryDXGIFormat(device, desc.Format, format)))
     return E_INVALIDARG;
 
-  layout.width = desc.Width;
-  layout.height = desc.Height;
-  layout.depth = 1;
+  const UINT mip = GetTextureSubresourceMipLevel(desc, sub_resource);
+  layout.width = std::max<UINT64>(1, desc.Width >> mip);
+  layout.height = desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D
+                      ? 1
+                      : std::max<UINT>(1, desc.Height >> mip);
+  layout.depth = desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D
+                     ? std::max<UINT>(1, desc.DepthOrArraySize >> mip)
+                     : 1;
   layout.block_width = (format.Flag & MTL_DXGI_FORMAT_BC) ? 4 : 1;
   layout.block_height = (format.Flag & MTL_DXGI_FORMAT_BC) ? 4 : 1;
   layout.row_count = std::max<UINT>(
@@ -136,21 +195,29 @@ NormalizeTextureBox(const D3D12_RESOURCE_DESC &desc,
   if (normalized.left >= normalized.right || normalized.top >= normalized.bottom ||
       normalized.front >= normalized.back)
     return false;
-  if (normalized.right > desc.Width || normalized.bottom > desc.Height ||
-      normalized.back > 1)
+  if (normalized.right > layout.width || normalized.bottom > layout.height ||
+      normalized.back > layout.depth)
     return false;
   if ((normalized.left % layout.block_width) ||
       (normalized.top % layout.block_height))
+    return false;
+  if (normalized.right != layout.width &&
+      (normalized.right % layout.block_width))
+    return false;
+  if (normalized.bottom != layout.height &&
+      (normalized.bottom % layout.block_height))
     return false;
   return true;
 }
 
 static UINT64
 TextureRowOffset(const D3D12_BOX &box,
-                 const TextureSubresourceLayout &layout, UINT row) {
+                 const TextureSubresourceLayout &layout, UINT row,
+                 UINT depth_slice) {
   const UINT block_x = box.left / layout.block_width;
   const UINT block_y = (box.top / layout.block_height) + row;
-  return static_cast<UINT64>(block_y) * layout.row_pitch +
+  return static_cast<UINT64>(box.front + depth_slice) * layout.slice_pitch +
+         static_cast<UINT64>(block_y) * layout.row_pitch +
          static_cast<UINT64>(block_x) * layout.element_size;
 }
 
@@ -170,6 +237,16 @@ TextureBoxRowSize(const D3D12_BOX &box,
   return block_columns * layout.element_size;
 }
 
+static UINT
+TextureBoxDepthCount(const D3D12_BOX &box) {
+  return box.back - box.front;
+}
+
+static UINT
+EffectiveSlicePitch(UINT slice_pitch, UINT row_pitch, UINT row_count) {
+  return slice_pitch ? slice_pitch : row_pitch * row_count;
+}
+
 static HRESULT
 ValidateTextureCopyPitches(UINT64 row_size, UINT row_count, UINT row_pitch,
                            UINT slice_pitch) {
@@ -184,23 +261,42 @@ ValidateTextureCopyPitches(UINT64 row_size, UINT row_count, UINT row_pitch,
 }
 
 static HRESULT
+ValidateTextureCopyPitches(UINT64 row_size, UINT row_count, UINT depth_count,
+                           UINT row_pitch, UINT slice_pitch) {
+  if (FAILED(ValidateTextureCopyPitches(row_size, row_count, row_pitch,
+                                        slice_pitch)))
+    return E_INVALIDARG;
+  if (depth_count > 1 && slice_pitch < row_pitch * (row_count - 1) + row_size)
+    return E_INVALIDARG;
+  return S_OK;
+}
+
+static HRESULT
 CopyTextureRowsToMemory(void *dst_data, UINT dst_row_pitch,
                         UINT dst_slice_pitch, const void *src_data,
                         UINT src_row_pitch, UINT src_slice_pitch,
-                        UINT64 row_size, UINT row_count) {
+                        UINT64 row_size, UINT row_count,
+                        UINT depth_count = 1) {
   if (!dst_data || !src_data)
     return E_POINTER;
-  if (FAILED(ValidateTextureCopyPitches(row_size, row_count, src_row_pitch,
-                                        src_slice_pitch)) ||
-      FAILED(ValidateTextureCopyPitches(row_size, row_count, dst_row_pitch,
-                                        dst_slice_pitch)))
+  if (FAILED(ValidateTextureCopyPitches(row_size, row_count, depth_count,
+                                        src_row_pitch, src_slice_pitch)) ||
+      FAILED(ValidateTextureCopyPitches(row_size, row_count, depth_count,
+                                        dst_row_pitch, dst_slice_pitch)))
     return E_INVALIDARG;
 
   auto *dst = static_cast<char *>(dst_data);
   const auto *src = static_cast<const char *>(src_data);
-  for (UINT row = 0; row < row_count; row++)
-    std::memcpy(dst + row * dst_row_pitch, src + row * src_row_pitch,
-                static_cast<size_t>(row_size));
+  const UINT dst_effective_slice =
+      EffectiveSlicePitch(dst_slice_pitch, dst_row_pitch, row_count);
+  const UINT src_effective_slice =
+      EffectiveSlicePitch(src_slice_pitch, src_row_pitch, row_count);
+  for (UINT z = 0; z < depth_count; z++) {
+    for (UINT row = 0; row < row_count; row++)
+      std::memcpy(dst + z * dst_effective_slice + row * dst_row_pitch,
+                  src + z * src_effective_slice + row * src_row_pitch,
+                  static_cast<size_t>(row_size));
+  }
   return S_OK;
 }
 
@@ -219,7 +315,7 @@ public:
     if (desc_.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER)
       CreateBuffer();
     else
-      CreateTexture2D();
+      CreateTexture();
   }
 
   ~ResourceImpl() {
@@ -490,13 +586,12 @@ private:
                                   const D3D12_BOX *dst_box,
                                   const void *src_data, UINT src_row_pitch,
                                   UINT src_slice_pitch) {
-    if (!IsSingleSubresourceTexture2D(desc_, dst_sub_resource) ||
-        !texture_ || !texture_allocation_)
-      return E_NOTIMPL;
+    if (!texture_ || !texture_allocation_)
+      return E_INVALIDARG;
 
     TextureSubresourceLayout layout = {};
     HRESULT hr = GetTextureSubresourceLayout(device_->GetDXMTDevice().device(),
-                                             desc_, layout);
+                                             desc_, dst_sub_resource, layout);
     if (FAILED(hr))
       return hr;
 
@@ -505,29 +600,32 @@ private:
       return E_INVALIDARG;
 
     const UINT row_count = TextureBoxRowCount(box, layout);
+    const UINT depth_count = TextureBoxDepthCount(box);
     const UINT64 row_size = TextureBoxRowSize(box, layout);
-    if (FAILED(ValidateTextureCopyPitches(row_size, row_count, src_row_pitch,
-                                          src_slice_pitch)))
+    if (FAILED(ValidateTextureCopyPitches(row_size, row_count, depth_count,
+                                          src_row_pitch, src_slice_pitch)))
       return E_INVALIDARG;
 
-    if (texture_allocation_->mappedMemory)
+    if (texture_allocation_->mappedMemory &&
+        IsCpuLinearTextureSubresource(desc_, dst_sub_resource))
       return WriteMappedTextureRows(box, layout, src_data, src_row_pitch,
-                                    row_size, row_count);
+                                    src_slice_pitch, row_size, row_count,
+                                    depth_count);
 
     return WriteTextureRowsViaBlit(box, layout, src_data, src_row_pitch,
-                                   row_size, row_count);
+                                   src_slice_pitch, row_size, row_count,
+                                   depth_count, dst_sub_resource);
   }
 
   HRESULT ReadTextureSubresource(void *dst_data, UINT dst_row_pitch,
                                  UINT dst_slice_pitch, UINT src_sub_resource,
                                  const D3D12_BOX *src_box) {
-    if (!IsSingleSubresourceTexture2D(desc_, src_sub_resource) ||
-        !texture_ || !texture_allocation_)
-      return E_NOTIMPL;
+    if (!texture_ || !texture_allocation_)
+      return E_INVALIDARG;
 
     TextureSubresourceLayout layout = {};
     HRESULT hr = GetTextureSubresourceLayout(device_->GetDXMTDevice().device(),
-                                             desc_, layout);
+                                             desc_, src_sub_resource, layout);
     if (FAILED(hr))
       return hr;
 
@@ -536,50 +634,68 @@ private:
       return E_INVALIDARG;
 
     const UINT row_count = TextureBoxRowCount(box, layout);
+    const UINT depth_count = TextureBoxDepthCount(box);
     const UINT64 row_size = TextureBoxRowSize(box, layout);
-    if (FAILED(ValidateTextureCopyPitches(row_size, row_count, dst_row_pitch,
-                                          dst_slice_pitch)))
+    if (FAILED(ValidateTextureCopyPitches(row_size, row_count, depth_count,
+                                          dst_row_pitch, dst_slice_pitch)))
       return E_INVALIDARG;
 
-    if (texture_allocation_->mappedMemory)
+    if (texture_allocation_->mappedMemory &&
+        IsCpuLinearTextureSubresource(desc_, src_sub_resource))
       return ReadMappedTextureRows(dst_data, dst_row_pitch, box, layout,
-                                   row_size, row_count);
+                                   dst_slice_pitch, row_size, row_count,
+                                   depth_count);
 
     return ReadTextureRowsViaBlit(dst_data, dst_row_pitch, box, layout,
-                                  row_size, row_count);
+                                  dst_slice_pitch, row_size, row_count,
+                                  depth_count, src_sub_resource);
   }
 
   HRESULT WriteMappedTextureRows(const D3D12_BOX &box,
                                  const TextureSubresourceLayout &layout,
                                  const void *src_data, UINT src_row_pitch,
-                                 UINT64 row_size, UINT row_count) {
+                                 UINT src_slice_pitch, UINT64 row_size,
+                                 UINT row_count, UINT depth_count) {
     auto *dst = static_cast<char *>(texture_allocation_->mappedMemory);
     const auto *src = static_cast<const char *>(src_data);
-    for (UINT row = 0; row < row_count; row++)
-      std::memcpy(dst + TextureRowOffset(box, layout, row),
-                  src + row * src_row_pitch, static_cast<size_t>(row_size));
+    const UINT src_effective_slice =
+        EffectiveSlicePitch(src_slice_pitch, src_row_pitch, row_count);
+    for (UINT z = 0; z < depth_count; z++) {
+      for (UINT row = 0; row < row_count; row++)
+        std::memcpy(dst + TextureRowOffset(box, layout, row, z),
+                    src + z * src_effective_slice + row * src_row_pitch,
+                    static_cast<size_t>(row_size));
+    }
     return S_OK;
   }
 
   HRESULT ReadMappedTextureRows(void *dst_data, UINT dst_row_pitch,
                                 const D3D12_BOX &box,
                                 const TextureSubresourceLayout &layout,
-                                UINT64 row_size, UINT row_count) {
+                                UINT dst_slice_pitch, UINT64 row_size,
+                                UINT row_count, UINT depth_count) {
     auto *dst = static_cast<char *>(dst_data);
     const auto *src = static_cast<const char *>(texture_allocation_->mappedMemory);
-    for (UINT row = 0; row < row_count; row++)
-      std::memcpy(dst + row * dst_row_pitch,
-                  src + TextureRowOffset(box, layout, row),
-                  static_cast<size_t>(row_size));
+    const UINT dst_effective_slice =
+        EffectiveSlicePitch(dst_slice_pitch, dst_row_pitch, row_count);
+    for (UINT z = 0; z < depth_count; z++) {
+      for (UINT row = 0; row < row_count; row++)
+        std::memcpy(dst + z * dst_effective_slice + row * dst_row_pitch,
+                    src + TextureRowOffset(box, layout, row, z),
+                    static_cast<size_t>(row_size));
+    }
     return S_OK;
   }
 
   HRESULT WriteTextureRowsViaBlit(const D3D12_BOX &box,
                                   const TextureSubresourceLayout &layout,
                                   const void *src_data, UINT src_row_pitch,
-                                  UINT64 row_size, UINT row_count) {
+                                  UINT src_slice_pitch, UINT64 row_size,
+                                  UINT row_count, UINT depth_count,
+                                  UINT dst_sub_resource) {
+    const UINT staging_slice_pitch = layout.row_pitch * row_count;
     WMTBufferInfo buffer_info = {};
-    buffer_info.length = layout.row_pitch * row_count;
+    buffer_info.length = staging_slice_pitch * depth_count;
     buffer_info.options = WMTResourceHazardTrackingModeUntracked |
                           WMTResourceOptionCPUCacheModeWriteCombined;
     auto buffer = device_->GetDXMTDevice().device().newBuffer(buffer_info);
@@ -589,28 +705,44 @@ private:
     auto *mapped = static_cast<char *>(buffer_info.memory.get());
     std::memset(mapped, 0, static_cast<size_t>(buffer_info.length));
     const auto *src = static_cast<const char *>(src_data);
-    for (UINT row = 0; row < row_count; row++)
-      std::memcpy(mapped + row * layout.row_pitch, src + row * src_row_pitch,
-                  static_cast<size_t>(row_size));
+    const UINT src_effective_slice =
+        EffectiveSlicePitch(src_slice_pitch, src_row_pitch, row_count);
+    for (UINT z = 0; z < depth_count; z++) {
+      for (UINT row = 0; row < row_count; row++)
+        std::memcpy(mapped + z * staging_slice_pitch + row * layout.row_pitch,
+                    src + z * src_effective_slice + row * src_row_pitch,
+                    static_cast<size_t>(row_size));
+    }
 
     Rc<dxmt::Texture> texture = texture_;
+    const UINT dst_slice = GetTextureSubresourceArraySlice(desc_, dst_sub_resource);
+    const UINT dst_level = GetTextureSubresourceMipLevel(desc_, dst_sub_resource);
+    const UINT origin_z =
+        desc_.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D ? box.front : 0;
+    const UINT bytes_per_image =
+        desc_.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D
+            ? staging_slice_pitch
+            : 0;
     return SubmitSynchronousDxmtBlit(
-        [buffer, texture, box, row_pitch = layout.row_pitch](
+        [buffer, texture, box, row_pitch = layout.row_pitch,
+         bytes_per_image, dst_slice, dst_level, origin_z, depth_count](
             ArgumentEncodingContext &enc) {
           enc.startBlitPass();
-          auto dst = enc.access(texture, 0, 0, ResourceAccess::Write);
+          auto dst = enc.access(texture, dst_level, dst_slice,
+                                ResourceAccess::Write);
           auto &copy =
               enc.encodeBlitCommand<wmtcmd_blit_copy_from_buffer_to_texture>();
           copy.type = WMTBlitCommandCopyFromBufferToTexture;
           copy.src = buffer;
           copy.src_offset = 0;
           copy.bytes_per_row = row_pitch;
-          copy.bytes_per_image = 0;
-          copy.size = {box.right - box.left, box.bottom - box.top, 1};
+          copy.bytes_per_image = bytes_per_image;
+          copy.size = {box.right - box.left, box.bottom - box.top,
+                       depth_count};
           copy.dst = dst;
-          copy.slice = 0;
-          copy.level = 0;
-          copy.origin = {box.left, box.top, 0};
+          copy.slice = dst_slice;
+          copy.level = dst_level;
+          copy.origin = {box.left, box.top, origin_z};
           enc.endPass();
         });
   }
@@ -618,40 +750,55 @@ private:
   HRESULT ReadTextureRowsViaBlit(void *dst_data, UINT dst_row_pitch,
                                  const D3D12_BOX &box,
                                  const TextureSubresourceLayout &layout,
-                                 UINT64 row_size, UINT row_count) {
+                                 UINT dst_slice_pitch, UINT64 row_size,
+                                 UINT row_count, UINT depth_count,
+                                 UINT src_sub_resource) {
+    const UINT staging_slice_pitch = layout.row_pitch * row_count;
     WMTBufferInfo buffer_info = {};
-    buffer_info.length = layout.row_pitch * row_count;
+    buffer_info.length = staging_slice_pitch * depth_count;
     buffer_info.options = WMTResourceHazardTrackingModeUntracked;
     auto buffer = device_->GetDXMTDevice().device().newBuffer(buffer_info);
     if (!buffer || !buffer_info.memory.get())
       return E_FAIL;
 
     Rc<dxmt::Texture> texture = texture_;
+    const UINT src_slice = GetTextureSubresourceArraySlice(desc_, src_sub_resource);
+    const UINT src_level = GetTextureSubresourceMipLevel(desc_, src_sub_resource);
+    const UINT origin_z =
+        desc_.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D ? box.front : 0;
+    const UINT bytes_per_image =
+        desc_.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D
+            ? staging_slice_pitch
+            : 0;
     HRESULT hr = SubmitSynchronousDxmtBlit(
-        [buffer, texture, box, row_pitch = layout.row_pitch](
+        [buffer, texture, box, row_pitch = layout.row_pitch, bytes_per_image,
+         src_slice, src_level, origin_z, depth_count](
             ArgumentEncodingContext &enc) {
           enc.startBlitPass();
-          auto src = enc.access(texture, 0, 0, ResourceAccess::Read);
+          auto src = enc.access(texture, src_level, src_slice,
+                                ResourceAccess::Read);
           auto &copy =
               enc.encodeBlitCommand<wmtcmd_blit_copy_from_texture_to_buffer>();
           copy.type = WMTBlitCommandCopyFromTextureToBuffer;
           copy.src = src;
-          copy.slice = 0;
-          copy.level = 0;
-          copy.origin = {box.left, box.top, 0};
-          copy.size = {box.right - box.left, box.bottom - box.top, 1};
+          copy.slice = src_slice;
+          copy.level = src_level;
+          copy.origin = {box.left, box.top, origin_z};
+          copy.size = {box.right - box.left, box.bottom - box.top,
+                       depth_count};
           copy.dst = buffer;
           copy.offset = 0;
           copy.bytes_per_row = row_pitch;
-          copy.bytes_per_image = 0;
+          copy.bytes_per_image = bytes_per_image;
           enc.endPass();
         });
     if (FAILED(hr))
       return hr;
 
-    return CopyTextureRowsToMemory(dst_data, dst_row_pitch, 0,
+    return CopyTextureRowsToMemory(dst_data, dst_row_pitch, dst_slice_pitch,
                                    buffer_info.memory.get(), layout.row_pitch,
-                                   0, row_size, row_count);
+                                   staging_slice_pitch, row_size, row_count,
+                                   depth_count);
   }
 
   template <typename Encode>
@@ -674,7 +821,7 @@ private:
     RegisterBufferGpuVirtualAddress(this, GetGpuVirtualAddress(), desc_.Width);
   }
 
-  void CreateTexture2D() {
+  void CreateTexture() {
     MTL_DXGI_FORMAT_DESC format = {};
     if (FAILED(MTLQueryDXGIFormat(device_->GetDXMTDevice().device(),
                                   desc_.Format, format)))
@@ -683,11 +830,17 @@ private:
     WMTTextureInfo info = {};
     info.pixel_format = format.PixelFormat;
     info.width = static_cast<uint32_t>(desc_.Width);
-    info.height = desc_.Height;
-    info.depth = 1;
-    info.array_length = desc_.DepthOrArraySize;
+    info.height = desc_.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D
+                      ? 1
+                      : desc_.Height;
+    info.depth = desc_.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D
+                     ? desc_.DepthOrArraySize
+                     : 1;
+    info.array_length = desc_.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D
+                            ? 1
+                            : desc_.DepthOrArraySize;
     info.type = GetTextureType(desc_);
-    info.mipmap_level_count = desc_.MipLevels ? desc_.MipLevels : 1;
+    info.mipmap_level_count = GetMipLevels(desc_);
     info.sample_count = desc_.SampleDesc.Count ? desc_.SampleDesc.Count : 1;
     info.usage = GetTextureUsage(desc_.Flags);
 
@@ -695,9 +848,9 @@ private:
     TextureSubresourceLayout layout = {};
     const bool linear_cpu_texture =
         GetHeapType(heap_properties_) != D3D12_HEAP_TYPE_DEFAULT &&
-        IsSingleSubresourceTexture2D(desc_, 0) &&
+        IsCpuLinearTextureSubresource(desc_, 0) &&
         SUCCEEDED(GetTextureSubresourceLayout(device_->GetDXMTDevice().device(),
-                                             desc_, layout));
+                                             desc_, 0, layout));
 
     if (linear_cpu_texture) {
       texture_ = new dxmt::Texture(layout.slice_pitch, layout.row_pitch, info,
@@ -758,19 +911,42 @@ IsSupportedResourceDesc(const D3D12_RESOURCE_DESC &desc) {
            desc.SampleDesc.Count == 1 && desc.SampleDesc.Quality == 0 &&
            desc.Layout == D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
   }
-  if (desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D) {
-    if (desc.Layout == D3D12_TEXTURE_LAYOUT_ROW_MAJOR) {
+  if (desc.Format == DXGI_FORMAT_UNKNOWN)
+    return false;
+
+  const bool layout_row_major =
+      desc.Layout == D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+  const bool layout_swizzled =
+      desc.Layout == D3D12_TEXTURE_LAYOUT_UNKNOWN ||
+      desc.Layout == D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE ||
+      desc.Layout == D3D12_TEXTURE_LAYOUT_64KB_STANDARD_SWIZZLE;
+  if (!layout_row_major && !layout_swizzled)
+    return false;
+
+  switch (desc.Dimension) {
+  case D3D12_RESOURCE_DIMENSION_TEXTURE1D:
+    if (desc.Height != 1 || desc.SampleDesc.Count != 1)
+      return false;
+    if (layout_row_major)
+      return desc.DepthOrArraySize == 1 && desc.MipLevels <= 1;
+    return true;
+  case D3D12_RESOURCE_DIMENSION_TEXTURE2D:
+    if (layout_row_major) {
       if (desc.SampleDesc.Count != 1 || desc.DepthOrArraySize != 1 ||
           desc.MipLevels > 1)
         return false;
-    } else if (desc.Layout != D3D12_TEXTURE_LAYOUT_UNKNOWN &&
-               desc.Layout != D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE &&
-               desc.Layout != D3D12_TEXTURE_LAYOUT_64KB_STANDARD_SWIZZLE) {
-      return false;
+    } else if (desc.SampleDesc.Count > 1) {
+      if (desc.DepthOrArraySize != 1 || desc.MipLevels != 1)
+        return false;
     }
-    return desc.Format != DXGI_FORMAT_UNKNOWN;
+    return true;
+  case D3D12_RESOURCE_DIMENSION_TEXTURE3D:
+    if (desc.SampleDesc.Count != 1 || layout_row_major)
+      return false;
+    return true;
+  default:
+    return false;
   }
-  return false;
 }
 
 Com<ID3D12Resource>
