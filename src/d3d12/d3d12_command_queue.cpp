@@ -226,8 +226,7 @@ GetD3D12SwapChainLayerColorSpace(DXGI_FORMAT format,
 }
 
 static constexpr UINT D3D12SupportedPresentFlags =
-    DXGI_PRESENT_TEST | DXGI_PRESENT_DO_NOT_SEQUENCE | DXGI_PRESENT_RESTART |
-    DXGI_PRESENT_DO_NOT_WAIT | DXGI_PRESENT_ALLOW_TEARING;
+    DXGI_PRESENT_TEST | DXGI_PRESENT_ALLOW_TEARING;
 
 static constexpr UINT D3D12SupportedSwapChainFlags =
     DXGI_SWAP_CHAIN_FLAG_ALLOW_MODE_SWITCH |
@@ -590,6 +589,14 @@ NormalizeViewCount(UINT requested, UINT first, UINT total) {
   return std::min(requested, remaining);
 }
 
+static UINT
+GetMipDepth(const Resource &resource, UINT mip_slice) {
+  const auto &desc = resource.GetResourceDesc();
+  if (desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE3D)
+    return 1;
+  return static_cast<UINT>(std::max<UINT64>(1, desc.DepthOrArraySize >> mip_slice));
+}
+
 static WMTPixelFormat
 ResolveTextureViewFormat(WMT::Device device, Resource &resource,
                          DXGI_FORMAT format) {
@@ -777,8 +784,30 @@ CreateUnorderedAccessTextureView(WMT::Device device, Resource &resource,
     view.type = WMTTextureType3D;
     view.firstMiplevel = uav.Texture3D.MipSlice;
     view.arraySize = 1;
-    if (uav.Texture3D.FirstWSlice || uav.Texture3D.WSize != UINT_MAX)
-      WARN("D3D12CommandQueue: 3D texture UAV W slice range is not lowered yet");
+    if (view.firstMiplevel >= texture->miplevelCount()) {
+      WARN("D3D12CommandQueue: invalid 3D texture UAV mip slice ",
+           view.firstMiplevel);
+      return {};
+    }
+    {
+      const UINT mip_depth = GetMipDepth(resource, view.firstMiplevel);
+      const UINT first_w = uav.Texture3D.FirstWSlice;
+      const UINT w_size = uav.Texture3D.WSize == UINT_MAX
+                              ? (first_w < mip_depth ? mip_depth - first_w : 0)
+                              : uav.Texture3D.WSize;
+      if (first_w >= mip_depth || w_size == 0 || w_size > mip_depth - first_w) {
+        WARN("D3D12CommandQueue: invalid 3D texture UAV W slice range first=",
+             first_w, " size=", w_size, " mip_depth=", mip_depth);
+        return {};
+      }
+      if (first_w != 0 || w_size != mip_depth) {
+        // TODO(d3d12): lower 3D texture UAV depth-slice subviews once the
+        // DXMT texture view layer can represent a W-slice range for 3D images.
+        WARN("D3D12CommandQueue: unsupported 3D texture UAV W slice subrange first=",
+             first_w, " size=", w_size, " mip_depth=", mip_depth);
+        return {};
+      }
+    }
     break;
   default:
     WARN("D3D12CommandQueue: unsupported UAV texture dimension ",
@@ -1420,9 +1449,11 @@ private:
           !(desc_.Flags & DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING)) {
         WARN("D3D12SwapChain::Present1: ALLOW_TEARING used without swapchain "
              "tearing support");
+        return DXGI_ERROR_INVALID_CALL;
       }
       if ((flags & DXGI_PRESENT_ALLOW_TEARING) && sync_interval) {
         WARN("D3D12SwapChain::Present1: ALLOW_TEARING requires sync interval 0");
+        return DXGI_ERROR_INVALID_CALL;
       }
       if (present_parameters &&
           (present_parameters->DirtyRectsCount || present_parameters->pDirtyRects ||
@@ -3104,8 +3135,17 @@ private:
               view_id = CreateBufferView(device_->GetMTLDevice(), *resource,
                                          srv.Format, offset, byte_size,
                                          WMTTextureUsageShaderRead);
+              if (!view_id) {
+                WARN("D3D12CommandQueue: typed buffer SRV failed to create Metal texture buffer view format=",
+                     uint32_t(srv.Format));
+                return;
+              }
               slice = StructuredBufferSlice(*resource, offset, byte_size,
                                             format.BytesPerTexel);
+            } else {
+              WARN("D3D12CommandQueue: typed buffer SRV uses unsupported format ",
+                   uint32_t(srv.Format));
+              return;
             }
           } else if (srv.Buffer.StructureByteStride) {
             offset += first_element * srv.Buffer.StructureByteStride;
@@ -3220,8 +3260,17 @@ private:
                                          uav.Format, offset, byte_size,
                                          WMTTextureUsageShaderRead |
                                              WMTTextureUsageShaderWrite);
+              if (!view_id) {
+                WARN("D3D12CommandQueue: typed buffer UAV failed to create Metal texture buffer view format=",
+                     uint32_t(uav.Format));
+                return;
+              }
               slice = StructuredBufferSlice(*resource, offset, byte_size,
                                             format.BytesPerTexel);
+            } else {
+              WARN("D3D12CommandQueue: typed buffer UAV uses unsupported format ",
+                   uint32_t(uav.Format));
+              return;
             }
           } else if (uav.Buffer.StructureByteStride) {
             offset += first_element * uav.Buffer.StructureByteStride;

@@ -1269,8 +1269,12 @@ ParsePipelineStateStream(const D3D12_PIPELINE_STATE_STREAM_DESC &stream,
           depth_stencil.StencilWriteMask;
       graphics.DepthStencilState.FrontFace = depth_stencil.FrontFace;
       graphics.DepthStencilState.BackFace = depth_stencil.BackFace;
-      if (depth_stencil.DepthBoundsTestEnable)
-        WARN("D3D12PipelineState: depth bounds in PSO stream is ignored");
+      if (depth_stencil.DepthBoundsTestEnable) {
+        // TODO(d3d12): lower depth bounds once dynamic min/max depth-bounds
+        // state is represented in the Metal command stream.
+        WARN("D3D12PipelineState: depth bounds in PSO stream is unsupported");
+        return E_NOTIMPL;
+      }
       break;
     }
     case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_INPUT_LAYOUT:

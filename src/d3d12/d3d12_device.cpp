@@ -232,6 +232,20 @@ IsTextureResource(ID3D12Resource *resource) {
          dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D;
 }
 
+static const D3D12_RESOURCE_DESC *
+GetResourceDesc(ID3D12Resource *resource) {
+  auto *d3d12_resource = dynamic_cast<Resource *>(resource);
+  return d3d12_resource ? &d3d12_resource->GetResourceDesc() : nullptr;
+}
+
+static UINT
+GetTextureMipDepth(const D3D12_RESOURCE_DESC &resource_desc, UINT mip_slice) {
+  if (resource_desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE3D)
+    return 1;
+  return static_cast<UINT>(
+      std::max<UINT64>(1, resource_desc.DepthOrArraySize >> mip_slice));
+}
+
 static bool
 IsSupportedSrvDimension(D3D12_SRV_DIMENSION dimension) {
   switch (dimension) {
@@ -334,6 +348,37 @@ ValidateUnorderedAccessView(ID3D12Resource *resource,
   if (resource && !IsTextureResource(resource)) {
     WARN("D3D12Device: texture UAV created for non-texture resource");
     return false;
+  }
+  if (desc.ViewDimension == D3D12_UAV_DIMENSION_TEXTURE3D) {
+    const auto *resource_desc = GetResourceDesc(resource);
+    if (resource_desc && resource_desc->Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE3D) {
+      WARN("D3D12Device: 3D texture UAV created for non-3D texture resource");
+      return false;
+    }
+    if (resource_desc && desc.Texture3D.MipSlice >= resource_desc->MipLevels) {
+      WARN("D3D12Device: 3D texture UAV mip slice out of range ",
+           desc.Texture3D.MipSlice);
+      return false;
+    }
+    if (resource_desc) {
+      const UINT mip_depth = GetTextureMipDepth(*resource_desc, desc.Texture3D.MipSlice);
+      const UINT first_w = desc.Texture3D.FirstWSlice;
+      const UINT w_size = desc.Texture3D.WSize == UINT_MAX
+                              ? (first_w < mip_depth ? mip_depth - first_w : 0)
+                              : desc.Texture3D.WSize;
+      if (first_w >= mip_depth || w_size == 0 || w_size > mip_depth - first_w) {
+        WARN("D3D12Device: invalid 3D texture UAV W slice range first=",
+             first_w, " size=", w_size, " mip_depth=", mip_depth);
+        return false;
+      }
+      if (first_w != 0 || w_size != mip_depth) {
+        // TODO(d3d12): support 3D texture UAV W-slice subranges when the
+        // Metal texture view layer can preserve D3D12 depth-slice semantics.
+        WARN("D3D12Device: unsupported 3D texture UAV W slice subrange first=",
+             first_w, " size=", w_size, " mip_depth=", mip_depth);
+        return false;
+      }
+    }
   }
   if (counter_resource) {
     WARN("D3D12Device: UAV counter resource is ignored for texture UAVs");
