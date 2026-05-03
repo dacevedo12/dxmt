@@ -593,6 +593,10 @@ public:
     return *device_;
   }
 
+  uint64_t NextTimestampQueryValue() override {
+    return ++timestamp_query_value_;
+  }
+
   D3DKMT_HANDLE STDMETHODCALLTYPE GetLocalD3DKMT() override {
     return local_kmt_;
   }
@@ -1900,6 +1904,7 @@ private:
   LUID adapter_luid_ = {};
   UINT maximum_frame_latency_ = 3;
   INT gpu_thread_priority_ = 0;
+  uint64_t timestamp_query_value_ = 0;
   std::string name_;
 };
 
