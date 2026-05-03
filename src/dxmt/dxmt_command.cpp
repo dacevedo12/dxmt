@@ -689,12 +689,15 @@ ClearResourceKernelContext::clear(uint32_t offset_x, uint32_t offset_y, uint32_t
       settexbuf.index = 0;
       meta_temp_.offset[0] += dst_sub_offset;
     } else {
-      auto [dst_, dst_sub_offset] = ctx_.access(clearing_buffer_, offset_x, width, ResourceAccess::Write);
+      const uint32_t byte_offset = offset_x * sizeof(uint32_t);
+      const uint32_t byte_length = width * sizeof(uint32_t);
+      auto [dst_, dst_sub_offset] = ctx_.access(clearing_buffer_, byte_offset, byte_length, ResourceAccess::Write);
       auto &setbuf = ctx_.encodeComputeCommand<wmtcmd_compute_setbuffer>();
       setbuf.type = WMTComputeCommandSetBuffer;
       setbuf.buffer = dst_->buffer();
       setbuf.index = 0;
-      setbuf.offset = dst_sub_offset;
+      setbuf.offset = dst_sub_offset + byte_offset;
+      meta_temp_.offset[0] = 0;
     }
   } else {
     return;
