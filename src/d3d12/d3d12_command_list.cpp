@@ -1073,6 +1073,10 @@ public:
     return arguments_;
   }
 
+  ID3D12RootSignature *GetRootSignature() const override {
+    return root_signature_.ptr();
+  }
+
 private:
   Com<IMTLD3D12Device> device_;
   Com<ID3D12RootSignature> root_signature_;

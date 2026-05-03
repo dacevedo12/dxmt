@@ -200,10 +200,6 @@ GetD3D12SwapChainColorSpace(DXGI_COLOR_SPACE_TYPE color_space) {
     return WMTColorSpaceSRGB;
   case DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709:
     return WMTColorSpaceSRGBLinear;
-  case DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020:
-    return WMTColorSpaceHDR_PQ;
-  case DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P2020:
-    return WMTColorSpaceBT2020;
   default:
     return WMTColorSpaceInvalid;
   }
@@ -626,6 +622,40 @@ ResolveTextureViewFormat(WMT::Device device, Resource &resource,
   return format_desc.PixelFormat;
 }
 
+static bool
+ValidateTextureViewRange(const char *context, TextureViewDescriptor &view,
+                         const Resource &resource) {
+  const auto *texture = resource.GetTexture();
+  if (!texture)
+    return false;
+
+  if (view.firstMiplevel >= texture->miplevelCount() ||
+      view.miplevelCount == 0 ||
+      view.miplevelCount > texture->miplevelCount() - view.firstMiplevel) {
+    WARN("D3D12CommandQueue: ", context,
+         " mip range exceeds texture levels first=", view.firstMiplevel,
+         " count=", view.miplevelCount,
+         " levels=", texture->miplevelCount());
+    return false;
+  }
+
+  if (resource.GetResourceDesc().Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D) {
+    view.firstArraySlice = 0;
+    view.arraySize = 1;
+    return true;
+  }
+
+  if (view.firstArraySlice >= texture->arrayLength() ||
+      view.arraySize == 0 ||
+      view.arraySize > texture->arrayLength() - view.firstArraySlice) {
+    WARN("D3D12CommandQueue: ", context,
+         " array range exceeds texture array first=", view.firstArraySlice,
+         " count=", view.arraySize, " array_length=", texture->arrayLength());
+    return false;
+  }
+  return true;
+}
+
 static TextureViewKey
 CreateShaderResourceTextureView(WMT::Device device, Resource &resource,
                                 const DescriptorRecord &descriptor) {
@@ -735,6 +765,8 @@ CreateShaderResourceTextureView(WMT::Device device, Resource &resource,
     return {};
   }
 
+  if (!ValidateTextureViewRange("SRV texture view", view, resource))
+    return {};
   return texture->createView(view);
 }
 
@@ -825,6 +857,8 @@ CreateUnorderedAccessTextureView(WMT::Device device, Resource &resource,
     return {};
   }
 
+  if (!ValidateTextureViewRange("UAV texture view", view, resource))
+    return {};
   return texture->createView(view);
 }
 
@@ -2273,6 +2307,10 @@ private:
     const auto &arguments = signature->GetArguments();
     if (!desc.ByteStride || arguments.empty())
       return;
+    if (RequiresRootSignature(arguments) && !signature->GetRootSignature()) {
+      WARN("D3D12CommandQueue: ExecuteIndirect skipped because command signature has root arguments but no root signature");
+      return;
+    }
 
     const auto direct_operation = GetDirectIndirectOperation(arguments);
     if (direct_operation != DirectIndirectOperation::None &&
@@ -2281,6 +2319,22 @@ private:
       return;
 
     ReplayExecuteIndirectCpuFallback(chunk, state, record, *signature);
+  }
+
+  static bool RequiresRootSignature(
+      const std::vector<D3D12_INDIRECT_ARGUMENT_DESC> &arguments) {
+    for (const auto &argument : arguments) {
+      switch (argument.Type) {
+      case D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT:
+      case D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT_BUFFER_VIEW:
+      case D3D12_INDIRECT_ARGUMENT_TYPE_SHADER_RESOURCE_VIEW:
+      case D3D12_INDIRECT_ARGUMENT_TYPE_UNORDERED_ACCESS_VIEW:
+        return true;
+      default:
+        break;
+      }
+    }
+    return false;
   }
 
   bool ReplayExecuteIndirectDirect(
@@ -3750,10 +3804,14 @@ private:
     descriptor.resource = resource->GetD3D12Resource();
     descriptor.has_desc = true;
     if (type == DescriptorRecordType::ConstantBufferView) {
+      const auto remaining = resource->GetResourceDesc().Width - offset;
+      const auto size = std::min<UINT64>(remaining, UINT_MAX);
+      if (size & (D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT - 1)) {
+        WARN("D3D12CommandQueue: root CBV resolved size is not 256-byte aligned");
+        return;
+      }
       descriptor.desc.cbv.BufferLocation = it->second;
-      descriptor.desc.cbv.SizeInBytes =
-          UINT(std::min<UINT64>(resource->GetResourceDesc().Width - offset,
-                                UINT_MAX));
+      descriptor.desc.cbv.SizeInBytes = UINT(size);
     } else if (type == DescriptorRecordType::ShaderResourceView) {
       descriptor.desc.srv.Format = DXGI_FORMAT_UNKNOWN;
       descriptor.desc.srv.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;

@@ -1064,17 +1064,39 @@ CloneGraphicsState(const D3D12_GRAPHICS_PIPELINE_STATE_DESC &desc,
   if (desc.NumRenderTargets > D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT ||
       desc.SampleDesc.Count == 0)
     return E_INVALIDARG;
+  if (desc.NodeMask > 1) {
+    WARN("D3D12PipelineState: multi-node graphics PSOs are unsupported");
+    return E_INVALIDARG;
+  }
+  if (desc.StreamOutput.NumEntries || desc.StreamOutput.NumStrides) {
+    WARN("D3D12PipelineState: stream output is unsupported");
+    return E_INVALIDARG;
+  }
+  if (desc.PrimitiveTopologyType == D3D12_PRIMITIVE_TOPOLOGY_TYPE_UNDEFINED ||
+      desc.PrimitiveTopologyType == D3D12_PRIMITIVE_TOPOLOGY_TYPE_PATCH) {
+    WARN("D3D12PipelineState: unsupported primitive topology type ",
+         uint32_t(desc.PrimitiveTopologyType));
+    return E_INVALIDARG;
+  }
+  if (desc.SampleDesc.Quality != 0) {
+    WARN("D3D12PipelineState: MSAA quality levels are unsupported");
+    return E_INVALIDARG;
+  }
   if ((desc.HS.BytecodeLength || desc.HS.pShaderBytecode ||
        desc.DS.BytecodeLength || desc.DS.pShaderBytecode) &&
       (!HasBytecode(desc.HS) || !HasBytecode(desc.DS)))
     return E_INVALIDARG;
+  if (HasBytecode(desc.HS) || HasBytecode(desc.DS)) {
+    WARN("D3D12PipelineState: tessellation shaders are unsupported");
+    return E_INVALIDARG;
+  }
+  if (HasBytecode(desc.GS)) {
+    WARN("D3D12PipelineState: geometry shaders are unsupported");
+    return E_INVALIDARG;
+  }
   if (!HasBytecode(desc.VS))
     return E_INVALIDARG;
   if (desc.InputLayout.NumElements && !desc.InputLayout.pInputElementDescs)
-    return E_INVALIDARG;
-  if (desc.StreamOutput.NumEntries && !desc.StreamOutput.pSODeclaration)
-    return E_INVALIDARG;
-  if (desc.StreamOutput.NumStrides && !desc.StreamOutput.pBufferStrides)
     return E_INVALIDARG;
 
   state = {};

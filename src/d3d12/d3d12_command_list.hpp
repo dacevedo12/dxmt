@@ -261,6 +261,7 @@ public:
   virtual ~CommandSignature() = default;
   virtual const D3D12_COMMAND_SIGNATURE_DESC &GetDesc() const = 0;
   virtual const std::vector<D3D12_INDIRECT_ARGUMENT_DESC> &GetArguments() const = 0;
+  virtual ID3D12RootSignature *GetRootSignature() const = 0;
 };
 
 Com<ID3D12GraphicsCommandList>

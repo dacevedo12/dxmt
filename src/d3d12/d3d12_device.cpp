@@ -1096,6 +1096,15 @@ public:
         WARN("D3D12Device: CBV BufferLocation is not 256-byte aligned");
       if (desc->SizeInBytes & (D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT - 1))
         WARN("D3D12Device: CBV SizeInBytes is not 256-byte aligned");
+      UINT64 offset = 0;
+      auto *resource =
+          LookupBufferResourceByGpuVirtualAddress(desc->BufferLocation, &offset);
+      if (!resource || !resource->GetBuffer()) {
+        WARN("D3D12Device: CBV BufferLocation does not resolve to a buffer resource");
+      } else if (desc->SizeInBytes >
+                 resource->GetResourceDesc().Width - offset) {
+        WARN("D3D12Device: CBV range exceeds buffer resource size");
+      }
       record->desc.cbv = *desc;
       record->has_desc = true;
     }
