@@ -605,6 +605,16 @@ ResolveTextureViewFormat(WMT::Device device, Resource &resource,
     return WMTPixelFormatInvalid;
   if (format == DXGI_FORMAT_UNKNOWN)
     return texture->pixelFormat();
+  if (DepthStencilPlanarFlags(texture->pixelFormat())) {
+    switch (format) {
+    case DXGI_FORMAT_R32_FLOAT:
+      if (texture->pixelFormat() == WMTPixelFormatDepth32Float)
+        return texture->pixelFormat();
+      break;
+    default:
+      break;
+    }
+  }
 
   MTL_DXGI_FORMAT_DESC format_desc = {};
   if (FAILED(MTLQueryDXGIFormat(device, format, format_desc)) ||

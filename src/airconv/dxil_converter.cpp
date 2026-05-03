@@ -75,6 +75,10 @@ TextureArgumentFlags(const dxmt::dxil::DxilTranslationResourceInfo &resource,
     break;
   }
 
+  if (resource.compared)
+    flags = MTL_SM50_SHADER_ARGUMENT_FLAG(
+        flags | MTL_SM50_SHADER_ARGUMENT_TEXTURE_DEPTH);
+
   if (texture_kind == 6 || texture_kind == 7 || texture_kind == 8 ||
       texture_kind == 9)
     flags =

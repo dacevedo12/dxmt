@@ -382,6 +382,7 @@ struct DxilTypedOperationInfo {
 struct LlvmInstructionInfo {
   std::string opcode_name;
   std::string result_name;
+  std::string result_text;
   std::string result_type;
   LlvmTypeInfo result_type_info;
   std::vector<LlvmOperandInfo> operands;
@@ -424,6 +425,8 @@ struct LlvmCallGraphInfo {
 
 struct LlvmDxilOperationInfo {
   uint32_t instruction_index = 0;
+  std::string result_name;
+  std::string result_text;
   std::string called_function;
   uint32_t opcode = 0;
   std::string opcode_name;
@@ -973,6 +976,7 @@ struct DxilTranslationResourceInfo {
   bool read = false;
   bool written = false;
   bool sampled = false;
+  bool compared = false;
   bool queried = false;
 };
 
@@ -1006,6 +1010,8 @@ struct DxilTranslationOperationInfo {
   std::string function_name;
   std::string basic_block_name;
   uint32_t instruction_index = 0;
+  std::string result_name;
+  std::string result_text;
   uint32_t opcode = 0;
   std::string opcode_name;
   std::string opcode_class;

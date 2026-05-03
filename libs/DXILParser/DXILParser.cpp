@@ -27,6 +27,7 @@
 #include <initializer_list>
 #include <iterator>
 #include <limits>
+#include <map>
 #include <sstream>
 #include <utility>
 
@@ -49,6 +50,13 @@ ReadU32(std::span<const uint8_t> data, size_t offset) {
 uint64_t
 ReadU64(std::span<const uint8_t> data, size_t offset) {
   return uint64_t(ReadU32(data, offset)) | (uint64_t(ReadU32(data, offset + 4)) << 32);
+}
+
+bool
+IsComparisonSampleOpcode(std::string_view name) {
+  return name == "SampleCmp" || name == "SampleCmpLevelZero" ||
+         name == "SampleCmpLevel" || name == "SampleCmpGrad" ||
+         name == "SampleCmpBias" || name == "TextureGatherCmp";
 }
 
 bool
@@ -794,6 +802,7 @@ ParseLlvmInstruction(const llvm::Instruction &instruction) {
   info.result_type_info = ParseLlvmType(instruction.getType());
   if (instruction.hasName())
     info.result_name = instruction.getName().str();
+  info.result_text = ValueOperandText(&instruction);
 
   info.operands.reserve(instruction.getNumOperands());
   for (const auto &operand : instruction.operands())
@@ -827,6 +836,8 @@ ParseDxilOperation(const LlvmInstructionInfo &instruction,
                    uint32_t instruction_index) {
   LlvmDxilOperationInfo info = {};
   info.instruction_index = instruction_index;
+  info.result_name = instruction.result_name;
+  info.result_text = instruction.result_text;
   info.called_function = instruction.called_function;
   info.opcode = instruction.dxil_opcode.value_or(0);
   info.opcode_name = instruction.dxil_opcode_name;
@@ -4428,6 +4439,8 @@ ApplyOperationToTranslationResource(DxilTranslationResourceInfo &resource,
   case DxilSemanticOperationKind::ResourceSample:
     resource.sampled = true;
     resource.read = true;
+    if (IsComparisonSampleOpcode(operation.opcode_name))
+      resource.compared = true;
     break;
   case DxilSemanticOperationKind::ResourceQuery:
     resource.queried = true;
@@ -4702,6 +4715,8 @@ BuildTranslationOperation(const LlvmFunctionInfo &function,
           FindBasicBlockForInstruction(function, operation.instruction_index))
     out.basic_block_name = block->name;
   out.instruction_index = operation.instruction_index;
+  out.result_name = operation.result_name;
+  out.result_text = operation.result_text;
   out.opcode = operation.opcode;
   out.opcode_name = operation.opcode_name;
   out.opcode_class = operation.opcode_class;
@@ -4721,6 +4736,122 @@ BuildTranslationOperation(const LlvmFunctionInfo &function,
   out.operands = operation.operands;
   out.typed = operation.typed;
   return out;
+}
+
+struct DxilResourceUseHandle {
+  DxilTranslationResourceClass resource_class =
+      DxilTranslationResourceClass::Unknown;
+  uint32_t resource_id = 0;
+  bool valid = false;
+};
+
+std::string
+NormalizeLlvmValueName(std::string value) {
+  if (!value.empty() && value[0] == '%')
+    value.erase(value.begin());
+  return value;
+}
+
+std::string
+DxilHandleOperandName(const DxilTranslationOperationInfo &operation) {
+  if (operation.typed.operands.empty())
+    return {};
+  return NormalizeLlvmValueName(operation.typed.operands[0].text);
+}
+
+uint32_t
+DxilResourceClassToValue(DxilTranslationResourceClass resource_class) {
+  switch (resource_class) {
+  case DxilTranslationResourceClass::Srv:
+    return 0;
+  case DxilTranslationResourceClass::Uav:
+    return 1;
+  case DxilTranslationResourceClass::Cbv:
+    return 2;
+  case DxilTranslationResourceClass::Sampler:
+    return 3;
+  default:
+    return UINT32_MAX;
+  }
+}
+
+DxilResourceUseHandle
+ResourceUseHandleFromOperation(
+    const DxilTranslationOperationInfo &operation,
+    const std::vector<DxilTranslationResourceInfo> &resources,
+    const std::map<std::string, DxilResourceUseHandle> &handles) {
+  DxilResourceUseHandle handle = {};
+  if (operation.has_resource_id) {
+    handle.resource_class =
+        operation.typed.has_resource_class
+            ? TranslationResourceClassFromValue(operation.typed.resource_class)
+            : DxilTranslationResourceClass::Unknown;
+    handle.resource_id = operation.resource_id;
+    handle.valid = handle.resource_class != DxilTranslationResourceClass::Unknown;
+    return handle;
+  }
+
+  if (operation.semantic_kind == DxilSemanticOperationKind::ResourceHandle &&
+      operation.typed.has_resource_binding) {
+    handle.resource_class =
+        operation.typed.has_resource_class
+            ? TranslationResourceClassFromValue(operation.typed.resource_class)
+            : DxilTranslationResourceClass::Unknown;
+    for (const auto &resource : resources) {
+      if (resource.resource_class == handle.resource_class &&
+          resource.space == operation.typed.resource_space &&
+          resource.lower_bound == operation.typed.resource_lower_bound) {
+        handle.resource_id = resource.id;
+        break;
+      }
+    }
+    handle.valid = handle.resource_class != DxilTranslationResourceClass::Unknown;
+    return handle;
+  }
+
+  const auto operand_name = DxilHandleOperandName(operation);
+  if (operand_name.empty())
+    return handle;
+  const auto found = handles.find(operand_name);
+  if (found != handles.end())
+    return found->second;
+  return handle;
+}
+
+void
+PropagateTranslationResourceUses(
+    std::vector<DxilTranslationOperationInfo> &operations,
+    const std::vector<DxilTranslationResourceInfo> &resources) {
+  std::map<std::string, DxilResourceUseHandle> handles;
+  for (auto &operation : operations) {
+    if (operation.semantic_kind == DxilSemanticOperationKind::ResourceHandle) {
+      auto handle = ResourceUseHandleFromOperation(operation, resources, handles);
+      if (operation.has_resource_id)
+        handle.resource_id = operation.resource_id;
+      if (operation.typed.has_resource_binding)
+        handle.valid = true;
+      if (!operation.result_name.empty() && handle.valid)
+        handles[NormalizeLlvmValueName(operation.result_name)] = handle;
+      if (!operation.result_text.empty() && handle.valid)
+        handles[NormalizeLlvmValueName(operation.result_text)] = handle;
+      continue;
+    }
+
+    const auto handle = ResourceUseHandleFromOperation(operation, resources, handles);
+    if (!handle.valid)
+      continue;
+    if (handle.resource_id) {
+      operation.resource_id = handle.resource_id;
+      operation.has_resource_id = true;
+    }
+    if (!operation.typed.has_resource_class) {
+      const auto resource_class = DxilResourceClassToValue(handle.resource_class);
+      if (resource_class != UINT32_MAX) {
+        operation.typed.resource_class = resource_class;
+        operation.typed.has_resource_class = true;
+      }
+    }
+  }
 }
 
 void
@@ -5742,6 +5873,7 @@ BuildDxilTranslationInfo(const Parser &parser, DxilTranslationInfo &info) {
   info.resources.reserve(reflection->resources.size());
   for (const auto &resource : reflection->resources)
     info.resources.push_back(BuildTranslationResource(resource));
+  PropagateTranslationResourceUses(info.operations, info.resources);
   for (auto &resource : info.resources) {
     for (const auto &operation : info.operations)
       ApplyOperationToTranslationResource(resource, operation);

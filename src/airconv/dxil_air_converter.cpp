@@ -693,7 +693,7 @@ llvm::air::Texture
 BuildTexture(const dxil::DxilTranslationResourceInfo &resource,
              air::MemoryAccess access) {
   auto resource_type = ToResourceType(resource.resource_kind, resource.dimension);
-  auto texture_kind = air::to_air_resource_type(resource_type);
+  auto texture_kind = air::to_air_resource_type(resource_type, resource.compared);
   auto scaler = ToScalerDataType(resource.return_type);
   llvm::air::Texture::SampleType sample_type = llvm::air::Texture::sample_float;
   if (scaler == shader::common::ScalerDataType::Uint)
@@ -867,6 +867,21 @@ IsStructuredBuffer(const dxil::DxilTranslationResourceInfo &resource) {
 bool
 IsTypedBufferResource(shader::common::ResourceType resource_type) {
   return resource_type == shader::common::ResourceType::TextureBuffer;
+}
+
+bool
+IsDepthTexture(const llvm::air::Texture &texture) {
+  switch (texture.kind) {
+  case llvm::air::Texture::depth2d:
+  case llvm::air::Texture::depth2d_array:
+  case llvm::air::Texture::depthcube:
+  case llvm::air::Texture::depthcube_array:
+  case llvm::air::Texture::depth2d_ms:
+  case llvm::air::Texture::depth2d_ms_array:
+    return true;
+  default:
+    return false;
+  }
 }
 
 Value *
@@ -1387,14 +1402,20 @@ LowerDxilCall(const CallBase &call, DxilAirContext &ctx,
           VectorFromOperands(call, 8, TextureCoordinateCount(*resource), true, ctx),
           VectorFromOperands(call, 11, TextureCoordinateCount(*resource), true, ctx),
           offset);
-    else if (name == "SampleCmp" || name == "SampleCmpLevelZero")
-      result = ctx.air.CreateSampleCmp(
-          air_texture, texture, sampler, coord, array_index,
-          OperandValue(call, 8, ctx), offset,
-          llvm::air::sample_level{name == "SampleCmpLevelZero"
-                                      ? ctx.air.getFloat(0)
-                                      : ctx.air.getFloat(0)});
-    else
+    else if (name == "SampleCmp" || name == "SampleCmpLevelZero") {
+      if (!IsDepthTexture(air_texture))
+        return UnsupportedDxilCall(call, "SampleCmp requires a depth texture resource", ctx);
+      auto *reference = OperandValue(call, 10, ctx);
+      if (name == "SampleCmpLevelZero")
+        result = ctx.air.CreateSampleCmp(
+            air_texture, texture, sampler, coord, array_index, reference,
+            offset, llvm::air::sample_level{ctx.air.getFloat(0)});
+      else
+        result = ctx.air.CreateSampleCmp(
+            air_texture, texture, sampler, coord, array_index, reference,
+            offset, llvm::air::sample_bias{ctx.air.getFloat(0)},
+            llvm::air::sample_min_lod_clamp{ctx.air.getFloat(0)});
+    } else
       result = ctx.air.CreateSample(air_texture, texture, sampler, coord,
                                     array_index, offset);
     ctx.values[&call] = PackDxilReturn(call, result.first, ctx, result.second);
@@ -1833,6 +1854,7 @@ BuildDxilShaderInfoImpl(const dxil::DxilTranslationInfo &translation,
       srv.scaler_type = scaler;
       srv.read = resource.read;
       srv.sampled = resource.sampled;
+      srv.compared = resource.compared;
       srv.structure_stride = resource.element_stride;
       auto attr = GetArgumentIndex(SM50BindingType::SRV, binding_slot);
       if (IsTypedBufferResource(resource_type)) {
@@ -1842,7 +1864,7 @@ BuildDxilShaderInfoImpl(const dxil::DxilTranslationInfo &translation,
       } else if (resource_type != ResourceType::NonApplicable) {
         srv.arg_index = shader_info.binding_table.DefineTexture(
             "t" + std::to_string(range_id),
-            air::to_air_resource_type(resource_type),
+            air::to_air_resource_type(resource_type, resource.compared),
             resource.sampled ? air::MemoryAccess::sample
                              : air::MemoryAccess::read,
             air::to_air_scaler_type(scaler), attr);
