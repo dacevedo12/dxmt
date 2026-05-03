@@ -390,6 +390,10 @@ WarnUnsupportedResourceState(D3D12_RESOURCE_STATES state, const char *context) {
   }
 }
 
+static WMTPixelFormat
+ResolveDepthStencilViewFormat(WMT::Device device, Resource &resource,
+                              DXGI_FORMAT format);
+
 static TextureViewKey
 CreateRenderTargetView(Resource &resource, const DescriptorRecord &descriptor) {
   auto *texture = resource.GetTexture();
@@ -431,7 +435,8 @@ CreateRenderTargetView(Resource &resource, const DescriptorRecord &descriptor) {
 }
 
 static TextureViewKey
-CreateDepthStencilView(Resource &resource, const DescriptorRecord &descriptor) {
+CreateDepthStencilView(WMT::Device device, Resource &resource,
+                       const DescriptorRecord &descriptor) {
   auto *texture = resource.GetTexture();
   if (!texture)
     return {};
@@ -447,6 +452,10 @@ CreateDepthStencilView(Resource &resource, const DescriptorRecord &descriptor) {
 
   if (descriptor.has_desc) {
     const auto &dsv = descriptor.desc.dsv;
+    view.format = ResolveDepthStencilViewFormat(device, resource, dsv.Format);
+    if (view.format == WMTPixelFormatInvalid)
+      return {};
+
     switch (dsv.ViewDimension) {
     case D3D12_DSV_DIMENSION_TEXTURE2D:
       view.firstMiplevel = dsv.Texture2D.MipSlice;
@@ -603,6 +612,10 @@ ResolveTextureViewFormat(WMT::Device device, Resource &resource,
     return texture->pixelFormat();
   if (DepthStencilPlanarFlags(texture->pixelFormat())) {
     switch (format) {
+    case DXGI_FORMAT_R16_UNORM:
+      if (texture->pixelFormat() == WMTPixelFormatDepth16Unorm)
+        return texture->pixelFormat();
+      break;
     case DXGI_FORMAT_R32_FLOAT:
       if (texture->pixelFormat() == WMTPixelFormatDepth32Float)
         return texture->pixelFormat();
@@ -616,6 +629,25 @@ ResolveTextureViewFormat(WMT::Device device, Resource &resource,
   if (FAILED(MTLQueryDXGIFormat(device, format, format_desc)) ||
       format_desc.PixelFormat == WMTPixelFormatInvalid) {
     WARN("D3D12CommandQueue: unsupported texture view format ",
+         uint32_t(format));
+    return WMTPixelFormatInvalid;
+  }
+  return format_desc.PixelFormat;
+}
+
+static WMTPixelFormat
+ResolveDepthStencilViewFormat(WMT::Device device, Resource &resource,
+                              DXGI_FORMAT format) {
+  auto *texture = resource.GetTexture();
+  if (!texture)
+    return WMTPixelFormatInvalid;
+  if (format == DXGI_FORMAT_UNKNOWN)
+    return texture->pixelFormat();
+
+  MTL_DXGI_FORMAT_DESC format_desc = {};
+  if (FAILED(MTLQueryDXGIFormat(device, format, format_desc)) ||
+      !DepthStencilPlanarFlags(format_desc.PixelFormat)) {
+    WARN("D3D12CommandQueue: unsupported DSV texture view format ",
          uint32_t(format));
     return WMTPixelFormatInvalid;
   }
@@ -4047,7 +4079,8 @@ private:
     if (state.depth_stencil) {
       auto *resource = GetResource(state.depth_stencil->resource.ptr());
       if (resource && resource->GetTexture()) {
-        auto view = CreateDepthStencilView(*resource, *state.depth_stencil);
+        auto view = CreateDepthStencilView(device_->GetMTLDevice(), *resource,
+                                           *state.depth_stencil);
         auto *texture = resource->GetTexture();
         attachments.depth_stencil = ReplayDepthStencilAttachment{
             .texture = texture,
@@ -4706,7 +4739,8 @@ private:
       return;
 
     Rc<Texture> texture = resource->GetTexture();
-    auto view = CreateDepthStencilView(*resource, record.descriptor);
+    auto view = CreateDepthStencilView(device_->GetMTLDevice(), *resource,
+                                       record.descriptor);
     const UINT array_length = GetDepthStencilArrayLength(record.descriptor);
     unsigned flags = 0;
     if (record.flags & D3D12_CLEAR_FLAG_DEPTH)

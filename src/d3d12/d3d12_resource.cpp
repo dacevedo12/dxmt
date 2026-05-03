@@ -59,6 +59,21 @@ GetTextureUsage(D3D12_RESOURCE_FLAGS flags) {
   return usage;
 }
 
+DXGI_FORMAT
+ResolveTextureBackingFormat(const D3D12_RESOURCE_DESC &desc) {
+  if (!(desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL))
+    return desc.Format;
+
+  switch (desc.Format) {
+  case DXGI_FORMAT_R16_TYPELESS:
+    return DXGI_FORMAT_D16_UNORM;
+  case DXGI_FORMAT_R32_TYPELESS:
+    return DXGI_FORMAT_D32_FLOAT;
+  default:
+    return desc.Format;
+  }
+}
+
 WMTTextureType
 GetTextureType(const D3D12_RESOURCE_DESC &desc) {
   if (desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D)
@@ -824,7 +839,7 @@ private:
   void CreateTexture() {
     MTL_DXGI_FORMAT_DESC format = {};
     if (FAILED(MTLQueryDXGIFormat(device_->GetDXMTDevice().device(),
-                                  desc_.Format, format)))
+                                  ResolveTextureBackingFormat(desc_), format)))
       return;
 
     WMTTextureInfo info = {};

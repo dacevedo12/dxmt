@@ -85,6 +85,18 @@ HasFormatCapability(FormatCapability caps, FormatCapability cap) {
   return (static_cast<int>(caps) & static_cast<int>(cap)) != 0;
 }
 
+static DXGI_FORMAT
+ResolveDepthTypelessFormatForD3D12Caps(DXGI_FORMAT format) {
+  switch (format) {
+  case DXGI_FORMAT_R16_TYPELESS:
+    return DXGI_FORMAT_D16_UNORM;
+  case DXGI_FORMAT_R32_TYPELESS:
+    return DXGI_FORMAT_D32_FLOAT;
+  default:
+    return format;
+  }
+}
+
 static FormatCapability
 GetD3D12FormatCapability(WMT::Device device,
                          const MTL_DXGI_FORMAT_DESC &format) {
@@ -781,7 +793,9 @@ public:
         return E_INVALIDARG;
 
       MTL_DXGI_FORMAT_DESC format = {};
-      if (FAILED(MTLQueryDXGIFormat(device_->device(), data->Format, format))) {
+      const auto query_format =
+          ResolveDepthTypelessFormatForD3D12Caps(data->Format);
+      if (FAILED(MTLQueryDXGIFormat(device_->device(), query_format, format))) {
         WARN("D3D12Device: CheckFeatureSupport(MSAA) unsupported format ",
              data->Format);
         return S_OK;
