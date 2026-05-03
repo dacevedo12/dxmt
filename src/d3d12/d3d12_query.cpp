@@ -110,7 +110,7 @@ public:
     }
     auto &query = queries_[index];
     query.timestamp = new TimestampQuery();
-    query.timestamp->issue(++timestamp_value_);
+    query.timestamp->issue(device_->NextTimestampQueryValue());
     query.valid = true;
     return query.timestamp;
   }
@@ -257,7 +257,6 @@ private:
   ComPrivateData private_data_;
   D3D12_QUERY_HEAP_DESC desc_ = {};
   std::vector<QueryData> queries_;
-  uint64_t timestamp_value_ = 0;
   std::string name_;
 };
 
