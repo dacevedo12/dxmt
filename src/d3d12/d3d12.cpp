@@ -18,6 +18,40 @@ Logger Logger::s_instance("d3d12.log");
 
 namespace dxmt::d3d12 {
 
+MIDL_INTERFACE("e9eb5314-33aa-42b2-a718-d77f58b1f1c7")
+ID3D12SDKConfiguration : public IUnknown {
+  virtual HRESULT STDMETHODCALLTYPE SetSDKVersion(UINT version, const char *path) = 0;
+};
+
+static constexpr GUID CLSID_D3D12SDKConfiguration = {
+    0x7cda6aca, 0xa03e, 0x49c8, {0x94, 0x58, 0x03, 0x34, 0xd2, 0x0e, 0x07, 0xce}};
+static constexpr GUID IID_ID3D12SDKConfiguration = {
+    0xe9eb5314, 0x33aa, 0x42b2, {0xa7, 0x18, 0xd7, 0x7f, 0x58, 0xb1, 0xf1, 0xc7}};
+
+class SDKConfigurationImpl final : public ComObjectWithInitialRef<ID3D12SDKConfiguration> {
+public:
+  HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void **object) {
+    InitReturnPtr(object);
+    if (!object)
+      return E_POINTER;
+
+    if (riid == __uuidof(IUnknown) ||
+        riid == dxmt::d3d12::IID_ID3D12SDKConfiguration) {
+      *object = ref(static_cast<ID3D12SDKConfiguration *>(this));
+      return S_OK;
+    }
+
+    return E_NOINTERFACE;
+  }
+
+  HRESULT STDMETHODCALLTYPE SetSDKVersion(UINT version, const char *path) {
+    Logger::info(str::format(
+        "D3D12SDKConfiguration: accepting SDK version request version=",
+        version, ", path=", path ? path : "<null>"));
+    return S_OK;
+  }
+};
+
 SupportGateResult
 CheckSupportGate(WMT::Device device) {
   SupportGateResult result = {
@@ -148,6 +182,24 @@ D3D12GetDebugInterface(REFIID riid, void **debug) {
   dxmt::Logger::warn(dxmt::str::format(
       "D3D12GetDebugInterface: debug layer is not supported for riid ",
       dxmt::str::format(riid)));
+  return E_NOINTERFACE;
+}
+
+extern "C" HRESULT __stdcall
+D3D12GetInterface(REFCLSID clsid, REFIID riid, void **object) {
+  dxmt::InitReturnPtr(object);
+  if (!object)
+    return E_POINTER;
+
+  if (clsid == dxmt::d3d12::CLSID_D3D12SDKConfiguration) {
+    auto configuration =
+        dxmt::Com<IUnknown>::transfer(new dxmt::d3d12::SDKConfigurationImpl());
+    return configuration->QueryInterface(riid, object);
+  }
+
+  dxmt::Logger::warn(dxmt::str::format(
+      "D3D12GetInterface: unsupported class ", dxmt::str::format(clsid),
+      ", riid ", dxmt::str::format(riid)));
   return E_NOINTERFACE;
 }
 
