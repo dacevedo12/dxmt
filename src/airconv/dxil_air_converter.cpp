@@ -845,23 +845,23 @@ llvm::AtomicRMWInst::BinOp
 AtomicOpFromDxil(uint32_t op) {
   switch (op) {
   case 0:
-    return llvm::AtomicRMWInst::Xchg;
-  case 1:
     return llvm::AtomicRMWInst::Add;
-  case 2:
+  case 1:
     return llvm::AtomicRMWInst::And;
-  case 3:
+  case 2:
     return llvm::AtomicRMWInst::Or;
-  case 4:
+  case 3:
     return llvm::AtomicRMWInst::Xor;
-  case 5:
+  case 4:
     return llvm::AtomicRMWInst::Min;
-  case 6:
+  case 5:
     return llvm::AtomicRMWInst::Max;
-  case 7:
+  case 6:
     return llvm::AtomicRMWInst::UMin;
-  case 8:
+  case 7:
     return llvm::AtomicRMWInst::UMax;
+  case 8:
+    return llvm::AtomicRMWInst::Xchg;
   default:
     return llvm::AtomicRMWInst::Add;
   }
@@ -1283,7 +1283,7 @@ LowerDxilCall(const CallBase &call, DxilAirContext &ctx,
                                 OperandValue(call, 8, ctx)},
                                ctx);
     ctx.air.CreateWrite(texture, texture_handle, coord, array_index, nullptr,
-                        nullptr, value);
+                        ctx.builder.getInt32(0), value);
     return Error::success();
   }
   if (name.starts_with("Sample")) {
@@ -1380,14 +1380,14 @@ LowerDxilCall(const CallBase &call, DxilAirContext &ctx,
     }
 
     auto *ptr = GetBufferPointer(handle, true, ctx);
-    if (!ptr)
+    const auto *buffer_resource =
+        FindResource(ctx.translation, handle.resource_class, handle.range_id);
+    if (!ptr || !buffer_resource)
       return UnsupportedDxilCall(call, "atomic without resolved UAV handle", ctx);
-    auto *offset = name == "AtomicBinOp" ? OperandValue(call, 3, ctx)
-                                         : OperandValue(call, 2, ctx);
-    if (!offset)
-      offset = ctx.builder.getInt32(0);
     auto *pointee = cast<PointerType>(ptr->getType())->getNonOpaquePointerElementType();
-    auto *word_index = ctx.builder.CreateLShr(offset, 2);
+    auto *word_index = name == "AtomicBinOp"
+                           ? BufferWordIndex(*buffer_resource, call, 3, 4, ctx)
+                           : BufferWordIndex(*buffer_resource, call, 2, 3, ctx);
     auto *gep = ctx.builder.CreateGEP(pointee, ptr, word_index);
     Value *value = nullptr;
     if (name == "AtomicCompareExchange") {
