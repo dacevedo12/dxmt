@@ -411,22 +411,12 @@ using DeviceComBase = ID3D12Device2;
 using DeviceComBase = ID3D12Device1;
 #endif
 
-static void
-SignalWin32Event(HANDLE event) {
-  if (!event)
-    return;
-#ifdef _WIN32
-  ::SetEvent(event);
-#else
-  WARN("D3D12Device: SetEventOnMultipleFenceCompletion cannot signal native "
-       "Win32 event handles");
-#endif
-}
-
 class DeviceImpl final : public ComObjectWithInitialRef<IMTLD3D12Device, DeviceComBase> {
 public:
   DeviceImpl(std::unique_ptr<dxmt::Device> &&device, IMTLDXGIAdapter *adapter)
       : adapter_(adapter), device_(std::move(device)) {
+    enqueue_set_event_signal_ = device_->device().newSharedEvent();
+    multiple_fence_wait_signal_ = device_->device().newSharedEvent();
     DXGI_ADAPTER_DESC adapter_desc = {};
     if (SUCCEEDED(adapter_->GetDesc(&adapter_desc)))
       adapter_luid_ = adapter_desc.AdapterLuid;
@@ -580,7 +570,19 @@ public:
   }
 
   HRESULT STDMETHODCALLTYPE EnqueueSetEvent(HANDLE event) override {
-    return E_FAIL;
+    if (!event)
+      return E_INVALIDARG;
+    auto &queue = device_->queue();
+    auto signal = enqueue_set_event_signal_;
+    auto value = ++enqueue_set_event_value_;
+    MTLSharedEvent_setWin32EventAtValue(
+        signal.handle, queue.GetSharedEventListener(), event, value);
+    queue.CurrentChunk()->emitcc([signal = std::move(signal), value](
+                                    ArgumentEncodingContext &enc) mutable {
+      enc.signalEvent(std::move(signal), value);
+    });
+    queue.CommitCurrentChunk();
+    return S_OK;
   }
 
   void STDMETHODCALLTYPE Trim() override {}
@@ -1463,7 +1465,12 @@ public:
     };
 
     if (completed()) {
-      SignalWin32Event(event);
+      if (event) {
+        auto signal = device_->device().newSharedEvent();
+        MTLSharedEvent_setWin32EventAtValue(
+            signal.handle, device_->queue().GetSharedEventListener(), event, 1);
+        signal.signalValue(1);
+      }
       return S_OK;
     }
 
@@ -1473,8 +1480,15 @@ public:
       return S_OK;
     }
 
+    auto signal = multiple_fence_wait_signal_;
+    auto signal_value = ++multiple_fence_wait_value_;
+    MTLSharedEvent_setWin32EventAtValue(
+        signal.handle, device_->queue().GetSharedEventListener(), event,
+        signal_value);
+
     dxmt::thread([wait_fences = std::move(wait_fences),
-                  wait_values = std::move(wait_values), flags, event]() {
+                  wait_values = std::move(wait_values), flags,
+                  signal = std::move(signal), signal_value]() mutable {
       auto completed = [&]() {
         if (flags & D3D12_MULTIPLE_FENCE_WAIT_FLAG_ANY) {
           for (size_t i = 0; i < wait_fences.size(); i++) {
@@ -1493,7 +1507,7 @@ public:
 
       while (!completed())
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
-      SignalWin32Event(event);
+      signal.signalValue(signal_value);
     }).detach();
 
     return S_OK;
@@ -1900,11 +1914,15 @@ private:
   Com<IMTLDXGIAdapter> adapter_;
   std::unique_ptr<dxmt::Device> device_;
   ComPrivateData private_data_;
+  WMT::Reference<WMT::SharedEvent> enqueue_set_event_signal_;
+  WMT::Reference<WMT::SharedEvent> multiple_fence_wait_signal_;
   D3DKMT_HANDLE local_kmt_ = 0;
   LUID adapter_luid_ = {};
   UINT maximum_frame_latency_ = 3;
   INT gpu_thread_priority_ = 0;
   uint64_t timestamp_query_value_ = 0;
+  uint64_t enqueue_set_event_value_ = 0;
+  uint64_t multiple_fence_wait_value_ = 0;
   std::string name_;
 };
 
