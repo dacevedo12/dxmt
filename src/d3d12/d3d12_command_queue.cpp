@@ -4563,7 +4563,6 @@ private:
       UINT64 byte_size = resource->GetResourceDesc().Width;
       uint64_t view_id = 0;
       bool raw_buffer = false;
-      bool raw_fallback = false;
 
       if (record.descriptor.has_desc &&
           record.descriptor.desc.uav.ViewDimension ==
@@ -4571,13 +4570,9 @@ private:
         const auto &uav = record.descriptor.desc.uav;
         const UINT64 first_element = uav.Buffer.FirstElement;
         if (uav.Buffer.Flags & D3D12_BUFFER_UAV_FLAG_RAW) {
-          raw_fallback = true;
+          raw_buffer = true;
           offset += first_element * sizeof(uint32_t);
           byte_size = UINT64(uav.Buffer.NumElements) * sizeof(uint32_t);
-          view_id = CreateBufferView(device_->GetMTLDevice(), *resource,
-                                     DXGI_FORMAT_R32_UINT, offset, byte_size,
-                                     WMTTextureUsageShaderRead |
-                                         WMTTextureUsageShaderWrite);
         } else if (uav.Format != DXGI_FORMAT_UNKNOWN) {
           MTL_DXGI_FORMAT_DESC format = {};
           if (SUCCEEDED(MTLQueryDXGIFormat(device_->GetMTLDevice(),
@@ -4607,9 +4602,6 @@ private:
         raw_buffer = true;
       }
 
-      if (!view_id && raw_fallback)
-        raw_buffer = true;
-
       if (!view_id && !raw_buffer) {
         WARN("D3D12CommandQueue: ClearUnorderedAccessView buffer view is unsupported");
         return;
@@ -4624,13 +4616,21 @@ private:
                      integer = record.integer,
                      uint_values = record.uint_values,
                      float_values = record.float_values,
-                     element_count](ArgumentEncodingContext &enc) mutable {
+                     byte_offset = offset,
+                     byte_size, element_count](ArgumentEncodingContext &enc) mutable {
         if (raw_buffer) {
+          enc.startComputePass(0);
+          auto [allocation, suballocation_offset] =
+              enc.access(buffer, byte_offset, byte_size, ResourceAccess::Write);
           if (integer)
-            enc.clear_res_cmd.begin(uint_values, Rc<Buffer>(buffer), true);
+            enc.emulated_cmd.ClearBufferUint(allocation->buffer(),
+                                             suballocation_offset + byte_offset,
+                                             element_count, uint_values);
           else
-            enc.clear_res_cmd.begin(float_values, Rc<Buffer>(buffer), false);
-          enc.clear_res_cmd.clear(0, 0, element_count, 1);
+            enc.emulated_cmd.ClearBufferFloat(allocation->buffer(),
+                                               suballocation_offset + byte_offset,
+                                               element_count, float_values);
+          enc.endPass();
         } else {
           if (integer)
             enc.clear_res_cmd.begin(uint_values, Rc<Buffer>(buffer), view_id);
