@@ -336,6 +336,7 @@ public:
   Value *CreateFPUnOp(FPUnOp Op, Value *Operand, bool FastVariant = true);
 
   Value *CreateIsNaN(Value *Operand);
+  Value *CreateIsInf(Value *Operand);
 
   enum FPBinOp {
     fmax,

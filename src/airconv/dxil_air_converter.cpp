@@ -74,6 +74,7 @@ struct DxilAirContext {
   std::unordered_map<const Value *, Value *> values;
   std::unordered_map<const GlobalVariable *, GlobalVariable *> globals;
   std::unordered_map<const BasicBlock *, BasicBlock *> blocks;
+  std::unordered_map<const BasicBlock *, BasicBlock *> block_exits;
   std::unordered_map<const Value *, DxilResourceHandle> handles;
   std::map<uint32_t, uint32_t> input_args;
   std::map<uint32_t, uint32_t> output_indices;
@@ -419,6 +420,13 @@ ZeroValue(Type *type) {
   if (type->isVoidTy())
     return nullptr;
   return Constant::getNullValue(type);
+}
+
+Value *
+ExtendDxilBool(Value *value, Type *target_type, DxilAirContext &ctx) {
+  if (!value || value->getType() == target_type)
+    return value;
+  return ctx.builder.CreateSExt(value, target_type);
 }
 
 Value *
@@ -1202,7 +1210,9 @@ BuildDxilMath(const CallBase &call, std::string_view name, DxilAirContext &ctx) 
   if (name == "Round_z")
     return ctx.air.CreateFPUnOp(llvm::air::AIRBuilder::trunc, a);
   if (name == "IsNaN")
-    return ctx.builder.CreateSExt(ctx.air.CreateIsNaN(a), MapType(call.getType(), ctx));
+    return ExtendDxilBool(ctx.air.CreateIsNaN(a), MapType(call.getType(), ctx), ctx);
+  if (name == "IsInf")
+    return ExtendDxilBool(ctx.air.CreateIsInf(a), MapType(call.getType(), ctx), ctx);
   if (name == "Bfrev")
     return ctx.air.CreateIntUnOp(llvm::air::AIRBuilder::reverse_bits, a);
   if (name == "Countbits")
@@ -1847,6 +1857,13 @@ BuildPhiNodes(const Function &source, DxilAirContext &ctx) {
 
 void
 PatchPhiNodes(const Function &source, DxilAirContext &ctx) {
+  auto resolve_block = [&](const BasicBlock *block) -> BasicBlock * {
+    auto mapped = ctx.block_exits.find(block);
+    if (mapped != ctx.block_exits.end())
+      return mapped->second;
+    return ctx.blocks.at(block);
+  };
+
   for (const auto &block : source) {
     for (const auto &instruction : block) {
       const auto *phi = dyn_cast<PHINode>(&instruction);
@@ -1855,7 +1872,7 @@ PatchPhiNodes(const Function &source, DxilAirContext &ctx) {
       auto *mapped = cast<PHINode>(ctx.values[phi]);
       for (uint32_t i = 0; i < phi->getNumIncomingValues(); i++)
         mapped->addIncoming(MapValue(phi->getIncomingValue(i), ctx),
-                            ctx.blocks[phi->getIncomingBlock(i)]);
+                            resolve_block(phi->getIncomingBlock(i)));
     }
   }
 }
@@ -2141,6 +2158,7 @@ LowerFunction(const Function &source, DxilAirContext &ctx) {
       return Unsupported("DXIL basic block without terminator");
     if (auto err = LowerTerminator(*terminator, ctx, current_return))
       return err;
+    ctx.block_exits[&block] = ctx.builder.GetInsertBlock();
   }
 
   PatchPhiNodes(source, ctx);

@@ -1722,6 +1722,43 @@ AIRBuilder::CreateIsNaN(Value *Operand) {
 }
 
 Value *
+AIRBuilder::CreateIsInf(Value *Operand) {
+  auto OperandType = Operand->getType();
+  auto ScalarType = OperandType->getScalarType();
+
+  unsigned BitWidth = 0;
+  uint64_t AbsMask = 0;
+  uint64_t InfBits = 0;
+  if (ScalarType->isHalfTy()) {
+    BitWidth = 16;
+    AbsMask = 0x7c00u | 0x03ffu;
+    InfBits = 0x7c00u;
+  } else if (ScalarType->isFloatTy()) {
+    BitWidth = 32;
+    AbsMask = 0x7f800000u | 0x007fffffu;
+    InfBits = 0x7f800000u;
+  } else if (ScalarType->isDoubleTy()) {
+    BitWidth = 64;
+    AbsMask = 0x7ff0000000000000ull | 0x000fffffffffffffull;
+    InfBits = 0x7ff0000000000000ull;
+  } else {
+    debug << "invalid operation: isinf operand must be floating point.\n";
+    return nullptr;
+  }
+
+  llvm::Type *TyCast = llvm::IntegerType::get(getContext(), BitWidth);
+  llvm::Value *BitsAbs = llvm::ConstantInt::get(TyCast, AbsMask);
+  llvm::Value *BitsInf = llvm::ConstantInt::get(TyCast, InfBits);
+  if (auto *TyVec = dyn_cast<llvm::FixedVectorType>(OperandType)) {
+    auto ElementCount = TyVec->getNumElements();
+    TyCast = llvm::FixedVectorType::get(TyCast, ElementCount);
+    BitsAbs = builder.CreateVectorSplat(ElementCount, BitsAbs);
+    BitsInf = builder.CreateVectorSplat(ElementCount, BitsInf);
+  }
+  return builder.CreateICmpEQ(builder.CreateAnd(builder.CreateBitCast(Operand, TyCast), BitsAbs), BitsInf);
+}
+
+Value *
 AIRBuilder::CreateFPBinOp(FPBinOp Op, Value *LHS, Value *RHS, bool FastVariant) {
   static char const *FnNames[] = {
       "fmax",
