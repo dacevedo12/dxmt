@@ -1201,6 +1201,8 @@ BuildDxilMath(const CallBase &call, std::string_view name, DxilAirContext &ctx) 
     return ctx.air.CreateFPUnOp(llvm::air::AIRBuilder::log2, a);
   if (name == "Frc")
     return ctx.air.CreateFPUnOp(llvm::air::AIRBuilder::fract, a);
+  if (name == "Saturate")
+    return ctx.air.CreateFPUnOp(llvm::air::AIRBuilder::saturate, a);
   if (name == "Round_ne")
     return ctx.air.CreateFPUnOp(llvm::air::AIRBuilder::rint, a);
   if (name == "Round_ni")
