@@ -14,6 +14,48 @@
 namespace dxmt::d3d12 {
 namespace {
 
+#ifdef __ID3D12GraphicsCommandList4_INTERFACE_DEFINED__
+static bool
+IsRenderPassPreserveOrNoAccess(D3D12_RENDER_PASS_BEGINNING_ACCESS_TYPE type) {
+  return type == D3D12_RENDER_PASS_BEGINNING_ACCESS_TYPE_PRESERVE ||
+         type == D3D12_RENDER_PASS_BEGINNING_ACCESS_TYPE_NO_ACCESS;
+}
+
+static bool
+IsRenderPassPreserveOrNoAccess(D3D12_RENDER_PASS_ENDING_ACCESS_TYPE type) {
+  return type == D3D12_RENDER_PASS_ENDING_ACCESS_TYPE_PRESERVE ||
+         type == D3D12_RENDER_PASS_ENDING_ACCESS_TYPE_NO_ACCESS;
+}
+
+static UINT
+RenderPassMipLevel(const D3D12_RESOURCE_DESC &desc, UINT subresource) {
+  const UINT mip_levels = desc.MipLevels ? desc.MipLevels : 1;
+  return mip_levels ? subresource % mip_levels : 0;
+}
+
+static bool
+IsFullSubresourceRect(ID3D12Resource *resource, UINT subresource,
+                      const D3D12_RECT &rect) {
+  if (!resource)
+    return false;
+
+  auto *d3d12_resource = dynamic_cast<Resource *>(resource);
+  if (!d3d12_resource)
+    return false;
+
+  const auto &desc = d3d12_resource->GetResourceDesc();
+  if (desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER)
+    return false;
+
+  const UINT mip = RenderPassMipLevel(desc, subresource);
+  const LONG width = static_cast<LONG>(std::max<UINT64>(1, desc.Width >> mip));
+  const LONG height =
+      static_cast<LONG>(std::max<UINT64>(1, desc.Height >> mip));
+  return rect.left == 0 && rect.top == 0 && rect.right == width &&
+         rect.bottom == height;
+}
+#endif
+
 StoredTextureCopyLocation
 StoreTextureCopyLocation(const D3D12_TEXTURE_COPY_LOCATION &location) {
   StoredTextureCopyLocation stored = {};
@@ -678,6 +720,16 @@ public:
       const D3D12_RENDER_PASS_RENDER_TARGET_DESC *render_targets,
       const D3D12_RENDER_PASS_DEPTH_STENCIL_DESC *depth_stencil,
       D3D12_RENDER_PASS_FLAGS flags) override {
+    pending_render_pass_resolves_.clear();
+    if (flags & ~(D3D12_RENDER_PASS_FLAG_NONE |
+                  D3D12_RENDER_PASS_FLAG_ALLOW_UAV_WRITES)) {
+      // TODO(d3d12): model suspended/resumed render passes instead of
+      // flattening them into ordinary target binds.
+      WARN("D3D12GraphicsCommandList: suspended/resumed render passes are "
+           "unsupported");
+      return;
+    }
+
     RenderTargetsRecord record = {};
     if (render_targets && render_targets_count) {
       record.render_targets.reserve(render_targets_count);
@@ -693,9 +745,24 @@ public:
         record.depth_stencil = *descriptor;
     }
     AddRecord(std::move(record));
+
+    if (render_targets && render_targets_count) {
+      for (UINT i = 0; i < render_targets_count; i++)
+        AddRenderPassRenderTargetAccess(render_targets[i]);
+    }
+
+    if (depth_stencil)
+      AddRenderPassDepthStencilAccess(*depth_stencil);
   }
 
-  void STDMETHODCALLTYPE EndRenderPass() override {}
+  void STDMETHODCALLTYPE EndRenderPass() override {
+    for (const auto &resolve : pending_render_pass_resolves_) {
+      AddRecord(ResolveSubresourceRecord{
+          resolve.dst, resolve.dst_subresource, resolve.src,
+          resolve.src_subresource, resolve.format});
+    }
+    pending_render_pass_resolves_.clear();
+  }
 
   void STDMETHODCALLTYPE InitializeMetaCommand(
       ID3D12MetaCommand *meta_command,
@@ -776,6 +843,148 @@ private:
     records_.push_back(CommandRecord{std::forward<T>(payload)});
   }
 
+#ifdef __ID3D12GraphicsCommandList4_INTERFACE_DEFINED__
+  void AddRenderPassRenderTargetAccess(
+      const D3D12_RENDER_PASS_RENDER_TARGET_DESC &render_target) {
+    auto *descriptor = GetDescriptorRecordFromCpuHandle(render_target.cpuDescriptor);
+    if (!descriptor)
+      return;
+
+    switch (render_target.BeginningAccess.Type) {
+    case D3D12_RENDER_PASS_BEGINNING_ACCESS_TYPE_CLEAR: {
+      ClearRenderTargetRecord clear = {};
+      clear.descriptor = *descriptor;
+      std::copy(std::begin(render_target.BeginningAccess.Clear.ClearValue.Color),
+                std::end(render_target.BeginningAccess.Clear.ClearValue.Color),
+                clear.color.begin());
+      AddRecord(std::move(clear));
+      break;
+    }
+    case D3D12_RENDER_PASS_BEGINNING_ACCESS_TYPE_DISCARD:
+      AddRenderPassDiscard(*descriptor);
+      break;
+    default:
+      if (!IsRenderPassPreserveOrNoAccess(render_target.BeginningAccess.Type))
+        WARN("D3D12GraphicsCommandList: unsupported render pass RTV beginning "
+             "access type ",
+             render_target.BeginningAccess.Type);
+      break;
+    }
+
+    AddRenderPassEndingAccess(render_target.EndingAccess);
+  }
+
+  void AddRenderPassDepthStencilAccess(
+      const D3D12_RENDER_PASS_DEPTH_STENCIL_DESC &depth_stencil) {
+    auto *descriptor = GetDescriptorRecordFromCpuHandle(depth_stencil.cpuDescriptor);
+    if (!descriptor)
+      return;
+
+    ClearDepthStencilRecord clear = {};
+    clear.descriptor = *descriptor;
+    clear.flags = D3D12_CLEAR_FLAGS(0);
+    if (depth_stencil.DepthBeginningAccess.Type ==
+        D3D12_RENDER_PASS_BEGINNING_ACCESS_TYPE_CLEAR) {
+      clear.flags =
+          static_cast<D3D12_CLEAR_FLAGS>(clear.flags | D3D12_CLEAR_FLAG_DEPTH);
+      clear.depth =
+          depth_stencil.DepthBeginningAccess.Clear.ClearValue.DepthStencil.Depth;
+    } else if (depth_stencil.DepthBeginningAccess.Type ==
+               D3D12_RENDER_PASS_BEGINNING_ACCESS_TYPE_DISCARD) {
+      AddRenderPassDiscard(*descriptor);
+    } else if (!IsRenderPassPreserveOrNoAccess(
+                   depth_stencil.DepthBeginningAccess.Type)) {
+      WARN("D3D12GraphicsCommandList: unsupported render pass depth beginning "
+           "access type ",
+           depth_stencil.DepthBeginningAccess.Type);
+    }
+
+    if (depth_stencil.StencilBeginningAccess.Type ==
+        D3D12_RENDER_PASS_BEGINNING_ACCESS_TYPE_CLEAR) {
+      clear.flags =
+          static_cast<D3D12_CLEAR_FLAGS>(clear.flags | D3D12_CLEAR_FLAG_STENCIL);
+      clear.stencil =
+          depth_stencil.StencilBeginningAccess.Clear.ClearValue.DepthStencil.Stencil;
+    } else if (depth_stencil.StencilBeginningAccess.Type ==
+               D3D12_RENDER_PASS_BEGINNING_ACCESS_TYPE_DISCARD) {
+      AddRenderPassDiscard(*descriptor);
+    } else if (!IsRenderPassPreserveOrNoAccess(
+                   depth_stencil.StencilBeginningAccess.Type)) {
+      WARN("D3D12GraphicsCommandList: unsupported render pass stencil "
+           "beginning access type ",
+           depth_stencil.StencilBeginningAccess.Type);
+    }
+
+    if (clear.flags != D3D12_CLEAR_FLAGS(0))
+      AddRecord(std::move(clear));
+
+    AddRenderPassEndingAccess(depth_stencil.DepthEndingAccess);
+    AddRenderPassEndingAccess(depth_stencil.StencilEndingAccess);
+  }
+
+  void AddRenderPassDiscard(const DescriptorRecord &descriptor) {
+    if (!descriptor.resource)
+      return;
+    DiscardResourceRecord discard = {};
+    discard.resource = descriptor.resource.ptr();
+    AddRecord(std::move(discard));
+  }
+
+  void AddRenderPassEndingAccess(
+      const D3D12_RENDER_PASS_ENDING_ACCESS &ending_access) {
+    switch (ending_access.Type) {
+    case D3D12_RENDER_PASS_ENDING_ACCESS_TYPE_RESOLVE:
+      AddRenderPassResolve(ending_access.Resolve);
+      break;
+    case D3D12_RENDER_PASS_ENDING_ACCESS_TYPE_DISCARD:
+      // D3D12 render-pass discard only says prior contents do not need to be
+      // preserved after the pass. The current backend has no end-store action,
+      // so this remains a conservative no-op.
+      break;
+    default:
+      if (!IsRenderPassPreserveOrNoAccess(ending_access.Type))
+        WARN("D3D12GraphicsCommandList: unsupported render pass ending access "
+             "type ",
+             ending_access.Type);
+      break;
+    }
+  }
+
+  void AddRenderPassResolve(
+      const D3D12_RENDER_PASS_ENDING_ACCESS_RESOLVE_PARAMETERS &resolve) {
+    if (!resolve.pSrcResource || !resolve.pDstResource ||
+        !resolve.SubresourceCount || !resolve.pSubresourceParameters)
+      return;
+
+    if (resolve.ResolveMode != D3D12_RESOLVE_MODE_AVERAGE ||
+        !resolve.PreserveResolveSource) {
+      // TODO(d3d12): support MIN/MAX/decompress resolves and non-preserving
+      // source discard semantics without silently changing render-pass meaning.
+      WARN("D3D12GraphicsCommandList: render pass resolve mode/source discard "
+           "is unsupported");
+      return;
+    }
+
+    for (UINT i = 0; i < resolve.SubresourceCount; i++) {
+      const auto &subresource = resolve.pSubresourceParameters[i];
+      if (subresource.DstX || subresource.DstY ||
+          !IsFullSubresourceRect(resolve.pSrcResource,
+                                 subresource.SrcSubresource,
+                                 subresource.SrcRect)) {
+        // TODO(d3d12): lower partial render-pass resolves once
+        // ResolveSubresourceRegion has real region support.
+        WARN("D3D12GraphicsCommandList: partial render pass resolves are "
+             "unsupported");
+        continue;
+      }
+      pending_render_pass_resolves_.push_back(PendingRenderPassResolve{
+          resolve.pSrcResource, resolve.pDstResource,
+          subresource.SrcSubresource, subresource.DstSubresource,
+          resolve.Format});
+    }
+  }
+#endif
+
   Com<IMTLD3D12Device> device_;
   UINT node_mask_;
   D3D12_COMMAND_LIST_TYPE type_;
@@ -792,6 +1001,7 @@ private:
   UINT sample_position_pixel_count_ = 0;
   std::vector<D3D12_SAMPLE_POSITION> sample_positions_;
   UINT view_instance_mask_ = 0xffffffffu;
+  std::vector<PendingRenderPassResolve> pending_render_pass_resolves_;
   bool closed_ = false;
   bool submitted_ = false;
   std::string name_;

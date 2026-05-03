@@ -82,6 +82,14 @@ struct ResolveSubresourceRecord {
   DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
 };
 
+struct PendingRenderPassResolve {
+  Com<ID3D12Resource> src;
+  Com<ID3D12Resource> dst;
+  UINT src_subresource = 0;
+  UINT dst_subresource = 0;
+  DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
+};
+
 struct WriteBufferImmediateRecord {
   std::vector<D3D12_WRITEBUFFERIMMEDIATE_PARAMETER> parameters;
   std::vector<D3D12_WRITEBUFFERIMMEDIATE_MODE> modes;
