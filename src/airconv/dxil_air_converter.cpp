@@ -316,6 +316,11 @@ MapType(Type *source, DxilAirContext &ctx);
 
 Value *
 MapConstant(const Constant *constant, DxilAirContext &ctx) {
+  if (const auto *global = dyn_cast<GlobalVariable>(constant)) {
+    auto found = ctx.globals.find(global);
+    if (found != ctx.globals.end())
+      return found->second;
+  }
   if (const auto *integer = dyn_cast<ConstantInt>(constant))
     return ConstantInt::get(MapType(integer->getType(), ctx),
                             integer->getValue());
@@ -338,8 +343,18 @@ MapConstant(const Constant *constant, DxilAirContext &ctx) {
     return ConstantVector::get(elements);
   }
   if (const auto *constant_expr = dyn_cast<ConstantExpr>(constant)) {
+    if (constant_expr->getOpcode() == Instruction::GetElementPtr) {
+      SmallVector<Value *, 8> indices;
+      for (uint32_t i = 1; i < constant_expr->getNumOperands(); i++)
+        indices.push_back(MapConstant(constant_expr->getOperand(i), ctx));
+      auto *base = MapConstant(constant_expr->getOperand(0), ctx);
+      auto *base_type = cast<PointerType>(base->getType())
+                            ->getNonOpaquePointerElementType();
+      return ctx.builder.CreateGEP(
+          base_type, base, indices);
+    }
     if (constant_expr->isCast())
-    return ctx.builder.CreateCast(
+      return ctx.builder.CreateCast(
           static_cast<Instruction::CastOps>(constant_expr->getOpcode()),
           MapConstant(constant_expr->getOperand(0), ctx),
           MapType(constant_expr->getType(), ctx));
@@ -964,10 +979,16 @@ EmitBarrier(const DxilBarrierInfo &info, DxilAirContext &ctx) {
   const bool non_execution_barrier = SupportsNonExecutionBarrier(ctx);
   if (info.mem_flags != llvm::air::MemFlags::None && non_execution_barrier)
     ctx.air.CreateAtomicFence(info.mem_flags, info.scope);
-  if (info.execution_sync)
-    ctx.air.CreateBarrier(non_execution_barrier
-                              ? llvm::air::MemFlags::None
-                              : info.mem_flags);
+  if (info.execution_sync) {
+    auto barrier_flags = info.mem_flags;
+    if (non_execution_barrier) {
+      barrier_flags = HasFlag(uint32_t(info.mem_flags),
+                              uint32_t(llvm::air::MemFlags::Threadgroup))
+                          ? llvm::air::MemFlags::Threadgroup
+                          : llvm::air::MemFlags::None;
+    }
+    ctx.air.CreateBarrier(barrier_flags);
+  }
 }
 
 Value *
