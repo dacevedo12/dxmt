@@ -105,6 +105,9 @@ BufferArgumentFlags(const dxmt::dxil::DxilTranslationResourceInfo &resource,
 }
 
 bool IsBufferResource(const dxmt::dxil::DxilTranslationResourceInfo &resource) {
+  if (resource.resource_kind == 10)
+    return true;
+
   switch (resource.resource_kind) {
   case 1:
   case 2:
@@ -115,7 +118,6 @@ bool IsBufferResource(const dxmt::dxil::DxilTranslationResourceInfo &resource) {
   case 7:
   case 8:
   case 9:
-  case 10:
     return false;
   case 11:
   case 12:

@@ -864,6 +864,11 @@ IsStructuredBuffer(const dxil::DxilTranslationResourceInfo &resource) {
   return resource.resource_kind == 12;
 }
 
+bool
+IsTypedBufferResource(shader::common::ResourceType resource_type) {
+  return resource_type == shader::common::ResourceType::TextureBuffer;
+}
+
 Value *
 BufferWordIndex(const dxil::DxilTranslationResourceInfo &resource,
                 const CallBase &call, uint32_t element_operand,
@@ -1273,10 +1278,12 @@ LowerDxilCall(const CallBase &call, DxilAirContext &ctx,
     auto handle = ResolveHandle(call.getArgOperand(1), ctx);
     const auto *resource =
         FindResource(ctx.translation, handle.resource_class, handle.range_id);
+    if (!resource)
+      return UnsupportedDxilCall(call, "buffer load without resolved resource metadata", ctx);
     auto *ptr = GetBufferPointer(handle,
                                  handle.resource_class == dxil::DxilTranslationResourceClass::Uav,
                                  ctx);
-    if (!ptr || !resource)
+    if (!ptr)
       return UnsupportedDxilCall(call, "buffer load without resolved buffer handle", ctx);
     uint32_t mask = 0xfu;
     if (name == "RawBufferLoad") {
@@ -1828,7 +1835,11 @@ BuildDxilShaderInfoImpl(const dxil::DxilTranslationInfo &translation,
       srv.sampled = resource.sampled;
       srv.structure_stride = resource.element_stride;
       auto attr = GetArgumentIndex(SM50BindingType::SRV, binding_slot);
-      if (resource_type != ResourceType::NonApplicable) {
+      if (IsTypedBufferResource(resource_type)) {
+        srv.arg_index = shader_info.binding_table.DefineBuffer(
+            "t" + std::to_string(range_id), air::AddressSpace::device,
+            air::MemoryAccess::read, air::msl_uint, attr);
+      } else if (resource_type != ResourceType::NonApplicable) {
         srv.arg_index = shader_info.binding_table.DefineTexture(
             "t" + std::to_string(range_id),
             air::to_air_resource_type(resource_type),
@@ -1860,7 +1871,11 @@ BuildDxilShaderInfoImpl(const dxil::DxilTranslationInfo &translation,
       const auto access = uav.written ? (uav.read ? air::MemoryAccess::read_write
                                                   : air::MemoryAccess::write)
                                       : air::MemoryAccess::read;
-      if (resource_type != ResourceType::NonApplicable) {
+      if (IsTypedBufferResource(resource_type)) {
+        uav.arg_index = shader_info.binding_table.DefineBuffer(
+            "u" + std::to_string(range_id), air::AddressSpace::device, access,
+            air::msl_uint, attr);
+      } else if (resource_type != ResourceType::NonApplicable) {
         uav.arg_index = shader_info.binding_table.DefineTexture(
             "u" + std::to_string(range_id),
             air::to_air_resource_type(resource_type), access,

@@ -2895,6 +2895,74 @@ private:
     return std::nullopt;
   }
 
+  static const MTL_SM50_SHADER_ARGUMENT *
+  ResolveShaderBindingArgument(const PipelineState &pipeline,
+                               PipelineStage stage,
+                               SM50BindingType binding_type,
+                               UINT shader_register,
+                               UINT register_space) {
+    const auto *shader = FindShaderForStage(pipeline, stage);
+    if (!shader)
+      return nullptr;
+
+    const auto *arguments =
+        binding_type == SM50BindingType::ConstantBuffer
+            ? shader->constantBufferInfo()
+            : shader->resourceArgumentInfo();
+    const auto argument_count =
+        binding_type == SM50BindingType::ConstantBuffer
+            ? shader->reflection.NumConstantBuffers
+            : shader->reflection.NumArguments;
+    if (!arguments)
+      return nullptr;
+
+    for (UINT i = 0; i < argument_count; i++) {
+      const auto &argument = arguments[i];
+      if (argument.Type != binding_type)
+        continue;
+      const auto lower = argument.RegisterCount ? argument.RegisterLowerBound
+                                                : argument.SM50BindingSlot;
+      const auto space = argument.RegisterCount ? argument.RegisterSpace : 0;
+      const auto count = argument.RegisterCount ? argument.RegisterCount : 1;
+      if (space != register_space || shader_register < lower)
+        continue;
+      const auto index = shader_register - lower;
+      if (count != UINT_MAX && index >= count)
+        continue;
+      return &argument;
+    }
+    return nullptr;
+  }
+
+  static const MTL_SM50_SHADER_ARGUMENT *
+  ResolveShaderBindingArgumentBySlot(const PipelineState &pipeline,
+                                     PipelineStage stage,
+                                     SM50BindingType binding_type,
+                                     UINT binding_slot) {
+    const auto *shader = FindShaderForStage(pipeline, stage);
+    if (!shader)
+      return nullptr;
+
+    const auto *arguments =
+        binding_type == SM50BindingType::ConstantBuffer
+            ? shader->constantBufferInfo()
+            : shader->resourceArgumentInfo();
+    const auto argument_count =
+        binding_type == SM50BindingType::ConstantBuffer
+            ? shader->reflection.NumConstantBuffers
+            : shader->reflection.NumArguments;
+    if (!arguments)
+      return nullptr;
+
+    for (UINT i = 0; i < argument_count; i++) {
+      const auto &argument = arguments[i];
+      if (argument.Type == binding_type &&
+          argument.SM50BindingSlot == binding_slot)
+        return &argument;
+    }
+    return nullptr;
+  }
+
   void BindRootConstants(ArgumentEncodingContext &enc, const ReplayState &state,
                          const PipelineState &pipeline, bool compute,
                          UINT root_index,
@@ -3042,16 +3110,17 @@ private:
 
   void BindDescriptor(ArgumentEncodingContext &enc, PipelineStage stage,
                       D3D12_DESCRIPTOR_RANGE_TYPE range_type, UINT slot,
-                      const DescriptorRecord &descriptor) {
+                      const DescriptorRecord &descriptor,
+                      const MTL_SM50_SHADER_ARGUMENT *argument) {
     switch (range_type) {
     case D3D12_DESCRIPTOR_RANGE_TYPE_CBV:
       BindConstantBufferDescriptor(enc, stage, slot, descriptor);
       break;
     case D3D12_DESCRIPTOR_RANGE_TYPE_SRV:
-      BindShaderResourceDescriptor(enc, stage, slot, descriptor);
+      BindShaderResourceDescriptor(enc, stage, slot, descriptor, argument);
       break;
     case D3D12_DESCRIPTOR_RANGE_TYPE_UAV:
-      BindUnorderedAccessDescriptor(enc, stage, slot, descriptor);
+      BindUnorderedAccessDescriptor(enc, stage, slot, descriptor, argument);
       break;
     case D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER:
       BindSamplerDescriptor(enc, stage, slot, descriptor);
@@ -3105,7 +3174,8 @@ private:
 
   void BindShaderResourceDescriptor(ArgumentEncodingContext &enc,
                                     PipelineStage stage, UINT slot,
-                                    const DescriptorRecord &descriptor) {
+                                    const DescriptorRecord &descriptor,
+                                    const MTL_SM50_SHADER_ARGUMENT *argument) {
     if (descriptor.type != DescriptorRecordType::ShaderResourceView)
       return;
     if (slot >= kSRVBindings) {
@@ -3128,13 +3198,17 @@ private:
       if (descriptor.has_desc) {
         const auto &srv = descriptor.desc.srv;
         if (srv.ViewDimension == D3D12_SRV_DIMENSION_BUFFER) {
+          const bool needs_texture_buffer_view =
+              argument && (argument->Flags & MTL_SM50_SHADER_ARGUMENT_TEXTURE);
           const UINT64 first_element = srv.Buffer.FirstElement;
           if (srv.Buffer.Flags & D3D12_BUFFER_SRV_FLAG_RAW) {
             offset += first_element * sizeof(uint32_t);
             byte_size = UINT64(srv.Buffer.NumElements) * sizeof(uint32_t);
-            view_id = CreateBufferView(device_->GetMTLDevice(), *resource,
-                                       DXGI_FORMAT_R32_UINT, offset,
-                                       byte_size, WMTTextureUsageShaderRead);
+            if (needs_texture_buffer_view) {
+              view_id = CreateBufferView(device_->GetMTLDevice(), *resource,
+                                         DXGI_FORMAT_R32_UINT, offset,
+                                         byte_size, WMTTextureUsageShaderRead);
+            }
             slice = StructuredBufferSlice(*resource, offset, byte_size,
                                           sizeof(uint32_t));
           } else if (srv.Format != DXGI_FORMAT_UNKNOWN) {
@@ -3144,13 +3218,15 @@ private:
               offset += first_element * format.BytesPerTexel;
               byte_size = UINT64(srv.Buffer.NumElements) *
                           format.BytesPerTexel;
-              view_id = CreateBufferView(device_->GetMTLDevice(), *resource,
-                                         srv.Format, offset, byte_size,
-                                         WMTTextureUsageShaderRead);
-              if (!view_id) {
-                WARN("D3D12CommandQueue: typed buffer SRV failed to create Metal texture buffer view format=",
-                     uint32_t(srv.Format));
-                return;
+              if (needs_texture_buffer_view) {
+                view_id = CreateBufferView(device_->GetMTLDevice(), *resource,
+                                           srv.Format, offset, byte_size,
+                                           WMTTextureUsageShaderRead);
+                if (!view_id) {
+                  WARN("D3D12CommandQueue: typed buffer SRV failed to create Metal texture buffer view format=",
+                       uint32_t(srv.Format),
+                       "; falling back to raw buffer binding");
+                }
               }
               slice = StructuredBufferSlice(*resource, offset, byte_size,
                                             format.BytesPerTexel);
@@ -3163,12 +3239,14 @@ private:
             offset += first_element * srv.Buffer.StructureByteStride;
             byte_size = UINT64(srv.Buffer.NumElements) *
                         srv.Buffer.StructureByteStride;
-            if (const auto view_format = UintBufferViewFormatForStride(
-                    srv.Buffer.StructureByteStride);
-                view_format != DXGI_FORMAT_UNKNOWN) {
-              view_id = CreateBufferView(device_->GetMTLDevice(), *resource,
-                                         view_format, offset, byte_size,
-                                         WMTTextureUsageShaderRead);
+            if (needs_texture_buffer_view) {
+              if (const auto view_format = UintBufferViewFormatForStride(
+                      srv.Buffer.StructureByteStride);
+                  view_format != DXGI_FORMAT_UNKNOWN) {
+                view_id = CreateBufferView(device_->GetMTLDevice(), *resource,
+                                           view_format, offset, byte_size,
+                                           WMTTextureUsageShaderRead);
+              }
             }
             slice = StructuredBufferSlice(*resource, offset, byte_size,
                                           srv.Buffer.StructureByteStride);
@@ -3219,7 +3297,8 @@ private:
 
   void BindUnorderedAccessDescriptor(ArgumentEncodingContext &enc,
                                      PipelineStage stage, UINT slot,
-                                     const DescriptorRecord &descriptor) {
+                                     const DescriptorRecord &descriptor,
+                                     const MTL_SM50_SHADER_ARGUMENT *argument) {
     if (descriptor.type != DescriptorRecordType::UnorderedAccessView)
       return;
     if (slot >= kUAVBindings) {
@@ -3250,15 +3329,19 @@ private:
       if (descriptor.has_desc) {
         const auto &uav = descriptor.desc.uav;
         if (uav.ViewDimension == D3D12_UAV_DIMENSION_BUFFER) {
+          const bool needs_texture_buffer_view =
+              argument && (argument->Flags & MTL_SM50_SHADER_ARGUMENT_TEXTURE);
           const UINT64 first_element = uav.Buffer.FirstElement;
           if (uav.Buffer.Flags & D3D12_BUFFER_UAV_FLAG_RAW) {
             offset += first_element * sizeof(uint32_t);
             byte_size = UINT64(uav.Buffer.NumElements) * sizeof(uint32_t);
-            view_id = CreateBufferView(device_->GetMTLDevice(), *resource,
-                                       DXGI_FORMAT_R32_UINT, offset,
-                                       byte_size,
-                                       WMTTextureUsageShaderRead |
-                                           WMTTextureUsageShaderWrite);
+            if (needs_texture_buffer_view) {
+              view_id = CreateBufferView(device_->GetMTLDevice(), *resource,
+                                         DXGI_FORMAT_R32_UINT, offset,
+                                         byte_size,
+                                         WMTTextureUsageShaderRead |
+                                             WMTTextureUsageShaderWrite);
+            }
             slice = StructuredBufferSlice(*resource, offset, byte_size,
                                           sizeof(uint32_t));
           } else if (uav.Format != DXGI_FORMAT_UNKNOWN) {
@@ -3268,14 +3351,16 @@ private:
               offset += first_element * format.BytesPerTexel;
               byte_size = UINT64(uav.Buffer.NumElements) *
                           format.BytesPerTexel;
-              view_id = CreateBufferView(device_->GetMTLDevice(), *resource,
-                                         uav.Format, offset, byte_size,
-                                         WMTTextureUsageShaderRead |
-                                             WMTTextureUsageShaderWrite);
-              if (!view_id) {
-                WARN("D3D12CommandQueue: typed buffer UAV failed to create Metal texture buffer view format=",
-                     uint32_t(uav.Format));
-                return;
+              if (needs_texture_buffer_view) {
+                view_id = CreateBufferView(device_->GetMTLDevice(), *resource,
+                                           uav.Format, offset, byte_size,
+                                           WMTTextureUsageShaderRead |
+                                               WMTTextureUsageShaderWrite);
+                if (!view_id) {
+                  WARN("D3D12CommandQueue: typed buffer UAV failed to create Metal texture buffer view format=",
+                       uint32_t(uav.Format),
+                       "; falling back to raw buffer binding");
+                }
               }
               slice = StructuredBufferSlice(*resource, offset, byte_size,
                                             format.BytesPerTexel);
@@ -3288,13 +3373,15 @@ private:
             offset += first_element * uav.Buffer.StructureByteStride;
             byte_size = UINT64(uav.Buffer.NumElements) *
                         uav.Buffer.StructureByteStride;
-            if (const auto view_format = UintBufferViewFormatForStride(
-                    uav.Buffer.StructureByteStride);
-                view_format != DXGI_FORMAT_UNKNOWN) {
-              view_id = CreateBufferView(device_->GetMTLDevice(), *resource,
-                                         view_format, offset, byte_size,
-                                         WMTTextureUsageShaderRead |
-                                             WMTTextureUsageShaderWrite);
+            if (needs_texture_buffer_view) {
+              if (const auto view_format = UintBufferViewFormatForStride(
+                      uav.Buffer.StructureByteStride);
+                  view_format != DXGI_FORMAT_UNKNOWN) {
+                view_id = CreateBufferView(device_->GetMTLDevice(), *resource,
+                                           view_format, offset, byte_size,
+                                           WMTTextureUsageShaderRead |
+                                               WMTTextureUsageShaderWrite);
+              }
             }
             slice = StructuredBufferSlice(*resource, offset, byte_size,
                                           uav.Buffer.StructureByteStride);
@@ -3591,8 +3678,11 @@ private:
                       range.base_shader_register + i, range.register_space);
                   if (!slot)
                     return;
+                  const auto *argument = ResolveShaderBindingArgumentBySlot(
+                      pipeline, stage, BindingTypeForRange(range.range_type),
+                      *slot);
                   BindDescriptor(enc, stage, range.range_type, *slot,
-                                 *descriptor);
+                                 *descriptor, argument);
                 });
           }
           if (range.descriptor_count != UINT_MAX)
@@ -3681,13 +3771,14 @@ private:
                   ? D3D12_DESCRIPTOR_RANGE_TYPE_SRV
                   : D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
     ForEachVisibleStage(parameter.visibility, compute, [&](PipelineStage stage) {
-      auto slot = ResolveShaderBindingSlot(
+      const auto *argument = ResolveShaderBindingArgument(
           pipeline, stage, BindingTypeForRange(range_type),
           parameter.descriptor.ShaderRegister,
           parameter.descriptor.RegisterSpace);
-      if (!slot)
+      if (!argument)
         return;
-      BindDescriptor(enc, stage, range_type, *slot, descriptor);
+      BindDescriptor(enc, stage, range_type, argument->SM50BindingSlot,
+                     descriptor, argument);
     });
   }
 

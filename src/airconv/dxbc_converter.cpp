@@ -357,6 +357,18 @@ void setup_binding_table(
         },
         false
       };
+      if (srv.resource_type == shader::common::ResourceType::TextureBuffer) {
+        resource_map.srv_buf_range_map[range_id] = {
+          srv.structure_stride,
+          [=, index = srv.arg_index](pvalue) {
+            return get_item_in_argbuf_binding_table(binding_table_index, index);
+          },
+          [=, index = srv.arg_metadata_index](pvalue) {
+            return get_item_in_argbuf_binding_table(binding_table_index, index);
+          },
+          false
+        };
+      }
     } else {
       resource_map.srv_buf_range_map[range_id] = {
         srv.structure_stride,
@@ -394,6 +406,26 @@ void setup_binding_table(
         },
         uav.global_coherent
       };
+      if (uav.resource_type == shader::common::ResourceType::TextureBuffer) {
+        resource_map.uav_buf_range_map[range_id] = {
+          uav.structure_stride,
+          [=, index = uav.arg_index](pvalue) {
+            return get_item_in_argbuf_binding_table(binding_table_index, index);
+          },
+          [=, index = uav.arg_metadata_index](pvalue) {
+            return get_item_in_argbuf_binding_table(binding_table_index, index);
+          },
+          uav.global_coherent
+        };
+        if (uav.with_counter) {
+          auto argbuf_index_counterptr = uav.arg_counter_index;
+          resource_map.uav_counter_range_map[range_id] = [=](pvalue) {
+            return get_item_in_argbuf_binding_table(
+              binding_table_index, argbuf_index_counterptr
+            );
+          };
+        }
+      }
     } else {
       resource_map.uav_buf_range_map[range_id] = {
         uav.structure_stride,
