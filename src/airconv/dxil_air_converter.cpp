@@ -558,6 +558,15 @@ ConstantOperandU32(const CallBase &call, uint32_t index) {
   return std::nullopt;
 }
 
+std::optional<int32_t>
+ConstantOperandI32(const CallBase &call, uint32_t index) {
+  if (index >= call.arg_size())
+    return std::nullopt;
+  if (const auto *integer = dyn_cast<ConstantInt>(call.getArgOperand(index)))
+    return int32_t(integer->getSExtValue());
+  return std::nullopt;
+}
+
 std::optional<uint32_t>
 ConstantAggregateElementU32(const Value *value, uint32_t index) {
   const auto *constant = dyn_cast_or_null<Constant>(value);
@@ -1402,7 +1411,9 @@ LowerDxilCall(const CallBase &call, DxilAirContext &ctx,
           VectorFromOperands(call, 8, TextureCoordinateCount(*resource), true, ctx),
           VectorFromOperands(call, 11, TextureCoordinateCount(*resource), true, ctx),
           offset);
-    else if (name == "SampleCmp" || name == "SampleCmpLevelZero") {
+    else if (name == "SampleCmp" || name == "SampleCmpLevelZero" ||
+             name == "SampleCmpLevel" || name == "SampleCmpBias" ||
+             name == "SampleCmpGrad") {
       if (!IsDepthTexture(air_texture))
         return UnsupportedDxilCall(call, "SampleCmp requires a depth texture resource", ctx);
       auto *reference = OperandValue(call, 10, ctx);
@@ -1410,6 +1421,18 @@ LowerDxilCall(const CallBase &call, DxilAirContext &ctx,
         result = ctx.air.CreateSampleCmp(
             air_texture, texture, sampler, coord, array_index, reference,
             offset, llvm::air::sample_level{ctx.air.getFloat(0)});
+      else if (name == "SampleCmpLevel")
+        result = ctx.air.CreateSampleCmp(
+            air_texture, texture, sampler, coord, array_index, reference,
+            offset, llvm::air::sample_level{OperandValue(call, 11, ctx)});
+      else if (name == "SampleCmpBias")
+        result = ctx.air.CreateSampleCmp(
+            air_texture, texture, sampler, coord, array_index, reference,
+            offset, llvm::air::sample_bias{OperandValue(call, 11, ctx)},
+            llvm::air::sample_min_lod_clamp{OperandValue(call, 12, ctx)});
+      else if (name == "SampleCmpGrad")
+        return UnsupportedDxilCall(
+            call, "SampleCmpGrad lowering TODO: compare gradients are unsupported", ctx);
       else
         result = ctx.air.CreateSampleCmp(
             air_texture, texture, sampler, coord, array_index, reference,
@@ -1431,16 +1454,23 @@ LowerDxilCall(const CallBase &call, DxilAirContext &ctx,
     auto air_texture = BuildTexture(*resource, air::MemoryAccess::sample);
     auto *coord = TextureCoord(*resource, call, 3, true, ctx);
     auto *array_index = TextureArrayIndex(*resource, call, 3, true, ctx);
-    int32_t offset[3] = {};
+    int32_t offset[3] = {
+        ConstantOperandI32(call, 8).value_or(0),
+        ConstantOperandI32(call, 9).value_or(0),
+        0,
+    };
     std::pair<Value *, Value *> result = {nullptr, nullptr};
-    if (name == "TextureGatherCmp")
+    if (name == "TextureGatherCmp") {
+      if (!IsDepthTexture(air_texture))
+        return UnsupportedDxilCall(call, "TextureGatherCmp requires a depth texture resource", ctx);
       result = ctx.air.CreateGatherCompare(
           air_texture, texture, sampler, coord, array_index,
-          OperandValue(call, 8, ctx), offset);
-    else
+          OperandValue(call, 11, ctx), offset);
+    } else {
       result = ctx.air.CreateGather(
           air_texture, texture, sampler, coord, array_index, offset,
-          ctx.builder.getInt32(ConstantOperandU32(call, 8).value_or(0)));
+          ctx.builder.getInt32(ConstantOperandU32(call, 10).value_or(0)));
+    }
     ctx.values[&call] = PackDxilReturn(call, result.first, ctx, result.second);
     return Error::success();
   }

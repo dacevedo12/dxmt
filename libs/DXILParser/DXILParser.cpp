@@ -481,8 +481,7 @@ bool
 IsSampleOpcode(std::string_view name) {
   return name == "Sample" || name == "SampleBias" ||
          name == "SampleLevel" || name == "SampleGrad" ||
-         name == "SampleCmp" || name == "SampleCmpLevelZero" ||
-         name == "CalculateLOD" ||
+         IsComparisonSampleOpcode(name) || name == "CalculateLOD" ||
          name.starts_with("WriteSamplerFeedback");
 }
 
@@ -4742,6 +4741,7 @@ struct DxilResourceUseHandle {
   DxilTranslationResourceClass resource_class =
       DxilTranslationResourceClass::Unknown;
   uint32_t resource_id = 0;
+  bool has_resource_id = false;
   bool valid = false;
 };
 
@@ -4787,6 +4787,7 @@ ResourceUseHandleFromOperation(
             ? TranslationResourceClassFromValue(operation.typed.resource_class)
             : DxilTranslationResourceClass::Unknown;
     handle.resource_id = operation.resource_id;
+    handle.has_resource_id = true;
     handle.valid = handle.resource_class != DxilTranslationResourceClass::Unknown;
     return handle;
   }
@@ -4802,6 +4803,7 @@ ResourceUseHandleFromOperation(
           resource.space == operation.typed.resource_space &&
           resource.lower_bound == operation.typed.resource_lower_bound) {
         handle.resource_id = resource.id;
+        handle.has_resource_id = true;
         break;
       }
     }
@@ -4826,8 +4828,10 @@ PropagateTranslationResourceUses(
   for (auto &operation : operations) {
     if (operation.semantic_kind == DxilSemanticOperationKind::ResourceHandle) {
       auto handle = ResourceUseHandleFromOperation(operation, resources, handles);
-      if (operation.has_resource_id)
+      if (operation.has_resource_id) {
         handle.resource_id = operation.resource_id;
+        handle.has_resource_id = true;
+      }
       if (operation.typed.has_resource_binding)
         handle.valid = true;
       if (!operation.result_name.empty() && handle.valid)
@@ -4840,7 +4844,7 @@ PropagateTranslationResourceUses(
     const auto handle = ResourceUseHandleFromOperation(operation, resources, handles);
     if (!handle.valid)
       continue;
-    if (handle.resource_id) {
+    if (handle.has_resource_id) {
       operation.resource_id = handle.resource_id;
       operation.has_resource_id = true;
     }
