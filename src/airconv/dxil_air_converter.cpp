@@ -536,6 +536,48 @@ BitcastOrCastValue(Value *value, Type *type, DxilAirContext &ctx) {
 }
 
 Value *
+TruncAndBitcastToHalf(Value *value, DxilAirContext &ctx) {
+  auto *type = value->getType();
+  auto *scalar_type = type->getScalarType();
+  if (scalar_type->isHalfTy())
+    return value;
+
+  if (auto *vector = dyn_cast<FixedVectorType>(type)) {
+    const auto elements = vector->getNumElements();
+    auto *int16_vector = FixedVectorType::get(ctx.builder.getInt16Ty(), elements);
+    if (!scalar_type->isIntegerTy(32))
+      value = ctx.builder.CreateBitCast(value, ctx.air.getIntTy(elements));
+    return ctx.builder.CreateBitCast(
+        ctx.builder.CreateTrunc(value, int16_vector),
+        ctx.air.getHalfTy(elements));
+  }
+
+  if (!scalar_type->isIntegerTy(32))
+    value = ctx.builder.CreateBitCast(value, ctx.builder.getInt32Ty());
+  return ctx.builder.CreateBitCast(
+      ctx.builder.CreateTrunc(value, ctx.builder.getInt16Ty()),
+      ctx.builder.getHalfTy());
+}
+
+Value *
+ZExtAndBitcastHalfToInt32(Value *value, DxilAirContext &ctx) {
+  auto *type = value->getType();
+  auto *scalar_type = type->getScalarType();
+  if (scalar_type->isHalfTy()) {
+    if (auto *vector = dyn_cast<FixedVectorType>(type)) {
+      const auto elements = vector->getNumElements();
+      auto *int16_vector = FixedVectorType::get(ctx.builder.getInt16Ty(), elements);
+      return ctx.builder.CreateZExt(ctx.builder.CreateBitCast(value, int16_vector),
+                                    ctx.air.getIntTy(elements));
+    }
+    return ctx.builder.CreateZExt(ctx.builder.CreateBitCast(value, ctx.builder.getInt16Ty()),
+                                  ctx.builder.getInt32Ty());
+  }
+
+  return BitcastOrCastValue(value, MapType(type, ctx), ctx);
+}
+
+Value *
 PackDxilReturn(const CallBase &call, Value *value, DxilAirContext &ctx,
                Value *status = nullptr) {
   auto *return_type = MapType(call.getType(), ctx);
@@ -1249,6 +1291,10 @@ BuildDxilMath(const CallBase &call, std::string_view name, DxilAirContext &ctx) 
     return ctx.air.CreateFPUnOp(llvm::air::AIRBuilder::fract, a);
   if (name == "Saturate")
     return ctx.air.CreateFPUnOp(llvm::air::AIRBuilder::saturate, a);
+  if (name == "LegacyF16ToF32")
+    return ctx.air.CreateConvertToFloat(TruncAndBitcastToHalf(a, ctx));
+  if (name == "LegacyF32ToF16")
+    return ZExtAndBitcastHalfToInt32(ctx.air.CreateConvertToHalf(a), ctx);
   if (name == "Round_ne")
     return ctx.air.CreateFPUnOp(llvm::air::AIRBuilder::rint, a);
   if (name == "Round_ni")
