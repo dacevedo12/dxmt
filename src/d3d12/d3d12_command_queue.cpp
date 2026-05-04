@@ -15,22 +15,327 @@
 #include "dxmt_presenter.hpp"
 #include "dxmt_sampler.hpp"
 #include "log/log.hpp"
+#include "util_env.hpp"
 #include "util_string.hpp"
 #include "util_win32_compat.h"
 #include "wsi_window.hpp"
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <cfloat>
+#include <iomanip>
 #include <mutex>
 #include <optional>
+#include <sstream>
 #include <type_traits>
 #include <unordered_map>
 #include <vector>
 
 namespace dxmt::d3d12 {
 namespace {
+
+static bool
+D3D12DiagEnabledEnv(const char *name) {
+  auto value = env::getEnvVar(name);
+  return value == "1" || value == "true" || value == "yes" || value == "trace";
+}
+
+static bool
+D3D12DiagTextureCopyEnabled() {
+  static const bool enabled =
+      D3D12DiagEnabledEnv("DXMT_DIAG_TEXTURE_COPY") ||
+      D3D12DiagEnabledEnv("DXMT_DIAG_D3D12_VIEWS") ||
+      D3D12DiagEnabledEnv("DXMT_DIAG_COMMAND_QUEUE");
+  return enabled;
+}
+
+static bool
+D3D12DiagViewEnabled() {
+  static const bool enabled =
+      D3D12DiagEnabledEnv("DXMT_DIAG_D3D12_VIEWS") ||
+      D3D12DiagEnabledEnv("DXMT_DIAG_COMMAND_QUEUE");
+  return enabled;
+}
+
+static bool
+D3D12DiagDrawStateEnabled() {
+  static const bool enabled =
+      D3D12DiagEnabledEnv("DXMT_DIAG_DRAW_STATE") ||
+      D3D12DiagEnabledEnv("DXMT_DIAG_RENDER_COMMANDS") ||
+      D3D12DiagEnabledEnv("DXMT_DIAG_COMMAND_QUEUE");
+  return enabled;
+}
+
+static bool
+D3D12DiagSwapChainEnabled() {
+  static const bool enabled =
+      D3D12DiagEnabledEnv("DXMT_DIAG_SWAPCHAIN") ||
+      D3D12DiagEnabledEnv("DXMT_DIAG_COMMAND_QUEUE");
+  return enabled;
+}
+
+static bool
+D3D12DiagIAReadbackEnabled() {
+  static const bool enabled =
+      D3D12DiagEnabledEnv("DXMT_DIAG_IA_READBACK") ||
+      D3D12DiagEnabledEnv("DXMT_DIAG_DRAW_STATE_READBACK");
+  return enabled;
+}
+
+static bool
+D3D12DiagBindingsEnabled() {
+  static const bool enabled =
+      D3D12DiagEnabledEnv("DXMT_DIAG_BINDINGS") ||
+      D3D12DiagEnabledEnv("DXMT_DIAG_COMMAND_QUEUE");
+  return enabled;
+}
+
+static bool
+D3D12DiagDrawVisibilityEnabled() {
+  static const bool enabled =
+      D3D12DiagEnabledEnv("DXMT_DIAG_DRAW_VISIBILITY") ||
+      D3D12DiagEnabledEnv("DXMT_DIAG_DRAW_STATE_READBACK");
+  return enabled;
+}
+
+static bool
+D3D12DiagCBVReadbackEnabled() {
+  static const bool enabled =
+      D3D12DiagEnabledEnv("DXMT_DIAG_CBV_READBACK") ||
+      D3D12DiagEnabledEnv("DXMT_DIAG_DRAW_STATE_READBACK");
+  return enabled;
+}
+
+static uint32_t
+D3D12DiagLogLimit() {
+  static const uint32_t limit = []() {
+    auto value = env::getEnvVar("DXMT_DIAG_D3D12_LIMIT");
+    if (value.empty())
+      value = env::getEnvVar("DXMT_DIAG_BINDING_LIMIT");
+    if (value.empty())
+      return 2000u;
+    char *end = nullptr;
+    auto parsed = std::strtoul(value.c_str(), &end, 10);
+    if (end == value.c_str())
+      return 2000u;
+    return static_cast<uint32_t>(std::max<unsigned long>(1, parsed));
+  }();
+  return limit;
+}
+
+static uint32_t
+D3D12DiagIAReadbackBytes() {
+  static const uint32_t size = []() {
+    auto value = env::getEnvVar("DXMT_DIAG_IA_READBACK_BYTES");
+    if (value.empty())
+      return 256u;
+    char *end = nullptr;
+    auto parsed = std::strtoul(value.c_str(), &end, 10);
+    if (end == value.c_str())
+      return 256u;
+    return static_cast<uint32_t>(
+        std::clamp<unsigned long>(parsed, 16, 4096));
+  }();
+  return size;
+}
+
+static uint32_t
+D3D12DiagCBVReadbackBytes() {
+  static const uint32_t size = []() {
+    auto value = env::getEnvVar("DXMT_DIAG_CBV_READBACK_BYTES");
+    if (value.empty())
+      return 256u;
+    char *end = nullptr;
+    auto parsed = std::strtoul(value.c_str(), &end, 10);
+    if (end == value.c_str())
+      return 256u;
+    return static_cast<uint32_t>(
+        std::clamp<unsigned long>(parsed, 16, 4096));
+  }();
+  return size;
+}
+
+static bool
+D3D12DiagShouldLog(std::atomic<uint32_t> &counter, bool enabled) {
+  if (!enabled)
+    return false;
+  return counter.fetch_add(1, std::memory_order_relaxed) < D3D12DiagLogLimit();
+}
+
+static std::string
+D3D12DiagHexBytes(const uint8_t *bytes, size_t size) {
+  std::ostringstream out;
+  out << std::hex << std::setfill('0');
+  const auto count = std::min<size_t>(size, 64);
+  for (size_t i = 0; i < count; i++) {
+    if (i)
+      out << ' ';
+    out << std::setw(2) << uint32_t(bytes[i]);
+  }
+  return out.str();
+}
+
+static Rc<VisibilityResultQuery>
+D3D12DiagCreateDrawVisibilityQuery(
+    CommandChunk *chunk, const char *kind, const std::string &pso,
+    uint32_t vertex_count, uint32_t index_count, uint32_t instance_count) {
+  static std::atomic<uint32_t> log_count = 0;
+  if (!D3D12DiagShouldLog(log_count, D3D12DiagDrawVisibilityEnabled()))
+    return nullptr;
+
+  Rc<VisibilityResultQuery> query = new VisibilityResultQuery();
+  chunk->deferred_readbacks.push_back(
+      [query, kind = std::string(kind), pso, vertex_count, index_count,
+       instance_count]() {
+        uint64_t value = 0;
+        const bool ready = query->getValue(&value);
+        INFO("D3D12 diagnostic: draw visibility",
+             " kind=", kind,
+             " pso=", pso,
+             " ready=", uint32_t(ready),
+             " visibleSamples=", ready ? value : 0,
+             " vertexCount=", vertex_count,
+             " indexCount=", index_count,
+             " instanceCount=", instance_count);
+      });
+  return query;
+}
+
+static std::string
+D3D12DiagFloatWords(const uint8_t *bytes, size_t size) {
+  std::ostringstream out;
+  const auto count = std::min<size_t>(size / sizeof(float), 16);
+  for (size_t i = 0; i < count; i++) {
+    float value = 0.0f;
+    std::memcpy(&value, bytes + i * sizeof(value), sizeof(value));
+    if (i)
+      out << ',';
+    out << value;
+  }
+  return out.str();
+}
+
+static std::string
+D3D12DiagIndexWords(const uint8_t *bytes, size_t size,
+                    DXGI_FORMAT format) {
+  std::ostringstream out;
+  const size_t index_size = format == DXGI_FORMAT_R16_UINT ? 2 : 4;
+  const auto count = std::min<size_t>(size / index_size, 32);
+  for (size_t i = 0; i < count; i++) {
+    uint32_t value = 0;
+    if (index_size == 2) {
+      uint16_t v = 0;
+      std::memcpy(&v, bytes + i * index_size, sizeof(v));
+      value = v;
+    } else {
+      std::memcpy(&value, bytes + i * index_size, sizeof(value));
+    }
+    if (i)
+      out << ',';
+    out << value;
+  }
+  return out.str();
+}
+
+static const char *
+D3D12FillModeName(D3D12_FILL_MODE mode) {
+  switch (mode) {
+  case D3D12_FILL_MODE_WIREFRAME:
+    return "wireframe";
+  case D3D12_FILL_MODE_SOLID:
+    return "solid";
+  default:
+    return "unknown";
+  }
+}
+
+static const char *
+D3D12CullModeName(D3D12_CULL_MODE mode) {
+  switch (mode) {
+  case D3D12_CULL_MODE_NONE:
+    return "none";
+  case D3D12_CULL_MODE_FRONT:
+    return "front";
+  case D3D12_CULL_MODE_BACK:
+    return "back";
+  default:
+    return "unknown";
+  }
+}
+
+static const char *
+D3D12TextureCopyTypeName(D3D12_TEXTURE_COPY_TYPE type) {
+  switch (type) {
+  case D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX:
+    return "subresource";
+  case D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT:
+    return "placed_footprint";
+  default:
+    return "unknown";
+  }
+}
+
+static DXGI_FORMAT
+D3D12DiagDescriptorFormat(const DescriptorRecord &descriptor) {
+  if (!descriptor.has_desc)
+    return DXGI_FORMAT_UNKNOWN;
+
+  switch (descriptor.type) {
+  case DescriptorRecordType::ShaderResourceView:
+    return descriptor.desc.srv.Format;
+  case DescriptorRecordType::UnorderedAccessView:
+    return descriptor.desc.uav.Format;
+  case DescriptorRecordType::RenderTargetView:
+    return descriptor.desc.rtv.Format;
+  case DescriptorRecordType::DepthStencilView:
+    return descriptor.desc.dsv.Format;
+  default:
+    return DXGI_FORMAT_UNKNOWN;
+  }
+}
+
+static void
+D3D12DiagLogTextureView(const char *kind, Resource &resource,
+                        const DescriptorRecord &descriptor,
+                        const TextureViewDescriptor &view,
+                        TextureViewKey key) {
+  static std::atomic<uint32_t> log_count = 0;
+  if (!D3D12DiagShouldLog(log_count, D3D12DiagViewEnabled()))
+    return;
+
+  auto *texture = resource.GetTexture();
+  auto *allocation = resource.GetTextureAllocation();
+  const auto &desc = resource.GetResourceDesc();
+  INFO("D3D12 diagnostic: texture view",
+       " kind=", kind,
+       " key=", uint64_t(key),
+       " resource=", uint64_t(resource.GetD3D12Resource()),
+       " texture_descriptor=", uint64_t(texture),
+       " allocation=", uint64_t(allocation),
+       " has_desc=", descriptor.has_desc,
+       " desc_format=", uint32_t(D3D12DiagDescriptorFormat(descriptor)),
+       " resource_format=", uint32_t(desc.Format),
+       " resource_dimension=", uint32_t(desc.Dimension),
+       " resource_size=", uint64_t(desc.Width), "x", uint32_t(desc.Height), "x", uint32_t(desc.DepthOrArraySize),
+       " resource_mips=", uint32_t(desc.MipLevels),
+       " texture_format=", texture ? uint32_t(texture->pixelFormat()) : 0,
+       " texture=", texture && texture->current() ? uint64_t(texture->current()->texture()) : 0,
+       " texture_type=", texture ? uint32_t(texture->textureType()) : 0,
+       " texture_size=", texture ? texture->width() : 0, "x", texture ? texture->height() : 0, "x", texture ? texture->depth() : 0,
+       " texture_array=", texture ? texture->arrayLength() : 0,
+       " texture_mips=", texture ? texture->miplevelCount() : 0,
+       " texture_samples=", texture ? texture->sampleCount() : 0,
+       " view_format=", uint32_t(view.format),
+       " view_type=", uint32_t(view.type),
+       " view_mip=", uint32_t(view.firstMiplevel),
+       " view_mips=", uint32_t(view.miplevelCount),
+       " view_array=", uint32_t(view.firstArraySlice),
+       " view_array_size=", uint32_t(view.arraySize),
+       " view_usage=", uint32_t(view.intendedUsage));
+}
 
 static bool
 IsSupportedQueueType(D3D12_COMMAND_LIST_TYPE type) {
@@ -431,7 +736,9 @@ CreateRenderTargetView(Resource &resource, const DescriptorRecord &descriptor) {
     }
   }
 
-  return texture->createView(view);
+  auto key = texture->createView(view);
+  D3D12DiagLogTextureView("RTV", resource, descriptor, view, key);
+  return key;
 }
 
 static TextureViewKey
@@ -476,7 +783,9 @@ CreateDepthStencilView(WMT::Device device, Resource &resource,
     }
   }
 
-  return texture->createView(view);
+  auto key = texture->createView(view);
+  D3D12DiagLogTextureView("DSV", resource, descriptor, view, key);
+  return key;
 }
 
 static UINT
@@ -492,6 +801,37 @@ GetRenderTargetArrayLength(const DescriptorRecord &descriptor) {
   default:
     return 1;
   }
+}
+
+static void
+D3D12DiagLogSwapChainBackBuffer(const char *event, UINT index,
+                                UINT current_index,
+                                ID3D12Resource *backbuffer) {
+  static std::atomic<uint32_t> log_count = 0;
+  if (!D3D12DiagShouldLog(log_count, D3D12DiagSwapChainEnabled()))
+    return;
+
+  auto *resource = dynamic_cast<Resource *>(backbuffer);
+  auto *texture = resource ? resource->GetTexture() : nullptr;
+  auto *allocation = resource ? resource->GetTextureAllocation() : nullptr;
+  WMT::Texture metal_texture =
+      texture && texture->current() ? texture->current()->texture()
+                                    : WMT::Texture{};
+  const auto desc = resource ? resource->GetResourceDesc() : D3D12_RESOURCE_DESC{};
+  INFO("D3D12 diagnostic: swapchain backbuffer",
+       " event=", event,
+       " index=", index,
+       " current=", current_index,
+       " resource=", uint64_t(backbuffer),
+       " texture_descriptor=", uint64_t(texture),
+       " allocation=", uint64_t(allocation),
+       " texture=", uint64_t(metal_texture),
+       " resource_size=", resource ? uint64_t(desc.Width) : 0, "x",
+       resource ? uint32_t(desc.Height) : 0,
+       " resource_format=", resource ? uint32_t(desc.Format) : 0,
+       " texture_size=", texture ? texture->width() : 0, "x",
+       texture ? texture->height() : 0,
+       " texture_format=", texture ? uint32_t(texture->pixelFormat()) : 0);
 }
 
 static UINT
@@ -704,8 +1044,11 @@ CreateShaderResourceTextureView(WMT::Device device, Resource &resource,
   view.arraySize = texture->arrayLength();
   view.intendedUsage = WMTTextureUsageShaderRead;
 
-  if (!descriptor.has_desc)
-    return texture->createView(view);
+  if (!descriptor.has_desc) {
+    auto key = texture->createView(view);
+    D3D12DiagLogTextureView("SRV", resource, descriptor, view, key);
+    return key;
+  }
 
   const auto &srv = descriptor.desc.srv;
   view.format = ResolveTextureViewFormat(device, resource, srv.Format);
@@ -799,7 +1142,9 @@ CreateShaderResourceTextureView(WMT::Device device, Resource &resource,
 
   if (!ValidateTextureViewRange("SRV texture view", view, resource))
     return {};
-  return texture->createView(view);
+  auto key = texture->createView(view);
+  D3D12DiagLogTextureView("SRV", resource, descriptor, view, key);
+  return key;
 }
 
 static TextureViewKey
@@ -819,8 +1164,11 @@ CreateUnorderedAccessTextureView(WMT::Device device, Resource &resource,
   view.intendedUsage =
       WMTTextureUsageShaderRead | WMTTextureUsageShaderWrite;
 
-  if (!descriptor.has_desc)
-    return texture->createView(view);
+  if (!descriptor.has_desc) {
+    auto key = texture->createView(view);
+    D3D12DiagLogTextureView("UAV", resource, descriptor, view, key);
+    return key;
+  }
 
   const auto &uav = descriptor.desc.uav;
   view.format = ResolveTextureViewFormat(device, resource, uav.Format);
@@ -891,7 +1239,9 @@ CreateUnorderedAccessTextureView(WMT::Device device, Resource &resource,
 
   if (!ValidateTextureViewRange("UAV texture view", view, resource))
     return {};
-  return texture->createView(view);
+  auto key = texture->createView(view);
+  D3D12DiagLogTextureView("UAV", resource, descriptor, view, key);
+  return key;
 }
 
 static HRESULT
@@ -1326,6 +1676,9 @@ private:
       *surface = nullptr;
       if (buffer_idx >= backbuffers_.size())
         return DXGI_ERROR_INVALID_CALL;
+      D3D12DiagLogSwapChainBackBuffer("GetBuffer", buffer_idx,
+                                      current_backbuffer_,
+                                      backbuffers_[buffer_idx].ptr());
       return backbuffers_[buffer_idx]->QueryInterface(riid, surface);
     }
 
@@ -1450,6 +1803,9 @@ private:
             &resource_desc, D3D12_RESOURCE_STATE_PRESENT, 0));
         if (!backbuffers_.back())
           return E_FAIL;
+        D3D12DiagLogSwapChainBackBuffer("ResizeBuffers", i,
+                                        current_backbuffer_,
+                                        backbuffers_.back().ptr());
       }
 
       current_backbuffer_ = desc_.BufferCount ? old_index % desc_.BufferCount : 0;
@@ -1562,6 +1918,9 @@ private:
           backbuffers_[current_backbuffer_].ptr());
       if (!resource || !resource->GetTexture())
         return E_FAIL;
+      D3D12DiagLogSwapChainBackBuffer("Present1", current_backbuffer_,
+                                      current_backbuffer_,
+                                      backbuffers_[current_backbuffer_].ptr());
 
       double vsync_duration = sync_interval ? sync_interval / 60.0 : 0.0;
       auto &dxmt_queue = queue_->device_->GetDXMTDevice().queue();
@@ -1691,6 +2050,12 @@ private:
     }
 
     UINT STDMETHODCALLTYPE GetCurrentBackBufferIndex() override {
+      D3D12DiagLogSwapChainBackBuffer("GetCurrentBackBufferIndex",
+                                      current_backbuffer_,
+                                      current_backbuffer_,
+                                      current_backbuffer_ < backbuffers_.size()
+                                          ? backbuffers_[current_backbuffer_].ptr()
+                                          : nullptr);
       return current_backbuffer_;
     }
 
@@ -3096,6 +3461,12 @@ private:
           parameter.constants.RegisterSpace);
       if (!slot)
         return;
+      DebugLogRootBinding("root-constants", pipeline, compute, stage,
+                          root_index, *slot,
+                          parameter.constants.ShaderRegister,
+                          parameter.constants.RegisterSpace,
+                          actual_count * sizeof(UINT),
+                          0);
       if (*slot >= 14) {
         WARN("D3D12CommandQueue: root constants target unsupported CBV slot b",
              *slot);
@@ -3224,6 +3595,56 @@ private:
     }
   }
 
+  static const char *
+  DescriptorRangeTypeName(D3D12_DESCRIPTOR_RANGE_TYPE range_type) {
+    switch (range_type) {
+    case D3D12_DESCRIPTOR_RANGE_TYPE_CBV:
+      return "table-cbv";
+    case D3D12_DESCRIPTOR_RANGE_TYPE_SRV:
+      return "table-srv";
+    case D3D12_DESCRIPTOR_RANGE_TYPE_UAV:
+      return "table-uav";
+    case D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER:
+      return "table-sampler";
+    default:
+      return "table-unknown";
+    }
+  }
+
+  static UINT64 DescriptorRecordSizeBytes(const DescriptorRecord &descriptor) {
+    if (!descriptor.has_desc)
+      return 0;
+    if (descriptor.type == DescriptorRecordType::ConstantBufferView)
+      return descriptor.desc.cbv.SizeInBytes;
+    auto *resource = GetResource(descriptor.resource.ptr());
+    return resource ? resource->GetResourceDesc().Width : 0;
+  }
+
+  void DebugLogRootBinding(const char *kind, const PipelineState &pipeline,
+                           bool compute, PipelineStage stage, UINT root_index,
+                           UINT slot, UINT shader_register,
+                           UINT register_space, UINT64 size,
+                           D3D12_GPU_VIRTUAL_ADDRESS address) {
+    static std::atomic<uint32_t> log_count = 0;
+    if (!D3D12DiagShouldLog(log_count, D3D12DiagBindingsEnabled()))
+      return;
+
+    const auto &cache_key = pipeline.GetShaderCacheKey();
+    const auto key_size = std::min<size_t>(cache_key.size(), 16);
+    std::string key_prefix(cache_key.c_str(), cache_key.c_str() + key_size);
+    INFO("D3D12 diagnostic: root binding",
+         " kind=", kind,
+         " pso=", key_prefix,
+         " pipeline=", compute ? "compute" : "graphics",
+         " stage=", PipelineStageName(stage),
+         " root=", root_index,
+         " slot=", slot,
+         " register=", shader_register,
+         " space=", register_space,
+         " size=", uint64_t(size),
+         " address=", uint64_t(address));
+  }
+
   void BindConstantBufferDescriptor(ArgumentEncodingContext &enc,
                                     PipelineStage stage, UINT slot,
                                     const DescriptorRecord &descriptor) {
@@ -3250,19 +3671,20 @@ private:
         ResolveBufferGpuAddress(descriptor.desc.cbv.BufferLocation, resource);
     if (!resource || !resource->GetBuffer())
       return;
+    const auto buffer_offset = resource->GetHeapOffset() + offset;
 
     auto buffer = Rc<Buffer>(resource->GetBuffer());
     switch (stage) {
     case PipelineStage::Compute:
-      enc.bindConstantBuffer<PipelineStage::Compute>(slot, offset,
+      enc.bindConstantBuffer<PipelineStage::Compute>(slot, buffer_offset,
                                                      std::move(buffer));
       break;
     case PipelineStage::Pixel:
-      enc.bindConstantBuffer<PipelineStage::Pixel>(slot, offset,
+      enc.bindConstantBuffer<PipelineStage::Pixel>(slot, buffer_offset,
                                                    std::move(buffer));
       break;
     default:
-      enc.bindConstantBuffer<PipelineStage::Vertex>(slot, offset,
+      enc.bindConstantBuffer<PipelineStage::Vertex>(slot, buffer_offset,
                                                     std::move(buffer));
       break;
     }
@@ -3777,6 +4199,11 @@ private:
                   const auto *argument = ResolveShaderBindingArgumentBySlot(
                       pipeline, stage, BindingTypeForRange(range.range_type),
                       *slot);
+                  DebugLogRootBinding(
+                      DescriptorRangeTypeName(range.range_type), pipeline,
+                      compute, stage, root_index, *slot,
+                      range.base_shader_register + i, range.register_space,
+                      DescriptorRecordSizeBytes(*descriptor), 0);
                   BindDescriptor(enc, stage, range.range_type, *slot,
                                  *descriptor, argument);
                 });
@@ -3877,6 +4304,15 @@ private:
           parameter.descriptor.RegisterSpace);
       if (!argument)
         return;
+      DebugLogRootBinding(
+          type == DescriptorRecordType::ConstantBufferView
+              ? "root-cbv"
+              : type == DescriptorRecordType::ShaderResourceView ? "root-srv"
+                                                                 : "root-uav",
+          pipeline, compute, stage, root_index, argument->SM50BindingSlot,
+          parameter.descriptor.ShaderRegister,
+          parameter.descriptor.RegisterSpace,
+          resource->GetResourceDesc().Width - offset, it->second);
       BindDescriptor(enc, stage, range_type, argument->SM50BindingSlot,
                      descriptor, argument);
     });
@@ -3938,7 +4374,8 @@ private:
                                                   &resource_offset);
       if (!resource || !resource->GetBuffer())
         continue;
-      enc.bindVertexBuffer(slot, resource_offset, view.StrideInBytes,
+      enc.bindVertexBuffer(slot, resource->GetHeapOffset() + resource_offset,
+                           view.StrideInBytes,
                            Rc<Buffer>(resource->GetBuffer()));
     }
 
@@ -4191,6 +4628,514 @@ private:
     return true;
   }
 
+  static uint32_t InputSlotMask(const PipelineGraphicsState *graphics_state) {
+    if (!graphics_state)
+      return 0;
+
+    uint32_t slot_mask = 0;
+    for (const auto &element : graphics_state->input_elements) {
+      if (element.InputSlot < 32)
+        slot_mask |= 1u << element.InputSlot;
+    }
+    return slot_mask;
+  }
+
+  void DebugLogDrawState(const char *kind, const ReplayState &state,
+                         PipelineState &pipeline,
+                         const PipelineMetalGraphicsState &metal,
+                         const ReplayRenderPassAttachments &attachments,
+                         const std::vector<D3D12_VIEWPORT> &viewports,
+                         const std::vector<D3D12_RECT> &scissors,
+                         const DrawInstancedRecord *draw,
+                         const DrawIndexedInstancedRecord *indexed_draw,
+                         UINT64 index_resource_offset,
+                         UINT64 index_offset) {
+    static std::atomic<uint32_t> log_count = 0;
+    if (!D3D12DiagShouldLog(log_count, D3D12DiagDrawStateEnabled()))
+      return;
+
+    const auto *graphics = pipeline.GetGraphicsState();
+    const auto &desc = graphics->desc;
+    const auto slot_mask = InputSlotMask(graphics);
+    const auto &cache_key = pipeline.GetShaderCacheKey();
+    const auto *key = cache_key.c_str();
+    const auto key_size = std::min<size_t>(cache_key.size(), 16);
+    std::string key_prefix(key, key + key_size);
+    const bool color0_write =
+        desc.NumRenderTargets &&
+        desc.BlendState.RenderTarget[0].RenderTargetWriteMask != 0;
+
+    INFO("D3D12 diagnostic: draw state",
+         " kind=", kind,
+         " pso=", key_prefix,
+         " topology=", uint32_t(state.topology),
+         " primitiveTopologyType=", uint32_t(desc.PrimitiveTopologyType),
+         " sampleMask=", uint32_t(desc.SampleMask),
+         " sampleCount=", uint32_t(desc.SampleDesc.Count),
+         " rtvCount=", uint32_t(desc.NumRenderTargets),
+         " dsvFormat=", uint32_t(desc.DSVFormat),
+         " inputElements=", uint32_t(graphics->input_elements.size()),
+         " inputSlotMask=0x", std::hex, slot_mask, std::dec,
+         " viewportCount=", uint32_t(viewports.size()),
+         " scissorCount=", uint32_t(scissors.size()),
+         " colorAttachments=", uint32_t(attachments.colors.size()),
+         " hasDepthStencil=", attachments.depth_stencil.has_value(),
+         " fill=", D3D12FillModeName(desc.RasterizerState.FillMode),
+         " cull=", D3D12CullModeName(desc.RasterizerState.CullMode),
+         " frontCCW=", uint32_t(desc.RasterizerState.FrontCounterClockwise),
+         " depthClip=", uint32_t(desc.RasterizerState.DepthClipEnable),
+         " metalCull=", uint32_t(metal.rasterizer.cull_mode),
+         " metalWinding=", uint32_t(metal.rasterizer.winding),
+         " depthEnable=", uint32_t(desc.DepthStencilState.DepthEnable),
+         " depthWrite=", uint32_t(desc.DepthStencilState.DepthWriteMask),
+         " depthFunc=", uint32_t(desc.DepthStencilState.DepthFunc),
+         " stencilEnable=", uint32_t(desc.DepthStencilState.StencilEnable),
+         " alphaToCoverage=", uint32_t(desc.BlendState.AlphaToCoverageEnable),
+         " independentBlend=", uint32_t(desc.BlendState.IndependentBlendEnable),
+         " color0WriteMask=", desc.NumRenderTargets
+                                 ? uint32_t(desc.BlendState.RenderTarget[0].RenderTargetWriteMask)
+                                 : 0u,
+         " color0Write=", color0_write,
+         " color0Blend=", desc.NumRenderTargets
+                              ? uint32_t(desc.BlendState.RenderTarget[0].BlendEnable)
+                              : 0u,
+         " drawVertexCount=", draw ? draw->vertex_count_per_instance : 0,
+         " drawStartVertex=", draw ? draw->start_vertex_location : 0,
+         " indexedIndexCount=", indexed_draw ? indexed_draw->index_count_per_instance : 0,
+         " indexedStartIndex=", indexed_draw ? indexed_draw->start_index_location : 0,
+         " indexedBaseVertex=", indexed_draw ? indexed_draw->base_vertex_location : 0,
+         " instanceCount=", draw ? draw->instance_count
+                                  : indexed_draw ? indexed_draw->instance_count : 0,
+         " baseInstance=", draw ? draw->start_instance_location
+                                 : indexed_draw ? indexed_draw->start_instance_location : 0,
+         " indexFormat=", state.index_buffer ? uint32_t(state.index_buffer->Format) : 0u,
+         " indexSize=", state.index_buffer ? uint32_t(state.index_buffer->SizeInBytes) : 0u,
+         " indexViewOffset=", uint64_t(index_resource_offset),
+         " indexMetalOffset=", uint64_t(index_offset));
+
+    for (UINT i = 0; i < desc.NumRenderTargets && i < 8; i++) {
+      const auto &blend = desc.BlendState.RenderTarget[
+          desc.BlendState.IndependentBlendEnable ? i : 0];
+      INFO("D3D12 diagnostic: draw render target state",
+           " pso=", key_prefix,
+           " slot=", i,
+           " descFormat=", uint32_t(desc.RTVFormats[i]),
+           " writeMask=", uint32_t(blend.RenderTargetWriteMask),
+           " blend=", uint32_t(blend.BlendEnable),
+           " src=", uint32_t(blend.SrcBlend),
+           " dst=", uint32_t(blend.DestBlend),
+           " op=", uint32_t(blend.BlendOp),
+           " srcAlpha=", uint32_t(blend.SrcBlendAlpha),
+           " dstAlpha=", uint32_t(blend.DestBlendAlpha),
+           " opAlpha=", uint32_t(blend.BlendOpAlpha));
+    }
+
+    for (const auto &color : attachments.colors) {
+      INFO("D3D12 diagnostic: draw attachment state",
+           " pso=", key_prefix,
+           " slot=", uint32_t(color.slot),
+           " view=", uint64_t(color.view),
+           " format=", uint32_t(color.format),
+           " size=", color.width, "x", color.height,
+           " array=", uint32_t(color.array_length));
+    }
+    if (attachments.depth_stencil) {
+      const auto &depth = *attachments.depth_stencil;
+      INFO("D3D12 diagnostic: draw depth state",
+           " pso=", key_prefix,
+           " view=", uint64_t(depth.view),
+           " format=", uint32_t(depth.format),
+           " size=", depth.width, "x", depth.height,
+           " array=", uint32_t(depth.array_length));
+    }
+
+    for (size_t i = 0; i < viewports.size(); i++) {
+      const auto &viewport = viewports[i];
+      INFO("D3D12 diagnostic: draw viewport",
+           " pso=", key_prefix,
+           " index=", uint32_t(i),
+           " rect=", viewport.TopLeftX, ",", viewport.TopLeftY, ",",
+           viewport.Width, ",", viewport.Height,
+           " depth=", viewport.MinDepth, ",", viewport.MaxDepth);
+    }
+    for (size_t i = 0; i < scissors.size(); i++) {
+      const auto &rect = scissors[i];
+      INFO("D3D12 diagnostic: draw scissor",
+           " pso=", key_prefix,
+           " index=", uint32_t(i),
+           " rect=", rect.left, ",", rect.top, ",", rect.right, ",",
+           rect.bottom);
+    }
+
+    const auto max_slot = slot_mask ? 32u - __builtin_clz(slot_mask) : 0u;
+    for (UINT slot = 0; slot < max_slot; slot++) {
+      if (!(slot_mask & (1u << slot)))
+        continue;
+      const auto has_view = state.vertex_buffers[slot].has_value();
+      UINT64 resource_offset = 0;
+      Resource *resource = nullptr;
+      if (has_view)
+        resource = LookupBufferResourceByGpuVirtualAddress(
+            state.vertex_buffers[slot]->BufferLocation, &resource_offset);
+      INFO("D3D12 diagnostic: draw vertex buffer",
+           " pso=", key_prefix,
+           " slot=", slot,
+           " hasView=", has_view,
+           " resolved=", resource && resource->GetBuffer(),
+           " stride=", has_view ? state.vertex_buffers[slot]->StrideInBytes : 0,
+           " viewSize=", has_view ? state.vertex_buffers[slot]->SizeInBytes : 0,
+           " resourceOffset=", uint64_t(resource_offset),
+           " resourceWidth=", resource ? uint64_t(resource->GetResourceDesc().Width) : 0,
+           " heapOffset=", resource ? uint64_t(resource->GetHeapOffset()) : 0);
+    }
+  }
+
+  void DebugEncodeIAReadbacks(CommandChunk *chunk, const char *kind,
+                              const ReplayState &state,
+                              PipelineState &pipeline,
+                              const DrawInstancedRecord *draw,
+                              const DrawIndexedInstancedRecord *indexed_draw,
+                              UINT64 index_offset) {
+    static std::atomic<uint32_t> log_count = 0;
+    if (!D3D12DiagShouldLog(log_count, D3D12DiagIAReadbackEnabled()))
+      return;
+
+    const auto *graphics = pipeline.GetGraphicsState();
+    if (!graphics)
+      return;
+
+    const auto sample_limit = D3D12DiagIAReadbackBytes();
+    const auto &cache_key = pipeline.GetShaderCacheKey();
+    const auto key_size = std::min<size_t>(cache_key.size(), 16);
+    std::string key_prefix(cache_key.c_str(), cache_key.c_str() + key_size);
+
+    if (indexed_draw && state.index_buffer) {
+      UINT64 index_resource_offset = 0;
+      auto *resource = LookupBufferResourceByGpuVirtualAddress(
+          state.index_buffer->BufferLocation, &index_resource_offset);
+      if (resource && resource->GetBufferAllocation()) {
+        const auto index_size = GetIndexSize(state.index_buffer->Format);
+        const auto max_bytes =
+            uint64_t(indexed_draw->index_count_per_instance) * index_size;
+        const auto size =
+            std::min<uint64_t>({sample_limit, max_bytes,
+                                state.index_buffer->SizeInBytes});
+        if (size) {
+          WMTBufferInfo info = {};
+          info.length = size;
+          info.options = WMTResourceStorageModeShared |
+                         WMTResourceHazardTrackingModeUntracked;
+          info.memory.set(nullptr);
+#ifdef __i386__
+          info.memory.set(wsi::aligned_malloc(size, DXMT_PAGE_SIZE));
+#endif
+          auto staging = device_->GetMTLDevice().newBuffer(info);
+          auto *mapped =
+              static_cast<uint8_t *>(info.memory.get_accessible_or_null());
+          if (staging && mapped) {
+            Rc<BufferAllocation> allocation = resource->GetBufferAllocation();
+            chunk->emitcc([allocation, staging = WMT::Reference<WMT::Buffer>(staging),
+                           index_offset, size](ArgumentEncodingContext &enc) {
+              enc.retainAllocation(allocation.ptr());
+              enc.startBlitPass();
+              auto &copy =
+                  enc.encodeBlitCommand<wmtcmd_blit_copy_from_buffer_to_buffer>();
+              copy.type = WMTBlitCommandCopyFromBufferToBuffer;
+              copy.src = allocation->buffer();
+              copy.src_offset = index_offset;
+              copy.dst = staging;
+              copy.dst_offset = 0;
+              copy.copy_length = size;
+              enc.endPass();
+            });
+            chunk->deferred_readbacks.push_back(
+                [staging = WMT::Reference<WMT::Buffer>(staging), mapped,
+                 key_prefix, kind = std::string(kind),
+                 format = state.index_buffer->Format, size,
+                 start_index = indexed_draw->start_index_location,
+                 index_count = indexed_draw->index_count_per_instance,
+                 base_vertex = indexed_draw->base_vertex_location]() {
+                  INFO("D3D12 diagnostic: IA index readback",
+                       " kind=", kind,
+                       " pso=", key_prefix,
+                       " format=", uint32_t(format),
+                       " startIndex=", start_index,
+                       " indexCount=", index_count,
+                       " baseVertex=", base_vertex,
+                       " bytes=", size,
+                       " indices=", D3D12DiagIndexWords(mapped, size, format),
+                       " hex=", D3D12DiagHexBytes(mapped, size));
+#ifdef __i386__
+                  wsi::aligned_free(mapped);
+#endif
+                });
+          }
+#ifdef __i386__
+          else {
+            wsi::aligned_free(info.memory.get_accessible_or_null());
+          }
+#endif
+        }
+      }
+    }
+
+    const auto slot_mask = InputSlotMask(graphics);
+    const auto max_slot = slot_mask ? 32u - __builtin_clz(slot_mask) : 0u;
+    for (UINT slot = 0; slot < max_slot; slot++) {
+      if (!(slot_mask & (1u << slot)) || !state.vertex_buffers[slot])
+        continue;
+
+      const auto &view = *state.vertex_buffers[slot];
+      UINT64 resource_offset = 0;
+      auto *resource =
+          LookupBufferResourceByGpuVirtualAddress(view.BufferLocation,
+                                                  &resource_offset);
+      if (!resource || !resource->GetBufferAllocation() || !view.SizeInBytes)
+        continue;
+
+      const UINT64 vertex_offset =
+          draw ? uint64_t(draw->start_vertex_location) * view.StrideInBytes
+               : indexed_draw && indexed_draw->base_vertex_location > 0
+                     ? uint64_t(indexed_draw->base_vertex_location) *
+                           view.StrideInBytes
+                     : 0;
+      if (vertex_offset >= view.SizeInBytes)
+        continue;
+
+      const auto size =
+          std::min<uint64_t>(sample_limit, view.SizeInBytes - vertex_offset);
+      if (!size)
+        continue;
+
+      WMTBufferInfo info = {};
+      info.length = size;
+      info.options = WMTResourceStorageModeShared |
+                     WMTResourceHazardTrackingModeUntracked;
+      info.memory.set(nullptr);
+#ifdef __i386__
+      info.memory.set(wsi::aligned_malloc(size, DXMT_PAGE_SIZE));
+#endif
+      auto staging = device_->GetMTLDevice().newBuffer(info);
+      auto *mapped = static_cast<uint8_t *>(info.memory.get_accessible_or_null());
+      if (!staging || !mapped) {
+#ifdef __i386__
+        wsi::aligned_free(info.memory.get_accessible_or_null());
+#endif
+        continue;
+      }
+
+      Rc<BufferAllocation> allocation = resource->GetBufferAllocation();
+      const auto src_offset =
+          resource->GetHeapOffset() + resource_offset + vertex_offset;
+      chunk->emitcc([allocation, staging = WMT::Reference<WMT::Buffer>(staging),
+                     src_offset, size](ArgumentEncodingContext &enc) {
+        enc.retainAllocation(allocation.ptr());
+        enc.startBlitPass();
+        auto &copy =
+            enc.encodeBlitCommand<wmtcmd_blit_copy_from_buffer_to_buffer>();
+        copy.type = WMTBlitCommandCopyFromBufferToBuffer;
+        copy.src = allocation->buffer();
+        copy.src_offset = src_offset;
+        copy.dst = staging;
+        copy.dst_offset = 0;
+        copy.copy_length = size;
+        enc.endPass();
+      });
+      chunk->deferred_readbacks.push_back(
+          [staging = WMT::Reference<WMT::Buffer>(staging), mapped, key_prefix,
+           kind = std::string(kind), slot, stride = view.StrideInBytes,
+           view_size = view.SizeInBytes, resource_offset, vertex_offset,
+           heap_offset = resource->GetHeapOffset(), size]() {
+            INFO("D3D12 diagnostic: IA vertex readback",
+                 " kind=", kind,
+                 " pso=", key_prefix,
+                 " slot=", slot,
+                 " stride=", stride,
+                 " viewSize=", view_size,
+                 " resourceOffset=", uint64_t(resource_offset),
+                 " heapOffset=", uint64_t(heap_offset),
+                 " vertexOffset=", uint64_t(vertex_offset),
+                 " bytes=", size,
+                 " floats=", D3D12DiagFloatWords(mapped, size),
+                 " hex=", D3D12DiagHexBytes(mapped, size));
+#ifdef __i386__
+            wsi::aligned_free(mapped);
+#endif
+          });
+    }
+  }
+
+  void DebugEncodeCBVReadbacks(CommandChunk *chunk, const char *kind,
+                               const ReplayState &state,
+                               PipelineState &pipeline) {
+    static std::atomic<uint32_t> log_count = 0;
+    if (!D3D12DiagShouldLog(log_count, D3D12DiagCBVReadbackEnabled()))
+      return;
+
+    auto *root = GetRootSignature(state.graphics_root_signature.ptr());
+    if (!root)
+      return;
+
+    const auto &cache_key = pipeline.GetShaderCacheKey();
+    const auto key_size = std::min<size_t>(cache_key.size(), 16);
+    std::string key_prefix(cache_key.c_str(), cache_key.c_str() + key_size);
+    const auto sample_limit = D3D12DiagCBVReadbackBytes();
+    const auto parameters = root->GetParameters();
+
+    for (UINT root_index = 0; root_index < parameters.size(); root_index++) {
+      const auto &parameter = parameters[root_index];
+      struct CBVReadbackTarget {
+        UINT slot;
+        DescriptorRecord descriptor;
+      };
+      std::vector<CBVReadbackTarget> cbvs;
+      if (parameter.parameter_type ==
+          D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE) {
+        const auto base = GetTableHandle(state, false, root_index);
+        if (!base.ptr)
+          continue;
+        UINT running_offset = 0;
+        for (const auto &range : parameter.ranges) {
+          const auto range_offset =
+              DescriptorRangeOffset(range, running_offset);
+          const auto count =
+              range.descriptor_count == UINT_MAX
+                  ? ReflectedDescriptorRangeCount(
+                        pipeline, range, parameter.visibility, false)
+                  : range.descriptor_count;
+          if (range.range_type == D3D12_DESCRIPTOR_RANGE_TYPE_CBV) {
+            for (UINT i = 0; i < count; i++) {
+              auto *descriptor = GetBoundDescriptorRecordInRange(
+                  state, base, range_offset, i, count,
+                  D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+              if (!descriptor)
+                continue;
+              ForEachVisibleStage(
+                  parameter.visibility, false, [&](PipelineStage stage) {
+                    if (stage != PipelineStage::Vertex)
+                      return;
+                    auto slot = ResolveShaderBindingSlot(
+                        pipeline, stage, SM50BindingType::ConstantBuffer,
+                        range.base_shader_register + i,
+                        range.register_space);
+                    if (slot)
+                      cbvs.push_back({*slot, *descriptor});
+                  });
+            }
+          }
+          if (range.descriptor_count != UINT_MAX)
+            running_offset = range_offset + range.descriptor_count;
+        }
+      } else if (parameter.parameter_type == D3D12_ROOT_PARAMETER_TYPE_CBV) {
+        auto it = state.graphics_cbv_roots.find(root_index);
+        if (it == state.graphics_cbv_roots.end())
+          continue;
+
+        Resource *resource = nullptr;
+        const auto offset = ResolveBufferGpuAddress(it->second, resource);
+        if (!resource || !resource->GetBuffer())
+          continue;
+
+        DescriptorRecord descriptor = {};
+        descriptor.type = DescriptorRecordType::ConstantBufferView;
+        descriptor.resource = resource->GetD3D12Resource();
+        descriptor.has_desc = true;
+        descriptor.desc.cbv.BufferLocation = it->second;
+        descriptor.desc.cbv.SizeInBytes =
+            UINT(std::min<UINT64>(resource->GetResourceDesc().Width - offset,
+                                  UINT_MAX));
+
+        ForEachVisibleStage(parameter.visibility, false,
+                            [&](PipelineStage stage) {
+                              if (stage != PipelineStage::Vertex)
+                                return;
+                              auto slot = ResolveShaderBindingSlot(
+                                  pipeline, stage,
+                                  SM50BindingType::ConstantBuffer,
+                                  parameter.descriptor.ShaderRegister,
+                                  parameter.descriptor.RegisterSpace);
+                              if (slot)
+                                cbvs.push_back({*slot, descriptor});
+                            });
+      }
+
+      for (const auto &[slot, descriptor] : cbvs) {
+        if (descriptor.type != DescriptorRecordType::ConstantBufferView ||
+            !descriptor.has_desc)
+          continue;
+
+        Resource *resource = nullptr;
+        const auto resource_offset = ResolveBufferGpuAddress(
+            descriptor.desc.cbv.BufferLocation, resource);
+        if (!resource || !resource->GetBufferAllocation())
+          continue;
+
+        const auto size =
+            std::min<UINT64>(sample_limit, descriptor.desc.cbv.SizeInBytes);
+        if (!size)
+          continue;
+
+        WMTBufferInfo info = {};
+        info.length = size;
+        info.options = WMTResourceStorageModeShared |
+                       WMTResourceHazardTrackingModeUntracked;
+        info.memory.set(nullptr);
+#ifdef __i386__
+        info.memory.set(wsi::aligned_malloc(size, DXMT_PAGE_SIZE));
+#endif
+        auto staging = device_->GetMTLDevice().newBuffer(info);
+        auto *mapped =
+            static_cast<uint8_t *>(info.memory.get_accessible_or_null());
+        if (!staging || !mapped) {
+#ifdef __i386__
+          wsi::aligned_free(info.memory.get_accessible_or_null());
+#endif
+          continue;
+        }
+
+        Rc<BufferAllocation> allocation = resource->GetBufferAllocation();
+        const auto src_offset = resource->GetHeapOffset() + resource_offset;
+        chunk->emitcc([allocation,
+                       staging = WMT::Reference<WMT::Buffer>(staging),
+                       src_offset, size](ArgumentEncodingContext &enc) {
+          enc.retainAllocation(allocation.ptr());
+          enc.startBlitPass();
+          auto &copy =
+              enc.encodeBlitCommand<wmtcmd_blit_copy_from_buffer_to_buffer>();
+          copy.type = WMTBlitCommandCopyFromBufferToBuffer;
+          copy.src = allocation->buffer();
+          copy.src_offset = src_offset;
+          copy.dst = staging;
+          copy.dst_offset = 0;
+          copy.copy_length = size;
+          enc.endPass();
+        });
+        chunk->deferred_readbacks.push_back(
+            [staging = WMT::Reference<WMT::Buffer>(staging), mapped,
+             key_prefix, kind = std::string(kind), root_index, slot,
+             address = descriptor.desc.cbv.BufferLocation,
+             declared_size = descriptor.desc.cbv.SizeInBytes, resource_offset,
+             heap_offset = resource->GetHeapOffset(), size]() {
+              INFO("D3D12 diagnostic: CBV readback",
+                   " kind=", kind,
+                   " pso=", key_prefix,
+                   " root=", root_index,
+                   " slot=", slot,
+                   " address=", uint64_t(address),
+                   " declaredSize=", uint32_t(declared_size),
+                   " resourceOffset=", uint64_t(resource_offset),
+                   " heapOffset=", uint64_t(heap_offset),
+                   " bytes=", size,
+                   " floats=", D3D12DiagFloatWords(mapped, size),
+                   " hex=", D3D12DiagHexBytes(mapped, size));
+#ifdef __i386__
+              wsi::aligned_free(mapped);
+#endif
+            });
+      }
+    }
+  }
+
   static void EncodeDynamicRenderState(
       ArgumentEncodingContext &enc, const std::vector<D3D12_VIEWPORT> &viewports,
       const std::vector<D3D12_RECT> &scissors,
@@ -4264,6 +5209,14 @@ private:
     auto attachments = BuildRenderPassAttachments(state);
     if (!ResolveDynamicRasterRects(viewports, scissors, "draw"))
       return;
+    DebugLogDrawState("draw", state, *pipeline, *metal, attachments,
+                      viewports, scissors, &record, nullptr, 0, 0);
+    DebugEncodeIAReadbacks(chunk, "draw", state, *pipeline, &record, nullptr,
+                           0);
+    DebugEncodeCBVReadbacks(chunk, "draw", state, *pipeline);
+    auto visibility_query = D3D12DiagCreateDrawVisibilityQuery(
+        chunk, "draw", pipeline->GetShaderCacheKey(),
+        record.vertex_count_per_instance, 0, record.instance_count);
     const auto argument_buffer_size = EstimateGraphicsArgumentBufferSize(*pipeline);
     chunk->emitcc([this, metal_pso = metal->pso,
                    depth_stencil = metal->depth_stencil,
@@ -4276,6 +5229,7 @@ private:
                    vertex_count = record.vertex_count_per_instance,
                    instance_count = record.instance_count,
                    base_instance = record.start_instance_location,
+                   visibility_query = std::move(visibility_query),
                    viewports = std::move(viewports),
                    scissors = std::move(scissors),
                    attachments = std::move(attachments)](ArgumentEncodingContext &enc) mutable {
@@ -4299,6 +5253,13 @@ private:
       EncodeDynamicRenderState(enc, viewports, scissors, blend_factor,
                                stencil_ref);
 
+      Rc<VisibilityResultQuery> active_visibility_query;
+      if (visibility_query) {
+        active_visibility_query = visibility_query;
+        enc.beginVisibilityResultQuery(std::move(visibility_query));
+        enc.bumpVisibilityResultOffset();
+      }
+
       auto &draw = enc.encodeRenderCommand<wmtcmd_render_draw>();
       draw.type = WMTRenderCommandDraw;
       draw.primitive_type = *primitive;
@@ -4306,6 +5267,10 @@ private:
       draw.vertex_count = vertex_count;
       draw.instance_count = instance_count;
       draw.base_instance = base_instance;
+      if (active_visibility_query) {
+        enc.endVisibilityResultQuery(std::move(active_visibility_query));
+        enc.bumpVisibilityResultOffset();
+      }
       enc.endPass();
     });
   }
@@ -4360,6 +5325,15 @@ private:
     auto scissors = state.scissors;
     if (!ResolveDynamicRasterRects(viewports, scissors, "indexed draw"))
       return;
+    DebugLogDrawState("indexed", state, *pipeline, *metal, attachments,
+                      viewports, scissors, nullptr, &record,
+                      index_resource_offset, index_offset);
+    DebugEncodeIAReadbacks(chunk, "indexed", state, *pipeline, nullptr,
+                           &record, index_offset);
+    DebugEncodeCBVReadbacks(chunk, "indexed", state, *pipeline);
+    auto visibility_query = D3D12DiagCreateDrawVisibilityQuery(
+        chunk, "indexed", pipeline->GetShaderCacheKey(), 0,
+        record.index_count_per_instance, record.instance_count);
     const auto argument_buffer_size = EstimateGraphicsArgumentBufferSize(*pipeline);
     chunk->emitcc([this, metal_pso = metal->pso,
                    depth_stencil = metal->depth_stencil,
@@ -4376,6 +5350,7 @@ private:
                    instance_count = record.instance_count,
                    base_vertex = record.base_vertex_location,
                    base_instance = record.start_instance_location,
+                   visibility_query = std::move(visibility_query),
                    attachments = std::move(attachments)](ArgumentEncodingContext &enc) mutable {
       enc.retainAllocation(index_allocation.ptr());
       if (!BeginRenderPass(enc, attachments, argument_buffer_size))
@@ -4397,6 +5372,13 @@ private:
       EncodeDynamicRenderState(enc, viewports, scissors, blend_factor,
                                stencil_ref);
 
+      Rc<VisibilityResultQuery> active_visibility_query;
+      if (visibility_query) {
+        active_visibility_query = visibility_query;
+        enc.beginVisibilityResultQuery(std::move(visibility_query));
+        enc.bumpVisibilityResultOffset();
+      }
+
       auto &draw = enc.encodeRenderCommand<wmtcmd_render_draw_indexed>();
       draw.type = WMTRenderCommandDrawIndexed;
       draw.primitive_type = *primitive;
@@ -4407,6 +5389,10 @@ private:
       draw.instance_count = instance_count;
       draw.base_vertex = base_vertex;
       draw.base_instance = base_instance;
+      if (active_visibility_query) {
+        enc.endVisibilityResultQuery(std::move(active_visibility_query));
+        enc.bumpVisibilityResultOffset();
+      }
       enc.endPass();
     });
   }
@@ -4603,6 +5589,38 @@ private:
       const UINT src_level = GetMipLevel(*src, src_subresource);
       Rc<Texture> dst_texture = dst->GetTexture();
       Rc<Texture> src_texture = src->GetTexture();
+      if (D3D12DiagTextureCopyEnabled()) {
+        static std::atomic<uint32_t> log_count = 0;
+        if (D3D12DiagShouldLog(log_count, true)) {
+          INFO("D3D12 diagnostic: texture copy record",
+               " dst_resource=", uint64_t(dst->GetD3D12Resource()),
+               " src_resource=", uint64_t(src->GetD3D12Resource()),
+               " dst_texture=", dst_texture && dst_texture->current()
+                                  ? uint64_t(dst_texture->current()->texture())
+                                  : 0,
+               " src_texture=", src_texture && src_texture->current()
+                                  ? uint64_t(src_texture->current()->texture())
+                                  : 0,
+               " dst_subresource=", uint32_t(dst_subresource),
+               " src_subresource=", uint32_t(src_subresource),
+               " dst_level=", uint32_t(dst_level),
+               " dst_slice=", uint32_t(dst_slice),
+               " src_level=", uint32_t(src_level),
+               " src_slice=", uint32_t(src_slice),
+               " dst_origin=", uint32_t(dst_origin.x), ",",
+               uint32_t(dst_origin.y), ",", uint32_t(dst_origin.z),
+               " src_origin=", uint32_t(src_origin.x), ",",
+               uint32_t(src_origin.y), ",", uint32_t(src_origin.z),
+               " size=", uint32_t(size.width), "x", uint32_t(size.height),
+               "x", uint32_t(size.depth),
+               " dst_resource_size=", uint64_t(dst->GetResourceDesc().Width),
+               "x", uint32_t(dst->GetResourceDesc().Height),
+               " src_resource_size=", uint64_t(src->GetResourceDesc().Width),
+               "x", uint32_t(src->GetResourceDesc().Height),
+               " dst_format=", uint32_t(dst->GetResourceDesc().Format),
+               " src_format=", uint32_t(src->GetResourceDesc().Format));
+        }
+      }
       chunk->emitcc([dst_texture = std::move(dst_texture),
                      src_texture = std::move(src_texture), dst_slice, dst_level,
                      src_slice, src_level, src_origin, dst_origin,
@@ -4624,6 +5642,24 @@ private:
         copy.dst_slice = dst_slice;
         copy.dst_level = dst_level;
         copy.dst_origin = dst_origin;
+        if (D3D12DiagTextureCopyEnabled()) {
+          static std::atomic<uint32_t> log_count = 0;
+          if (D3D12DiagShouldLog(log_count, true)) {
+            INFO("D3D12 diagnostic: texture copy encode",
+                 " dst_texture=", uint64_t(dst),
+                 " src_texture=", uint64_t(src),
+                 " dst_level=", uint32_t(dst_level),
+                 " dst_slice=", uint32_t(dst_slice),
+                 " src_level=", uint32_t(src_level),
+                 " src_slice=", uint32_t(src_slice),
+                 " dst_origin=", uint32_t(dst_origin.x), ",",
+                 uint32_t(dst_origin.y), ",", uint32_t(dst_origin.z),
+                 " src_origin=", uint32_t(src_origin.x), ",",
+                 uint32_t(src_origin.y), ",", uint32_t(src_origin.z),
+                 " size=", uint32_t(size.width), "x",
+                 uint32_t(size.height), "x", uint32_t(size.depth));
+          }
+        }
         enc.endPass();
       });
       return;
@@ -4671,12 +5707,71 @@ private:
     const UINT64 buffer_offset =
         buffer_resource.GetHeapOffset() + buffer_location.placed_footprint.Offset;
     const UINT row_pitch = footprint.RowPitch;
-    const UINT image_pitch = footprint.RowPitch * footprint.Height;
+    MTL_DXGI_FORMAT_DESC footprint_format_desc = {};
+    const bool footprint_format_known =
+        SUCCEEDED(MTLQueryDXGIFormat(device_->GetMTLDevice(), footprint.Format,
+                                     footprint_format_desc));
+    const UINT footprint_block_height =
+        footprint_format_known && (footprint_format_desc.Flag & MTL_DXGI_FORMAT_BC)
+            ? 4u
+            : 1u;
+    const UINT footprint_row_count =
+        std::max(1u, (footprint.Height + footprint_block_height - 1) /
+                         footprint_block_height);
+    const UINT image_pitch = footprint.RowPitch * footprint_row_count;
+    const DXGI_FORMAT footprint_format = footprint.Format;
+    const DXGI_FORMAT resource_format = texture_resource.GetResourceDesc().Format;
+    const uint32_t resource_width = uint32_t(texture_resource.GetResourceDesc().Width);
+    const uint32_t resource_height = texture_resource.GetResourceDesc().Height;
+    const uint32_t resource_depth = texture_resource.GetResourceDesc().DepthOrArraySize;
+    const uint32_t texture_format = uint32_t(texture->pixelFormat());
+    const uint32_t texture_type = uint32_t(texture->textureType());
+    const uint32_t texture_width = texture->width();
+    const uint32_t texture_height = texture->height();
+    const uint32_t texture_depth = texture->depth();
+    const uint32_t texture_array = texture->arrayLength();
+    const uint32_t texture_mips = texture->miplevelCount();
+    const uint32_t texture_samples = texture->sampleCount();
+
+    if (D3D12DiagTextureCopyEnabled()) {
+      static std::atomic<uint32_t> log_count = 0;
+      if (D3D12DiagShouldLog(log_count, true)) {
+        INFO("D3D12 diagnostic: buffer texture copy record",
+             " direction=", dst_is_buffer ? "texture_to_buffer" : "buffer_to_texture",
+             " dst_type=", D3D12TextureCopyTypeName(record.dst.type),
+             " src_type=", D3D12TextureCopyTypeName(record.src.type),
+             " subresource=", uint32_t(subresource),
+             " level=", uint32_t(level),
+             " slice=", uint32_t(slice),
+             " dst_xyz=", uint32_t(record.dst_x), ",", uint32_t(record.dst_y), ",", uint32_t(record.dst_z),
+             " origin=", uint32_t(origin.x), ",", uint32_t(origin.y), ",", uint32_t(origin.z),
+             " size=", uint32_t(size.width), "x", uint32_t(size.height), "x", uint32_t(size.depth),
+             " buffer_heap_offset=", uint64_t(buffer_resource.GetHeapOffset()),
+             " footprint_offset=", uint64_t(buffer_location.placed_footprint.Offset),
+             " buffer_offset=", uint64_t(buffer_offset),
+             " row_pitch=", uint32_t(row_pitch),
+             " image_pitch=", uint32_t(image_pitch),
+             " row_count=", uint32_t(footprint_row_count),
+             " block_height=", uint32_t(footprint_block_height),
+             " footprint_format=", uint32_t(footprint_format),
+             " footprint_size=", uint32_t(footprint.Width), "x", uint32_t(footprint.Height), "x", uint32_t(footprint.Depth),
+             " resource_format=", uint32_t(resource_format),
+             " resource_size=", resource_width, "x", resource_height, "x", resource_depth,
+             " texture_format=", texture_format,
+             " texture_type=", texture_type,
+             " texture_size=", texture_width, "x", texture_height, "x", texture_depth,
+             " texture_array=", texture_array,
+             " texture_mips=", texture_mips,
+             " texture_samples=", texture_samples);
+      }
+    }
 
     chunk->emitcc([dst_is_buffer, buffer = std::move(buffer),
                    texture = std::move(texture),
                    buffer_offset, row_pitch, image_pitch, size, origin, slice,
-                   level](ArgumentEncodingContext &enc) {
+                   level, footprint_format, resource_format, texture_format,
+                   footprint_row_count, footprint_block_height](
+                       ArgumentEncodingContext &enc) {
       enc.startBlitPass();
       if (dst_is_buffer) {
         auto src = enc.access(texture, level, slice, ResourceAccess::Read);
@@ -4694,6 +5789,23 @@ private:
         copy.offset = dst_offset + buffer_offset;
         copy.bytes_per_row = row_pitch;
         copy.bytes_per_image = image_pitch;
+        if (D3D12DiagTextureCopyEnabled()) {
+          static std::atomic<uint32_t> log_count = 0;
+          if (D3D12DiagShouldLog(log_count, true)) {
+            INFO("D3D12 diagnostic: buffer texture copy encode",
+                 " direction=texture_to_buffer",
+                 " access_offset=", uint64_t(dst_offset),
+                 " buffer_offset=", uint64_t(buffer_offset),
+                 " metal_offset=", uint64_t(copy.offset),
+                 " row_pitch=", uint32_t(row_pitch),
+                 " image_pitch=", uint32_t(image_pitch),
+                 " row_count=", uint32_t(footprint_row_count),
+                 " block_height=", uint32_t(footprint_block_height),
+                 " format=", uint32_t(footprint_format),
+                 " resource_format=", uint32_t(resource_format),
+                 " texture_format=", uint32_t(texture_format));
+          }
+        }
       } else {
         auto [src, src_offset] =
             enc.access(buffer, buffer_offset, image_pitch, ResourceAccess::Read);
@@ -4710,6 +5822,23 @@ private:
         copy.slice = slice;
         copy.level = level;
         copy.origin = origin;
+        if (D3D12DiagTextureCopyEnabled()) {
+          static std::atomic<uint32_t> log_count = 0;
+          if (D3D12DiagShouldLog(log_count, true)) {
+            INFO("D3D12 diagnostic: buffer texture copy encode",
+                 " direction=buffer_to_texture",
+                 " access_offset=", uint64_t(src_offset),
+                 " buffer_offset=", uint64_t(buffer_offset),
+                 " metal_offset=", uint64_t(copy.src_offset),
+                 " row_pitch=", uint32_t(row_pitch),
+                 " image_pitch=", uint32_t(image_pitch),
+                 " row_count=", uint32_t(footprint_row_count),
+                 " block_height=", uint32_t(footprint_block_height),
+                 " format=", uint32_t(footprint_format),
+                 " resource_format=", uint32_t(resource_format),
+                 " texture_format=", uint32_t(texture_format));
+          }
+        }
       }
       enc.endPass();
     });

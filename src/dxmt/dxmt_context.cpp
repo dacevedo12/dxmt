@@ -500,7 +500,385 @@ DebugShaderHashSelected(const std::string &shader_hash) {
 static bool
 DebugShouldLogBinding(const std::string &shader_hash) {
   static const bool enabled = DebugEnabledEnv("DXMT_DIAG_BINDINGS");
-  return enabled && DebugShaderHashSelected(shader_hash);
+  return enabled && (shader_hash.empty() || DebugShaderHashSelected(shader_hash));
+}
+
+static bool
+DebugShouldLogRenderCommands() {
+  static const bool enabled =
+      DebugEnabledEnv("DXMT_DIAG_RENDER_COMMANDS") ||
+      DebugEnabledEnv("DXMT_DIAG_COMMAND_QUEUE");
+  return enabled;
+}
+
+static bool
+DebugShouldLogRenderPasses() {
+  static const bool enabled = DebugEnabledEnv("DXMT_DIAG_RENDER_PASS");
+  return enabled;
+}
+
+static bool
+DebugPresentReadbackEnabled() {
+  static const bool enabled = DebugEnabledEnv("DXMT_DIAG_PRESENT_READBACK");
+  return enabled;
+}
+
+static bool
+DebugRenderReadbackEnabled() {
+  static const bool enabled = DebugEnabledEnv("DXMT_DIAG_RENDER_READBACK");
+  return enabled;
+}
+
+static bool
+DebugPresentReadbackGridEnabled() {
+  static const bool enabled =
+      DebugEnabledEnv("DXMT_DIAG_PRESENT_READBACK_GRID");
+  return enabled;
+}
+
+static uint32_t
+DebugPresentReadbackGridSize() {
+  static const uint32_t size = []() {
+    auto value = env::getEnvVar("DXMT_DIAG_PRESENT_READBACK_GRID_SIZE");
+    if (value.empty())
+      return 3u;
+    char *end = nullptr;
+    auto parsed = std::strtoul(value.c_str(), &end, 10);
+    if (end == value.c_str())
+      return 3u;
+    auto clamped = std::clamp<unsigned long>(parsed, 1, 33);
+    return static_cast<uint32_t>(clamped | 1u);
+  }();
+  return size;
+}
+
+static uint32_t
+DebugPresentReadbackLimit() {
+  static const uint32_t limit = []() {
+    auto value = env::getEnvVar("DXMT_DIAG_PRESENT_READBACK_LIMIT");
+    if (value.empty())
+      return 16u;
+    char *end = nullptr;
+    auto parsed = std::strtoul(value.c_str(), &end, 10);
+    if (end == value.c_str())
+      return 16u;
+    return static_cast<uint32_t>(std::max<unsigned long>(1, parsed));
+  }();
+  return limit;
+}
+
+static uint32_t
+DebugPresentReadbackSkip() {
+  static const uint32_t skip = []() {
+    auto value = env::getEnvVar("DXMT_DIAG_PRESENT_READBACK_SKIP");
+    if (value.empty())
+      return 0u;
+    char *end = nullptr;
+    auto parsed = std::strtoul(value.c_str(), &end, 10);
+    if (end == value.c_str())
+      return 0u;
+    return static_cast<uint32_t>(parsed);
+  }();
+  return skip;
+}
+
+static uint32_t
+DebugPresentReadbackInterval() {
+  static const uint32_t interval = []() {
+    auto value = env::getEnvVar("DXMT_DIAG_PRESENT_READBACK_INTERVAL");
+    if (value.empty())
+      return 1u;
+    char *end = nullptr;
+    auto parsed = std::strtoul(value.c_str(), &end, 10);
+    if (end == value.c_str())
+      return 1u;
+    return static_cast<uint32_t>(std::max<unsigned long>(1, parsed));
+  }();
+  return interval;
+}
+
+static uint32_t
+DebugRenderReadbackLimit() {
+  static const uint32_t limit = []() {
+    auto value = env::getEnvVar("DXMT_DIAG_RENDER_READBACK_LIMIT");
+    if (value.empty())
+      return 64u;
+    char *end = nullptr;
+    auto parsed = std::strtoul(value.c_str(), &end, 10);
+    if (end == value.c_str())
+      return 64u;
+    return static_cast<uint32_t>(std::max<unsigned long>(1, parsed));
+  }();
+  return limit;
+}
+
+static uint64_t
+DebugRenderReadbackFrameSkip() {
+  static const uint64_t skip = []() {
+    auto value = env::getEnvVar("DXMT_DIAG_RENDER_READBACK_FRAME_SKIP");
+    if (value.empty())
+      return 0ull;
+    char *end = nullptr;
+    auto parsed = std::strtoull(value.c_str(), &end, 10);
+    if (end == value.c_str())
+      return 0ull;
+    return static_cast<uint64_t>(parsed);
+  }();
+  return skip;
+}
+
+static uint64_t
+DebugRenderReadbackFrameInterval() {
+  static const uint64_t interval = []() {
+    auto value = env::getEnvVar("DXMT_DIAG_RENDER_READBACK_FRAME_INTERVAL");
+    if (value.empty())
+      return 1ull;
+    char *end = nullptr;
+    auto parsed = std::strtoull(value.c_str(), &end, 10);
+    if (end == value.c_str())
+      return 1ull;
+    return static_cast<uint64_t>(std::max<unsigned long long>(1, parsed));
+  }();
+  return interval;
+}
+
+static bool
+DebugShouldSamplePresentReadback(uint32_t &present_index) {
+  static std::atomic<uint32_t> present_count = 0;
+  static std::atomic<uint32_t> sample_count = 0;
+  if (!DebugPresentReadbackEnabled())
+    return false;
+  present_index = present_count.fetch_add(1, std::memory_order_relaxed);
+  auto skip = DebugPresentReadbackSkip();
+  if (present_index < skip)
+    return false;
+  if (((present_index - skip) % DebugPresentReadbackInterval()) != 0)
+    return false;
+  return sample_count.fetch_add(1, std::memory_order_relaxed) < DebugPresentReadbackLimit();
+}
+
+static bool
+DebugShouldSampleRenderReadback(uint64_t frame_id) {
+  static std::atomic<uint32_t> sample_count = 0;
+  if (!DebugRenderReadbackEnabled())
+    return false;
+  auto skip = DebugRenderReadbackFrameSkip();
+  if (frame_id < skip)
+    return false;
+  if (((frame_id - skip) % DebugRenderReadbackFrameInterval()) != 0)
+    return false;
+  return sample_count.fetch_add(1, std::memory_order_relaxed) < DebugRenderReadbackLimit();
+}
+
+static bool
+DebugSupportsTextureReadback(WMT::Texture texture) {
+  if (!texture)
+    return false;
+  auto format = texture.pixelFormat();
+  if (!MTLGetTexelSize(format))
+    return false;
+  if (IsBlockCompressionFormat(format))
+    return false;
+  return true;
+}
+
+static void
+DebugEncodeTexturePointReadback(QueryReadbacks &readbacks, WMT::CommandBuffer cmdbuf,
+                                WMT::Device device, WMT::Texture texture,
+                                const char *label, uint64_t frame_id,
+                                uint64_t seq_id, uint64_t encoder_id,
+                                uint32_t index, uint32_t point_x,
+                                uint32_t point_y, uint16_t level, uint16_t slice,
+                                uint32_t width, uint32_t height) {
+  if (!DebugSupportsTextureReadback(texture)) {
+    INFO("DXMT diagnostic: texture readback skipped",
+         " label=", label,
+         " frame=", frame_id,
+         " seq=", seq_id,
+         " encoder=", encoder_id,
+         " index=", index,
+         " texture=", uint64_t(texture),
+         " format=", texture ? uint32_t(texture.pixelFormat()) : 0,
+         " size=", texture ? texture.width() : 0, "x", texture ? texture.height() : 0,
+         " reason=unsupported_texture");
+    return;
+  }
+
+  if (!width || !height) {
+    INFO("DXMT diagnostic: texture readback skipped",
+         " label=", label,
+         " frame=", frame_id,
+         " seq=", seq_id,
+         " encoder=", encoder_id,
+         " index=", index,
+         " texture=", uint64_t(texture),
+         " format=", uint32_t(texture.pixelFormat()),
+         " size=", width, "x", height,
+         " reason=empty_texture");
+    return;
+  }
+
+  const auto texel_size = MTLGetTexelSize(texture.pixelFormat());
+  const auto row_pitch = std::max<uint32_t>(256, texel_size);
+  constexpr uint32_t readback_size = 256;
+  WMTBufferInfo buffer_info = {};
+  buffer_info.length = readback_size;
+  buffer_info.options = WMTResourceStorageModeShared | WMTResourceHazardTrackingModeUntracked;
+  buffer_info.memory.set(nullptr);
+#ifdef __i386__
+  buffer_info.memory.set(wsi::aligned_malloc(readback_size, DXMT_PAGE_SIZE));
+#endif
+  auto buffer = device.newBuffer(buffer_info);
+  auto *mapped = static_cast<uint8_t *>(buffer_info.memory.get_accessible_or_null());
+  if (!buffer || !mapped) {
+    INFO("DXMT diagnostic: texture readback skipped",
+         " label=", label,
+         " frame=", frame_id,
+         " seq=", seq_id,
+         " encoder=", encoder_id,
+         " index=", index,
+         " texture=", uint64_t(texture),
+         " format=", uint32_t(texture.pixelFormat()),
+         " size=", width, "x", height,
+         " reason=buffer_allocation_failed");
+#ifdef __i386__
+    wsi::aligned_free(buffer_info.memory.get_accessible_or_null());
+#endif
+    return;
+  }
+
+  const auto x = std::min(point_x, width - 1);
+  const auto y = std::min(point_y, height - 1);
+
+  auto encoder = cmdbuf.blitCommandEncoder();
+  wmtcmd_blit_copy_from_texture_to_buffer copy = {};
+  copy.type = WMTBlitCommandCopyFromTextureToBuffer;
+  copy.next.set(nullptr);
+  copy.src = texture;
+  copy.slice = slice;
+  copy.level = level;
+  copy.origin = {x, y, 0};
+  copy.size = {1, 1, 1};
+  copy.dst = buffer;
+  copy.offset = 0;
+  copy.bytes_per_row = row_pitch;
+  copy.bytes_per_image = readback_size;
+  encoder.encodeCommands(reinterpret_cast<const wmtcmd_blit_nop *>(&copy));
+  encoder.endEncoding();
+
+  const auto format = texture.pixelFormat();
+  readbacks.diagnostics.push_back(
+       [buffer = WMT::Reference<WMT::Buffer>(buffer), mapped, label = std::string(label),
+       frame_id, seq_id, texture_id = uint64_t(texture), format, width, height,
+       x, y, texel_size, encoder_id, index, level, slice]() {
+        uint8_t bytes[16] = {};
+        const auto copy_size = std::min<uint32_t>(texel_size, sizeof(bytes));
+        std::memcpy(bytes, mapped, copy_size);
+        const uint32_t u32 = uint32_t(bytes[0]) | (uint32_t(bytes[1]) << 8) |
+                             (uint32_t(bytes[2]) << 16) | (uint32_t(bytes[3]) << 24);
+        INFO("DXMT diagnostic: texture readback",
+             " label=", label,
+             " frame=", frame_id,
+             " seq=", seq_id,
+             " encoder=", encoder_id,
+             " index=", index,
+             " texture=", texture_id,
+             " format=", uint32_t(format),
+             " size=", width, "x", height,
+             " level=", uint32_t(level),
+             " slice=", uint32_t(slice),
+             " xy=", x, ",", y,
+             " texelSize=", texel_size,
+             " bytes=", uint32_t(bytes[0]), ",", uint32_t(bytes[1]), ",",
+             uint32_t(bytes[2]), ",", uint32_t(bytes[3]),
+             " u32=", u32);
+#ifdef __i386__
+        wsi::aligned_free(mapped);
+#endif
+      });
+}
+
+static void
+DebugEncodeTextureCenterReadback(QueryReadbacks &readbacks, WMT::CommandBuffer cmdbuf,
+                                 WMT::Device device, WMT::Texture texture,
+                                 const char *label, uint64_t frame_id,
+                                 uint64_t seq_id, uint32_t present_index) {
+  const auto width = texture ? texture.width() : 0;
+  const auto height = texture ? texture.height() : 0;
+  DebugEncodeTexturePointReadback(readbacks, cmdbuf, device, texture, label, frame_id,
+                                  seq_id, present_index, present_index,
+                                  width / 2, height / 2, 0, 0, width, height);
+}
+
+static void
+DebugEncodePresentReadbacks(QueryReadbacks &readbacks, WMT::CommandBuffer cmdbuf,
+                            WMT::Device device, WMT::Texture texture,
+                            const char *label, uint64_t frame_id,
+                            uint64_t seq_id, uint32_t present_index) {
+  if (!DebugPresentReadbackGridEnabled()) {
+    DebugEncodeTextureCenterReadback(readbacks, cmdbuf, device, texture, label,
+                                     frame_id, seq_id, present_index);
+    return;
+  }
+
+  const auto width = texture ? texture.width() : 0;
+  const auto height = texture ? texture.height() : 0;
+  const auto grid_size = DebugPresentReadbackGridSize();
+  for (uint32_t y = 0; y < grid_size; y++) {
+    for (uint32_t x = 0; x < grid_size; x++) {
+      const auto index = y * grid_size + x;
+      const auto point_x = width ? ((uint64_t(x) * width) + (width / 2)) / grid_size : 0;
+      const auto point_y = height ? ((uint64_t(y) * height) + (height / 2)) / grid_size : 0;
+    DebugEncodeTexturePointReadback(
+        readbacks, cmdbuf, device, texture, label, frame_id, seq_id,
+          present_index, index, point_x, point_y, 0, 0, width, height);
+    }
+  }
+}
+
+static void
+DebugEncodeRenderAttachmentReadbacks(QueryReadbacks &readbacks, WMT::CommandBuffer cmdbuf,
+                                     WMT::Device device, uint64_t frame_id,
+                                     uint64_t seq_id, const RenderEncoderData *data,
+                                     bool sample, const char *label) {
+  if (!sample)
+    return;
+
+  if (data->default_raster_sample_count > 1) {
+    INFO("DXMT diagnostic: render readback skipped",
+         " frame=", frame_id,
+         " seq=", seq_id,
+         " encoder=", data->id,
+         " samples=", uint32_t(data->default_raster_sample_count),
+         " reason=multisample");
+    return;
+  }
+
+  for (unsigned i = 0; i < std::size(data->colors); i++) {
+    auto &color = data->colors[i];
+    if (!color.attachment && !color.buffer_texture)
+      continue;
+
+    WMT::Texture texture;
+    uint16_t level = color.level;
+    uint16_t slice = color.slice;
+    uint32_t width = data->render_target_width;
+    uint32_t height = data->render_target_height;
+    if (color.attachment) {
+      texture = color.attachment.texture();
+    } else {
+      texture = color.buffer_texture;
+      level = 0;
+      slice = 0;
+      width = texture ? texture.width() : 0;
+      height = texture ? texture.height() : 0;
+    }
+
+    DebugEncodeTexturePointReadback(readbacks, cmdbuf, device, texture,
+                                    label, frame_id, seq_id,
+                                    data->id, i, width / 2, height / 2, level,
+                                    slice, width, height);
+  }
 }
 
 static uint32_t
@@ -539,6 +917,198 @@ DebugPipelineStageName(PipelineStage stage) {
   return "?";
 }
 
+static void
+DebugAccumulateRenderCommands(FrameStatistics &statistics,
+                              const wmtcmd_render_nop *cmd_head) {
+  if (!DebugShouldLogRenderCommands())
+    return;
+
+  auto command = reinterpret_cast<const wmtcmd_base *>(cmd_head->next.ptr);
+  while (command) {
+    statistics.render_command_count++;
+    switch (static_cast<WMTRenderCommandType>(command->type)) {
+    case WMTRenderCommandSetPSO:
+      statistics.render_pso_bind_count++;
+      break;
+    case WMTRenderCommandDraw:
+      statistics.render_draw_count++;
+      break;
+    case WMTRenderCommandDrawIndexed:
+      statistics.render_indexed_draw_count++;
+      break;
+    case WMTRenderCommandDrawIndirect:
+    case WMTRenderCommandDrawIndexedIndirect:
+      statistics.render_indirect_draw_count++;
+      break;
+    case WMTRenderCommandDrawMeshThreadgroups:
+    case WMTRenderCommandDrawMeshThreadgroupsIndirect:
+    case WMTRenderCommandDXMTGeometryDraw:
+    case WMTRenderCommandDXMTGeometryDrawIndexed:
+    case WMTRenderCommandDXMTGeometryDrawIndirect:
+    case WMTRenderCommandDXMTGeometryDrawIndexedIndirect:
+    case WMTRenderCommandDXMTTessellationMeshDraw:
+    case WMTRenderCommandDXMTTessellationMeshDrawIndexed:
+    case WMTRenderCommandDXMTTessellationMeshDrawIndirect:
+    case WMTRenderCommandDXMTTessellationMeshDrawIndexedIndirect:
+      statistics.render_mesh_draw_count++;
+      break;
+    case WMTRenderCommandDispatchThreadsPerTile:
+      statistics.render_tile_dispatch_count++;
+      break;
+    default:
+      break;
+    }
+    command = static_cast<const wmtcmd_base *>(command->next.ptr);
+  }
+}
+
+struct DebugRenderCommandSummary {
+  uint32_t command_count = 0;
+  uint32_t pso_binds = 0;
+  uint32_t draws = 0;
+  uint32_t indexed_draws = 0;
+  uint32_t indirect_draws = 0;
+  uint32_t mesh_draws = 0;
+  uint32_t tile_dispatches = 0;
+};
+
+static DebugRenderCommandSummary
+DebugSummarizeRenderCommands(const wmtcmd_render_nop *cmd_head) {
+  DebugRenderCommandSummary summary;
+  auto command = reinterpret_cast<const wmtcmd_base *>(cmd_head->next.ptr);
+  while (command) {
+    summary.command_count++;
+    switch (static_cast<WMTRenderCommandType>(command->type)) {
+    case WMTRenderCommandSetPSO:
+      summary.pso_binds++;
+      break;
+    case WMTRenderCommandDraw:
+      summary.draws++;
+      break;
+    case WMTRenderCommandDrawIndexed:
+      summary.indexed_draws++;
+      break;
+    case WMTRenderCommandDrawIndirect:
+    case WMTRenderCommandDrawIndexedIndirect:
+      summary.indirect_draws++;
+      break;
+    case WMTRenderCommandDrawMeshThreadgroups:
+    case WMTRenderCommandDrawMeshThreadgroupsIndirect:
+    case WMTRenderCommandDXMTGeometryDraw:
+    case WMTRenderCommandDXMTGeometryDrawIndexed:
+    case WMTRenderCommandDXMTGeometryDrawIndirect:
+    case WMTRenderCommandDXMTGeometryDrawIndexedIndirect:
+    case WMTRenderCommandDXMTTessellationMeshDraw:
+    case WMTRenderCommandDXMTTessellationMeshDrawIndexed:
+    case WMTRenderCommandDXMTTessellationMeshDrawIndirect:
+    case WMTRenderCommandDXMTTessellationMeshDrawIndexedIndirect:
+      summary.mesh_draws++;
+      break;
+    case WMTRenderCommandDispatchThreadsPerTile:
+      summary.tile_dispatches++;
+      break;
+    default:
+      break;
+    }
+    command = static_cast<const wmtcmd_base *>(command->next.ptr);
+  }
+  return summary;
+}
+
+static void
+DebugLogRenderPassInfo(uint64_t frame_id, uint64_t seq_id, uint64_t encoder_id,
+                       const RenderEncoderData *data,
+                       const DebugRenderCommandSummary &summary) {
+  if (!DebugShouldLogRenderPasses())
+    return;
+
+  static std::atomic<uint32_t> log_count = 0;
+  auto index = log_count.fetch_add(1, std::memory_order_relaxed);
+  if (index >= DebugBindingLogLimit())
+    return;
+
+  INFO(
+      "DXMT diagnostic: render pass",
+      " frame=", frame_id,
+      " seq=", seq_id,
+      " encoder=", encoder_id,
+      " size=", data->render_target_width, "x", data->render_target_height,
+      " rt_count=", uint32_t(data->render_target_count),
+      " samples=", uint32_t(data->default_raster_sample_count),
+      " array_length=", uint32_t(data->render_target_array_length),
+      " commands=", summary.command_count,
+      " psoBinds=", summary.pso_binds,
+      " draws=", summary.draws,
+      " indexedDraws=", summary.indexed_draws,
+      " indirectDraws=", summary.indirect_draws,
+      " meshDraws=", summary.mesh_draws,
+      " tileDispatches=", summary.tile_dispatches
+  );
+
+  for (unsigned i = 0; i < std::size(data->colors); i++) {
+    auto &color = data->colors[i];
+    if (!color.attachment && !color.buffer_texture)
+      continue;
+    WMT::Texture texture;
+    if (color.attachment)
+      texture = color.attachment.texture();
+    else
+      texture = color.buffer_texture;
+    auto *allocation = color.attachment ? color.attachment->allocation : nullptr;
+    auto *descriptor = allocation ? allocation->descriptor : nullptr;
+    INFO(
+        "DXMT diagnostic: render color attachment",
+        " frame=", frame_id,
+        " encoder=", encoder_id,
+        " slot=", i,
+        " texture=", uint64_t(texture),
+        " texture_descriptor=", uint64_t(descriptor),
+        " allocation=", uint64_t(allocation),
+        " allocation_texture=", allocation ? uint64_t(allocation->texture()) : 0,
+        " view=", color.attachment ? uint64_t(color.attachment->key) : color.buffer_view_id,
+        " load=", uint32_t(color.load_action),
+        " store=", uint32_t(color.store_action),
+        " clear=", color.clear_color.r, ",", color.clear_color.g, ",", color.clear_color.b, ",", color.clear_color.a,
+        " level=", uint32_t(color.level),
+        " slice=", uint32_t(color.slice),
+        " resolve=", uint64_t(color.resolve_attachment ? color.resolve_attachment.texture() : WMT::Texture{})
+    );
+  }
+}
+
+static void
+DebugLogClearPassInfo(uint64_t frame_id, uint64_t seq_id, uint64_t encoder_id,
+                      const ClearEncoderData *data) {
+  if (!DebugShouldLogRenderPasses())
+    return;
+
+  static std::atomic<uint32_t> log_count = 0;
+  auto index = log_count.fetch_add(1, std::memory_order_relaxed);
+  if (index >= DebugBindingLogLimit())
+    return;
+
+  WMT::Texture texture;
+  if (data->attachment)
+    texture = data->attachment.texture();
+  else
+    texture = data->buffer_texture;
+
+  INFO(
+      "DXMT diagnostic: clear pass",
+      " frame=", frame_id,
+      " seq=", seq_id,
+      " encoder=", encoder_id,
+      " size=", data->width, "x", data->height,
+      " array_length=", uint32_t(data->array_length),
+      " clear_dsv=", uint32_t(data->clear_dsv),
+      " texture=", uint64_t(texture),
+      " view=", data->attachment ? uint64_t(data->attachment->key) : data->buffer_view_id,
+      " color=", data->color.r, ",", data->color.g, ",", data->color.b, ",", data->color.a,
+      " depth=", data->depth_stencil.first,
+      " stencil=", uint32_t(data->depth_stencil.second)
+  );
+}
+
 static const char *
 DebugPipelineKindName(PipelineKind kind) {
   switch (kind) {
@@ -550,6 +1120,41 @@ DebugPipelineKindName(PipelineKind kind) {
     return "geometry";
   }
   return "?";
+}
+
+template <PipelineStage stage, PipelineKind kind>
+static void
+DebugLogConstantBufferBinding(
+    const std::string &shader_hash, const MTL_SM50_SHADER_ARGUMENT &arg,
+    const ConstantBufferBinding &binding, uint64_t encoded_address,
+    uint64_t valid_length, uint64_t encoder_id, bool dummy
+) {
+  if (!DebugShouldLogBinding(shader_hash))
+    return;
+
+  static std::atomic<uint32_t> log_count = 0;
+  auto index = log_count.fetch_add(1, std::memory_order_relaxed);
+  if (index >= DebugBindingLogLimit())
+    return;
+
+  INFO(
+      "DXMT diagnostic: shader constant buffer binding",
+      " stage=", DebugPipelineStageName(stage),
+      " kind=", DebugPipelineKindName(kind),
+      " shader=", shader_hash,
+      " encoder=", encoder_id,
+      " slot=", arg.SM50BindingSlot,
+      " arg_index=", GetArgumentIndex(arg.Type, arg.SM50BindingSlot),
+      " struct_qword=", arg.StructurePtrOffset,
+      " register_lower=", arg.RegisterLowerBound,
+      " register_count=", arg.RegisterCount,
+      " register_space=", arg.RegisterSpace,
+      " buffer=", uint64_t(binding.buffer.ptr()),
+      " offset=", uint32_t(binding.offset),
+      " length=", valid_length,
+      " encoded=0x", std::hex, encoded_address, std::dec,
+      " dummy=", dummy
+  );
 }
 
 static const char *
@@ -587,6 +1192,7 @@ ArgumentEncodingContext::encodeConstantBuffers(
     const ConstantBufferBinding *bindings
 ) {
   uint64_t *encoded_buffer = getMappedArgumentBuffer<uint64_t, stage == PipelineStage::Compute>(offset);
+  auto encoder_id = currentEncoderId();
 
   for (unsigned i = 0; i < reflection->NumConstantBuffers; i++) {
     auto &arg = constant_buffers[i];
@@ -595,6 +1201,9 @@ ArgumentEncodingContext::encodeConstantBuffers(
       auto &cbuf = bindings[i];
       if (!cbuf.buffer.ptr()) {
         encoded_buffer[arg.StructurePtrOffset] = dummy_cbuffer_info_.gpu_address;
+        DebugLogConstantBufferBinding<stage, kind>(
+            "", arg, cbuf, dummy_cbuffer_info_.gpu_address, 0, encoder_id,
+            true);
         makeResident<stage, kind>(dummy_cbuffer_, GetResidencyMask<kind>(stage, true, false));
         continue;
       }
@@ -602,6 +1211,9 @@ ArgumentEncodingContext::encodeConstantBuffers(
       auto valid_length = argbuf->length() > cbuf.offset ? argbuf->length() - cbuf.offset : 0;
       auto [argbuf_alloc, argbuf_offset] = access<stage>(argbuf, cbuf.offset, valid_length, ResourceAccess::Read);
       encoded_buffer[arg.StructurePtrOffset] = argbuf_alloc->gpuAddress() + argbuf_offset + cbuf.offset;
+      DebugLogConstantBufferBinding<stage, kind>(
+          "", arg, cbuf, encoded_buffer[arg.StructurePtrOffset],
+          valid_length, encoder_id, false);
       makeResident<stage, kind>(argbuf.ptr());
       break;
     }
@@ -722,6 +1334,43 @@ DebugLogTextureBindingMismatch(
       " size=", texture->width(view_id), "x", texture->height(view_id),
       " array_size=", texture->arrayLength(view_id),
       " action=keep_original"
+  );
+}
+
+template <PipelineStage stage, PipelineKind kind>
+static void
+DebugLogShaderTextureBinding(
+    const std::string &shader_hash, const MTL_SM50_SHADER_ARGUMENT &arg, Texture *texture, TextureViewKey view_id,
+    uint64_t encoder_id
+) {
+  if (!DebugShouldLogBinding(shader_hash))
+    return;
+
+  static std::atomic<uint32_t> log_count = 0;
+  auto index = log_count.fetch_add(1, std::memory_order_relaxed);
+  if (index >= DebugBindingLogLimit())
+    return;
+
+  INFO(
+      "DXMT diagnostic: shader texture binding",
+      " stage=", DebugPipelineStageName(stage),
+      " kind=", DebugPipelineKindName(kind),
+      " shader=", shader_hash,
+      " encoder=", encoder_id,
+      " binding=SRV",
+      " slot=", arg.SM50BindingSlot,
+      " arg_index=", GetArgumentIndex(arg.Type, arg.SM50BindingSlot),
+      " struct_qword=", arg.StructurePtrOffset,
+      " flags=0x", std::hex, arg.Flags, std::dec,
+      " view=", uint64_t(view_id),
+      " view_format=", uint32_t(texture->pixelFormat(view_id)),
+      " view_type=", DebugTextureTypeName(texture->textureType(view_id)), "(", uint32_t(texture->textureType(view_id)), ")",
+      " view_size=", texture->width(view_id), "x", texture->height(view_id),
+      " view_array=", texture->arrayLength(view_id),
+      " resource_format=", uint32_t(texture->pixelFormat()),
+      " resource_type=", DebugTextureTypeName(texture->textureType()), "(", uint32_t(texture->textureType()), ")",
+      " resource_size=", texture->width(), "x", texture->height(), "x", texture->depth(),
+      " sample_count=", texture->sampleCount()
   );
 }
 
@@ -848,6 +1497,7 @@ ArgumentEncodingContext::encodeShaderResources(
           assert(arg.Flags & MTL_SM50_SHADER_ARGUMENT_TEXTURE_MINLOD_CLAMP);
           auto viewIdChecked = srv.texture->checkViewUseArray(srv.viewId, arg.Flags & MTL_SM50_SHADER_ARGUMENT_TEXTURE_ARRAY);
           DebugLogTextureBindingMismatch<stage, kind>(shader_hash, arg, srv.texture.ptr(), viewIdChecked, encoder_id);
+          DebugLogShaderTextureBinding<stage, kind>(shader_hash, arg, srv.texture.ptr(), viewIdChecked, encoder_id);
           encoded_buffer[arg.StructurePtrOffset] =
               access<stage>(srv.texture, viewIdChecked, ResourceAccess::Read).gpuResourceID;
           encoded_buffer[arg.StructurePtrOffset + 1] = TextureMetadata(srv.texture->arrayLength(viewIdChecked), 0);
@@ -1544,6 +2194,10 @@ ArgumentEncodingContext::flushCommands(WMT::CommandBuffer cmdbuf, uint64_t seqId
       NormalizeRenderPassInfo(render_pass_info);
       FlushRenderEncoderArgumentBuffer(data);
       auto gpu_buffer_ = data->allocated_argbuf;
+      const bool sample_render_readback = DebugShouldSampleRenderReadback(frame_id_);
+      DebugEncodeRenderAttachmentReadbacks(readbacks, cmdbuf, device_, frame_id_,
+                                           seqId, data, sample_render_readback,
+                                           "render-color-before-pass");
       auto encoder = cmdbuf.renderCommandEncoder(render_pass_info);
       data->fence_wait.forEach(
           data->fence_wait_vertex, // if a fence is waited pre-raster, no need to wait again at fragment
@@ -1629,6 +2283,9 @@ ArgumentEncodingContext::flushCommands(WMT::CommandBuffer cmdbuf, uint64_t seqId
             WMTRenderStageVertex | WMTRenderStageMesh | WMTRenderStageObject
         );
       }
+      auto command_summary = DebugSummarizeRenderCommands(&data->cmd_head);
+      DebugAccumulateRenderCommands(currentFrameStatistics(), &data->cmd_head);
+      DebugLogRenderPassInfo(frame_id_, seqId, data->id, data, command_summary);
       encoder.encodeCommands(&data->cmd_head);
       data->fence_update_vertex.forEach(
           data->fence_update, // if a fence is updated at fragment, no need to update again pre-raster
@@ -1636,6 +2293,9 @@ ArgumentEncodingContext::flushCommands(WMT::CommandBuffer cmdbuf, uint64_t seqId
           [&](auto id) { encoder.updateFence(fence_pool_[id], WMTRenderStagePreRaster); }
       );
       encoder.endEncoding();
+      DebugEncodeRenderAttachmentReadbacks(readbacks, cmdbuf, device_, frame_id_,
+                                           seqId, data, sample_render_readback,
+                                           "render-color-after-pass");
       data->~RenderEncoderData();
       break;
     }
@@ -1675,6 +2335,14 @@ ArgumentEncodingContext::flushCommands(WMT::CommandBuffer cmdbuf, uint64_t seqId
     case EncoderType::Present: {
       auto data = static_cast<PresentData *>(current);
       auto t0 = clock::now();
+      currentFrameStatistics().present_pass_count++;
+      uint32_t present_index = 0;
+      const bool sample_present_readback = DebugShouldSamplePresentReadback(present_index);
+      if (sample_present_readback) {
+        DebugEncodePresentReadbacks(
+            readbacks, cmdbuf, device_, data->backbuffer, "backbuffer-before-present",
+            currentFrameId(), seqId, present_index);
+      }
       auto drawable = data->presenter->encodeCommands(
           cmdbuf, data->backbuffer, data->metadata,
           [&](WMT::RenderCommandEncoder encoder) {
@@ -1687,6 +2355,11 @@ ArgumentEncodingContext::flushCommands(WMT::CommandBuffer cmdbuf, uint64_t seqId
       auto t1 = clock::now();
       auto present_encode_interval = t1 - t0;
       currentFrameStatistics().drawable_blocking_interval += present_encode_interval;
+      if (sample_present_readback) {
+        DebugEncodePresentReadbacks(
+            readbacks, cmdbuf, device_, drawable.texture(), "drawable-after-present",
+            currentFrameId(), seqId, present_index);
+      }
       if (DebugEnabledEnv("DXMT_DIAG_SWAPCHAIN") || DebugMillis(present_encode_interval) > 250.0) {
         static std::atomic<uint64_t> present_diag_count = 0;
         auto index = present_diag_count.fetch_add(1, std::memory_order_relaxed);
@@ -1705,6 +2378,7 @@ ArgumentEncodingContext::flushCommands(WMT::CommandBuffer cmdbuf, uint64_t seqId
     }
     case EncoderType::Clear: {
       auto data = static_cast<ClearEncoderData *>(current);
+      DebugLogClearPassInfo(frame_id_, seqId, data->id, data);
       {
         WMTRenderPassInfo info;
         WMT::InitializeRenderPassInfo(info);

@@ -113,6 +113,8 @@ public:
   void
   reset() {
     signal_frame_latency_fence_ = ~0ull;
+    for (auto &diagnostic : readback.diagnostics)
+      diagnostic();
     readback = {};
     for (auto &readback : deferred_readbacks)
       readback();

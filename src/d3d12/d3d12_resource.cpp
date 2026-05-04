@@ -4,6 +4,7 @@
 #include "com/com_object.hpp"
 #include "com/com_private_data.hpp"
 #include "d3d12_heap.hpp"
+#include "dxmt_command_queue.hpp"
 #include "dxmt_format.hpp"
 #include "log/log.hpp"
 #include "util_string.hpp"
@@ -882,6 +883,21 @@ private:
     }
     texture_allocation_ = texture_->allocate(flags);
     texture_->rename(Rc<dxmt::TextureAllocation>(texture_allocation_));
+
+    if (GetHeapType(heap_properties_) == D3D12_HEAP_TYPE_DEFAULT) {
+      const UINT subresource_count =
+          GetMipLevels(desc_) *
+          (desc_.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D
+               ? 1u
+               : desc_.DepthOrArraySize);
+      auto &initializer = device_->GetDXMTDevice().queue().initializer;
+      for (UINT subresource = 0; subresource < subresource_count; subresource++) {
+        initializer.initWithZero(
+            texture_.ptr(), texture_allocation_.ptr(),
+            GetTextureSubresourceArraySlice(desc_, subresource),
+            GetTextureSubresourceMipLevel(desc_, subresource));
+      }
+    }
   }
 
   Com<IMTLD3D12Device> device_;

@@ -6,6 +6,7 @@
 #include <atomic>
 #include <cassert>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <vector>
 
@@ -341,6 +342,7 @@ private:
 struct QueryReadbacks {
   std::unique_ptr<VisibilityResultReadback> visibility;
   std::unique_ptr<TimestampReadback> timestamp;
+  std::vector<std::function<void()>> diagnostics;
 };
 
 } // namespace dxmt

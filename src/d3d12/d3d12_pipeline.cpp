@@ -6,10 +6,14 @@
 #include "dxmt_format.hpp"
 #include "log/log.hpp"
 #include "sha1/sha1_util.hpp"
+#include "util_env.hpp"
 #include "util_string.hpp"
 #include <algorithm>
+#include <atomic>
 #include <cstddef>
 #include <cstring>
+#include <cstdlib>
+#include <fstream>
 #include <limits>
 #include <string_view>
 #include <span>
@@ -18,6 +22,60 @@
 
 namespace dxmt::d3d12 {
 namespace {
+
+static bool
+D3D12PipelineDiagEnabledEnv(const char *name) {
+  auto value = env::getEnvVar(name);
+  return value == "1" || value == "true" || value == "yes" || value == "trace";
+}
+
+static bool
+D3D12PipelineDiagEnabled() {
+  static const bool enabled =
+      D3D12PipelineDiagEnabledEnv("DXMT_DIAG_PIPELINE") ||
+      D3D12PipelineDiagEnabledEnv("DXMT_DIAG_D3D12_PIPELINE") ||
+      D3D12PipelineDiagEnabledEnv("DXMT_DIAG_COMMAND_QUEUE");
+  return enabled;
+}
+
+static uint32_t
+D3D12PipelineDiagLimit() {
+  static const uint32_t limit = []() {
+    auto value = env::getEnvVar("DXMT_DIAG_PIPELINE_LIMIT");
+    if (value.empty())
+      value = env::getEnvVar("DXMT_DIAG_D3D12_LIMIT");
+    if (value.empty())
+      return 512u;
+    char *end = nullptr;
+    auto parsed = std::strtoul(value.c_str(), &end, 10);
+    if (end == value.c_str())
+      return 512u;
+    return static_cast<uint32_t>(std::max<unsigned long>(1, parsed));
+  }();
+  return limit;
+}
+
+static bool
+D3D12PipelineDiagShouldLog() {
+  static std::atomic<uint32_t> count = 0;
+  if (!D3D12PipelineDiagEnabled())
+    return false;
+  return count.fetch_add(1, std::memory_order_relaxed) <
+         D3D12PipelineDiagLimit();
+}
+
+static std::string
+D3D12PipelineDumpDirectory() {
+  std::string path = env::getEnvVar("DXMT_DUMP_PATH");
+  if (path.empty())
+    path = env::getEnvVar("DXMT_LOG_PATH");
+  if (path.empty() || path == "none")
+    path = ".";
+  env::createDirectory(path);
+  if (!path.empty() && path.back() != '/' && path.back() != '\\')
+    path += '/';
+  return path;
+}
 
 constexpr uint32_t kShaderKindPixel = 0;
 constexpr uint32_t kShaderKindVertex = 1;
@@ -424,6 +482,71 @@ BuildSignatureLinks(const std::vector<PipelineDxilShader> &shaders) {
   return links;
 }
 
+void
+DebugLogDxilShaderInfo(std::string_view shader_cache_key,
+                       const PipelineDxilShader &shader) {
+  if (!D3D12PipelineDiagShouldLog())
+    return;
+
+  const auto *info = shader.translation();
+  INFO("D3D12 diagnostic: pipeline shader",
+       " pso=", shader_cache_key.substr(0, std::min<size_t>(16, shader_cache_key.size())),
+       " stage=", ShaderStageName(shader.stage),
+       " bytecode=", uint64_t(shader.bytecode.size()),
+       " cbv=", uint32_t(shader.reflection.NumConstantBuffers),
+       " resources=", uint32_t(shader.reflection.NumArguments),
+       " argumentQwords=", uint32_t(shader.reflection.ArgumentTableQwords),
+       " signatures=", info ? uint32_t(info->signatures.size()) : 0u,
+       " hasRootSignature=", info && info->has_root_signature);
+
+  if (!info)
+    return;
+
+  for (uint32_t i = 0; i < info->signatures.size(); i++) {
+    const auto &sig = info->signatures[i];
+    INFO("D3D12 diagnostic: pipeline signature",
+         " pso=", shader_cache_key.substr(0, std::min<size_t>(16, shader_cache_key.size())),
+         " stage=", ShaderStageName(shader.stage),
+         " index=", i,
+         " kind=", uint32_t(sig.kind),
+         " semantic=", sig.semantic_key,
+         " semanticKind=", uint32_t(sig.semantic_kind),
+         " semanticIndex=", uint32_t(sig.semantic_index),
+         " elementId=", uint32_t(sig.element_id),
+         " stream=", uint32_t(sig.output_stream),
+         " rows=", uint32_t(sig.rows),
+         " cols=", uint32_t(sig.cols),
+         " startRow=", uint32_t(sig.start_row),
+         " startCol=", uint32_t(sig.start_col),
+         " mask=0x", std::hex, uint32_t(sig.component_mask), std::dec);
+  }
+}
+
+void
+DebugLogSignatureLinks(std::string_view shader_cache_key,
+                       const std::vector<PipelineSignatureLink> &links) {
+  if (!D3D12PipelineDiagShouldLog())
+    return;
+
+  INFO("D3D12 diagnostic: pipeline signature links",
+       " pso=", shader_cache_key.substr(0, std::min<size_t>(16, shader_cache_key.size())),
+       " count=", uint32_t(links.size()));
+  for (uint32_t i = 0; i < links.size(); i++) {
+    const auto &link = links[i];
+    INFO("D3D12 diagnostic: pipeline signature link",
+         " pso=", shader_cache_key.substr(0, std::min<size_t>(16, shader_cache_key.size())),
+         " index=", i,
+         " semantic=", link.semantic_key,
+         " producerShader=", link.producer_shader_index,
+         " producerSig=", link.producer_signature_index,
+         " consumerShader=", link.consumer_shader_index,
+         " consumerSig=", link.consumer_signature_index,
+         " producerMask=0x", std::hex, uint32_t(link.producer_component_mask),
+         " consumerMask=0x", uint32_t(link.consumer_component_mask),
+         std::dec);
+  }
+}
+
 Com<ID3D12RootSignature>
 ResolveRootSignature(IMTLD3D12Device *device,
                      ID3D12RootSignature *explicit_root_signature,
@@ -497,6 +620,127 @@ HashDxilShaders(Sha1HashState &hash,
     HashValue(hash, shader.stage);
     HashVector(hash, shader.bytecode);
   }
+}
+
+std::string
+DxilShaderDigest(const PipelineDxilShader &shader) {
+  return Sha1HashState::compute(shader.bytecode.data(), shader.bytecode.size())
+      .string();
+}
+
+bool
+D3D12PipelineFilterMatches(std::string filter, std::string_view value) {
+  if (filter.empty())
+    return false;
+  if (filter.starts_with("0x") || filter.starts_with("0X"))
+    filter = filter.substr(2);
+
+  size_t start = 0;
+  for (;;) {
+    const size_t end = filter.find_first_of(",; ", start);
+    const auto item =
+        filter.substr(start, end == std::string::npos ? end : end - start);
+    if (!item.empty() &&
+        (value == item || value.substr(0, item.size()) == item))
+      return true;
+    if (end == std::string::npos)
+      return false;
+    start = end + 1;
+  }
+}
+
+bool
+D3D12ShouldDumpPipeline(std::string_view shader_cache_key,
+                        const std::vector<PipelineDxilShader> &shaders,
+                        bool compute) {
+  std::string mode = compute ? env::getEnvVar("DXMT_DUMP_COMPUTE_SHADERS")
+                             : env::getEnvVar("DXMT_DUMP_PIPELINES");
+  if (mode == "0" || mode == "none" || mode == "false")
+    return false;
+
+  auto key = env::getEnvVar("DXMT_DUMP_PIPELINE_KEY");
+  if (!key.empty())
+    return D3D12PipelineFilterMatches(key, shader_cache_key);
+
+  auto stage_filter = [](PipelineShaderStage stage) {
+    switch (stage) {
+    case PipelineShaderStage::Vertex:
+      return env::getEnvVar("DXMT_DUMP_PIPELINE_VS");
+    case PipelineShaderStage::Pixel:
+      return env::getEnvVar("DXMT_DUMP_PIPELINE_PS");
+    case PipelineShaderStage::Geometry:
+      return env::getEnvVar("DXMT_DUMP_PIPELINE_GS");
+    case PipelineShaderStage::Hull:
+      return env::getEnvVar("DXMT_DUMP_PIPELINE_HS");
+    case PipelineShaderStage::Domain:
+      return env::getEnvVar("DXMT_DUMP_PIPELINE_DS");
+    case PipelineShaderStage::Compute: {
+      auto filter = env::getEnvVar("DXMT_DUMP_PIPELINE_CS");
+      if (filter.empty())
+        filter = env::getEnvVar("DXMT_DUMP_COMPUTE_SHADERS");
+      return filter;
+    }
+    }
+    return std::string();
+  };
+
+  bool has_stage_filter = false;
+  for (const auto &shader : shaders) {
+    if (!stage_filter(shader.stage).empty()) {
+      has_stage_filter = true;
+      break;
+    }
+  }
+  if (has_stage_filter) {
+    for (const auto &shader : shaders) {
+      const auto filter = stage_filter(shader.stage);
+      if (filter.empty())
+        continue;
+      if (!D3D12PipelineFilterMatches(filter, DxilShaderDigest(shader)))
+        return false;
+    }
+    return true;
+  }
+
+  return mode == "1" || mode == "all";
+}
+
+void
+D3D12DumpPipelineShaders(const char *kind, std::string_view shader_cache_key,
+                         const std::vector<PipelineDxilShader> &shaders) {
+  const bool compute = std::string_view(kind) == "compute";
+  if (!D3D12ShouldDumpPipeline(shader_cache_key, shaders, compute))
+    return;
+
+  const auto dir = D3D12PipelineDumpDirectory();
+  const auto key_prefix =
+      std::string(shader_cache_key.substr(0, std::min<size_t>(16, shader_cache_key.size())));
+  const auto manifest_path =
+      dir + env::getExeBaseName() + "_d3d12_pipeline_" + kind + "_" +
+      key_prefix + ".txt";
+
+  std::ofstream manifest(manifest_path, std::ios::out | std::ios::trunc);
+  if (manifest)
+    manifest << "kind=" << kind << "\n"
+             << "pso=" << shader_cache_key << "\n";
+
+  for (const auto &shader : shaders) {
+    const auto digest = DxilShaderDigest(shader);
+    const auto stage = ShaderStageName(shader.stage);
+    const auto filename = env::getExeBaseName() + "_d3d12_" + key_prefix +
+                          "_" + stage + "_" + digest.substr(0, 16) + ".dxil";
+    const auto path = dir + filename;
+    std::ofstream dump(path, std::ios::out | std::ios::binary | std::ios::trunc);
+    if (dump && !shader.bytecode.empty())
+      dump.write(reinterpret_cast<const char *>(shader.bytecode.data()),
+                 shader.bytecode.size());
+    if (manifest)
+      manifest << stage << "=" << digest << " " << filename
+               << " bytes=" << shader.bytecode.size() << "\n";
+  }
+
+  WARN("D3D12PipelineState: dumped ", kind, " pipeline shaders to ",
+       manifest_path);
 }
 
 std::string
@@ -642,10 +886,17 @@ BuildInputElements(IMTLD3D12Device *device,
                    uint32_t &slot_mask) {
   elements.clear();
   slot_mask = 0;
+  std::array<uint32_t, 32> append_offsets = {};
   elements.reserve(state.input_elements.size());
 
   for (uint32_t i = 0; i < state.input_elements.size(); i++) {
     const auto &input = state.input_elements[i];
+    if (input.InputSlot >= append_offsets.size()) {
+      WARN("D3D12PipelineState: unsupported input layout slot ",
+           uint32_t(input.InputSlot));
+      return false;
+    }
+
     MTL_DXGI_FORMAT_DESC format = {};
     if (FAILED(MTLQueryDXGIFormat(device->GetMTLDevice(), input.Format,
                                   format)) ||
@@ -654,16 +905,43 @@ BuildInputElements(IMTLD3D12Device *device,
            uint32_t(input.Format));
       return false;
     }
+    if (!format.BytesPerTexel) {
+      WARN("D3D12PipelineState: unsupported non-ordinary input layout format ",
+           uint32_t(input.Format));
+      return false;
+    }
+
+    const auto aligned_byte_offset =
+        input.AlignedByteOffset == D3D12_APPEND_ALIGNED_ELEMENT
+            ? align(append_offsets[input.InputSlot],
+                    std::min(4u, format.BytesPerTexel))
+            : input.AlignedByteOffset;
+    append_offsets[input.InputSlot] =
+        aligned_byte_offset + format.BytesPerTexel;
 
     elements.push_back({
         .reg = i,
         .slot = input.InputSlot,
-        .aligned_byte_offset = input.AlignedByteOffset,
+        .aligned_byte_offset = aligned_byte_offset,
         .format = uint32_t(format.AttributeFormat),
         .step_function = input.InputSlotClass ==
                          D3D12_INPUT_CLASSIFICATION_PER_INSTANCE_DATA,
         .step_rate = input.InstanceDataStepRate,
     });
+    if (D3D12PipelineDiagShouldLog()) {
+      INFO("D3D12 diagnostic: pipeline input element",
+           " semantic=", input.SemanticName ? input.SemanticName : "",
+           " semanticIndex=", uint32_t(input.SemanticIndex),
+           " format=", uint32_t(input.Format),
+           " slot=", uint32_t(input.InputSlot),
+           " sourceOffset=", uint32_t(input.AlignedByteOffset),
+           " loweredOffset=", uint32_t(aligned_byte_offset),
+           " attrFormat=", uint32_t(format.AttributeFormat),
+           " bytes=", uint32_t(format.BytesPerTexel),
+           " slotClass=", uint32_t(input.InputSlotClass),
+           " stepRate=", uint32_t(input.InstanceDataStepRate),
+           " reg=", i);
+    }
     if (input.InputSlot < 32)
       slot_mask |= 1u << input.InputSlot;
   }
@@ -897,6 +1175,9 @@ CreateMetalGraphicsPipeline(IMTLD3D12Device *device,
   ia_layout.elements = input_elements.empty() ? nullptr : input_elements.data();
 
   const auto vs_name = BuildFunctionName("vs", shader_cache_key);
+  for (const auto &shader : shaders)
+    DebugLogDxilShaderInfo(shader_cache_key, shader);
+  D3D12DumpPipelineShaders("graphics", shader_cache_key, shaders);
   if (!CompileMetalFunction(device, *vs, vs_name.c_str(),
                             reinterpret_cast<SM50_SHADER_COMPILATION_ARGUMENT_DATA *>(&ia_layout),
                             out.vertex))
@@ -979,6 +1260,7 @@ CreateMetalComputePipeline(IMTLD3D12Device *device,
   common.next = nullptr;
 
   const auto cs_name = BuildFunctionName("cs", shader_cache_key);
+  D3D12DumpPipelineShaders("compute", shader_cache_key, shaders);
   if (!CompileMetalFunction(device, *cs, cs_name.c_str(),
                             reinterpret_cast<SM50_SHADER_COMPILATION_ARGUMENT_DATA *>(&common),
                             out.compute))
@@ -1739,6 +2021,10 @@ CreatePipelineStateObject(IMTLD3D12Device *device, PipelineStateType type,
   auto signature_links = BuildSignatureLinks(shaders);
   auto resolved_root_signature =
       ResolveRootSignature(device, root_signature, shaders);
+  const auto shader_cache_key =
+      BuildShaderCacheKey(type, shaders, graphics_state, compute_state,
+                          resolved_root_signature.ptr());
+  DebugLogSignatureLinks(shader_cache_key, signature_links);
   return Com<ID3D12PipelineState>::transfer(
       new PipelineStateImpl(device, type, resolved_root_signature.ptr(),
                             std::move(shaders), std::move(signature_links),

@@ -29,6 +29,7 @@
 #include <array>
 #include <bit>
 #include <cctype>
+#include <cstdlib>
 #include <cstring>
 #include <map>
 #include <memory>
@@ -113,6 +114,14 @@ ResourceClassName(dxil::DxilTranslationResourceClass resource_class) {
   default:
     return "Unknown";
   }
+}
+
+bool
+DebugForcePixelColorEnabled() {
+  const char *value = std::getenv("DXMT_DIAG_FORCE_PS_COLOR");
+  return value && (std::strcmp(value, "1") == 0 ||
+                   std::strcmp(value, "true") == 0 ||
+                   std::strcmp(value, "yes") == 0);
 }
 
 dxil::DxilTranslationResourceClass
@@ -1094,9 +1103,6 @@ LoadSignatureInput(const CallBase &call, DxilAirContext &ctx) {
             index, ctx.builder.CreateUDiv(instance,
                                           ctx.builder.getInt32(element.step_rate)));
       }
-    } else if (ctx.base_vertex_arg != UINT32_MAX) {
-      index = ctx.builder.CreateAdd(index,
-                                    ctx.function->getArg(ctx.base_vertex_arg));
     }
 
     auto *table = ctx.builder.CreatePointerCast(
@@ -1156,6 +1162,46 @@ StoreSignatureOutput(const CallBase &call, Value *current_return,
   }
   value = CastValue(value, field_type, ctx);
   return ctx.builder.CreateInsertValue(current_return, value, out->second);
+}
+
+Value *
+BuildForcedPixelColorReturn(Value *current_return, DxilAirContext &ctx) {
+  if (!DebugForcePixelColorEnabled() ||
+      ctx.translation.shader_kind != uint32_t(DxilStage::Pixel) ||
+      !current_return || ctx.function->getReturnType()->isVoidTy())
+    return current_return;
+
+  for (const auto &[element_id, sig] : ctx.outputs) {
+    if (!sig || !IsSystemSemantic(*sig, "SV_Target"))
+      continue;
+    auto out = ctx.output_indices.find(element_id);
+    if (out == ctx.output_indices.end())
+      continue;
+
+    auto *field_type = ctx.function->getReturnType()->getStructElementType(out->second);
+    if (auto *field_vector = dyn_cast<FixedVectorType>(field_type)) {
+      auto *element_type = field_vector->getElementType();
+      Value *field = ConstantAggregateZero::get(field_type);
+      const double values[4] = {1.0, 0.0, 0.0, 1.0};
+      const auto count = std::min<unsigned>(field_vector->getNumElements(), 4);
+      for (unsigned i = 0; i < count; i++) {
+        Value *component = nullptr;
+        if (element_type->isFloatingPointTy())
+          component = ConstantFP::get(element_type, values[i]);
+        else
+          component = ConstantInt::get(element_type, i == 0 || i == 3 ? 1 : 0);
+        field = ctx.builder.CreateInsertElement(field, component, uint64_t(i));
+      }
+      current_return = ctx.builder.CreateInsertValue(current_return, field, out->second);
+    } else if (field_type->isFloatingPointTy()) {
+      current_return = ctx.builder.CreateInsertValue(
+          current_return, ConstantFP::get(field_type, 1.0), out->second);
+    } else if (field_type->isIntegerTy()) {
+      current_return = ctx.builder.CreateInsertValue(
+          current_return, ConstantInt::get(field_type, 1), out->second);
+    }
+  }
+  return current_return;
 }
 
 Value *
@@ -1806,12 +1852,17 @@ LowerTerminator(const Instruction &terminator, DxilAirContext &ctx,
     (void)ret;
     if (ctx.function->getReturnType()->isVoidTy())
       ctx.builder.CreateRetVoid();
-    else
+    else {
+      current_return = BuildForcedPixelColorReturn(
+          ctx.return_value
+              ? ctx.builder.CreateLoad(ctx.function->getReturnType(),
+                                       ctx.return_value)
+              : current_return,
+          ctx);
       ctx.builder.CreateRet(ctx.return_value
-                                ? ctx.builder.CreateLoad(
-                                      ctx.function->getReturnType(),
-                                      ctx.return_value)
+                                ? current_return
                                 : current_return);
+    }
     return Error::success();
   }
   if (const auto *branch = dyn_cast<BranchInst>(&terminator)) {
