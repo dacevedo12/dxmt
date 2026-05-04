@@ -15,6 +15,7 @@
 #include <cstdlib>
 #include <fstream>
 #include <limits>
+#include <sstream>
 #include <string_view>
 #include <span>
 #include <unordered_map>
@@ -649,9 +650,218 @@ D3D12PipelineFilterMatches(std::string filter, std::string_view value) {
   }
 }
 
+std::string
+TrimFilterToken(std::string_view token) {
+  const auto begin = token.find_first_not_of(" \t\r\n");
+  if (begin == std::string_view::npos)
+    return {};
+  const auto end = token.find_last_not_of(" \t\r\n");
+  return std::string(token.substr(begin, end - begin + 1));
+}
+
+size_t
+ShaderBytecodeSize(const std::vector<PipelineDxilShader> &shaders,
+                   PipelineShaderStage stage) {
+  if (auto *shader = FindShader(shaders, stage))
+    return shader->bytecode.size();
+  return 0;
+}
+
+std::string
+D3D12DebugShaderName(const std::vector<PipelineDxilShader> &shaders,
+                     PipelineShaderStage stage) {
+  auto *shader = FindShader(shaders, stage);
+  if (!shader)
+    return "null";
+
+  std::stringstream stream;
+  stream << DxilShaderDigest(*shader) << "/" << shader->bytecode.size();
+  return stream.str();
+}
+
+std::string
+D3D12DebugPipelineDesc(const char *kind, std::string_view shader_cache_key,
+                       const std::vector<PipelineDxilShader> &shaders,
+                       const PipelineGraphicsState *graphics_state,
+                       const PipelineComputeState *compute_state) {
+  std::stringstream stream;
+  stream << kind << " key=0x" << shader_cache_key
+         << " VS=" << D3D12DebugShaderName(shaders, PipelineShaderStage::Vertex)
+         << " HS=" << D3D12DebugShaderName(shaders, PipelineShaderStage::Hull)
+         << " DS=" << D3D12DebugShaderName(shaders, PipelineShaderStage::Domain)
+         << " GS=" << D3D12DebugShaderName(shaders, PipelineShaderStage::Geometry)
+         << " PS=" << D3D12DebugShaderName(shaders, PipelineShaderStage::Pixel)
+         << " CS=" << D3D12DebugShaderName(shaders, PipelineShaderStage::Compute)
+         << " VS.bytes=" << ShaderBytecodeSize(shaders, PipelineShaderStage::Vertex)
+         << " PS.bytes=" << ShaderBytecodeSize(shaders, PipelineShaderStage::Pixel)
+         << " CS.bytes=" << ShaderBytecodeSize(shaders, PipelineShaderStage::Compute);
+
+  if (graphics_state) {
+    const auto &desc = graphics_state->desc;
+    const auto &blend =
+        desc.BlendState.RenderTarget[desc.BlendState.IndependentBlendEnable ? 0 : 0];
+    stream << " inputs=" << graphics_state->input_elements.size()
+           << " so_entries=" << graphics_state->stream_output_entries.size()
+           << " rt_count=" << desc.NumRenderTargets
+           << " dsv=" << uint32_t(desc.DSVFormat)
+           << " topology=" << uint32_t(desc.PrimitiveTopologyType)
+           << " sample_count=" << desc.SampleDesc.Count
+           << " sample_quality=" << desc.SampleDesc.Quality
+           << " sample_mask=0x" << std::hex << desc.SampleMask << std::dec
+           << " alpha_to_coverage=" << uint32_t(desc.BlendState.AlphaToCoverageEnable)
+           << " independent_blend=" << uint32_t(desc.BlendState.IndependentBlendEnable)
+           << " depth_enable=" << uint32_t(desc.DepthStencilState.DepthEnable)
+           << " depth_write=" << uint32_t(desc.DepthStencilState.DepthWriteMask)
+           << " depth_func=" << uint32_t(desc.DepthStencilState.DepthFunc)
+           << " stencil_enable=" << uint32_t(desc.DepthStencilState.StencilEnable)
+           << " fill=" << uint32_t(desc.RasterizerState.FillMode)
+           << " cull=" << uint32_t(desc.RasterizerState.CullMode)
+           << " front_ccw=" << uint32_t(desc.RasterizerState.FrontCounterClockwise)
+           << " depth_clip=" << uint32_t(desc.RasterizerState.DepthClipEnable)
+           << " blend0=" << uint32_t(blend.BlendEnable)
+           << " src0=" << uint32_t(blend.SrcBlend)
+           << " dst0=" << uint32_t(blend.DestBlend)
+           << " op0=" << uint32_t(blend.BlendOp)
+           << " src_alpha0=" << uint32_t(blend.SrcBlendAlpha)
+           << " dst_alpha0=" << uint32_t(blend.DestBlendAlpha)
+           << " op_alpha0=" << uint32_t(blend.BlendOpAlpha)
+           << " write0=" << uint32_t(blend.RenderTargetWriteMask)
+           << " rtv=[";
+    for (UINT i = 0; i < desc.NumRenderTargets && i < 8; i++) {
+      if (i)
+        stream << ",";
+      stream << uint32_t(desc.RTVFormats[i]);
+    }
+    stream << "]";
+    for (UINT i = 0; i < desc.NumRenderTargets && i < 8; i++)
+      stream << " rtv" << i << "=" << uint32_t(desc.RTVFormats[i]);
+    for (size_t i = 0; i < graphics_state->input_elements.size(); i++) {
+      const auto &element = graphics_state->input_elements[i];
+      stream << " input" << i << "="
+             << (i < graphics_state->input_element_semantic_names.size()
+                     ? graphics_state->input_element_semantic_names[i]
+                     : "")
+             << element.SemanticIndex << ":" << uint32_t(element.Format)
+             << ":" << element.InputSlot << ":" << element.AlignedByteOffset
+             << ":" << uint32_t(element.InputSlotClass) << ":"
+             << element.InstanceDataStepRate;
+    }
+  }
+
+  if (compute_state)
+    stream << " flags=" << uint32_t(compute_state->desc.Flags);
+
+  return stream.str();
+}
+
+bool
+D3D12PipelineDescFilterMatches(std::string_view group,
+                               std::string_view desc) {
+  size_t start = 0;
+  bool has_token = false;
+  for (;;) {
+    const size_t end = group.find_first_of("; ", start);
+    const auto token = TrimFilterToken(group.substr(
+        start, end == std::string_view::npos ? group.size() - start
+                                             : end - start));
+    if (!token.empty()) {
+      has_token = true;
+      if (desc.find(token) == std::string_view::npos)
+        return false;
+    }
+    if (end == std::string_view::npos)
+      return has_token;
+    start = end + 1;
+  }
+}
+
+bool
+D3D12PipelineKeyFilterMatches(std::string filter, std::string_view key,
+                              std::string_view desc) {
+  if (filter.find('=') == std::string::npos)
+    return D3D12PipelineFilterMatches(std::move(filter), key);
+
+  size_t start = 0;
+  for (;;) {
+    const size_t end = filter.find(',', start);
+    const auto group = std::string_view(filter).substr(
+        start, end == std::string::npos ? filter.size() - start
+                                        : end - start);
+    const auto trimmed = TrimFilterToken(group);
+    if (!trimmed.empty() &&
+        (D3D12PipelineFilterMatches(trimmed, key) ||
+         D3D12PipelineDescFilterMatches(trimmed, desc)))
+      return true;
+    if (end == std::string::npos)
+      return false;
+    start = end + 1;
+  }
+}
+
+std::string
+D3D12PipelineStageFilter(PipelineShaderStage stage) {
+  switch (stage) {
+  case PipelineShaderStage::Vertex:
+    return env::getEnvVar("DXMT_DUMP_PIPELINE_VS");
+  case PipelineShaderStage::Pixel:
+    return env::getEnvVar("DXMT_DUMP_PIPELINE_PS");
+  case PipelineShaderStage::Geometry:
+    return env::getEnvVar("DXMT_DUMP_PIPELINE_GS");
+  case PipelineShaderStage::Hull:
+    return env::getEnvVar("DXMT_DUMP_PIPELINE_HS");
+  case PipelineShaderStage::Domain:
+    return env::getEnvVar("DXMT_DUMP_PIPELINE_DS");
+  case PipelineShaderStage::Compute:
+    return env::getEnvVar("DXMT_DUMP_PIPELINE_CS");
+  }
+  return {};
+}
+
+bool
+D3D12PipelineShaderFilterMatches(
+    const std::vector<PipelineDxilShader> &shaders, PipelineShaderStage stage,
+    std::string filter) {
+  if (filter.empty())
+    return true;
+
+  auto *shader = FindShader(shaders, stage);
+  if (!shader)
+    return filter == "null";
+
+  return D3D12PipelineFilterMatches(std::move(filter), DxilShaderDigest(*shader));
+}
+
+bool
+D3D12PipelineGraphicsStageFiltersMatch(
+    const std::vector<PipelineDxilShader> &shaders) {
+  constexpr PipelineShaderStage stages[] = {
+      PipelineShaderStage::Vertex, PipelineShaderStage::Pixel,
+      PipelineShaderStage::Geometry, PipelineShaderStage::Hull,
+      PipelineShaderStage::Domain};
+
+  bool has_stage_filter = false;
+  for (auto stage : stages) {
+    if (!D3D12PipelineStageFilter(stage).empty()) {
+      has_stage_filter = true;
+      break;
+    }
+  }
+  if (!has_stage_filter)
+    return false;
+
+  for (auto stage : stages) {
+    if (!D3D12PipelineShaderFilterMatches(
+            shaders, stage, D3D12PipelineStageFilter(stage)))
+      return false;
+  }
+  return true;
+}
+
 bool
 D3D12ShouldDumpPipeline(std::string_view shader_cache_key,
                         const std::vector<PipelineDxilShader> &shaders,
+                        const PipelineGraphicsState *graphics_state,
+                        const PipelineComputeState *compute_state,
                         bool compute) {
   std::string mode = compute ? env::getEnvVar("DXMT_DUMP_COMPUTE_SHADERS")
                              : env::getEnvVar("DXMT_DUMP_PIPELINES");
@@ -659,57 +869,40 @@ D3D12ShouldDumpPipeline(std::string_view shader_cache_key,
     return false;
 
   auto key = env::getEnvVar("DXMT_DUMP_PIPELINE_KEY");
+  const auto desc = D3D12DebugPipelineDesc(compute ? "compute" : "graphics",
+                                           shader_cache_key, shaders,
+                                           graphics_state, compute_state);
   if (!key.empty())
-    return D3D12PipelineFilterMatches(key, shader_cache_key);
+    return D3D12PipelineKeyFilterMatches(key, shader_cache_key, desc);
 
-  auto stage_filter = [](PipelineShaderStage stage) {
-    switch (stage) {
-    case PipelineShaderStage::Vertex:
-      return env::getEnvVar("DXMT_DUMP_PIPELINE_VS");
-    case PipelineShaderStage::Pixel:
-      return env::getEnvVar("DXMT_DUMP_PIPELINE_PS");
-    case PipelineShaderStage::Geometry:
-      return env::getEnvVar("DXMT_DUMP_PIPELINE_GS");
-    case PipelineShaderStage::Hull:
-      return env::getEnvVar("DXMT_DUMP_PIPELINE_HS");
-    case PipelineShaderStage::Domain:
-      return env::getEnvVar("DXMT_DUMP_PIPELINE_DS");
-    case PipelineShaderStage::Compute: {
-      auto filter = env::getEnvVar("DXMT_DUMP_PIPELINE_CS");
-      if (filter.empty())
-        filter = env::getEnvVar("DXMT_DUMP_COMPUTE_SHADERS");
-      return filter;
-    }
-    }
-    return std::string();
-  };
+  if (compute) {
+    if (mode == "1" || mode == "all")
+      return true;
 
-  bool has_stage_filter = false;
-  for (const auto &shader : shaders) {
-    if (!stage_filter(shader.stage).empty()) {
-      has_stage_filter = true;
-      break;
-    }
+    auto cs_filter = mode.empty()
+                         ? D3D12PipelineStageFilter(PipelineShaderStage::Compute)
+                         : mode;
+    if (cs_filter.empty())
+      return false;
+
+    return D3D12PipelineShaderFilterMatches(
+        shaders, PipelineShaderStage::Compute, std::move(cs_filter));
   }
-  if (has_stage_filter) {
-    for (const auto &shader : shaders) {
-      const auto filter = stage_filter(shader.stage);
-      if (filter.empty())
-        continue;
-      if (!D3D12PipelineFilterMatches(filter, DxilShaderDigest(shader)))
-        return false;
-    }
+
+  if (D3D12PipelineGraphicsStageFiltersMatch(shaders))
     return true;
-  }
 
   return mode == "1" || mode == "all";
 }
 
 void
 D3D12DumpPipelineShaders(const char *kind, std::string_view shader_cache_key,
-                         const std::vector<PipelineDxilShader> &shaders) {
+                         const std::vector<PipelineDxilShader> &shaders,
+                         const PipelineGraphicsState *graphics_state,
+                         const PipelineComputeState *compute_state) {
   const bool compute = std::string_view(kind) == "compute";
-  if (!D3D12ShouldDumpPipeline(shader_cache_key, shaders, compute))
+  if (!D3D12ShouldDumpPipeline(shader_cache_key, shaders, graphics_state,
+                               compute_state, compute))
     return;
 
   const auto dir = D3D12PipelineDumpDirectory();
@@ -722,7 +915,10 @@ D3D12DumpPipelineShaders(const char *kind, std::string_view shader_cache_key,
   std::ofstream manifest(manifest_path, std::ios::out | std::ios::trunc);
   if (manifest)
     manifest << "kind=" << kind << "\n"
-             << "pso=" << shader_cache_key << "\n";
+             << "pso=" << shader_cache_key << "\n"
+             << D3D12DebugPipelineDesc(kind, shader_cache_key, shaders,
+                                       graphics_state, compute_state)
+             << "\n";
 
   for (const auto &shader : shaders) {
     const auto digest = DxilShaderDigest(shader);
@@ -743,6 +939,42 @@ D3D12DumpPipelineShaders(const char *kind, std::string_view shader_cache_key,
        manifest_path);
 }
 
+void
+HashGraphicsInputElements(Sha1HashState &hash,
+                          const PipelineGraphicsState &graphics_state) {
+  HashValue(hash, uint32_t(graphics_state.input_elements.size()));
+  for (size_t i = 0; i < graphics_state.input_elements.size(); i++) {
+    const auto &element = graphics_state.input_elements[i];
+    HashString(hash, i < graphics_state.input_element_semantic_names.size()
+                         ? graphics_state.input_element_semantic_names[i]
+                         : std::string_view());
+    HashValue(hash, element.SemanticIndex);
+    HashValue(hash, element.Format);
+    HashValue(hash, element.InputSlot);
+    HashValue(hash, element.AlignedByteOffset);
+    HashValue(hash, element.InputSlotClass);
+    HashValue(hash, element.InstanceDataStepRate);
+  }
+}
+
+void
+HashGraphicsStreamOutput(Sha1HashState &hash,
+                         const PipelineGraphicsState &graphics_state) {
+  HashValue(hash, uint32_t(graphics_state.stream_output_entries.size()));
+  for (size_t i = 0; i < graphics_state.stream_output_entries.size(); i++) {
+    const auto &entry = graphics_state.stream_output_entries[i];
+    HashValue(hash, entry.Stream);
+    HashString(hash, i < graphics_state.stream_output_semantic_names.size()
+                         ? graphics_state.stream_output_semantic_names[i]
+                         : std::string_view());
+    HashValue(hash, entry.SemanticIndex);
+    HashValue(hash, entry.StartComponent);
+    HashValue(hash, entry.ComponentCount);
+    HashValue(hash, entry.OutputSlot);
+  }
+  HashVector(hash, graphics_state.stream_output_strides);
+}
+
 std::string
 BuildShaderCacheKey(PipelineStateType type,
                     const std::vector<PipelineDxilShader> &shaders,
@@ -755,9 +987,8 @@ BuildShaderCacheKey(PipelineStateType type,
                        : "dxmt-d3d12-compute-pipeline-cache-v2");
   HashDxilShaders(hash, shaders);
   if (type == PipelineStateType::Graphics) {
-    HashVector(hash, graphics_state.input_elements);
-    HashVector(hash, graphics_state.stream_output_entries);
-    HashVector(hash, graphics_state.stream_output_strides);
+    HashGraphicsInputElements(hash, graphics_state);
+    HashGraphicsStreamOutput(hash, graphics_state);
     HashValue(hash, graphics_state.desc.BlendState);
     HashValue(hash, graphics_state.desc.SampleMask);
     HashValue(hash, graphics_state.desc.RasterizerState);
@@ -1177,7 +1408,8 @@ CreateMetalGraphicsPipeline(IMTLD3D12Device *device,
   const auto vs_name = BuildFunctionName("vs", shader_cache_key);
   for (const auto &shader : shaders)
     DebugLogDxilShaderInfo(shader_cache_key, shader);
-  D3D12DumpPipelineShaders("graphics", shader_cache_key, shaders);
+  D3D12DumpPipelineShaders("graphics", shader_cache_key, shaders, &state,
+                           nullptr);
   if (!CompileMetalFunction(device, *vs, vs_name.c_str(),
                             reinterpret_cast<SM50_SHADER_COMPILATION_ARGUMENT_DATA *>(&ia_layout),
                             out.vertex))
@@ -1260,7 +1492,8 @@ CreateMetalComputePipeline(IMTLD3D12Device *device,
   common.next = nullptr;
 
   const auto cs_name = BuildFunctionName("cs", shader_cache_key);
-  D3D12DumpPipelineShaders("compute", shader_cache_key, shaders);
+  D3D12DumpPipelineShaders("compute", shader_cache_key, shaders, nullptr,
+                           nullptr);
   if (!CompileMetalFunction(device, *cs, cs_name.c_str(),
                             reinterpret_cast<SM50_SHADER_COMPILATION_ARGUMENT_DATA *>(&common),
                             out.compute))
