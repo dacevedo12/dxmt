@@ -253,6 +253,10 @@ fill_texture_descriptor(MTLTextureDescriptor *desc, struct WMTTextureInfo *info)
   desc.sampleCount = info->sample_count;
   desc.usage = (MTLTextureUsage)info->usage;
   desc.resourceOptions = (MTLResourceOptions)info->options;
+  // No descriptor-baked swizzle. Per-bind format/swizzle aliasing
+  // happens through newTextureView (see _MTLTexture_newTextureView +
+  // to_metal_swizzle below) so the base texture stays a clean
+  // identity-swizzle Metal object.
 };
 
 void
@@ -1227,6 +1231,26 @@ _MTLRenderCommandEncoder_encodeCommands(void *obj) {
       [encoder dispatchThreadsPerTile:MTLSizeMake(body->width, body->height, 1)];
       break;
     }
+    case WMTRenderCommandSetFragmentSamplerState: {
+      struct wmtcmd_render_setsamplerstate *body = (struct wmtcmd_render_setsamplerstate *)next;
+      [encoder setFragmentSamplerState:(id<MTLSamplerState>)body->sampler atIndex:body->index];
+      break;
+    }
+    case WMTRenderCommandSetVertexTexture: {
+      struct wmtcmd_render_settexture *body = (struct wmtcmd_render_settexture *)next;
+      [encoder setVertexTexture:(id<MTLTexture>)body->texture atIndex:body->index];
+      break;
+    }
+    case WMTRenderCommandSetVertexSamplerState: {
+      struct wmtcmd_render_setsamplerstate *body = (struct wmtcmd_render_setsamplerstate *)next;
+      [encoder setVertexSamplerState:(id<MTLSamplerState>)body->sampler atIndex:body->index];
+      break;
+    }
+    case WMTRenderCommandSetBlendColor: {
+      struct wmtcmd_render_setblendcolor_only *body = (struct wmtcmd_render_setblendcolor_only *)next;
+      [encoder setBlendColorRed:body->red green:body->green blue:body->blue alpha:body->alpha];
+      break;
+    }
     }
     next = next->next.ptr;
   }
@@ -1605,6 +1629,8 @@ _MetalLayer_setProps(void *obj) {
     layer.displaySyncEnabled = props->display_sync_enabled;
     layer.drawableSize = CGSizeMake(props->drawable_width, props->drawable_height);
     layer.pixelFormat = to_metal_pixel_format(props->pixel_format);
+    if (props->maximum_drawable_count != 0)
+      layer.maximumDrawableCount = props->maximum_drawable_count;
   });
   return STATUS_SUCCESS;
 }
@@ -1622,6 +1648,7 @@ _MetalLayer_getProps(void *obj) {
   props->drawable_height = layer.drawableSize.height;
   props->drawable_width = layer.drawableSize.width;
   props->pixel_format = layer.pixelFormat;
+  props->maximum_drawable_count = (uint32_t)layer.maximumDrawableCount;
   return STATUS_SUCCESS;
 }
 
@@ -1724,6 +1751,51 @@ thunk_SM50Destroy(void *args) {
   struct sm50_destroy_params *params = args;
 
   SM50Destroy(params->shader);
+
+  return STATUS_SUCCESS;
+}
+
+static NTSTATUS
+thunk_DXSOInitialize(void *args) {
+  struct dxso_initialize_params *params = args;
+
+  params->ret = DXSOInitialize(params->bytecode, params->bytecode_size, params->shader);
+
+  return STATUS_SUCCESS;
+}
+
+static NTSTATUS
+thunk_DXSODestroy(void *args) {
+  struct dxso_destroy_params *params = args;
+
+  DXSODestroy(params->shader);
+
+  return STATUS_SUCCESS;
+}
+
+static NTSTATUS
+thunk_DXSOCompile(void *args) {
+  struct dxso_compile_params *params = args;
+
+  params->ret = DXSOCompile(params->shader, params->args, params->func_name, params->bitcode);
+
+  return STATUS_SUCCESS;
+}
+
+static NTSTATUS
+thunk_DXSOGetCompiledBitcode(void *args) {
+  struct dxso_get_compiled_bitcode_params *params = args;
+
+  DXSOGetCompiledBitcode(params->bitcode, params->data_out);
+
+  return STATUS_SUCCESS;
+}
+
+static NTSTATUS
+thunk_DXSODestroyBitcode(void *args) {
+  struct dxso_destroy_bitcode_params *params = args;
+
+  DXSODestroyBitcode(params->bitcode);
 
   return STATUS_SUCCESS;
 }
@@ -1888,6 +1960,26 @@ thunk32_SM50Initialize(void *args) {
       UInt32ToPtr(params->bytecode), params->bytecode_size, UInt32ToPtr(params->shader),
       UInt32ToPtr(params->reflection), UInt32ToPtr(params->error)
   );
+
+  return STATUS_SUCCESS;
+}
+
+static NTSTATUS
+thunk32_DXSOInitialize(void *args) {
+  struct dxso_initialize_params32 *params = args;
+
+  params->ret = DXSOInitialize(
+      UInt32ToPtr(params->bytecode), params->bytecode_size, UInt32ToPtr(params->shader)
+  );
+
+  return STATUS_SUCCESS;
+}
+
+static NTSTATUS
+thunk32_DXSOGetCompiledBitcode(void *args) {
+  struct dxso_get_compiled_bitcode_params32 *params = args;
+
+  DXSOGetCompiledBitcode(params->bitcode, UInt32ToPtr(params->data_out));
 
   return STATUS_SUCCESS;
 }
@@ -2075,6 +2167,169 @@ sm50_compilation_argument32_free(struct SM50_SHADER_COMPILATION_ARGUMENT_DATA *f
     free(arg);
     arg = next;
   }
+}
+
+/* DXSO compilation argument chain — same shape as SM50's 32-bit
+   chain conversion (sm50_compilation_argument32_convert). DXSO has
+   its own enum + struct family so the d3d9 caller picks the right
+   types at compile time, but the wire-form is byte-identical to
+   SM50's so we reuse the same UInt32ToPtr unpack pattern. The IA
+   layout's `elements` pointer points at app-side memory — already
+   in the wow64 32-bit address space — so it round-trips through
+   UInt32ToPtr without further translation. */
+struct DXSO_SHADER_COMPILATION_ARGUMENT_DATA32 {
+  uint32_t next;
+  enum DXSO_SHADER_COMPILATION_ARGUMENT_TYPE type;
+};
+
+struct DXSO_SHADER_IA_INPUT_LAYOUT_DATA32 {
+  uint32_t next;
+  enum DXSO_SHADER_COMPILATION_ARGUMENT_TYPE type;
+  enum DXSO_INDEX_BUFFER_FORMAT index_buffer_format;
+  uint32_t slot_mask;
+  uint32_t num_elements;
+  uint32_t elements;
+};
+
+struct DXSO_SHADER_PSO_PIXEL_SHADER_DATA32 {
+  uint32_t next;
+  enum DXSO_SHADER_COMPILATION_ARGUMENT_TYPE type;
+  uint32_t alpha_test_func;
+  uint32_t alpha_test_ref;
+};
+
+struct DXSO_SHADER_PS_SAMPLER_LAYOUT_DATA32 {
+  uint32_t next;
+  enum DXSO_SHADER_COMPILATION_ARGUMENT_TYPE type;
+  uint8_t kinds[16];
+};
+
+struct DXSO_SHADER_PS_POINT_SPRITE_DATA32 {
+  uint32_t next;
+  enum DXSO_SHADER_COMPILATION_ARGUMENT_TYPE type;
+};
+
+struct DXSO_SHADER_VS_POINT_SIZE_DATA32 {
+  uint32_t next;
+  enum DXSO_SHADER_COMPILATION_ARGUMENT_TYPE type;
+  float value;
+};
+
+struct DXSO_SHADER_PS_BUMP_ENV_DATA32 {
+  uint32_t next;
+  enum DXSO_SHADER_COMPILATION_ARGUMENT_TYPE type;
+  float mat[8][4];
+  float lscale[8];
+  float loffset[8];
+};
+
+void
+dxso_compilation_argument32_convert(
+    struct DXSO_SHADER_COMPILATION_ARGUMENT_DATA *first_arg, struct DXSO_SHADER_COMPILATION_ARGUMENT_DATA32 *args32
+) {
+  struct DXSO_SHADER_COMPILATION_ARGUMENT_DATA *last_arg = first_arg;
+
+  first_arg->type = DXSO_SHADER_ARGUMENT_TYPE_MAX;
+  first_arg->next = NULL;
+
+  while (args32) {
+    switch (args32->type) {
+    case DXSO_SHADER_IA_INPUT_LAYOUT: {
+      struct DXSO_SHADER_IA_INPUT_LAYOUT_DATA32 *src = (void *)args32;
+      struct DXSO_SHADER_IA_INPUT_LAYOUT_DATA *data = malloc(sizeof(struct DXSO_SHADER_IA_INPUT_LAYOUT_DATA));
+      last_arg->next = data;
+      last_arg = (void *)data;
+      last_arg->next = NULL;
+      data->type = src->type;
+      data->index_buffer_format = src->index_buffer_format;
+      data->slot_mask = src->slot_mask;
+      data->num_elements = src->num_elements;
+      data->elements = UInt32ToPtr(src->elements);
+      break;
+    }
+    case DXSO_SHADER_PSO_PIXEL_SHADER: {
+      struct DXSO_SHADER_PSO_PIXEL_SHADER_DATA32 *src = (void *)args32;
+      struct DXSO_SHADER_PSO_PIXEL_SHADER_DATA *data = malloc(sizeof(struct DXSO_SHADER_PSO_PIXEL_SHADER_DATA));
+      last_arg->next = data;
+      last_arg = (void *)data;
+      last_arg->next = NULL;
+      data->type = src->type;
+      data->alpha_test_func = src->alpha_test_func;
+      data->alpha_test_ref = src->alpha_test_ref;
+      break;
+    }
+    case DXSO_SHADER_PS_SAMPLER_LAYOUT: {
+      struct DXSO_SHADER_PS_SAMPLER_LAYOUT_DATA32 *src = (void *)args32;
+      struct DXSO_SHADER_PS_SAMPLER_LAYOUT_DATA *data = malloc(sizeof(struct DXSO_SHADER_PS_SAMPLER_LAYOUT_DATA));
+      last_arg->next = data;
+      last_arg = (void *)data;
+      last_arg->next = NULL;
+      data->type = src->type;
+      memcpy(data->kinds, src->kinds, sizeof(data->kinds));
+      break;
+    }
+    case DXSO_SHADER_PS_POINT_SPRITE: {
+      struct DXSO_SHADER_PS_POINT_SPRITE_DATA *data = malloc(sizeof(struct DXSO_SHADER_PS_POINT_SPRITE_DATA));
+      last_arg->next = data;
+      last_arg = (void *)data;
+      last_arg->next = NULL;
+      data->type = DXSO_SHADER_PS_POINT_SPRITE;
+      break;
+    }
+    case DXSO_SHADER_VS_POINT_SIZE: {
+      struct DXSO_SHADER_VS_POINT_SIZE_DATA32 *src = (void *)args32;
+      struct DXSO_SHADER_VS_POINT_SIZE_DATA *data = malloc(sizeof(struct DXSO_SHADER_VS_POINT_SIZE_DATA));
+      last_arg->next = data;
+      last_arg = (void *)data;
+      last_arg->next = NULL;
+      data->type = DXSO_SHADER_VS_POINT_SIZE;
+      data->value = src->value;
+      break;
+    }
+    case DXSO_SHADER_PS_BUMP_ENV: {
+      struct DXSO_SHADER_PS_BUMP_ENV_DATA32 *src = (void *)args32;
+      struct DXSO_SHADER_PS_BUMP_ENV_DATA *data = malloc(sizeof(struct DXSO_SHADER_PS_BUMP_ENV_DATA));
+      last_arg->next = data;
+      last_arg = (void *)data;
+      last_arg->next = NULL;
+      data->type = DXSO_SHADER_PS_BUMP_ENV;
+      memcpy(data->mat, src->mat, sizeof(data->mat));
+      memcpy(data->lscale, src->lscale, sizeof(data->lscale));
+      memcpy(data->loffset, src->loffset, sizeof(data->loffset));
+      break;
+    }
+    case DXSO_SHADER_ARGUMENT_TYPE_MAX:
+      break;
+    }
+    args32 = UInt32ToPtr(args32->next);
+  }
+}
+
+void
+dxso_compilation_argument32_free(struct DXSO_SHADER_COMPILATION_ARGUMENT_DATA *first_arg) {
+  struct DXSO_SHADER_COMPILATION_ARGUMENT_DATA *arg = first_arg->next;
+
+  while (arg) {
+    struct DXSO_SHADER_COMPILATION_ARGUMENT_DATA *next = arg->next;
+    free(arg);
+    arg = next;
+  }
+}
+
+static NTSTATUS
+thunk32_DXSOCompile(void *args) {
+  struct dxso_compile_params32 *params = args;
+  struct DXSO_SHADER_COMPILATION_ARGUMENT_DATA first_arg;
+  struct DXSO_SHADER_COMPILATION_ARGUMENT_DATA32 *args32 = UInt32ToPtr(params->args);
+  dxso_compilation_argument32_convert(&first_arg, args32);
+
+  params->ret = DXSOCompile(
+      params->shader, &first_arg, UInt32ToPtr(params->func_name), UInt32ToPtr(params->bitcode)
+  );
+
+  dxso_compilation_argument32_free(&first_arg);
+
+  return STATUS_SUCCESS;
 }
 
 static NTSTATUS
@@ -2741,7 +2996,17 @@ _MTLBinaryArchive_serialize(void *obj) {
 static NTSTATUS
 _DispatchData_alloc_init(void *obj) {
   struct unixcall_generic_obj_uint64_obj_ret *params = obj;
-  params->ret = (obj_handle_t)dispatch_data_create((void *)params->handle, params->arg, NULL, NULL);
+  // dispatch_data_create with destructor=NULL is documented as
+  // "DISPATCH_DATA_DESTRUCTOR_DEFAULT" and copies the bytes, but the
+  // copy semantics across libdispatch versions and wine's loader
+  // surface have given us flaky AGX XPC failures at PSO link time on
+  // the d3d9 path. Explicitly malloc + memcpy + DISPATCH_DATA_DESTRUCTOR_FREE
+  // makes ownership unambiguous: the dispatch_data owns the buffer
+  // outright and frees via free(3) on last release.
+  void *copy = malloc(params->arg);
+  memcpy(copy, (void *)params->handle, params->arg);
+  params->ret = (obj_handle_t)dispatch_data_create(
+      copy, params->arg, NULL, DISPATCH_DATA_DESTRUCTOR_FREE);
   return STATUS_SUCCESS;
 }
 
@@ -3141,6 +3406,16 @@ const void *__wine_unix_call_funcs[] = {
     &_MTLCommandBuffer_blitCommandEncoderWithSampleBuffers,
     &_MTLCommandBuffer_property,
     &_MTLDevice_newTileRenderPipelineState,
+    // DXSO block: the position of these five entries must match
+    // unix_dxso_initialize / unix_dxso_* in airconv_thunks.h.
+    // Currently 136..140; if upstream inserts new entries above this
+    // line, both this block and the airconv_thunks.h anchor must move
+    // forward by the same amount.
+    &thunk_DXSOInitialize,
+    &thunk_DXSODestroy,
+    &thunk_DXSOCompile,
+    &thunk_DXSOGetCompiledBitcode,
+    &thunk_DXSODestroyBitcode,
 };
 
 #ifndef DXMT_NATIVE
@@ -3281,5 +3556,16 @@ const void *__wine_unix_call_wow64_funcs[] = {
     &_MTLCommandBuffer_blitCommandEncoderWithSampleBuffers,
     &_MTLCommandBuffer_property,
     &_MTLDevice_newTileRenderPipelineState,
+    // DXSO block — kept in lock-step with __wine_unix_call_funcs
+    // above and with unix_dxso_* in airconv_thunks.h.
+    &thunk32_DXSOInitialize,
+    /* dxso_destroy_params holds only sm50_ptr64_t (always 8 bytes), so
+       the 64-bit thunk is byte-compatible — no thunk32 needed. */
+    &thunk_DXSODestroy,
+    &thunk32_DXSOCompile,
+    &thunk32_DXSOGetCompiledBitcode,
+    /* dxso_destroy_bitcode_params is sm50_ptr64_t-only, see DXSODestroy
+       comment above. */
+    &thunk_DXSODestroyBitcode,
 };
 #endif

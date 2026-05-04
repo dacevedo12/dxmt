@@ -3,6 +3,7 @@
 #include "dxmt_context.hpp"
 #include "dxmt_format.hpp"
 #include "log/log.hpp"
+#include <cfloat>
 
 #include "dxmt_command.h"
 
@@ -346,6 +347,83 @@ ResolveTextureContext::resolve(
   ctx_.resolveTexture(
       std::move(src), src_view, std::move(dst), dst_view, pso,
       src_rect, dst_origin, resolve_size);
+}
+
+StretchBlitContext::StretchBlitContext(
+    WMT::Device device, InternalCommandLibrary &lib, ArgumentEncodingContext &ctx
+) :
+    ctx_(ctx),
+    device_(device) {
+  auto library = lib.getLibrary();
+  vs_blit_ = library.newFunction("vs_blit_quad");
+  fs_blit_ = library.newFunction("fs_blit_quad");
+}
+
+WMT::RenderPipelineState
+StretchBlitContext::getPSO(WMTPixelFormat dst_format) {
+  auto cached = psos_.find(dst_format);
+  if (cached != psos_.end())
+    return cached->second;
+
+  WMTRenderPipelineInfo info;
+  WMT::InitializeRenderPipelineInfo(info);
+  info.vertex_function = vs_blit_;
+  info.fragment_function = fs_blit_;
+  info.colors[0].pixel_format = dst_format;
+  info.rasterization_enabled = true;
+  info.input_primitive_topology = WMTPrimitiveTopologyClassTriangle;
+
+  WMT::Reference<WMT::Error> error;
+  auto pso = device_.newRenderPipelineState(info, error);
+  if (!pso) {
+    WARN("Failed to create StretchBlit PSO of format ", dst_format, ": ",
+         error ? error.description().getUTF8String() : "unknown error");
+  }
+  auto [entry, _] = psos_.emplace(dst_format, std::move(pso));
+  return entry->second;
+}
+
+WMT::SamplerState
+StretchBlitContext::getSampler(Filter filter) {
+  auto &slot = (filter == Filter::Linear) ? sampler_linear_ : sampler_point_;
+  if (slot)
+    return slot;
+  WMTSamplerInfo info{};
+  info.min_filter = (filter == Filter::Linear)
+                        ? WMTSamplerMinMagFilterLinear
+                        : WMTSamplerMinMagFilterNearest;
+  info.mag_filter = info.min_filter;
+  info.mip_filter = WMTSamplerMipFilterNotMipmapped;
+  info.r_address_mode = WMTSamplerAddressModeClampToEdge;
+  info.s_address_mode = WMTSamplerAddressModeClampToEdge;
+  info.t_address_mode = WMTSamplerAddressModeClampToEdge;
+  info.border_color = WMTSamplerBorderColorTransparentBlack;
+  info.compare_function = WMTCompareFunctionNever;
+  info.lod_min_clamp = 0.0f;
+  info.lod_max_clamp = FLT_MAX;
+  info.max_anisotroy = 1;
+  info.normalized_coords = true;
+  info.lod_average = false;
+  info.support_argument_buffers = false;
+  slot = device_.newSamplerState(info);
+  return slot;
+}
+
+void
+StretchBlitContext::blit(
+    Rc<Texture> src, TextureViewKey src_view, Rc<Texture> dst, TextureViewKey dst_view,
+    Filter filter, WMTOrigin src_origin, WMTSize src_size,
+    WMTOrigin dst_origin, WMTSize dst_size
+) {
+  auto pso = getPSO(dst->pixelFormat(dst_view));
+  if (!pso)
+    return;
+  auto sampler = getSampler(filter);
+  if (!sampler)
+    return;
+  ctx_.stretchBlit(
+      std::move(src), src_view, std::move(dst), dst_view, pso, sampler,
+      src_origin, src_size, dst_origin, dst_size);
 }
 
 DepthStencilBlitContext::DepthStencilBlitContext(

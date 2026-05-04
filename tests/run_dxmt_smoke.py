@@ -18,31 +18,46 @@ import pathlib
 import shlex
 import subprocess
 import sys
+import tempfile
 
 
 def quote_command(command: list[str]) -> str:
     return " ".join(shlex.quote(part) for part in command)
 
 
+def _capture(command: list[str], cwd: pathlib.Path, env: dict[str, str]) -> tuple[int, str]:
+    # Capture into a temporary file rather than subprocess.PIPE. Wine
+    # helper processes (wineserver, services.exe, the explorer stub)
+    # survive the test binary and inherit any pipe fd we hand to wine,
+    # which blocks pipe EOF until those daemons exit on their own. A
+    # file fd doesn't have that failure mode — wait() returns as soon
+    # as the test binary exits.
+    with tempfile.TemporaryFile(mode="w+", encoding="utf-8", errors="replace") as buf:
+        completed = subprocess.run(command, cwd=cwd, env=env, text=True,
+                                   stdout=buf, stderr=subprocess.STDOUT,
+                                   start_new_session=True)
+        buf.seek(0)
+        return completed.returncode, buf.read()
+
+
 def run_command(command: list[str], cwd: pathlib.Path, env: dict[str, str]) -> tuple[int, list[str]]:
     print("+", quote_command(command), flush=True)
-    completed = subprocess.run(command, cwd=cwd, env=env, text=True,
-                               stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-    print(completed.stdout, end="")
+    rc, output = _capture(command, cwd, env)
+    print(output, end="")
     failures = [
-        line for line in completed.stdout.splitlines()
+        line for line in output.splitlines()
         if line.startswith("not ok") or "Test failed:" in line
     ]
-    if completed.returncode:
-        failures.append(f"process exited with status {completed.returncode}")
+    if rc:
+        failures.append(f"process exited with status {rc}")
     for marker in ("Unhandled exception:", "Unhandled page fault", "wine: Unhandled"):
-        if marker in completed.stdout:
+        if marker in output:
             failures.append(marker)
     if failures:
         print("dxmt-smoke failed assertions:", file=sys.stderr)
         for failure in failures:
             print(f"  {failure}", file=sys.stderr)
-    return completed.returncode, failures
+    return rc, failures
 
 
 def resolve_repo_dir() -> pathlib.Path:
@@ -65,22 +80,42 @@ class TestTarget:
 def list_suite_tests(runner: pathlib.Path, target: TestTarget, env: dict[str, str]) -> list[str]:
     command = [str(runner), str(target.path), "--list-tests"]
     print("+", quote_command(command), flush=True)
-    completed = subprocess.run(command, cwd=target.path.parent, env=env, text=True,
-                               stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-    print(completed.stdout, end="")
-    if completed.returncode:
-        raise RuntimeError(f"failed to list {target.path.name}: status {completed.returncode}")
+    rc, output = _capture(command, target.path.parent, env)
+    print(output, end="")
+    if rc:
+        raise RuntimeError(f"failed to list {target.path.name}: status {rc}")
 
     tests: list[str] = []
-    for line in completed.stdout.splitlines():
+    for line in output.splitlines():
         name = line.strip()
         if name.startswith("test_") and " " not in name and name not in tests:
             tests.append(name)
     return tests
 
 
+def list_smoke_tests(runner: pathlib.Path, target: TestTarget, env: dict[str, str]) -> list[str]:
+    # dx9/dx11/dx12 smoke binaries support `--list` (no -tests suffix) and
+    # print one kebab-case test name per line, no "test_" prefix.
+    command = [str(runner), str(target.path), "--list"]
+    print("+", quote_command(command), flush=True)
+    rc, output = _capture(command, target.path.parent, env)
+    if rc:
+        raise RuntimeError(f"failed to list {target.path.name}: status {rc}")
+    tests: list[str] = []
+    for line in output.splitlines():
+        name = line.strip()
+        # Accept any non-empty, single-token name — smoke names are
+        # kebab-case (e.g. "draw-textured") and don't carry the
+        # "test_" prefix the vkd3d suites use.
+        if name and " " not in name and not name.startswith("#") and name not in tests:
+            tests.append(name)
+    return tests
+
+
 def smoke_targets(build_dir: pathlib.Path, only: str) -> list[TestTarget]:
     tests: list[TestTarget] = []
+    if only in ("all", "dx9"):
+        tests.append(TestTarget(build_dir / "tests" / "dx9" / "dx9_smoke.exe", "smoke"))
     if only in ("all", "dx11"):
         tests.append(TestTarget(build_dir / "tests" / "dx11" / "dx11_smoke.exe", "smoke"))
     if only in ("all", "dx12"):
@@ -123,7 +158,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument(
         "--only",
-        choices=("all", "dx11", "dx12", "d3d12-core", "d3d12-perf"),
+        choices=("all", "dx9", "dx11", "dx12", "d3d12-core", "d3d12-perf"),
         default="all",
         help="Subset to run.",
     )
@@ -154,6 +189,16 @@ def main(argv: list[str] | None = None) -> int:
         "--include-stress",
         action="store_true",
         help="Include tests whose names contain 'stress' when isolating named tests.",
+    )
+    parser.add_argument(
+        "--per-test",
+        action="store_true",
+        help=(
+            "For dx9/dx11/dx12 smoke binaries, list tests via --list and run "
+            "each in its own wine process via --filter <name>. Isolates state "
+            "across tests so a UAF in one smoke can't taint a later one. "
+            "Trades wine cold-start (~5s/test) for reproducible failures."
+        ),
     )
     args = parser.parse_args(argv)
 
@@ -230,6 +275,34 @@ def main(argv: list[str] | None = None) -> int:
             failed_assertions.extend(assertions)
         elif args.list:
             continue
+        elif args.per_test:
+            # Per-test isolation. List the smoke binary's tests, then
+            # run each in its own wine process via --filter. A UAF or
+            # heap overflow inside test N can't taint test N+1 because
+            # the process state resets on each invocation. Optional
+            # --filter narrows the per-test set to a substring match
+            # (same shape as the in-binary filter).
+            try:
+                names = list_smoke_tests(runner, target, test_env)
+            except RuntimeError as e:
+                print(str(e), file=sys.stderr)
+                failed = 1
+                failed_assertions.append(str(e))
+                continue
+            if args.filter:
+                names = [name for name in names if args.filter in name]
+            if not names:
+                print(f"no tests selected for {test_exe.name} (--per-test); skipping")
+                continue
+            print(
+                f"dxmt-smoke: running {len(names)} isolated tests from {test_exe.name}",
+                flush=True,
+            )
+            for name in names:
+                per_cmd = command + ["--filter", name]
+                returncode, assertions = run_command(per_cmd, test_exe.parent, test_env)
+                failed |= returncode
+                failed_assertions.extend(assertions)
         elif args.filter:
             command.extend(["--filter", args.filter])
             returncode, assertions = run_command(command, test_exe.parent, test_env)

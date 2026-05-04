@@ -68,7 +68,12 @@ public:
   WMT::MetalDrawable encodeCommands(
       WMT::CommandBuffer cmdbuf, WMT::Texture backbuffer, DXMTPresentMetadata metadata,
       std::function<void(WMT::RenderCommandEncoder)> &&wait_fences,
-      std::function<void(WMT::RenderCommandEncoder)> &&update_fences
+      std::function<void(WMT::RenderCommandEncoder)> &&update_fences,
+      // Optional out-param: microseconds spent inside layer_.nextDrawable.
+      // Useful to disambiguate "encode is slow" from "GPU back-pressure
+      // blocks drawable acquisition" — the latter shows up as a multi-
+      // hundred-millisecond duration. Default nullptr ignores.
+      uint64_t *out_next_drawable_us = nullptr
   );
 
 private:

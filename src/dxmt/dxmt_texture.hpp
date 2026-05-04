@@ -20,6 +20,12 @@ enum class TextureAllocationFlag : uint32_t {
   GpuManaged = 4,
   Shared = 5,
   ShaderReadonly = 6,
+  // Apple TBDR tile-local storage: render-target contents live only on
+  // the GPU tile, never in DRAM. Wins on transient depth/stencil + MSAA
+  // color where the contents are produced and consumed within one
+  // render pass and don't need to survive past it. Caller must use
+  // DontCare load/store actions at the render-pass layer.
+  Memoryless = 7,
 };
 
 struct TextureViewDescriptor {
@@ -120,6 +126,17 @@ public:
 
   WMT::Texture texture() const {
     return obj_;
+  }
+
+  // Underlying linear MTLBuffer for buffer-backed allocations (the
+  // bytes_per_image / bytes_per_row Texture ctor produces these). The
+  // d3d9 path needs the buffer handle so its level-0 surface can keep
+  // a separate retain on it for the LockRect contract — Lock returns
+  // the buffer's mapped bytes as pBits and Unlock is a no-op (UMA).
+  // Returns a default-constructed (null) WMT::Buffer for non-buffer-
+  // backed allocations.
+  WMT::Buffer buffer() const {
+    return buffer_;
   }
 
   Flags<TextureAllocationFlag>

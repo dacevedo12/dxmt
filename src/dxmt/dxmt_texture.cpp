@@ -226,6 +226,15 @@ Texture::Texture(const WMTTextureInfo &descriptor, WMT::Device device) :
       .miplevelCount = info_.mipmap_level_count,
       .firstArraySlice = 0,
       .arraySize = arrayLength(),
+      // The default fullView inherits the parent texture's intended
+      // usage. Metal's newTextureView with a swizzle parameter can
+      // silently strip usage flags (e.g. RenderTarget) from the view's
+      // MTLTexture; TextureView's ctor has a workaround that substitutes
+      // the parent texture when (intendedUsage & RT) and the view lost
+      // RT, but that workaround only fires when intendedUsage carries
+      // the bit. Without this default, d3d9's `fullView` produces a view
+      // missing RT usage and the RenderPass guard correctly rejects it.
+      .intendedUsage = info_.usage,
   });
   version_ = 1;
   fullView = TextureViewKey(viewDescriptors_[0], 0, info_.mipmap_level_count);
@@ -250,6 +259,11 @@ Texture::Texture(
       .miplevelCount = 1,
       .firstArraySlice = 0,
       .arraySize = 1,
+      // Buffer-backed textures inherit the parent's intended usage on
+      // the default view for the same reason as the GPU-backed ctor
+      // above — TextureView's RT-workaround branch only fires when
+      // intendedUsage carries the bit.
+      .intendedUsage = info_.usage,
   });
   version_ = 1;
   fullView = TextureViewKey(viewDescriptors_[0], 0, info_.mipmap_level_count);
@@ -257,7 +271,14 @@ Texture::Texture(
 
 Rc<TextureAllocation>
 Texture::allocate(Flags<TextureAllocationFlag> flags) {
-  WMTResourceOptions options = WMTResourceHazardTrackingModeUntracked;
+  // Default hazard tracking (was forced Untracked). NFS:MW's 3D-world
+  // texture flicker traced to inter-encoder hazards the driver wasn't
+  // tracking — render-to-texture followed by sample-from-texture in a
+  // later encoder needs a barrier the Untracked mode doesn't insert.
+  // MTL_SHADER_VALIDATION=1 had been masking the symptom because the
+  // validation layer's instrumentation implicitly forces synchronization.
+  // Letting the driver auto-track resolves it without per-call barriers.
+  WMTResourceOptions options = (WMTResourceOptions)0;
   WMTTextureInfo info = info_; // copy
   info.mach_port = 0;
   if (flags.test(TextureAllocationFlag::CpuWriteCombined)) {
@@ -268,6 +289,19 @@ Texture::allocate(Flags<TextureAllocationFlag> flags) {
   }
   if (flags.test(TextureAllocationFlag::GpuManaged)) {
     options |= WMTResourceStorageModeManaged;
+  }
+  // Memoryless wins on transient render-targets — never spills to DRAM,
+  // contents only live on the tile while the encoder owns it. Apple TBDR
+  // best practice for Discard depth/stencil + MSAA color. Overrides the
+  // CpuInvisible Private if both happen to be set (callers shouldn't mix,
+  // but Memoryless is the stricter mode that subsumes the no-CPU-mapping
+  // intent of Private).
+  if (flags.test(TextureAllocationFlag::Memoryless)) {
+    options = static_cast<WMTResourceOptions>(
+        (static_cast<uint64_t>(options) &
+         ~static_cast<uint64_t>(WMTResourceStorageModePrivate | WMTResourceStorageModeManaged)) |
+        static_cast<uint64_t>(WMTResourceStorageModeMemoryless)
+    );
   }
   info.options = options;
   if (bytes_per_image_) {

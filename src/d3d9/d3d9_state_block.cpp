@@ -1,0 +1,426 @@
+#include "d3d9_state_block.hpp"
+
+#include "d3d9_buffer.hpp"
+#include "d3d9_common_texture.hpp"
+#include "d3d9_device.hpp"
+#include "d3d9_shader.hpp"
+#include "d3d9_surface.hpp"
+#include "d3d9_trace.hpp"
+#include "d3d9_vertex_declaration.hpp"
+
+#include <array>
+#include <cstring>
+#include <memory>
+
+namespace dxmt {
+
+MTLD3D9StateBlock::MTLD3D9StateBlock(MTLD3D9Device *device, D3DSTATEBLOCKTYPE type) : m_device(device), m_type(type) {
+  AddRefPrivate();
+  // Register with the device so Reset can invalidate every
+  // outstanding block. Pairs with the unregister in the dtor.
+  m_device->registerStateBlock(this);
+  // Zero-init the snapshot — until the first Capture lands, Apply on
+  // a freshly constructed block writes a zero-state. CreateStateBlock
+  // calls Capture immediately after construction (matching D3D9's
+  // "capture on create" contract), so apps shouldn't see the zero
+  // state in practice; the init guards against UB if a future code
+  // path constructs a block and Apply's it without Capture.
+  std::memset(m_snapRenderStates, 0, sizeof(m_snapRenderStates));
+  std::memset(m_snapSamplerStates, 0, sizeof(m_snapSamplerStates));
+  std::memset(m_snapTextureStageStates, 0, sizeof(m_snapTextureStageStates));
+  std::memset(m_snapTransforms, 0, sizeof(m_snapTransforms));
+  std::memset(m_snapClipPlanes, 0, sizeof(m_snapClipPlanes));
+  std::memset(&m_snapViewport, 0, sizeof(m_snapViewport));
+  std::memset(&m_snapScissorRect, 0, sizeof(m_snapScissorRect));
+  m_snapFvf = 0;
+  std::memset(m_snapStreamOffsets, 0, sizeof(m_snapStreamOffsets));
+  std::memset(m_snapStreamStrides, 0, sizeof(m_snapStreamStrides));
+  std::memset(&m_snapMaterial, 0, sizeof(m_snapMaterial));
+  std::memset(m_snapVsConstantsF, 0, sizeof(m_snapVsConstantsF));
+  std::memset(m_snapVsConstantsI, 0, sizeof(m_snapVsConstantsI));
+  std::memset(m_snapVsConstantsB, 0, sizeof(m_snapVsConstantsB));
+  std::memset(m_snapPsConstantsF, 0, sizeof(m_snapPsConstantsF));
+  std::memset(m_snapPsConstantsI, 0, sizeof(m_snapPsConstantsI));
+  std::memset(m_snapPsConstantsB, 0, sizeof(m_snapPsConstantsB));
+}
+
+MTLD3D9StateBlock::~MTLD3D9StateBlock() {
+  m_device->unregisterStateBlock(this);
+}
+
+ULONG STDMETHODCALLTYPE
+MTLD3D9StateBlock::AddRef() {
+  ULONG ref = ComObject::AddRef();
+  // Pin the device. Same shape as MTLD3D9Texture::AddRef — currently
+  // safe because CreateStateBlock runs post-device-ctor (the device
+  // already has a non-zero pub refcount when the block is created).
+  // project_d3d9_ctor_refcount_trap auto-memory: if a future Reset /
+  // device-recreate path constructs state blocks during the device's
+  // own ctor window, the first pub-AddRef here will walk the device
+  // refcount through 0→1 and recursively destruct it. Switch to
+  // private-ref pinning if that scenario shows up.
+  if (ref == 1)
+    m_device->AddRef();
+  return ref;
+}
+
+ULONG STDMETHODCALLTYPE
+MTLD3D9StateBlock::Release() {
+  ULONG ref = ComObject::Release();
+  if (ref == 0) {
+    m_device->Release();
+    if (m_self_pinned) {
+      m_self_pinned = false;
+      ReleasePrivate();
+    }
+  }
+  return ref;
+}
+
+HRESULT STDMETHODCALLTYPE
+MTLD3D9StateBlock::QueryInterface(REFIID riid, void **ppvObject) {
+  D9_TRACE("IDirect3DStateBlock9::QueryInterface");
+  if (!ppvObject)
+    return E_POINTER;
+  *ppvObject = nullptr;
+
+  if (riid == __uuidof(IUnknown) || riid == __uuidof(IDirect3DStateBlock9)) {
+    *ppvObject = static_cast<IDirect3DStateBlock9 *>(this);
+    AddRef();
+    return S_OK;
+  }
+  return E_NOINTERFACE;
+}
+
+HRESULT STDMETHODCALLTYPE
+MTLD3D9StateBlock::GetDevice(IDirect3DDevice9 **ppDevice) {
+  D9_TRACE("IDirect3DStateBlock9::GetDevice");
+  if (!ppDevice)
+    return D3DERR_INVALIDCALL;
+  *ppDevice = ::dxmt::ref(static_cast<IDirect3DDevice9 *>(m_device));
+  return D3D_OK;
+}
+
+HRESULT STDMETHODCALLTYPE
+MTLD3D9StateBlock::Capture() {
+  D9_TRACE("IDirect3DStateBlock9::Capture");
+  // Reset-invalidation gate: the device's last Reset called invalidate()
+  // on every outstanding block. Capture / Apply on a marked block
+  // return INVALIDCALL — its reference-pinned slots may now be
+  // orphaned and the snapshot's stale values must not propagate.
+  // wined3d / DXVK match this shape.
+  if (m_invalid)
+    return D3DERR_INVALIDCALL;
+  // Coupling checks — each snapshot must match the device's storage
+  // exactly, otherwise the memcpy walks off. Member-function scope
+  // gives access to both private sides; namespace-level statics
+  // can't see m_device's private members. Fires at compile time if
+  // a future commit trims one side but forgets the other.
+  static_assert(
+      sizeof(m_snapRenderStates) == sizeof(m_device->m_renderStates),
+      "render-state snapshot size must match device array"
+  );
+  static_assert(
+      sizeof(m_snapSamplerStates) == sizeof(m_device->m_samplerStates),
+      "sampler-state snapshot size must match device array"
+  );
+  static_assert(
+      sizeof(m_snapTextureStageStates) == sizeof(m_device->m_textureStageStates),
+      "texture-stage snapshot size must match device array"
+  );
+  static_assert(
+      sizeof(m_snapTransforms) == sizeof(m_device->m_transforms), "transform snapshot size must match device array"
+  );
+  static_assert(
+      sizeof(m_snapClipPlanes) == sizeof(m_device->m_clipPlanes), "clip-planes snapshot size must match device array"
+  );
+  static_assert(
+      sizeof(m_snapStreamOffsets) == sizeof(m_device->m_streamOffsets),
+      "stream-offsets snapshot size must match device array"
+  );
+  static_assert(
+      sizeof(m_snapStreamStrides) == sizeof(m_device->m_streamStrides),
+      "stream-strides snapshot size must match device array"
+  );
+  static_assert(
+      sizeof(m_snapStreamFreq) == sizeof(m_device->m_streamFreq), "stream-freq snapshot size must match device array"
+  );
+  static_assert(
+      sizeof(m_snapVsConstantsF) == sizeof(m_device->m_vsConstantsF),
+      "VS F-constants snapshot size must match device array"
+  );
+  static_assert(
+      sizeof(m_snapVsConstantsI) == sizeof(m_device->m_vsConstantsI),
+      "VS I-constants snapshot size must match device array"
+  );
+  static_assert(
+      sizeof(m_snapVsConstantsB) == sizeof(m_device->m_vsConstantsB),
+      "VS B-constants snapshot size must match device array"
+  );
+  static_assert(
+      sizeof(m_snapPsConstantsF) == sizeof(m_device->m_psConstantsF),
+      "PS F-constants snapshot size must match device array"
+  );
+  static_assert(
+      sizeof(m_snapPsConstantsI) == sizeof(m_device->m_psConstantsI),
+      "PS I-constants snapshot size must match device array"
+  );
+  static_assert(
+      sizeof(m_snapPsConstantsB) == sizeof(m_device->m_psConstantsB),
+      "PS B-constants snapshot size must match device array"
+  );
+  // Per-category snapshot, gated by m_changes — the same mask that
+  // Apply walks. For CreateStateBlock(Type=ALL/PIXEL/VERTEX) blocks
+  // the mask was filled at construction via markAll() /
+  // markPixelStateSubset() / markVertexStateSubset(). For
+  // EndStateBlock-recorded blocks the mask reflects exactly what the
+  // app touched between Begin and End. Capture used to memcpy every
+  // category every time, which both wasted cycles on recorded blocks
+  // and made Capture/Apply asymmetric (Apply respected the mask,
+  // Capture didn't). wined3d stateblock.c d3d9_stateblock_Capture
+  // walks the same per-state mask.
+  //
+  // Render-state slots are individually masked (256 bits). All other
+  // categories use coarse-grained category bools; ref-counted slots
+  // (RTs, DS, textures, vertex/index buffers, decl, shaders) honour
+  // the category bool too — Com<,false>::operator= is the canonical
+  // ref-cycle on assignment, so a no-op skip is just "don't touch
+  // the existing snapshot slot".
+  for (uint32_t i = 0; i < 256; ++i) {
+    if (m_changes.render_states[i])
+      m_snapRenderStates[i] = m_device->m_renderStates[i];
+  }
+  if (m_changes.sampler_states)
+    std::memcpy(m_snapSamplerStates, m_device->m_samplerStates, sizeof(m_snapSamplerStates));
+  if (m_changes.texture_stage_states)
+    std::memcpy(m_snapTextureStageStates, m_device->m_textureStageStates, sizeof(m_snapTextureStageStates));
+  if (m_changes.transforms)
+    std::memcpy(m_snapTransforms, m_device->m_transforms, sizeof(m_snapTransforms));
+  if (m_changes.clip_planes)
+    std::memcpy(m_snapClipPlanes, m_device->m_clipPlanes, sizeof(m_snapClipPlanes));
+  if (m_changes.viewport)
+    m_snapViewport = m_device->m_viewport;
+  if (m_changes.scissor)
+    m_snapScissorRect = m_device->m_scissorRect;
+  if (m_changes.fvf)
+    m_snapFvf = m_device->m_fvf;
+  if (m_changes.streams) {
+    std::memcpy(m_snapStreamOffsets, m_device->m_streamOffsets, sizeof(m_snapStreamOffsets));
+    std::memcpy(m_snapStreamStrides, m_device->m_streamStrides, sizeof(m_snapStreamStrides));
+    std::memcpy(m_snapStreamFreq, m_device->m_streamFreq, sizeof(m_snapStreamFreq));
+    for (size_t i = 0; i < D3D9_MAX_VERTEX_STREAMS; ++i)
+      m_snapVertexBuffers[i] = m_device->m_vertexBuffers[i];
+  }
+  if (m_changes.material)
+    m_snapMaterial = m_device->m_material;
+  if (m_changes.vs_constants) {
+    std::memcpy(m_snapVsConstantsF, m_device->m_vsConstantsF, sizeof(m_snapVsConstantsF));
+    std::memcpy(m_snapVsConstantsI, m_device->m_vsConstantsI, sizeof(m_snapVsConstantsI));
+    std::memcpy(m_snapVsConstantsB, m_device->m_vsConstantsB, sizeof(m_snapVsConstantsB));
+  }
+  if (m_changes.ps_constants) {
+    std::memcpy(m_snapPsConstantsF, m_device->m_psConstantsF, sizeof(m_snapPsConstantsF));
+    std::memcpy(m_snapPsConstantsI, m_device->m_psConstantsI, sizeof(m_snapPsConstantsI));
+    std::memcpy(m_snapPsConstantsB, m_device->m_psConstantsB, sizeof(m_snapPsConstantsB));
+  }
+  // Ref-counted slots — Com<,false>::operator= runs AddRefPrivate on
+  // the new target before ReleasePrivate on the old (com_pointer.hpp
+  // operator=). Self-assignment is safe.
+  //
+  // RT[0..3] and DS are NOT captured. wined3d's
+  // wined3d_stateblock_capture (stateblock.c:903-1165) doesn't include
+  // framebuffer bindings in its stateblock state at all; D3D9's
+  // SetRenderTarget / SetDepthStencilSurface route straight through
+  // wined3d_device_context_set_rendertarget_views, bypassing the
+  // stateblock entirely. The dxmt Apply side at the bottom of this
+  // file (matching wined3d) already doesn't restore RT/DS — capturing
+  // them here was dead work that pinned a priv-ref AddRef per RT/DS
+  // per state block.
+  if (m_changes.textures) {
+    for (size_t i = 0; i < D3D9_MAX_TEXTURE_UNITS; ++i)
+      m_snapTextures[i] = m_device->m_textures[i];
+  }
+  if (m_changes.index_buffer)
+    m_snapIndexBuffer = m_device->m_indexBuffer;
+  if (m_changes.vertex_declaration)
+    m_snapVertexDeclaration = m_device->m_vertexDeclaration;
+  if (m_changes.vertex_shader)
+    m_snapVertexShader = m_device->m_vertexShader;
+  if (m_changes.pixel_shader)
+    m_snapPixelShader = m_device->m_pixelShader;
+  if (m_changes.lights) {
+    m_snapLights = m_device->m_lights;
+    m_snapLightEnables = m_device->m_lightEnables;
+  }
+  (void)m_type;
+  return D3D_OK;
+}
+
+HRESULT STDMETHODCALLTYPE
+MTLD3D9StateBlock::Apply() {
+  D9_TRACE("IDirect3DStateBlock9::Apply");
+  // Reset-invalidation gate — see Capture() above for the rationale.
+  if (m_invalid)
+    return D3DERR_INVALIDCALL;
+  // FlushDrawBatch was previously needed here to bound the batch
+  // before D9EmitOPRef mutations touched m_d9EncRefs on the encode
+  // thread. With per-draw pod_snapshot AND ref_snapshot, every queued
+  // BatchedDraw owns its own frozen state; Apply just rewrites the
+  // calling-thread shadows and bumps the COW generations, and new
+  // draws after this Apply pick up the new snapshot on next
+  // QueueBatchedDraw. Pending draws stay pinned to the pre-Apply
+  // snapshot via shared_ptr.
+  // Per-state render-state restore. wined3d
+  // dlls/wined3d/stateblock.c:1251 walks num_contained_render_states
+  // and writes only those slots; the previous unconditional memcpy
+  // here would stomp ALPHABLENDENABLE / ZENABLE / ZWRITEENABLE etc.
+  // that the app explicitly mutated since the snapshot was captured,
+  // producing the layering symptoms in NFS:MW (UI behind 3D, smoke
+  // through walls).
+  uint32_t pod_dirty = 0;
+  bool any_ref_change = false;
+  for (uint32_t i = 0; i < 256; ++i) {
+    if (!m_changes.render_states[i])
+      continue;
+    m_device->m_renderStates[i] = m_snapRenderStates[i];
+    pod_dirty |= dxmt::D9ES_DIRTY_RENDER_STATES;
+  }
+  if (m_changes.sampler_states) {
+    std::memcpy(m_device->m_samplerStates, m_snapSamplerStates, sizeof(m_snapSamplerStates));
+    pod_dirty |= dxmt::D9ES_DIRTY_SAMPLER_STATES;
+  }
+  if (m_changes.texture_stage_states) {
+    std::memcpy(m_device->m_textureStageStates, m_snapTextureStageStates, sizeof(m_snapTextureStageStates));
+    // No POD-snapshot bump: texture_stage_states isn't carried in
+    // BatchedDraw::pod_snapshot today (FFP shader generator hasn't
+    // landed).
+  }
+  if (m_changes.transforms) {
+    std::memcpy(m_device->m_transforms, m_snapTransforms, sizeof(m_snapTransforms));
+    // Same as texture_stage_states: transforms aren't in pod_snapshot.
+  }
+  if (m_changes.clip_planes) {
+    std::memcpy(m_device->m_clipPlanes, m_snapClipPlanes, sizeof(m_snapClipPlanes));
+    pod_dirty |= dxmt::D9ES_DIRTY_CLIP_PLANES;
+  }
+  if (m_changes.viewport) {
+    m_device->m_viewport = m_snapViewport;
+    m_device->m_viewportDirty = true;
+    pod_dirty |= dxmt::D9ES_DIRTY_VIEWPORT;
+  }
+  if (m_changes.scissor) {
+    m_device->m_scissorRect = m_snapScissorRect;
+    m_device->m_scissorDirty = true;
+    pod_dirty |= dxmt::D9ES_DIRTY_SCISSOR_RECT;
+  }
+  if (m_changes.fvf)
+    m_device->m_fvf = m_snapFvf;
+  if (m_changes.streams) {
+    std::memcpy(m_device->m_streamOffsets, m_snapStreamOffsets, sizeof(m_snapStreamOffsets));
+    std::memcpy(m_device->m_streamStrides, m_snapStreamStrides, sizeof(m_snapStreamStrides));
+    std::memcpy(m_device->m_streamFreq, m_snapStreamFreq, sizeof(m_snapStreamFreq));
+    for (size_t i = 0; i < D3D9_MAX_VERTEX_STREAMS; ++i) {
+      // Push SetRef op alongside the calling-thread shadow assign so
+      // m_encodeSideRefs tracks. Only push when the slot actually
+      // changes (same shape as SetStreamSource's buffer-changed gate).
+      if (m_device->m_vertexBuffers[i].ptr() != m_snapVertexBuffers[i].ptr()) {
+        auto *new_vb = m_snapVertexBuffers[i].ptr();
+        if (new_vb)
+          new_vb->AddRefPrivate();
+        m_device->QueueRefOp(
+            static_cast<MTLD3D9Device::PendingRefOp::Slot>(MTLD3D9Device::PendingRefOp::VertexBuffer0 + i), new_vb
+        );
+      }
+      m_device->m_vertexBuffers[i] = m_snapVertexBuffers[i];
+    }
+    pod_dirty |= dxmt::D9ES_DIRTY_STREAM_FREQ;
+    any_ref_change = true; // vertex_buffers slots live in ref_snapshot
+  }
+  if (m_changes.material)
+    m_device->m_material = m_snapMaterial;
+  if (m_changes.vs_constants) {
+    std::memcpy(m_device->m_vsConstantsF, m_snapVsConstantsF, sizeof(m_snapVsConstantsF));
+    std::memcpy(m_device->m_vsConstantsI, m_snapVsConstantsI, sizeof(m_snapVsConstantsI));
+    std::memcpy(m_device->m_vsConstantsB, m_snapVsConstantsB, sizeof(m_snapVsConstantsB));
+    pod_dirty |= dxmt::D9ES_DIRTY_VS_CONST_F | dxmt::D9ES_DIRTY_VS_CONST_I | dxmt::D9ES_DIRTY_VS_CONST_B;
+  }
+  if (m_changes.ps_constants) {
+    std::memcpy(m_device->m_psConstantsF, m_snapPsConstantsF, sizeof(m_snapPsConstantsF));
+    std::memcpy(m_device->m_psConstantsI, m_snapPsConstantsI, sizeof(m_snapPsConstantsI));
+    std::memcpy(m_device->m_psConstantsB, m_snapPsConstantsB, sizeof(m_snapPsConstantsB));
+    pod_dirty |= dxmt::D9ES_DIRTY_PS_CONST_F | dxmt::D9ES_DIRTY_PS_CONST_I | dxmt::D9ES_DIRTY_PS_CONST_B;
+  }
+  if (m_changes.textures) {
+    for (size_t i = 0; i < D3D9_MAX_TEXTURE_UNITS; ++i) {
+      if (m_device->m_textures[i].ptr() != m_snapTextures[i].ptr()) {
+        auto *new_tex = m_snapTextures[i].ptr();
+        if (new_tex)
+          new_tex->AddRefPrivate();
+        m_device->QueueRefOp(
+            static_cast<MTLD3D9Device::PendingRefOp::Slot>(MTLD3D9Device::PendingRefOp::Texture0 + i), new_tex
+        );
+      }
+      m_device->m_textures[i] = m_snapTextures[i];
+    }
+    any_ref_change = true;
+  }
+  if (m_changes.index_buffer) {
+    if (m_device->m_indexBuffer.ptr() != m_snapIndexBuffer.ptr()) {
+      auto *new_ib = m_snapIndexBuffer.ptr();
+      if (new_ib)
+        new_ib->AddRefPrivate();
+      m_device->QueueRefOp(MTLD3D9Device::PendingRefOp::IndexBuffer, new_ib);
+    }
+    m_device->m_indexBuffer = m_snapIndexBuffer;
+    any_ref_change = true;
+  }
+  if (m_changes.vertex_declaration) {
+    if (m_device->m_vertexDeclaration.ptr() != m_snapVertexDeclaration.ptr()) {
+      auto *new_decl = m_snapVertexDeclaration.ptr();
+      if (new_decl)
+        new_decl->AddRefPrivate();
+      m_device->QueueRefOp(MTLD3D9Device::PendingRefOp::VertexDeclaration, new_decl);
+    }
+    m_device->m_vertexDeclaration = m_snapVertexDeclaration;
+    any_ref_change = true;
+  }
+  if (m_changes.vertex_shader) {
+    if (m_device->m_vertexShader.ptr() != m_snapVertexShader.ptr()) {
+      auto *new_vs = m_snapVertexShader.ptr();
+      if (new_vs)
+        new_vs->AddRefPrivate();
+      m_device->QueueRefOp(MTLD3D9Device::PendingRefOp::VertexShader, new_vs);
+    }
+    m_device->m_vertexShader = m_snapVertexShader;
+    any_ref_change = true;
+  }
+  if (m_changes.pixel_shader) {
+    if (m_device->m_pixelShader.ptr() != m_snapPixelShader.ptr()) {
+      auto *new_ps = m_snapPixelShader.ptr();
+      if (new_ps)
+        new_ps->AddRefPrivate();
+      m_device->QueueRefOp(MTLD3D9Device::PendingRefOp::PixelShader, new_ps);
+    }
+    m_device->m_pixelShader = m_snapPixelShader;
+    any_ref_change = true;
+  }
+  m_device->m_encShadowDirty |= pod_dirty;
+  (void)any_ref_change; // tracked for future per-axis dirty mask; no longer drives a gen bump
+  if (m_changes.lights) {
+    m_device->m_lights = m_snapLights;
+    m_device->m_lightEnables = m_snapLightEnables;
+  }
+  // RT and DS are deliberately NOT in the per-category list — wined3d
+  // doesn't include framebuffer bindings in its stateblock state at
+  // all (dlls/wined3d/stateblock.c:903-1165 wined3d_stateblock_capture
+  // covers no RT/DS surfaces; SetRenderTarget /
+  // SetDepthStencilSurface in dlls/d3d9/device.c:2215,2276 route
+  // straight through wined3d_device_context_set_rendertarget_views,
+  // bypassing the stateblock). Capturing them here would silently
+  // un-bind the DS that the app set after the snapshot was taken,
+  // forcing depth_stencil_info_from_d3d9_state's no-DS path to coerce
+  // ZFUNC=Always — the second mechanism behind the layering bug.
+  return D3D_OK;
+}
+
+} // namespace dxmt

@@ -8,8 +8,7 @@
 
 typedef UINT64 unixlib_handle_t;
 
-extern NTSTATUS WINAPI __wine_unix_call(unixlib_handle_t handle,
-                                        unsigned int code, void *args);
+extern NTSTATUS WINAPI __wine_unix_call(unixlib_handle_t handle, unsigned int code, void *args);
 
 #ifdef WINE_UNIX_LIB
 
@@ -18,14 +17,11 @@ typedef NTSTATUS (*unixlib_entry_t)(void *args);
 /* some useful helpers from ntdll */
 extern const char *ntdll_get_build_dir(void);
 extern const char *ntdll_get_data_dir(void);
-extern DWORD ntdll_umbstowcs(const char *src, DWORD srclen, WCHAR *dst,
-                             DWORD dstlen);
-extern int ntdll_wcstoumbs(const WCHAR *src, DWORD srclen, char *dst,
-                           DWORD dstlen, BOOL strict);
+extern DWORD ntdll_umbstowcs(const char *src, DWORD srclen, WCHAR *dst, DWORD dstlen);
+extern int ntdll_wcstoumbs(const WCHAR *src, DWORD srclen, char *dst, DWORD dstlen, BOOL strict);
 extern int ntdll_wcsicmp(const WCHAR *str1, const WCHAR *str2);
 extern int ntdll_wcsnicmp(const WCHAR *str1, const WCHAR *str2, int n);
-extern NTSTATUS ntdll_init_syscalls(ULONG id, SYSTEM_SERVICE_TABLE *table,
-                                    void **dispatcher);
+extern NTSTATUS ntdll_init_syscalls(ULONG id, SYSTEM_SERVICE_TABLE *table, void **dispatcher);
 
 /* exception handling */
 
@@ -55,71 +51,74 @@ typedef struct {
 
 extern int __cdecl __attribute__((__nothrow__, __returns_twice__))
 __wine_setjmpex(__wine_jmp_buf *buf, EXCEPTION_REGISTRATION_RECORD *frame);
-extern void DECLSPEC_NORETURN __cdecl __wine_longjmp(__wine_jmp_buf *buf,
-                                                     int retval);
+extern void DECLSPEC_NORETURN __cdecl __wine_longjmp(__wine_jmp_buf *buf, int retval);
 extern void ntdll_set_exception_jmp_buf(__wine_jmp_buf *jmp);
 
-#define __TRY                                                                  \
-  do {                                                                         \
-    __wine_jmp_buf __jmp;                                                      \
-    int __first = 1;                                                           \
-    for (;;)                                                                   \
-      if (!__first) {                                                          \
+#define __TRY                                                                                                          \
+  do {                                                                                                                 \
+    __wine_jmp_buf __jmp;                                                                                              \
+    int __first = 1;                                                                                                   \
+    for (;;)                                                                                                           \
+      if (!__first) {                                                                                                  \
         do {
 
-#define __EXCEPT                                                               \
-  }                                                                            \
-  while (0)                                                                    \
-    ;                                                                          \
-  ntdll_set_exception_jmp_buf(NULL);                                           \
-  break;                                                                       \
-  }                                                                            \
-  else {                                                                       \
-    if (__wine_setjmpex(&__jmp, NULL)) {                                       \
+#define __EXCEPT                                                                                                       \
+  }                                                                                                                    \
+  while (0)                                                                                                            \
+    ;                                                                                                                  \
+  ntdll_set_exception_jmp_buf(NULL);                                                                                   \
+  break;                                                                                                               \
+  }                                                                                                                    \
+  else {                                                                                                               \
+    if (__wine_setjmpex(&__jmp, NULL)) {                                                                               \
       do {
 
-#define __ENDTRY                                                               \
-  }                                                                            \
-  while (0)                                                                    \
-    ;                                                                          \
-  break;                                                                       \
-  }                                                                            \
-  ntdll_set_exception_jmp_buf(&__jmp);                                         \
-  __first = 0;                                                                 \
-  }                                                                            \
-  }                                                                            \
-  while (0)                                                                    \
+#define __ENDTRY                                                                                                       \
+  }                                                                                                                    \
+  while (0)                                                                                                            \
+    ;                                                                                                                  \
+  break;                                                                                                               \
+  }                                                                                                                    \
+  ntdll_set_exception_jmp_buf(&__jmp);                                                                                 \
+  __first = 0;                                                                                                         \
+  }                                                                                                                    \
+  }                                                                                                                    \
+  while (0)                                                                                                            \
     ;
 
-NTSTATUS WINAPI KeUserModeCallback(ULONG id, const void *args, ULONG len,
-                                   void **ret_ptr, ULONG *ret_len);
+NTSTATUS WINAPI KeUserModeCallback(ULONG id, const void *args, ULONG len, void **ret_ptr, ULONG *ret_len);
 
 /* wide char string functions */
 
-static inline int ntdll_iswspace(WCHAR wc) {
+static inline int
+ntdll_iswspace(WCHAR wc) {
   return ('\t' <= wc && wc <= '\r') || wc == ' ' || wc == 0xa0;
 }
 
-static inline size_t ntdll_wcslen(const WCHAR *str) {
+static inline size_t
+ntdll_wcslen(const WCHAR *str) {
   const WCHAR *s = str;
   while (*s)
     s++;
   return s - str;
 }
 
-static inline WCHAR *ntdll_wcscpy(WCHAR *dst, const WCHAR *src) {
+static inline WCHAR *
+ntdll_wcscpy(WCHAR *dst, const WCHAR *src) {
   WCHAR *p = dst;
   while ((*p++ = *src++))
     ;
   return dst;
 }
 
-static inline WCHAR *ntdll_wcscat(WCHAR *dst, const WCHAR *src) {
+static inline WCHAR *
+ntdll_wcscat(WCHAR *dst, const WCHAR *src) {
   ntdll_wcscpy(dst + ntdll_wcslen(dst), src);
   return dst;
 }
 
-static inline int ntdll_wcscmp(const WCHAR *str1, const WCHAR *str2) {
+static inline int
+ntdll_wcscmp(const WCHAR *str1, const WCHAR *str2) {
   while (*str1 && (*str1 == *str2)) {
     str1++;
     str2++;
@@ -127,7 +126,8 @@ static inline int ntdll_wcscmp(const WCHAR *str1, const WCHAR *str2) {
   return *str1 - *str2;
 }
 
-static inline int ntdll_wcsncmp(const WCHAR *str1, const WCHAR *str2, int n) {
+static inline int
+ntdll_wcsncmp(const WCHAR *str1, const WCHAR *str2, int n) {
   if (n <= 0)
     return 0;
   while ((--n > 0) && *str1 && (*str1 == *str2)) {
@@ -137,7 +137,8 @@ static inline int ntdll_wcsncmp(const WCHAR *str1, const WCHAR *str2, int n) {
   return *str1 - *str2;
 }
 
-static inline WCHAR *ntdll_wcschr(const WCHAR *str, WCHAR ch) {
+static inline WCHAR *
+ntdll_wcschr(const WCHAR *str, WCHAR ch) {
   do {
     if (*str == ch)
       return (WCHAR *)(ULONG_PTR)str;
@@ -145,7 +146,8 @@ static inline WCHAR *ntdll_wcschr(const WCHAR *str, WCHAR ch) {
   return NULL;
 }
 
-static inline WCHAR *ntdll_wcsrchr(const WCHAR *str, WCHAR ch) {
+static inline WCHAR *
+ntdll_wcsrchr(const WCHAR *str, WCHAR ch) {
   WCHAR *ret = NULL;
   do {
     if (*str == ch)
@@ -154,14 +156,16 @@ static inline WCHAR *ntdll_wcsrchr(const WCHAR *str, WCHAR ch) {
   return ret;
 }
 
-static inline WCHAR *ntdll_wcspbrk(const WCHAR *str, const WCHAR *accept) {
+static inline WCHAR *
+ntdll_wcspbrk(const WCHAR *str, const WCHAR *accept) {
   for (; *str; str++)
     if (ntdll_wcschr(accept, *str))
       return (WCHAR *)(ULONG_PTR)str;
   return NULL;
 }
 
-static inline SIZE_T ntdll_wcsspn(const WCHAR *str, const WCHAR *accept) {
+static inline SIZE_T
+ntdll_wcsspn(const WCHAR *str, const WCHAR *accept) {
   const WCHAR *ptr;
   for (ptr = str; *ptr; ptr++)
     if (!ntdll_wcschr(accept, *ptr))
@@ -169,7 +173,8 @@ static inline SIZE_T ntdll_wcsspn(const WCHAR *str, const WCHAR *accept) {
   return ptr - str;
 }
 
-static inline SIZE_T ntdll_wcscspn(const WCHAR *str, const WCHAR *reject) {
+static inline SIZE_T
+ntdll_wcscspn(const WCHAR *str, const WCHAR *reject) {
   const WCHAR *ptr;
   for (ptr = str; *ptr; ptr++)
     if (ntdll_wcschr(reject, *ptr))
@@ -177,7 +182,8 @@ static inline SIZE_T ntdll_wcscspn(const WCHAR *str, const WCHAR *reject) {
   return ptr - str;
 }
 
-static inline LONG ntdll_wcstol(const WCHAR *s, WCHAR **end, int base) {
+static inline LONG
+ntdll_wcstol(const WCHAR *s, WCHAR **end, int base) {
   BOOL negative = FALSE, empty = TRUE;
   LONG ret = 0;
 
@@ -194,8 +200,7 @@ static inline LONG ntdll_wcstol(const WCHAR *s, WCHAR **end, int base) {
   } else if (*s == '+')
     s++;
 
-  if ((base == 0 || base == 16) && s[0] == '0' &&
-      (s[1] == 'x' || s[1] == 'X')) {
+  if ((base == 0 || base == 16) && s[0] == '0' && (s[1] == 'x' || s[1] == 'X')) {
     base = 16;
     s += 2;
   }
@@ -222,8 +227,7 @@ static inline LONG ntdll_wcstol(const WCHAR *s, WCHAR **end, int base) {
 
     if (!negative && (ret > MAXLONG / base || ret * base > MAXLONG - v))
       ret = MAXLONG;
-    else if (negative &&
-             (ret < (LONG)MINLONG / base || ret * base < (LONG)(MINLONG - v)))
+    else if (negative && (ret < (LONG)MINLONG / base || ret * base < (LONG)(MINLONG - v)))
       ret = MINLONG;
     else
       ret = ret * base + v;
@@ -234,7 +238,8 @@ static inline LONG ntdll_wcstol(const WCHAR *s, WCHAR **end, int base) {
   return ret;
 }
 
-static inline ULONG ntdll_wcstoul(const WCHAR *s, WCHAR **end, int base) {
+static inline ULONG
+ntdll_wcstoul(const WCHAR *s, WCHAR **end, int base) {
   BOOL negative = FALSE, empty = TRUE;
   ULONG ret = 0;
 
@@ -251,8 +256,7 @@ static inline ULONG ntdll_wcstoul(const WCHAR *s, WCHAR **end, int base) {
   } else if (*s == '+')
     s++;
 
-  if ((base == 0 || base == 16) && s[0] == '0' &&
-      (s[1] == 'x' || s[1] == 'X')) {
+  if ((base == 0 || base == 16) && s[0] == '0' && (s[1] == 'x' || s[1] == 'X')) {
     base = 16;
     s += 2;
   }
@@ -305,12 +309,29 @@ static inline ULONG ntdll_wcstoul(const WCHAR *s, WCHAR **end, int base) {
 #else /* WINE_UNIX_LIB */
 
 extern unixlib_handle_t __wine_unixlib_handle;
-extern NTSTATUS(WINAPI *__wine_unix_call_dispatcher)(unixlib_handle_t,
-                                                     unsigned int, void *);
+extern NTSTATUS(WINAPI *__wine_unix_call_dispatcher)(unixlib_handle_t, unsigned int, void *);
 extern NTSTATUS WINAPI __wine_init_unix_call(void);
 
-#define WINE_UNIX_CALL(code, args)                                             \
-  __wine_unix_call_dispatcher(__wine_unixlib_handle, (code), (args))
+/*
+ * dxmt instrumentation: every cross-boundary call from the win32 side
+ * of winemetal goes through WINE_UNIX_CALL. The per-code atomic array
+ * below is bumped here so dxmt's d3d9 trace layer can quote both a
+ * hard aggregate call rate AND a per-code breakdown alongside its
+ * high-level hotcounters (d3d9_trace.cpp). Defined in
+ * src/winemetal/main.c. atomic_fetch_add_explicit on a relaxed counter
+ * is sub-nanosecond on Apple Silicon, so the cost lives well below the
+ * cost of the cross-boundary call itself. The (code) & 0xFF mask is a
+ * defensive clamp — every dispatch code today fits in [0, 256) (the
+ * airconv block tops out at 140), but the mask lets a future code
+ * outside that range fall onto a wrap-around slot rather than
+ * corrupting memory. The comma-expression keeps the macro a single
+ * rvalue so existing callers compile unchanged.
+ */
+#include <stdatomic.h>
+extern _Atomic unsigned long long dxmt_unix_call_counters[256];
+#define WINE_UNIX_CALL(code, args)                                                                                     \
+  (atomic_fetch_add_explicit(&dxmt_unix_call_counters[(code) & 0xFF], 1ULL, memory_order_relaxed),                     \
+   __wine_unix_call_dispatcher(__wine_unixlib_handle, (code), (args)))
 
 #endif /* WINE_UNIX_LIB */
 

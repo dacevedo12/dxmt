@@ -1,0 +1,255 @@
+name: Test
+
+on:
+  push:
+    branches:
+    - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  LLVM_VERSION: llvmorg-15.0.7
+  WINE_VERSION: v8.16-3shain
+  WINE_URL: https://github.com/3Shain/wine/releases/download/v8.16-3shain/wine.tar.gz
+  LLVM_MINGW_VERSION: "20251216"
+  LLVM_MINGW_DIR: llvm-mingw-20251216-ucrt-macos-universal
+
+jobs:
+  lint:
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install lint tools
+        run: brew install ruff clang-format
+
+      - name: ruff check (tests/)
+        run: ruff check tests/
+
+      - name: clang-format check (d3d9 — strict)
+        run: |
+          set -e
+          {
+            find src/d3d9 tests/dx9 -type f \( -name '*.cpp' -o -name '*.hpp' -o -name '*.h' \)
+            find src/airconv -maxdepth 1 -type f \( -name 'dxso_*.cpp' -o -name 'dxso_*.hpp' \)
+          } | xargs clang-format --dry-run -Werror
+
+      - name: clang-format check (upstream — advisory)
+        continue-on-error: true
+        run: |
+          set +e
+          fail=0
+          for dir in src/airconv src/d3d10 src/d3d11 src/d3d12 src/dxgi src/dxmt \
+                     src/nvapi src/nvngx src/util src/winemetal src/nativemetal include; do
+            [ -d "$dir" ] || continue
+            n=0; total=0
+            while IFS= read -r f; do
+              total=$((total+1))
+              clang-format --dry-run -Werror "$f" >/dev/null 2>&1 || n=$((n+1))
+            done < <(find "$dir" -type f \( -name '*.cpp' -o -name '*.hpp' -o -name '*.h' -o -name '*.c' \) ! -name 'dxso_*')
+            printf '%-22s %d/%d non-compliant\n' "$dir" "$n" "$total"
+            [ "$n" -gt 0 ] && fail=1
+          done
+          exit $fail
+
+  setup-wine:
+    runs-on: macos-26
+    steps:
+      - name: Cache Wine
+        id: cache-wine
+        uses: actions/cache@v5
+        with:
+          key: wine-x86_64-${{ env.WINE_VERSION }}-macos
+          restore-keys: |
+            wine-x86_64-${{ env.WINE_VERSION }}-
+          lookup-only: true
+          path: ./toolchains/wine
+
+      - name: Install Wine
+        if: steps.cache-wine.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p ./toolchains/wine
+          curl -SL "${{ env.WINE_URL }}" > ./wine.tar.gz
+          tar -zxf ./wine.tar.gz -C ./toolchains/wine
+          rm ./wine.tar.gz
+
+      - name: Save Cache
+        if: steps.cache-wine.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v5
+        with:
+          key: wine-x86_64-${{ env.WINE_VERSION }}-macos
+          path: ./toolchains/wine
+
+  setup-llvm-mingw:
+    runs-on: macos-26
+    steps:
+      - name: Cache LLVM-MinGW
+        id: cache-llvm-mingw
+        uses: actions/cache@v5
+        with:
+          key: llvm-mingw-${{ env.LLVM_MINGW_VERSION }}-macos
+          restore-keys: |
+            llvm-mingw-${{ env.LLVM_MINGW_VERSION }}-
+          lookup-only: true
+          path: ./toolchains/${{ env.LLVM_MINGW_DIR }}
+
+      - name: Install LLVM-MinGW
+        if: steps.cache-llvm-mingw.outputs.cache-hit != 'true'
+        run: |
+          curl -SL https://github.com/mstorsjo/llvm-mingw/releases/download/${{ env.LLVM_MINGW_VERSION }}/${{ env.LLVM_MINGW_DIR }}.tar.xz > ./llvm.tar.xz
+          mkdir -p ./toolchains
+          tar -xf ./llvm.tar.xz -C ./toolchains
+          rm ./llvm.tar.xz
+
+      - name: Save Cache
+        if: steps.cache-llvm-mingw.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v5
+        with:
+          key: llvm-mingw-${{ env.LLVM_MINGW_VERSION }}-macos
+          path: ./toolchains/${{ env.LLVM_MINGW_DIR }}
+
+  setup-llvm-darwin:
+    runs-on: macos-26
+    steps:
+      - name: Cache LLVM Darwin Build
+        id: cache-llvm-darwin
+        uses: actions/cache@v5
+        with:
+          key: llvm-darwin-${{ env.LLVM_VERSION }}-x86_64-macos
+          restore-keys: |
+            llvm-darwin-${{ env.LLVM_VERSION }}-x86_64-
+          lookup-only: true
+          path: ./toolchains/llvm-darwin
+
+      - name: Build LLVM Darwin (x86_64)
+        if: steps.cache-llvm-darwin.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p ./toolchains
+          git clone --depth 1 --branch ${{ env.LLVM_VERSION }} https://github.com/llvm/llvm-project.git toolchains/llvm-project
+          mkdir -p ./toolchains/llvm-darwin-build
+          cmake -B ./toolchains/llvm-darwin-build -S ./toolchains/llvm-project/llvm \
+            -DCMAKE_INSTALL_PREFIX="$(pwd)/toolchains/llvm-darwin" \
+            -DCMAKE_OSX_ARCHITECTURES=x86_64 \
+            -DLLVM_HOST_TRIPLE=x86_64-apple-darwin \
+            -DLLVM_ENABLE_ASSERTIONS=On \
+            -DLLVM_ENABLE_ZSTD=Off \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DLLVM_TARGETS_TO_BUILD="" \
+            -DLLVM_BUILD_TOOLS=Off \
+            -DLLVM_VERSION_PRINTER_SHOW_HOST_TARGET_INFO=Off \
+            -G Ninja
+          cmake --build ./toolchains/llvm-darwin-build
+          cmake --install ./toolchains/llvm-darwin-build
+          rm -rf ./toolchains/llvm-project ./toolchains/llvm-darwin-build
+
+      - name: Save Cache
+        if: steps.cache-llvm-darwin.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v5
+        with:
+          key: llvm-darwin-${{ env.LLVM_VERSION }}-x86_64-macos
+          path: ./toolchains/llvm-darwin
+
+  tests-dx9:
+    runs-on: macos-26
+    needs: [setup-wine, setup-llvm-mingw, setup-llvm-darwin]
+    # Build ~3 min + deploy ~1 min + smoke ~2 min on a healthy
+    # macos-26 runner; total ~6 min steady-state. Cap at 16 to absorb
+    # the smoke step's retry budget (4-min per-attempt × 2 attempts)
+    # without sitting on the default 360-min idle limit during the
+    # known-intermittent macos-26 runner hang
+    # (actions/runner-images#13882, #13452).
+    timeout-minutes: 16
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: true
+
+      - name: Restore Wine
+        uses: actions/cache/restore@v5
+        with:
+          key: wine-x86_64-${{ env.WINE_VERSION }}-macos
+          path: ./toolchains/wine
+
+      - name: Restore LLVM-MinGW
+        uses: actions/cache/restore@v5
+        with:
+          key: llvm-mingw-${{ env.LLVM_MINGW_VERSION }}-macos
+          path: ./toolchains/${{ env.LLVM_MINGW_DIR }}
+
+      - name: Restore LLVM Darwin
+        uses: actions/cache/restore@v5
+        with:
+          key: llvm-darwin-${{ env.LLVM_VERSION }}-x86_64-macos
+          path: ./toolchains/llvm-darwin
+
+      - name: Select Xcode
+        run: sudo xcode-select -s /Applications/Xcode_26.4.app
+
+      - name: Install Meson
+        run: pip3 install meson==1.10.0 --break-system-packages
+
+      - name: Install vulkan-headers
+        run: brew install vulkan-headers
+
+      - name: Build (with tests)
+        run: |
+          export PATH="$PATH:$GITHUB_WORKSPACE/toolchains/${{ env.LLVM_MINGW_DIR }}/bin"
+          meson setup --cross-file build-win64.txt \
+            -Dnative_llvm_path=toolchains/llvm-darwin \
+            -Dwine_build_path= \
+            -Dwine_install_path=toolchains/wine \
+            -Denable_tests=true \
+            build --buildtype release
+          meson compile -C build
+
+      - name: Deploy DXMT DLLs and initialise Wine prefix
+        env:
+          WINEPREFIX: /tmp/wine-test
+          WINEDEBUG: -all
+          WINEDLLOVERRIDES: mscoree=;mshtml=
+        run: |
+          # Drop our built d3d9 / winemetal builtins into the wine
+          # builtin dir BEFORE wineboot, so the wineserver it spawns
+          # is consistent with what dx9_smoke.exe will load. Copying
+          # after wineboot needs a wineserver kill+respawn dance that
+          # has hung macos-26 runners.
+          BUILTIN="$GITHUB_WORKSPACE/toolchains/wine/lib/wine/x86_64-windows"
+          UNIXDIR="$GITHUB_WORKSPACE/toolchains/wine/lib/wine/x86_64-unix"
+          cp "$GITHUB_WORKSPACE/build/src/d3d9/d3d9.dll" "$BUILTIN/"
+          cp "$GITHUB_WORKSPACE/build/src/winemetal/winemetal.dll" "$BUILTIN/"
+          cp "$GITHUB_WORKSPACE/build/src/winemetal/unix/winemetal.so" "$UNIXDIR/"
+
+          mkdir -p "$WINEPREFIX"
+          "$GITHUB_WORKSPACE/toolchains/wine/bin/wine64" wineboot --init
+
+      - name: Run dx9 smoke suite
+        # macos-26 runners hang intermittently (1-in-10ish per
+        # actions/runner-images#13452, recurrence of the closed-then-
+        # reopened #13882). Healthy run is ~100s; bound each attempt
+        # at 4 minutes and retry once on timeout — real assertion
+        # failures don't retry. Two attempts × 4 min stays under the
+        # job's 16-min cap with build + deploy + overhead.
+        uses: nick-fields/retry@v3
+        env:
+          WINE: ${{ github.workspace }}/toolchains/wine/bin/wine64
+          WINEPREFIX: /tmp/wine-test
+          DXMT_BUILD_DIR: ${{ github.workspace }}/build
+          WINEDEBUG: "-all"
+          WINEDLLOVERRIDES: "mscoree=;mshtml="
+        with:
+          timeout_minutes: 4
+          max_attempts: 2
+          retry_on: timeout
+          # Redirect stdin from /dev/null so no wine descendant blocks
+          # on the runner's pipe. --per-test gives each smoke its own
+          # wine process so state can't leak across tests.
+          command: |
+            python3 tests/run_dxmt_smoke.py \
+              --only dx9 \
+              --per-test \
+              --runner "$WINE" \
+              --build-dir "$DXMT_BUILD_DIR" \
+              </dev/null
+

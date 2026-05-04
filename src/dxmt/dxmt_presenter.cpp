@@ -1,5 +1,6 @@
 
 #include <algorithm>
+#include <chrono>
 #include "Metal.hpp"
 #include "dxmt_format.hpp"
 #include "dxmt_presenter.hpp"
@@ -154,9 +155,14 @@ WMT::MetalDrawable
 Presenter::encodeCommands(
     WMT::CommandBuffer cmdbuf, WMT::Texture backbuffer, DXMTPresentMetadata metadata,
     std::function<void(WMT::RenderCommandEncoder)> &&wait_fences,
-    std::function<void(WMT::RenderCommandEncoder)> &&update_fences
+    std::function<void(WMT::RenderCommandEncoder)> &&update_fences, uint64_t *out_next_drawable_us
 ) {
+  auto t0 = std::chrono::steady_clock::now();
   auto drawable = layer_.nextDrawable();
+  if (out_next_drawable_us) {
+    *out_next_drawable_us =
+        std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count();
+  }
 
   WMTRenderPassInfo info;
   WMT::InitializeRenderPassInfo(info);

@@ -1,9 +1,11 @@
 #include "dxmt_command_queue.hpp"
 #include "Metal.hpp"
+#include "dxmt_queue_waits.hpp"
 #include "dxmt_statistics.hpp"
 #include "util_env.hpp"
 #include "util_win32_compat.h"
 #include <atomic>
+#include <cstdlib>
 
 #define ASYNC_ENCODING 1
 
@@ -60,6 +62,21 @@ CommandQueue::CommandQueue(WMT::Device device) :
     chunk.queue = this;
     chunk.reset();
   };
+  // DXMT_D9_MAX_LATENCY override — diagnostic knob. Default 3 matches
+  // d3d11 / wined3d. Raising it decouples the calling thread's
+  // PresentBoundary wait from GPU completion: useful to confirm whether
+  // a perf cap is the latency cap (raise it and fps rises) or the
+  // encode/GPU stack itself (raise it and fps stays flat).
+  {
+    std::string ml = env::getEnvVar("DXMT_D9_MAX_LATENCY");
+    if (!ml.empty()) {
+      const uint32_t v = static_cast<uint32_t>(std::atoi(ml.c_str()));
+      if (v >= 1 && v <= kCommandChunkCount - 1) {
+        max_latency_ = v;
+      }
+    }
+  }
+  WARN("dxmt::CommandQueue max_latency_=", max_latency_);
   event = device.newSharedEvent();
 
   std::string env = env::getEnvVar("DXMT_CAPTURE_FRAME");
@@ -109,6 +126,13 @@ CommandQueue::CommitCurrentChunk() {
   chunk_ongoing.fetch_add(1, std::memory_order_relaxed);
   auto t1 = clock::now();
   statistics.commit_interval += (t1 - t0);
+  {
+    auto &qw = QueueWaitCounters::instance();
+    uint64_t us = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
+    qw.chunkBackpressureUs.fetch_add(us, std::memory_order_relaxed);
+    qw.chunkBackpressureCount.fetch_add(1, std::memory_order_relaxed);
+    QueueWaitCounters::bump_max(qw.chunkBackpressureMaxUs, us);
+  }
 
 #else
   ready_for_encode.fetch_add(1, std::memory_order_relaxed);
@@ -116,6 +140,22 @@ CommandQueue::CommitCurrentChunk() {
 #endif
 
   cpu_command_allocator.free_blocks(cpu_coherent.signaledValue());
+}
+
+void
+CommandQueue::WaitCPUFence(uint64_t seq) {
+  if (cpu_coherent.signaledValue() >= seq) {
+    cpu_coherent.wait(seq);
+    return;
+  }
+  auto t0 = clock::now();
+  cpu_coherent.wait(seq);
+  auto t1 = clock::now();
+  auto &qw = QueueWaitCounters::instance();
+  uint64_t us = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
+  qw.cpuFenceUs.fetch_add(us, std::memory_order_relaxed);
+  qw.cpuFenceCount.fetch_add(1, std::memory_order_relaxed);
+  QueueWaitCounters::bump_max(qw.cpuFenceMaxUs, us);
 }
 
 void
@@ -129,6 +169,10 @@ CommandQueue::PresentBoundary() {
     frame_latency_fence_.wait(frame_count - max_latency_);
     auto t1 = clock::now();
     statistics.at(frame_count).present_latency_interval += (t1 - t0);
+    auto &qw = QueueWaitCounters::instance();
+    uint64_t us = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
+    qw.frameLatencyUs.fetch_add(us, std::memory_order_relaxed);
+    QueueWaitCounters::bump_max(qw.frameLatencyMaxUs, us);
   }
   statistics.at(frame_count).latency = max_latency_;
 }
