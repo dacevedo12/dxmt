@@ -378,7 +378,9 @@ void on_fence_dependency(
 #else
 
 inline bool d3d_enabled() { return false; }
-inline void set_current_d3d_sequence(uint64_t) {}
+// set_current_d3d_sequence's disabled-build stub is provided by
+// dxmt_apitrace.hpp (same dxmt::apitrace namespace); defining it here too
+// is a redefinition in any TU that includes both with apitrace disabled.
 inline uint64_t begin_d3d_call(const char *) { return 0; }
 inline uint64_t begin_d3d_call(const char *, const char *) { return 0; }
 inline uint64_t begin_d3d_call(const char *, const char *, const void *const *, uint32_t,
