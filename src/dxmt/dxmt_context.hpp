@@ -673,6 +673,10 @@ public:
 
   void endPass();
 
+  void appendRenderArgumentBufferBindings(
+      RenderEncoderData *data, WMT::Buffer buffer, bool use_geometry,
+      bool use_tessellation);
+
   constexpr EncoderData *
   currentEncoder() {
     assert(encoder_current);

@@ -2070,6 +2070,42 @@ FlushRenderEncoderArgumentBuffer(RenderEncoderData *data) {
   data->allocated_argbuf_needs_flush = false;
 }
 
+void
+ArgumentEncodingContext::appendRenderArgumentBufferBindings(
+    RenderEncoderData *data, WMT::Buffer buffer, bool use_geometry,
+    bool use_tessellation) {
+  auto append_setbuffer = [&](WMTRenderCommandType type, uint8_t index) {
+    auto cmd = reinterpret_cast<wmtcmd_render_setbuffer *>(
+        allocate_cpu_heap(sizeof(wmtcmd_render_setbuffer), 16));
+    cmd->type = type;
+    cmd->next.set(0);
+    cmd->buffer = buffer;
+    cmd->offset = 0;
+    cmd->index = index;
+    data->cmd_tail->next.set(cmd);
+    data->cmd_tail = reinterpret_cast<wmtcmd_base *>(cmd);
+  };
+
+  append_setbuffer(WMTRenderCommandSetVertexBuffer, 16);
+  append_setbuffer(WMTRenderCommandSetVertexBuffer, 29);
+  append_setbuffer(WMTRenderCommandSetVertexBuffer, 30);
+  append_setbuffer(WMTRenderCommandSetFragmentBuffer, 29);
+  append_setbuffer(WMTRenderCommandSetFragmentBuffer, 30);
+
+  if (use_geometry || use_tessellation) {
+    append_setbuffer(WMTRenderCommandSetObjectBuffer, 16);
+    append_setbuffer(WMTRenderCommandSetObjectBuffer, 21);
+    if (use_tessellation) {
+      append_setbuffer(WMTRenderCommandSetObjectBuffer, 27);
+      append_setbuffer(WMTRenderCommandSetObjectBuffer, 28);
+    }
+    append_setbuffer(WMTRenderCommandSetObjectBuffer, 29);
+    append_setbuffer(WMTRenderCommandSetObjectBuffer, 30);
+    append_setbuffer(WMTRenderCommandSetMeshBuffer, 29);
+    append_setbuffer(WMTRenderCommandSetMeshBuffer, 30);
+  }
+}
+
 QueryReadbacks
 ArgumentEncodingContext::flushCommands(WMT::CommandBuffer cmdbuf, uint64_t seqId, uint64_t event_seq_id) {
   assert(!encoder_current);
@@ -2695,6 +2731,20 @@ ArgumentEncodingContext::checkEncoderRelation(EncoderData *former, EncoderData *
       r1->stencil.store_action = r0->stencil.store_action;
 
       if ((void *)r0->cmd_tail != &r0->cmd_head) {
+        if (r0->allocated_argbuf != r1->allocated_argbuf) {
+          auto original_head = r0->cmd_head.next.get();
+          auto original_tail = r0->cmd_tail;
+          r0->cmd_head.next.set(nullptr);
+          r0->cmd_tail = reinterpret_cast<wmtcmd_base *>(&r0->cmd_head);
+          appendRenderArgumentBufferBindings(
+              r0, r0->allocated_argbuf, r0->use_geometry,
+              r0->use_tessellation);
+          r0->cmd_tail->next.set(original_head);
+          r0->cmd_tail = original_tail;
+          appendRenderArgumentBufferBindings(
+              r0, r1->allocated_argbuf, r1->use_geometry,
+              r1->use_tessellation);
+        }
         r0->cmd_tail->next.set(r1->cmd_head.next.get());
         r1->cmd_head.next.set(r0->cmd_head.next.get());
         r0->cmd_head.next.set(nullptr);
@@ -2780,13 +2830,6 @@ ArgumentEncodingContext::isEncoderSignatureMatched(RenderEncoderData *r0, Render
   if (r0->dsv_readonly_flags != r1->dsv_readonly_flags)
     return false;
   if (r0->render_target_array_length != r1->render_target_array_length)
-    return false;
-  /**
-  In case two encoder has different argument buffer
-  It can be further optimized by inserting extra setBuffer() calls
-  but let's just simplify it, as it's a rather rare case.
-  */
-  if (r0->allocated_argbuf != r1->allocated_argbuf)
     return false;
   if (r0->dsv_planar_flags & 1) {
     if (r0->depth.attachment != r1->depth.attachment)
