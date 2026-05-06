@@ -26,6 +26,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <cfloat>
+#include <functional>
 #include <iomanip>
 #include <mutex>
 #include <optional>
@@ -2169,6 +2170,42 @@ private:
     HANDLE present_semaphore_ = nullptr;
   };
 
+  struct ReplayRenderTargetAttachment {
+    Rc<Texture> texture;
+    TextureViewKey view = {};
+    UINT slot = 0;
+    UINT array_length = 1;
+    uint32_t width = 0;
+    uint32_t height = 0;
+    WMTPixelFormat format = WMTPixelFormatInvalid;
+  };
+
+  struct ReplayDepthStencilAttachment {
+    Rc<Texture> texture;
+    TextureViewKey view = {};
+    UINT array_length = 1;
+    uint32_t width = 0;
+    uint32_t height = 0;
+    WMTPixelFormat format = WMTPixelFormatInvalid;
+  };
+
+  struct ReplayRenderPassAttachments {
+    std::vector<ReplayRenderTargetAttachment> colors;
+    std::optional<ReplayDepthStencilAttachment> depth_stencil;
+  };
+
+  struct ReplayGraphicsPassCommand {
+    std::function<void(ArgumentEncodingContext &, uint64_t &)> encode;
+    uint64_t argument_buffer_size = 0;
+  };
+
+  struct ReplayGraphicsPassBatch {
+    ReplayRenderPassAttachments attachments;
+    std::vector<ReplayGraphicsPassCommand> commands;
+    uint64_t argument_buffer_size = 0;
+    bool active = false;
+  };
+
   struct ReplayState {
     std::unordered_map<ID3D12Resource *,
                        std::vector<D3D12_RESOURCE_STATES>> *resource_states =
@@ -2201,31 +2238,135 @@ private:
     UINT64 predication_buffer_offset = 0;
     D3D12_PREDICATION_OP predication_operation =
         D3D12_PREDICATION_OP_EQUAL_ZERO;
+    ReplayGraphicsPassBatch graphics_pass_batch;
   };
 
-  struct ReplayRenderTargetAttachment {
-    Rc<Texture> texture;
-    TextureViewKey view = {};
-    UINT slot = 0;
-    UINT array_length = 1;
-    uint32_t width = 0;
-    uint32_t height = 0;
-    WMTPixelFormat format = WMTPixelFormatInvalid;
-  };
+  static ReplayState
+  CloneReplayStateWithoutBatch(const ReplayState &state) {
+    ReplayState copy = {};
+    copy.resource_states = state.resource_states;
+    copy.pipeline_state = state.pipeline_state;
+    copy.graphics_root_signature = state.graphics_root_signature;
+    copy.compute_root_signature = state.compute_root_signature;
+    copy.topology = state.topology;
+    copy.viewports = state.viewports;
+    copy.scissors = state.scissors;
+    copy.blend_factor = state.blend_factor;
+    copy.stencil_ref = state.stencil_ref;
+    copy.render_targets = state.render_targets;
+    copy.depth_stencil = state.depth_stencil;
+    copy.vertex_buffers = state.vertex_buffers;
+    copy.index_buffer = state.index_buffer;
+    copy.cbv_srv_uav_heap = state.cbv_srv_uav_heap;
+    copy.sampler_heap = state.sampler_heap;
+    copy.graphics_tables = state.graphics_tables;
+    copy.compute_tables = state.compute_tables;
+    copy.graphics_root_constants = state.graphics_root_constants;
+    copy.compute_root_constants = state.compute_root_constants;
+    copy.graphics_cbv_roots = state.graphics_cbv_roots;
+    copy.compute_cbv_roots = state.compute_cbv_roots;
+    copy.graphics_srv_roots = state.graphics_srv_roots;
+    copy.compute_srv_roots = state.compute_srv_roots;
+    copy.graphics_uav_roots = state.graphics_uav_roots;
+    copy.compute_uav_roots = state.compute_uav_roots;
+    copy.predication_buffer = state.predication_buffer;
+    copy.predication_buffer_offset = state.predication_buffer_offset;
+    copy.predication_operation = state.predication_operation;
+    return copy;
+  }
 
-  struct ReplayDepthStencilAttachment {
-    Rc<Texture> texture;
-    TextureViewKey view = {};
-    UINT array_length = 1;
-    uint32_t width = 0;
-    uint32_t height = 0;
-    WMTPixelFormat format = WMTPixelFormatInvalid;
-  };
+  static bool
+  ReplayRenderPassAttachmentsMatch(const ReplayRenderPassAttachments &lhs,
+                                   const ReplayRenderPassAttachments &rhs) {
+    if (lhs.colors.size() != rhs.colors.size())
+      return false;
+    for (size_t i = 0; i < lhs.colors.size(); i++) {
+      const auto &a = lhs.colors[i];
+      const auto &b = rhs.colors[i];
+      if (a.slot != b.slot || a.array_length != b.array_length ||
+          a.width != b.width || a.height != b.height || a.format != b.format ||
+          a.texture.ptr() != b.texture.ptr() ||
+          uint64_t(a.view) != uint64_t(b.view))
+        return false;
+    }
+    if (lhs.depth_stencil.has_value() != rhs.depth_stencil.has_value())
+      return false;
+    if (lhs.depth_stencil) {
+      const auto &a = *lhs.depth_stencil;
+      const auto &b = *rhs.depth_stencil;
+      if (a.array_length != b.array_length || a.width != b.width ||
+          a.height != b.height || a.format != b.format ||
+          a.texture.ptr() != b.texture.ptr() ||
+          uint64_t(a.view) != uint64_t(b.view))
+        return false;
+    }
+    return true;
+  }
 
-  struct ReplayRenderPassAttachments {
-    std::vector<ReplayRenderTargetAttachment> colors;
-    std::optional<ReplayDepthStencilAttachment> depth_stencil;
-  };
+  static bool HasPendingGraphicsPass(const ReplayState &state) {
+    return state.graphics_pass_batch.active &&
+           !state.graphics_pass_batch.commands.empty();
+  }
+
+  void FlushGraphicsPassBatch(CommandChunk *chunk, ReplayState &state) {
+    auto &batch = state.graphics_pass_batch;
+    if (!HasPendingGraphicsPass(state))
+      return;
+
+    chunk->emitcc([attachments = std::move(batch.attachments),
+                   commands = std::move(batch.commands),
+                   argument_buffer_size = batch.argument_buffer_size](
+                      ArgumentEncodingContext &enc) mutable {
+      if (!BeginRenderPass(enc, attachments, argument_buffer_size))
+        return;
+      uint64_t argbuf_offset = 0;
+      for (auto &command : commands)
+        command.encode(enc, argbuf_offset);
+      enc.endPass();
+    });
+
+    batch = {};
+  }
+
+  template <typename Fn>
+  void QueueGraphicsPassCommand(CommandChunk *chunk, ReplayState &state,
+                                ReplayRenderPassAttachments attachments,
+                                uint64_t argument_buffer_size, Fn &&fn) {
+    auto &batch = state.graphics_pass_batch;
+    if (batch.active && !ReplayRenderPassAttachmentsMatch(batch.attachments, attachments))
+      FlushGraphicsPassBatch(chunk, state);
+
+    auto &active_batch = state.graphics_pass_batch;
+    if (!active_batch.active) {
+      active_batch.active = true;
+      active_batch.attachments = std::move(attachments);
+      active_batch.argument_buffer_size = 0;
+    }
+
+    active_batch.argument_buffer_size += argument_buffer_size;
+    active_batch.commands.push_back(
+        ReplayGraphicsPassCommand{std::forward<Fn>(fn), argument_buffer_size});
+  }
+
+  bool D3D12ReplayGraphicsBatchingEnabled() {
+    return !D3D12DiagIAReadbackEnabled() && !D3D12DiagCBVReadbackEnabled() &&
+           !D3D12DiagDrawVisibilityEnabled();
+  }
+
+  template <typename Fn>
+  void EmitSingleGraphicsPass(CommandChunk *chunk,
+                              ReplayRenderPassAttachments attachments,
+                              uint64_t argument_buffer_size, Fn &&fn) {
+    chunk->emitcc([attachments = std::move(attachments), argument_buffer_size,
+                   encode = std::function<void(ArgumentEncodingContext &, uint64_t &)>(
+                       std::forward<Fn>(fn))](ArgumentEncodingContext &enc) mutable {
+      if (!BeginRenderPass(enc, attachments, argument_buffer_size))
+        return;
+      uint64_t argbuf_offset = 0;
+      encode(enc, argbuf_offset);
+      enc.endPass();
+    });
+  }
 
   void ReplayCommandRecords(const std::vector<CommandRecord> &records) {
     auto *chunk = device_->GetDXMTDevice().queue().CurrentChunk();
@@ -2235,25 +2376,34 @@ private:
       std::visit([&](const auto &payload) { ReplayRecord(chunk, state, payload); },
                  record.payload);
     }
+    FlushGraphicsPassBatch(chunk, state);
   }
 
   template <typename T>
   void ReplayRecord(CommandChunk *chunk, ReplayState &state, const T &record) {
     if constexpr (std::is_same_v<T, CopyBufferRegionRecord>) {
+      FlushGraphicsPassBatch(chunk, state);
       ReplayCopyBufferRegion(chunk, record);
     } else if constexpr (std::is_same_v<T, CopyTextureRegionRecord>) {
+      FlushGraphicsPassBatch(chunk, state);
       ReplayCopyTextureRegion(chunk, record);
     } else if constexpr (std::is_same_v<T, CopyResourceRecord>) {
+      FlushGraphicsPassBatch(chunk, state);
       ReplayCopyResource(chunk, record);
     } else if constexpr (std::is_same_v<T, ResolveSubresourceRecord>) {
+      FlushGraphicsPassBatch(chunk, state);
       ReplayResolveSubresource(chunk, record);
     } else if constexpr (std::is_same_v<T, ClearRenderTargetRecord>) {
+      FlushGraphicsPassBatch(chunk, state);
       ReplayClearRenderTarget(chunk, record);
     } else if constexpr (std::is_same_v<T, ClearDepthStencilRecord>) {
+      FlushGraphicsPassBatch(chunk, state);
       ReplayClearDepthStencil(chunk, record);
     } else if constexpr (std::is_same_v<T, ClearUnorderedAccessRecord>) {
+      FlushGraphicsPassBatch(chunk, state);
       ReplayClearUnorderedAccess(chunk, record);
     } else if constexpr (std::is_same_v<T, DiscardResourceRecord>) {
+      FlushGraphicsPassBatch(chunk, state);
       ReplayDiscardResource(chunk, record);
     } else if constexpr (std::is_same_v<T, PipelineStateRecord>) {
       state.pipeline_state = record.pipeline_state;
@@ -2271,6 +2421,7 @@ private:
       state.render_targets = record.render_targets;
       state.depth_stencil = record.depth_stencil;
     } else if constexpr (std::is_same_v<T, DescriptorHeapsRecord>) {
+      FlushGraphicsPassBatch(chunk, state);
       state.cbv_srv_uav_heap = nullptr;
       state.sampler_heap = nullptr;
       for (const auto &heap : record.heaps) {
@@ -2293,8 +2444,10 @@ private:
     } else if constexpr (std::is_same_v<T, IndexBufferRecord>) {
       state.index_buffer = record.view;
     } else if constexpr (std::is_same_v<T, ResourceBarrierRecord>) {
+      FlushGraphicsPassBatch(chunk, state);
       ReplayResourceBarrier(chunk, state, record);
     } else if constexpr (std::is_same_v<T, RootSignatureRecord>) {
+      FlushGraphicsPassBatch(chunk, state);
       if (record.compute)
         state.compute_root_signature = record.root_signature;
       else
@@ -2308,14 +2461,19 @@ private:
     } else if constexpr (std::is_same_v<T, RootConstantsRecord>) {
       StoreRootConstants(state, record);
     } else if constexpr (std::is_same_v<T, BeginQueryRecord>) {
+      FlushGraphicsPassBatch(chunk, state);
       ReplayBeginQuery(chunk, record);
     } else if constexpr (std::is_same_v<T, EndQueryRecord>) {
+      FlushGraphicsPassBatch(chunk, state);
       ReplayEndQuery(chunk, record);
     } else if constexpr (std::is_same_v<T, ResolveQueryDataRecord>) {
+      FlushGraphicsPassBatch(chunk, state);
       ReplayResolveQueryData(chunk, record);
     } else if constexpr (std::is_same_v<T, PredicationRecord>) {
+      FlushGraphicsPassBatch(chunk, state);
       ReplaySetPredication(state, record);
     } else if constexpr (std::is_same_v<T, WriteBufferImmediateRecord>) {
+      FlushGraphicsPassBatch(chunk, state);
       ReplayWriteBufferImmediate(record);
     } else if constexpr (std::is_same_v<T, ExecuteIndirectRecord>) {
       ReplayExecuteIndirect(chunk, state, record);
@@ -2324,6 +2482,7 @@ private:
     } else if constexpr (std::is_same_v<T, DrawIndexedInstancedRecord>) {
       ReplayDrawIndexedInstanced(chunk, state, record);
     } else if constexpr (std::is_same_v<T, DispatchRecord>) {
+      FlushGraphicsPassBatch(chunk, state);
       ReplayDispatch(chunk, state, record);
     }
   }
@@ -2810,6 +2969,7 @@ private:
             counted_args, counted_offset, argument_size, command_index);
         break;
       case DirectIndirectOperation::Dispatch:
+        FlushGraphicsPassBatch(chunk, state);
         ReplayDispatchIndirect(chunk, state, arg_buffer, arg_offset,
                                count_buffer, count_offset, counted_args,
                                counted_offset, argument_size, command_index);
@@ -3009,27 +3169,16 @@ private:
     if (!ResolveDynamicRasterRects(viewports, scissors, "indirect draw"))
       return;
     const auto argument_buffer_size = EstimateGraphicsArgumentBufferSize(*pipeline);
-    chunk->emitcc([this, metal_pso = metal->pso,
-                   depth_stencil = metal->depth_stencil,
-                   rasterizer = metal->rasterizer, pipeline,
-                   replay_state = state, primitive, argument_buffer_size,
-                   blend_factor = state.blend_factor,
-                   stencil_ref = state.stencil_ref, arg_buffer, arg_offset,
-                   count_buffer, count_offset, counted_args, counted_offset,
-                   argument_size, command_index,
-                   viewports = std::move(viewports),
-                   scissors = std::move(scissors),
-                   attachments = std::move(attachments)](ArgumentEncodingContext &enc) mutable {
-      const bool has_count = count_buffer.ptr();
-      if (has_count) {
-        PrepareCountedIndirectArguments(
-            enc, arg_buffer, arg_offset, count_buffer, count_offset,
-            counted_args, counted_offset, argument_size, command_index);
-      }
 
-      if (!BeginRenderPass(enc, attachments, argument_buffer_size))
-        return;
-
+    auto encode_draw =
+        [this, metal_pso = metal->pso, depth_stencil = metal->depth_stencil,
+         rasterizer = metal->rasterizer, pipeline,
+         replay_state = CloneReplayStateWithoutBatch(state), primitive,
+         blend_factor = state.blend_factor, stencil_ref = state.stencil_ref,
+         arg_buffer, arg_offset, count_buffer, count_offset, counted_args,
+         counted_offset, argument_size, command_index,
+         viewports = std::move(viewports), scissors = std::move(scissors)](
+            ArgumentEncodingContext &enc, uint64_t &argbuf_offset) mutable {
       auto &set_pso = enc.encodeRenderCommand<wmtcmd_render_setpso>();
       set_pso.type = WMTRenderCommandSetPSO;
       set_pso.pso = metal_pso;
@@ -3042,14 +3191,13 @@ private:
       auto &rs = enc.encodeRenderCommand<wmtcmd_render_setrasterizerstate>();
       rs = rasterizer;
 
-      uint64_t argbuf_offset = 0;
       EncodeGraphicsBindings(enc, replay_state, *pipeline, argbuf_offset);
       EncodeDynamicRenderState(enc, viewports, scissors, blend_factor,
                                stencil_ref);
 
       WMT::Buffer indirect_buffer = counted_args;
       UINT64 indirect_offset = counted_offset;
-      if (!has_count) {
+      if (!count_buffer.ptr()) {
         auto [arg_allocation, arg_sub_offset] =
             enc.access<PipelineStage::Vertex>(arg_buffer, arg_offset,
                                               argument_size,
@@ -3063,6 +3211,31 @@ private:
       draw.primitive_type = *primitive;
       draw.indirect_args_buffer = indirect_buffer;
       draw.indirect_args_offset = indirect_offset;
+    };
+
+    const bool has_count = count_buffer.ptr();
+    if (D3D12ReplayGraphicsBatchingEnabled() && !has_count) {
+      QueueGraphicsPassCommand(chunk, state, std::move(attachments),
+                               argument_buffer_size, std::move(encode_draw));
+      return;
+    }
+
+    FlushGraphicsPassBatch(chunk, state);
+    chunk->emitcc([this, attachments = std::move(attachments),
+                   argument_buffer_size, arg_buffer, arg_offset, count_buffer,
+                   count_offset, counted_args, counted_offset, argument_size,
+                   command_index, encode = std::move(encode_draw)](
+                      ArgumentEncodingContext &enc) mutable {
+      if (count_buffer) {
+        PrepareCountedIndirectArguments(
+            enc, arg_buffer, arg_offset, count_buffer, count_offset,
+            counted_args, counted_offset, argument_size, command_index);
+      }
+
+      if (!BeginRenderPass(enc, attachments, argument_buffer_size))
+        return;
+      uint64_t argbuf_offset = 0;
+      encode(enc, argbuf_offset);
       enc.endPass();
     });
   }
@@ -3116,29 +3289,18 @@ private:
     if (!ResolveDynamicRasterRects(viewports, scissors, "indirect indexed draw"))
       return;
     const auto argument_buffer_size = EstimateGraphicsArgumentBufferSize(*pipeline);
-    chunk->emitcc([this, metal_pso = metal->pso,
-                   depth_stencil = metal->depth_stencil,
-                   rasterizer = metal->rasterizer, pipeline,
-                   replay_state = state, index_allocation, primitive,
-                   index_type, index_offset, argument_buffer_size,
-                   blend_factor = state.blend_factor,
-                   stencil_ref = state.stencil_ref, arg_buffer, arg_offset,
-                   count_buffer, count_offset, counted_args, counted_offset,
-                   argument_size, command_index,
-                   viewports = std::move(viewports),
-                   scissors = std::move(scissors),
-                   attachments = std::move(attachments)](ArgumentEncodingContext &enc) mutable {
-      const bool has_count = count_buffer.ptr();
-      if (has_count) {
-        PrepareCountedIndirectArguments(
-            enc, arg_buffer, arg_offset, count_buffer, count_offset,
-            counted_args, counted_offset, argument_size, command_index);
-      }
 
+    auto encode_draw =
+        [this, metal_pso = metal->pso, depth_stencil = metal->depth_stencil,
+         rasterizer = metal->rasterizer, pipeline,
+         replay_state = CloneReplayStateWithoutBatch(state), index_allocation,
+         primitive, index_type, index_offset, blend_factor = state.blend_factor,
+         stencil_ref = state.stencil_ref, arg_buffer, arg_offset, count_buffer,
+         count_offset, counted_args, counted_offset, argument_size,
+         command_index, viewports = std::move(viewports),
+         scissors = std::move(scissors)](ArgumentEncodingContext &enc,
+                                         uint64_t &argbuf_offset) mutable {
       enc.retainAllocation(index_allocation.ptr());
-      if (!BeginRenderPass(enc, attachments, argument_buffer_size))
-        return;
-
       auto &set_pso = enc.encodeRenderCommand<wmtcmd_render_setpso>();
       set_pso.type = WMTRenderCommandSetPSO;
       set_pso.pso = metal_pso;
@@ -3151,14 +3313,13 @@ private:
       auto &rs = enc.encodeRenderCommand<wmtcmd_render_setrasterizerstate>();
       rs = rasterizer;
 
-      uint64_t argbuf_offset = 0;
       EncodeGraphicsBindings(enc, replay_state, *pipeline, argbuf_offset);
       EncodeDynamicRenderState(enc, viewports, scissors, blend_factor,
                                stencil_ref);
 
       WMT::Buffer indirect_buffer = counted_args;
       UINT64 indirect_offset = counted_offset;
-      if (!has_count) {
+      if (!count_buffer.ptr()) {
         auto [arg_allocation, arg_sub_offset] =
             enc.access<PipelineStage::Vertex>(arg_buffer, arg_offset,
                                               argument_size,
@@ -3176,6 +3337,31 @@ private:
       draw.index_buffer_offset = index_offset;
       draw.indirect_args_buffer = indirect_buffer;
       draw.indirect_args_offset = indirect_offset;
+    };
+
+    const bool has_count = count_buffer.ptr();
+    if (D3D12ReplayGraphicsBatchingEnabled() && !has_count) {
+      QueueGraphicsPassCommand(chunk, state, std::move(attachments),
+                               argument_buffer_size, std::move(encode_draw));
+      return;
+    }
+
+    FlushGraphicsPassBatch(chunk, state);
+    chunk->emitcc([this, attachments = std::move(attachments),
+                   argument_buffer_size, arg_buffer, arg_offset, count_buffer,
+                   count_offset, counted_args, counted_offset, argument_size,
+                   command_index, encode = std::move(encode_draw)](
+                      ArgumentEncodingContext &enc) mutable {
+      if (count_buffer) {
+        PrepareCountedIndirectArguments(
+            enc, arg_buffer, arg_offset, count_buffer, count_offset,
+            counted_args, counted_offset, argument_size, command_index);
+      }
+
+      if (!BeginRenderPass(enc, attachments, argument_buffer_size))
+        return;
+      uint64_t argbuf_offset = 0;
+      encode(enc, argbuf_offset);
       enc.endPass();
     });
   }
@@ -5230,24 +5416,18 @@ private:
         chunk, "draw", pipeline->GetShaderCacheKey(),
         record.vertex_count_per_instance, 0, record.instance_count);
     const auto argument_buffer_size = EstimateGraphicsArgumentBufferSize(*pipeline);
-    chunk->emitcc([this, metal_pso = metal->pso,
-                   depth_stencil = metal->depth_stencil,
-                   rasterizer = metal->rasterizer,
-                   pipeline, replay_state = state, primitive,
-                   argument_buffer_size,
-                   blend_factor = state.blend_factor,
-                   stencil_ref = state.stencil_ref,
-                   vertex_start = record.start_vertex_location,
-                   vertex_count = record.vertex_count_per_instance,
-                   instance_count = record.instance_count,
-                   base_instance = record.start_instance_location,
-                   visibility_query = std::move(visibility_query),
-                   viewports = std::move(viewports),
-                   scissors = std::move(scissors),
-                   attachments = std::move(attachments)](ArgumentEncodingContext &enc) mutable {
-      if (!BeginRenderPass(enc, attachments, argument_buffer_size))
-        return;
-
+    auto encode_draw =
+        [this, metal_pso = metal->pso, depth_stencil = metal->depth_stencil,
+         rasterizer = metal->rasterizer, pipeline,
+         replay_state = CloneReplayStateWithoutBatch(state), primitive,
+         blend_factor = state.blend_factor, stencil_ref = state.stencil_ref,
+         vertex_start = record.start_vertex_location,
+         vertex_count = record.vertex_count_per_instance,
+         instance_count = record.instance_count,
+         base_instance = record.start_instance_location,
+         visibility_query = std::move(visibility_query),
+         viewports = std::move(viewports), scissors = std::move(scissors)](
+            ArgumentEncodingContext &enc, uint64_t &argbuf_offset) mutable {
       auto &set_pso = enc.encodeRenderCommand<wmtcmd_render_setpso>();
       set_pso.type = WMTRenderCommandSetPSO;
       set_pso.pso = metal_pso;
@@ -5260,7 +5440,6 @@ private:
       auto &rs = enc.encodeRenderCommand<wmtcmd_render_setrasterizerstate>();
       rs = rasterizer;
 
-      uint64_t argbuf_offset = 0;
       EncodeGraphicsBindings(enc, replay_state, *pipeline, argbuf_offset);
       EncodeDynamicRenderState(enc, viewports, scissors, blend_factor,
                                stencil_ref);
@@ -5283,8 +5462,17 @@ private:
         enc.endVisibilityResultQuery(std::move(active_visibility_query));
         enc.bumpVisibilityResultOffset();
       }
-      enc.endPass();
-    });
+    };
+
+    if (D3D12ReplayGraphicsBatchingEnabled()) {
+      QueueGraphicsPassCommand(chunk, state, std::move(attachments),
+                               argument_buffer_size, std::move(encode_draw));
+      return;
+    }
+
+    FlushGraphicsPassBatch(chunk, state);
+    EmitSingleGraphicsPass(chunk, std::move(attachments), argument_buffer_size,
+                           std::move(encode_draw));
   }
 
   void ReplayDrawIndexedInstanced(CommandChunk *chunk, ReplayState &state,
@@ -5347,26 +5535,20 @@ private:
         chunk, "indexed", pipeline->GetShaderCacheKey(), 0,
         record.index_count_per_instance, record.instance_count);
     const auto argument_buffer_size = EstimateGraphicsArgumentBufferSize(*pipeline);
-    chunk->emitcc([this, metal_pso = metal->pso,
-                   depth_stencil = metal->depth_stencil,
-                   rasterizer = metal->rasterizer,
-                   pipeline, replay_state = state,
-                   index_allocation, primitive,
-                   index_type, index_offset,
-                   argument_buffer_size,
-                   blend_factor = state.blend_factor,
-                   stencil_ref = state.stencil_ref,
-                   viewports = std::move(viewports),
-                   scissors = std::move(scissors),
-                   index_count = record.index_count_per_instance,
-                   instance_count = record.instance_count,
-                   base_vertex = record.base_vertex_location,
-                   base_instance = record.start_instance_location,
-                   visibility_query = std::move(visibility_query),
-                   attachments = std::move(attachments)](ArgumentEncodingContext &enc) mutable {
+    auto encode_draw =
+        [this, metal_pso = metal->pso, depth_stencil = metal->depth_stencil,
+         rasterizer = metal->rasterizer, pipeline,
+         replay_state = CloneReplayStateWithoutBatch(state), index_allocation,
+         primitive, index_type, index_offset, blend_factor = state.blend_factor,
+         stencil_ref = state.stencil_ref, viewports = std::move(viewports),
+         scissors = std::move(scissors),
+         index_count = record.index_count_per_instance,
+         instance_count = record.instance_count,
+         base_vertex = record.base_vertex_location,
+         base_instance = record.start_instance_location,
+         visibility_query = std::move(visibility_query)](
+            ArgumentEncodingContext &enc, uint64_t &argbuf_offset) mutable {
       enc.retainAllocation(index_allocation.ptr());
-      if (!BeginRenderPass(enc, attachments, argument_buffer_size))
-        return;
       auto &set_pso = enc.encodeRenderCommand<wmtcmd_render_setpso>();
       set_pso.type = WMTRenderCommandSetPSO;
       set_pso.pso = metal_pso;
@@ -5379,7 +5561,6 @@ private:
       auto &rs = enc.encodeRenderCommand<wmtcmd_render_setrasterizerstate>();
       rs = rasterizer;
 
-      uint64_t argbuf_offset = 0;
       EncodeGraphicsBindings(enc, replay_state, *pipeline, argbuf_offset);
       EncodeDynamicRenderState(enc, viewports, scissors, blend_factor,
                                stencil_ref);
@@ -5405,8 +5586,17 @@ private:
         enc.endVisibilityResultQuery(std::move(active_visibility_query));
         enc.bumpVisibilityResultOffset();
       }
-      enc.endPass();
-    });
+    };
+
+    if (D3D12ReplayGraphicsBatchingEnabled()) {
+      QueueGraphicsPassCommand(chunk, state, std::move(attachments),
+                               argument_buffer_size, std::move(encode_draw));
+      return;
+    }
+
+    FlushGraphicsPassBatch(chunk, state);
+    EmitSingleGraphicsPass(chunk, std::move(attachments), argument_buffer_size,
+                           std::move(encode_draw));
   }
 
   void ReplayDispatch(CommandChunk *chunk, ReplayState &state,
