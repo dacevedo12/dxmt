@@ -12,6 +12,11 @@ namespace dxmt {
 
 Com<IMTLDXGIAdapter> CreateAdapter(WMT::Device Device,
                                    IDXGIFactory2 *pFactory, Config &config);
+LUID GetAdapterLuid(WMT::Device device);
+
+static bool IsEqualLuid(LUID a, LUID b) {
+  return a.LowPart == b.LowPart && a.HighPart == b.HighPart;
+}
 
 static constexpr UINT SupportedSwapChainFlags =
     DXGI_SWAP_CHAIN_FLAG_NONPREROTATED |
@@ -313,7 +318,20 @@ public:
 
   HRESULT STDMETHODCALLTYPE EnumAdapterByLuid(LUID luid, REFIID iid,
                                               void **adapter) override {
-    ERR("DXGIFactory::EnumAdapterByLuid: not implemented");
+    InitReturnPtr(adapter);
+    if (!adapter)
+      return DXGI_ERROR_INVALID_CALL;
+
+    auto devices = WMT::CopyAllDevices();
+    for (UINT i = 0; i < devices.count(); i++) {
+      auto device = devices.object(i);
+      if (!IsEqualLuid(GetAdapterLuid(device), luid))
+        continue;
+
+      auto dxgi_adapter = CreateAdapter(device, this, Config::getInstance());
+      return dxgi_adapter->QueryInterface(iid, adapter);
+    }
+
     return DXGI_ERROR_NOT_FOUND;
   }
 
