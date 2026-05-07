@@ -31,6 +31,8 @@ class RootSignature {
 public:
   virtual ~RootSignature() = default;
 
+  virtual ULONG STDMETHODCALLTYPE AddRefPrivate() = 0;
+  virtual void STDMETHODCALLTYPE ReleasePrivate() = 0;
   virtual const D3D12_VERSIONED_ROOT_SIGNATURE_DESC &GetVersionedDesc() const = 0;
   virtual std::span<const std::byte> GetSerializedBlob() const = 0;
   virtual std::span<const RootSignatureParameter> GetParameters() const = 0;
@@ -39,5 +41,16 @@ public:
 
 Com<ID3D12RootSignature> CreateRootSignatureFromBlob(IMTLD3D12Device *device,
                                                       std::span<const std::byte> blob);
+
+HRESULT CreateRootSignatureDeserializer(std::span<const std::byte> blob,
+                                         REFIID iid, void **deserializer);
+
+HRESULT CreateRootSignatureDeserializerFromSubobjectInLibrary(
+    std::span<const std::byte> library_blob, const WCHAR *subobject_name,
+    REFIID iid, void **deserializer);
+
+HRESULT SerializeVersionedRootSignature(
+    const D3D12_VERSIONED_ROOT_SIGNATURE_DESC *root_signature_desc,
+    ID3DBlob **blob, ID3DBlob **error_blob);
 
 } // namespace dxmt::d3d12

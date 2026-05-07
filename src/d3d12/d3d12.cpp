@@ -2,15 +2,19 @@
 
 #include "com/com_object.hpp"
 #include "com/com_pointer.hpp"
+#include "d3d12_agility.hpp"
 #include "d3d12_device.hpp"
+#include "d3d12_root_signature.hpp"
 #include "dxgi_interfaces.h"
 #include "dxmt_device.hpp"
 #include "log/log.hpp"
 #include "util_env.hpp"
 #include "util_error.hpp"
 #include "util_string.hpp"
+#include <windows.h>
 #include <d3d12.h>
 #include <dxgi1_6.h>
+#include <mutex>
 
 namespace dxmt {
 Logger Logger::s_instance("d3d12.log");
@@ -18,38 +22,69 @@ Logger Logger::s_instance("d3d12.log");
 
 namespace dxmt::d3d12 {
 
-MIDL_INTERFACE("e9eb5314-33aa-42b2-a718-d77f58b1f1c7")
-ID3D12SDKConfiguration : public IUnknown {
-  virtual HRESULT STDMETHODCALLTYPE SetSDKVersion(UINT version, const char *path) = 0;
-};
+static HRESULT
+CreateD3D12DeviceInstance(IUnknown *adapter, D3D_FEATURE_LEVEL minimum_feature_level,
+                          REFIID riid, void **device,
+                          bool use_global_singleton = false);
 
-static constexpr GUID CLSID_D3D12SDKConfiguration = {
-    0x7cda6aca, 0xa03e, 0x49c8, {0x94, 0x58, 0x03, 0x34, 0xd2, 0x0e, 0x07, 0xce}};
-static constexpr GUID IID_ID3D12SDKConfiguration = {
-    0xe9eb5314, 0x33aa, 0x42b2, {0xa7, 0x18, 0xd7, 0x7f, 0x58, 0xb1, 0xf1, 0xc7}};
+using PFN_DXMTCreateD3D12DeviceFactory = HRESULT (__stdcall *)(REFIID, void **);
 
-class SDKConfigurationImpl final : public ComObjectWithInitialRef<ID3D12SDKConfiguration> {
+static HRESULT
+CreateCoreDeviceFactory(REFIID riid, void **factory) {
+  InitReturnPtr(factory);
+  if (!factory)
+    return E_POINTER;
+
+  HMODULE core = LoadLibraryA("d3d12core.dll");
+  if (!core) {
+    Logger::err("D3D12SDKConfiguration: failed to load d3d12core.dll");
+    return HRESULT_FROM_WIN32(GetLastError());
+  }
+
+  auto create_factory = reinterpret_cast<PFN_DXMTCreateD3D12DeviceFactory>(
+      GetProcAddress(core, "DXMTCreateD3D12DeviceFactory"));
+  if (!create_factory) {
+    Logger::err("D3D12SDKConfiguration: d3d12core.dll does not export DXMTCreateD3D12DeviceFactory");
+    return E_NOINTERFACE;
+  }
+
+  return create_factory(riid, factory);
+}
+
+class SDKConfigurationImpl final : public ComObjectWithInitialRef<ID3D12SDKConfiguration1> {
 public:
-  HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void **object) {
+  HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void **object) override {
     InitReturnPtr(object);
     if (!object)
       return E_POINTER;
 
     if (riid == __uuidof(IUnknown) ||
-        riid == dxmt::d3d12::IID_ID3D12SDKConfiguration) {
-      *object = ref(static_cast<ID3D12SDKConfiguration *>(this));
+        riid == __uuidof(ID3D12SDKConfiguration) ||
+        riid == __uuidof(ID3D12SDKConfiguration1)) {
+      *object = ref(static_cast<ID3D12SDKConfiguration1 *>(this));
       return S_OK;
     }
 
     return E_NOINTERFACE;
   }
 
-  HRESULT STDMETHODCALLTYPE SetSDKVersion(UINT version, const char *path) {
+  HRESULT STDMETHODCALLTYPE SetSDKVersion(UINT version, const char *path) override {
     Logger::info(str::format(
         "D3D12SDKConfiguration: accepting SDK version request version=",
         version, ", path=", path ? path : "<null>"));
     return S_OK;
   }
+
+  HRESULT STDMETHODCALLTYPE CreateDeviceFactory(UINT version, LPCSTR path,
+                                                REFIID riid,
+                                                void **factory) override {
+    Logger::info(str::format(
+        "D3D12SDKConfiguration: creating device factory for SDK version ",
+        version, ", path=", path ? path : "<null>"));
+    return CreateCoreDeviceFactory(riid, factory);
+  }
+
+  void STDMETHODCALLTYPE FreeUnusedSDKs() override {}
 };
 
 SupportGateResult
@@ -113,10 +148,10 @@ FormatSupportGateFailure(const SupportGateResult &gate) {
       ", macOS=", gate.os_version.major, ".", gate.os_version.minor, ".", gate.os_version.patch);
 }
 
-} // namespace dxmt::d3d12
-
-extern "C" HRESULT __stdcall
-D3D12CreateDevice(IUnknown *adapter, D3D_FEATURE_LEVEL minimum_feature_level, REFIID riid, void **device) {
+static HRESULT
+CreateD3D12DeviceInstance(IUnknown *adapter, D3D_FEATURE_LEVEL minimum_feature_level,
+                          REFIID riid, void **device,
+                          bool use_global_singleton) {
   dxmt::InitReturnPtr(device);
 
   dxmt::Com<IDXGIAdapter> dxgi_adapter = nullptr;
@@ -149,22 +184,38 @@ D3D12CreateDevice(IUnknown *adapter, D3D_FEATURE_LEVEL minimum_feature_level, RE
     return DXGI_ERROR_UNSUPPORTED;
   }
 
-  dxmt::Logger::info(dxmt::str::format(
-      "D3D12CreateDevice: experimental D3D12 support gate passed, minimum feature level ",
-      minimum_feature_level, ", riid ", dxmt::str::format(riid)));
-
   constexpr D3D_FEATURE_LEVEL supported_feature_level = D3D_FEATURE_LEVEL_12_0;
-  if (minimum_feature_level > supported_feature_level) {
+  if (minimum_feature_level < D3D_FEATURE_LEVEL_11_0 ||
+      minimum_feature_level > supported_feature_level) {
     dxmt::Logger::err(dxmt::str::format(
         "D3D12CreateDevice: requested feature level ", minimum_feature_level,
-        " exceeds supported feature level ", supported_feature_level));
+        " is outside supported D3D12 range [", D3D_FEATURE_LEVEL_11_0,
+        ", ", supported_feature_level, "]"));
     return E_INVALIDARG;
   }
 
   if (!device)
     return S_FALSE;
 
+  dxmt::Logger::info(dxmt::str::format(
+      "D3D12CreateDevice: experimental D3D12 support gate passed, minimum feature level ",
+      minimum_feature_level, ", riid ", dxmt::str::format(riid)));
+
   try {
+    static std::mutex singleton_mutex;
+    static Com<IMTLD3D12Device, false> singleton_device;
+
+    if (use_global_singleton) {
+      std::lock_guard lock(singleton_mutex);
+      if (singleton_device)
+        return singleton_device->QueryInterface(riid, device);
+
+      singleton_device = dxmt::d3d12::CreateD3D12Device(
+          dxmt::CreateDXMTDevice({.device = metal_adapter->GetMTLDevice()}),
+          metal_adapter.ptr()).prvRef();
+      return singleton_device->QueryInterface(riid, device);
+    }
+
     auto d3d12_device = dxmt::d3d12::CreateD3D12Device(
         dxmt::CreateDXMTDevice({.device = metal_adapter->GetMTLDevice()}),
         metal_adapter.ptr());
@@ -174,6 +225,22 @@ D3D12CreateDevice(IUnknown *adapter, D3D_FEATURE_LEVEL minimum_feature_level, RE
     dxmt::Logger::err(dxmt::str::format("D3D12CreateDevice: failed to create device: ", e.message()));
     return E_FAIL;
   }
+}
+
+} // namespace dxmt::d3d12
+
+extern "C" HRESULT __stdcall
+D3D12CreateDevice(IUnknown *adapter, D3D_FEATURE_LEVEL minimum_feature_level, REFIID riid, void **device) {
+  return dxmt::d3d12::CreateD3D12DeviceInstance(
+      adapter, minimum_feature_level, riid, device, true);
+}
+
+extern "C" HRESULT __stdcall
+DXMTCreateD3D12DeviceFromFactory(IUnknown *adapter,
+                                 D3D_FEATURE_LEVEL minimum_feature_level,
+                                 REFIID riid, void **device) {
+  return dxmt::d3d12::CreateD3D12DeviceInstance(
+      adapter, minimum_feature_level, riid, device, false);
 }
 
 extern "C" HRESULT __stdcall
@@ -191,10 +258,14 @@ D3D12GetInterface(REFCLSID clsid, REFIID riid, void **object) {
   if (!object)
     return E_POINTER;
 
-  if (clsid == dxmt::d3d12::CLSID_D3D12SDKConfiguration) {
+  if (clsid == dxmt::d3d12::kCLSID_D3D12SDKConfiguration) {
     auto configuration =
-        dxmt::Com<IUnknown>::transfer(new dxmt::d3d12::SDKConfigurationImpl());
+        dxmt::Com<ID3D12SDKConfiguration1>::transfer(new dxmt::d3d12::SDKConfigurationImpl());
     return configuration->QueryInterface(riid, object);
+  }
+
+  if (clsid == dxmt::d3d12::kCLSID_D3D12DeviceFactory) {
+    return dxmt::d3d12::CreateCoreDeviceFactory(riid, object);
   }
 
   dxmt::Logger::warn(dxmt::str::format(

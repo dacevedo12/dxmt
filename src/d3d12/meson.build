@@ -16,6 +16,10 @@ d3d12_src = [
   'd3d12_frame_interop.cpp',
 ]
 
+d3d12core_src = [
+  'd3d12core.cpp',
+]
+
 d3d12_ld_args      = ['-L' + windows_native_install_dir]
 d3d12_link_depends = []
 
@@ -36,6 +40,19 @@ d3d12_dll = shared_library('d3d12', d3d12_src, d3d12_res,
   link_depends        : [ d3d12_link_depends ],
 )
 
+d3d12core_dll = shared_library('d3d12core', d3d12core_src,
+  name_prefix         : '',
+  dependencies        : [
+    dxgi_dep,
+    util_dep ],
+  include_directories : [ dxmt_include_path ],
+  install             : true,
+  install_dir         : windows_native_install_dir,
+  vs_module_defs      : 'd3d12core.def',
+  link_args           : d3d12_ld_args,
+  link_depends        : [ d3d12_link_depends ],
+)
+
 d3d12_dep = declare_dependency(
   link_with           : [ d3d12_dll ],
   include_directories : [ dxmt_include_path ],
@@ -47,6 +64,16 @@ custom_target('postprocess_libd3d12',
   output: 'd3d12.dll.postproc',
   command : [ winebuild, '--builtin', '@INPUT@' ],
   depends : d3d12_dll,
+  build_by_default : true
+)
+endif
+
+if wine_builtin_dll
+custom_target('postprocess_libd3d12core',
+  input : d3d12core_dll,
+  output: 'd3d12core.dll.postproc',
+  command : [ winebuild, '--builtin', '@INPUT@' ],
+  depends : d3d12core_dll,
   build_by_default : true
 )
 endif
