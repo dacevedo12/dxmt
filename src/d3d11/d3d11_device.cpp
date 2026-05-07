@@ -63,6 +63,7 @@ public:
     d3d10_ = std::make_unique<MTLD3D10Device>(this, context_.get());
     is_traced_ = !!::GetModuleHandle("dxgitrace.dll");
     format_inspector_.Inspect(GetMTLDevice());
+    counters_ = BuildDeviceCounterRegistry(GetMTLDevice());
   }
 
   HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid,
@@ -438,8 +439,15 @@ public:
   CreateCounter(const D3D11_COUNTER_DESC *pCounterDesc,
                 ID3D11Counter **ppCounter) override {
     InitReturnPtr(ppCounter);
-    WARN("CreateCounter: not supported");
-    return E_NOTIMPL;
+    if (!pCounterDesc)
+      return E_INVALIDARG;
+
+    const auto *metadata =
+        FindDeviceCounterMetadata(counters_, pCounterDesc->Counter);
+    if (!metadata)
+      return DXGI_ERROR_UNSUPPORTED;
+
+    return CreateDeviceCounter(this, *metadata, ppCounter);
   }
 
   HRESULT STDMETHODCALLTYPE CreateDeferredContext(
@@ -563,9 +571,10 @@ public:
   CheckCounterInfo(D3D11_COUNTER_INFO *pCounterInfo) override {
     if (!pCounterInfo)
       return;
-    pCounterInfo->LastDeviceDependentCounter = D3D11_COUNTER{D3D11_COUNTER_DEVICE_DEPENDENT_0};
-    pCounterInfo->NumSimultaneousCounters = 0;
-    pCounterInfo->NumDetectableParallelUnits = 0;
+    pCounterInfo->LastDeviceDependentCounter =
+        counters_.empty() ? D3D11_COUNTER(0) : counters_.back().counter;
+    pCounterInfo->NumSimultaneousCounters = counters_.size();
+    pCounterInfo->NumDetectableParallelUnits = counters_.empty() ? 0 : 1;
   }
 
   HRESULT STDMETHODCALLTYPE CheckCounter(const D3D11_COUNTER_DESC *pDesc,
@@ -575,8 +584,17 @@ public:
                                          UINT *pUnitsLength,
                                          LPSTR szDescription,
                                          UINT *pDescriptionLength) override {
-    WARN("CheckCounter: not supported");
-    return E_NOTIMPL;
+    if (!pDesc)
+      return E_INVALIDARG;
+
+    const auto *metadata =
+        FindDeviceCounterMetadata(counters_, pDesc->Counter);
+    if (!metadata)
+      return DXGI_ERROR_UNSUPPORTED;
+
+    return CopyDeviceCounterMetadata(
+        *metadata, pType, pActiveCounters, szName, pNameLength, szUnits,
+        pUnitsLength, szDescription, pDescriptionLength);
   }
 
   HRESULT STDMETHODCALLTYPE
@@ -1110,6 +1128,7 @@ private:
   /** ensure destructor called first */
   std::unique_ptr<MTLD3D11DeviceContextBase> context_;
   std::unique_ptr<MTLD3D10Device> d3d10_;
+  std::vector<D3D11DeviceCounterMetadata> counters_;
   D3D11Multithread d3dmt_;
 };
 

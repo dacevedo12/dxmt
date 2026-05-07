@@ -1215,8 +1215,21 @@ MTLD3D10Device::CreatePredicate(const D3D10_QUERY_DESC *pPredicateDesc, ID3D10Pr
 HRESULT STDMETHODCALLTYPE
 MTLD3D10Device::CreateCounter(const D3D10_COUNTER_DESC *pCounterDesc, ID3D10Counter **ppCounter) {
   InitReturnPtr(ppCounter);
-  WARN("CreateCounter: not supported");
-  return E_NOTIMPL;
+  if (!pCounterDesc)
+    return E_INVALIDARG;
+
+  D3D11_COUNTER_DESC d3d11_desc;
+  d3d11_desc.Counter = D3D11_COUNTER(pCounterDesc->Counter);
+  d3d11_desc.MiscFlags = pCounterDesc->MiscFlags;
+
+  Com<ID3D11Counter> d3d11_counter;
+  HRESULT hr =
+      d3d11_device_->CreateCounter(&d3d11_desc, ppCounter ? &d3d11_counter : nullptr);
+
+  if (hr != S_OK)
+    return hr;
+
+  return ppCounter ? d3d11_counter->QueryInterface(IID_PPV_ARGS(ppCounter)) : hr;
 }
 
 HRESULT STDMETHODCALLTYPE
@@ -1234,9 +1247,14 @@ void STDMETHODCALLTYPE
 MTLD3D10Device::CheckCounterInfo(D3D10_COUNTER_INFO *pCounterInfo) {
   if (!pCounterInfo)
     return;
-  pCounterInfo->LastDeviceDependentCounter = D3D10_COUNTER{D3D10_COUNTER_DEVICE_DEPENDENT_0};
-  pCounterInfo->NumSimultaneousCounters = 0;
-  pCounterInfo->NumDetectableParallelUnits = 0;
+
+  D3D11_COUNTER_INFO d3d11_info;
+  d3d11_device_->CheckCounterInfo(&d3d11_info);
+  pCounterInfo->LastDeviceDependentCounter =
+      D3D10_COUNTER(d3d11_info.LastDeviceDependentCounter);
+  pCounterInfo->NumSimultaneousCounters = d3d11_info.NumSimultaneousCounters;
+  pCounterInfo->NumDetectableParallelUnits =
+      d3d11_info.NumDetectableParallelUnits;
 }
 
 HRESULT STDMETHODCALLTYPE
@@ -1244,8 +1262,22 @@ MTLD3D10Device::CheckCounter(
     const D3D10_COUNTER_DESC *pDesc, D3D10_COUNTER_TYPE *pType, UINT *pActiveCounters, char *name, UINT *pNameLength,
     char *units, UINT *pUnitsLength, char *description, UINT *pDescriptionLength
 ) {
-  WARN("CheckCounter: not supported");
-  return E_NOTIMPL;
+  if (!pDesc)
+    return E_INVALIDARG;
+
+  D3D11_COUNTER_DESC d3d11_desc;
+  d3d11_desc.Counter = D3D11_COUNTER(pDesc->Counter);
+  d3d11_desc.MiscFlags = pDesc->MiscFlags;
+
+  D3D11_COUNTER_TYPE d3d11_type;
+  HRESULT hr = d3d11_device_->CheckCounter(
+      &d3d11_desc, pType ? &d3d11_type : nullptr, pActiveCounters, name,
+      pNameLength, units, pUnitsLength, description, pDescriptionLength);
+
+  if (SUCCEEDED(hr) && pType)
+    *pType = D3D10_COUNTER_TYPE(d3d11_type);
+
+  return hr;
 }
 
 UINT STDMETHODCALLTYPE

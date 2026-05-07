@@ -300,6 +300,13 @@ public:
     if (unlikely(!pAsync))
       return;
 
+    if (auto counter = com_cast<IMTLD3D11CounterExt>(pAsync)) {
+      EmitOP([counter = std::move(counter)](ArgumentEncodingContext &enc) mutable {
+        counter->ReplayBeginCounter(&enc);
+      });
+      return;
+    }
+
     D3D11_QUERY_DESC desc;
     ((ID3D11Query *)pAsync)->GetDesc(&desc);
     switch (desc.Query) {
@@ -344,6 +351,14 @@ public:
   End(ID3D11Asynchronous *pAsync) override {
     if (unlikely(!pAsync))
       return;
+
+    if (auto counter = com_cast<IMTLD3D11CounterExt>(pAsync)) {
+      promote_flush = true;
+      EmitOP([counter = std::move(counter)](ArgumentEncodingContext &enc) mutable {
+        counter->ReplayEndCounter(&enc);
+      });
+      return;
+    }
 
     D3D11_QUERY_DESC desc;
     ((ID3D11Query *)pAsync)->GetDesc(&desc);

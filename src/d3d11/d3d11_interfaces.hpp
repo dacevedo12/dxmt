@@ -2,6 +2,10 @@
 #include "com/com_guid.hpp"
 #include "d3d11.h"
 
+namespace dxmt {
+class ArgumentEncodingContext;
+}
+
 struct MTL_TEMPORAL_UPSCALE_D3D11_DESC {
   UINT InputContentWidth; // can be 0, which means full width
   UINT InputContentHeight; // can be 0, which means full height
@@ -42,4 +46,20 @@ DEFINE_COM_INTERFACE("19a8e35a-38be-418f-94e3-9f7323936870", IMTLD3D11ContextExt
 DEFINE_COM_INTERFACE("efc77ae6-2179-4c0a-b844-7661ca0dcde7", IMTLD3D11DeviceExt)
     : public IUnknown {
   virtual void STDMETHODCALLTYPE SetShaderExtensionSlot(UINT Slot) = 0;
+};
+
+DEFINE_COM_INTERFACE("8cc8848d-76c9-4aea-8309-67a5d4c7e0bf",
+                     IMTLD3D11CounterExt)
+    : public IUnknown {
+  virtual void STDMETHODCALLTYPE BeginCounter() = 0;
+  virtual void STDMETHODCALLTYPE EndCounter() = 0;
+  virtual void STDMETHODCALLTYPE EncodeBeginCounter(
+      dxmt::ArgumentEncodingContext *enc) = 0;
+  virtual void STDMETHODCALLTYPE EncodeEndCounter(
+      dxmt::ArgumentEncodingContext *enc) = 0;
+  virtual void STDMETHODCALLTYPE ReplayBeginCounter(
+      dxmt::ArgumentEncodingContext *enc) = 0;
+  virtual void STDMETHODCALLTYPE ReplayEndCounter(
+      dxmt::ArgumentEncodingContext *enc) = 0;
+  virtual HRESULT STDMETHODCALLTYPE GetCounterData(void *data) = 0;
 };

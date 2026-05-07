@@ -303,8 +303,10 @@ private:
   WMT::CommandBuffer cmdbuf_;
 };
 
-// compile-time: choose a timestamp impl: SBuf (sample buffer) or CBuf (command buffer `gpuEndTime`)
-using TimestampReadback = TimestampReadbackCBuf;
+// Timestamp counters need per-sample values. The command-buffer end-time fallback
+// collapses all samples in one command buffer to the same timestamp, which makes
+// begin/end deltas always resolve to zero.
+using TimestampReadback = TimestampReadbackSBuf;
 
 class TimestampQueryState {
 public:

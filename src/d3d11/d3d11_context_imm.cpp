@@ -322,8 +322,16 @@ public:
 
     std::lock_guard<d3d11_device_mutex> lock(mutex);
 
+    if (auto counter = com_cast<IMTLD3D11CounterExt>(pAsync)) {
+      counter->BeginCounter();
+      EmitOP([counter = std::move(counter)](ArgumentEncodingContext &enc) mutable {
+        counter->EncodeBeginCounter(&enc);
+      });
+      return;
+    }
+
     // in theory pAsync could be any of them: { Query, Predicate, Counter }.
-    // However `Predicate` and `Counter` are not supported at all
+    // However `Predicate` is still not supported.
     D3D11_QUERY_DESC desc;
     ((ID3D11Query *)pAsync)->GetDesc(&desc);
     switch (desc.Query) {
@@ -357,6 +365,15 @@ public:
       return;
 
     std::lock_guard<d3d11_device_mutex> lock(mutex);
+
+    if (auto counter = com_cast<IMTLD3D11CounterExt>(pAsync)) {
+      counter->EndCounter();
+      EmitOP([counter = std::move(counter)](ArgumentEncodingContext &enc) mutable {
+        counter->EncodeEndCounter(&enc);
+      });
+      promote_flush = true;
+      return;
+    }
 
     D3D11_QUERY_DESC desc;
     ((ID3D11Query *)pAsync)->GetDesc(&desc);
@@ -415,6 +432,18 @@ public:
     // Allow dataSize to be zero
     if (DataSize && DataSize != pAsync->GetDataSize())
       return E_INVALIDARG;
+
+    if (auto counter = com_cast<IMTLD3D11CounterExt>(pAsync)) {
+      uint64_t null_data = 0;
+      auto *data_ptr = pData ? static_cast<uint64_t *>(pData) : &null_data;
+      auto hr = counter->GetCounterData(data_ptr);
+      if (hr == S_FALSE &&
+          (GetDataFlags & D3D11_ASYNC_GETDATA_DONOTFLUSH) == 0) {
+        cmd_queue.CurrentFrameStatistics().event_stall++;
+        Flush();
+      }
+      return hr;
+    }
 
     HRESULT hr = S_FALSE;
 

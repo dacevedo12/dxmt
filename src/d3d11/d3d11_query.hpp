@@ -1,11 +1,57 @@
 #pragma once
 #include "com/com_guid.hpp"
 #include "d3d11_device_child.hpp"
+#include "d3d11_interfaces.hpp"
 #include "dxmt_occlusion_query.hpp"
 #include "log/log.hpp"
 #include "../d3d10/d3d10_query.hpp"
+#include <vector>
 
 namespace dxmt {
+
+class ArgumentEncodingContext;
+
+enum class DeviceCounterKind {
+  GpuRunningTime,
+  GpuSharedUsage,
+  GpuDedicatedUsage,
+};
+
+struct D3D11DeviceCounterMetadata {
+  D3D11_COUNTER counter;
+  D3D11_COUNTER_TYPE type;
+  UINT active_counters;
+  const char *name;
+  const char *units;
+  const char *description;
+  DeviceCounterKind kind;
+};
+
+std::vector<D3D11DeviceCounterMetadata>
+BuildDeviceCounterRegistry(WMT::Device device);
+
+const D3D11DeviceCounterMetadata *
+FindDeviceCounterMetadata(
+    const std::vector<D3D11DeviceCounterMetadata> &metadata,
+    D3D11_COUNTER counter);
+
+HRESULT
+CopyDeviceCounterMetadata(
+    const D3D11DeviceCounterMetadata &metadata,
+    D3D11_COUNTER_TYPE *pType,
+    UINT *pActiveCounters,
+    LPSTR szName,
+    UINT *pNameLength,
+    LPSTR szUnits,
+    UINT *pUnitsLength,
+    LPSTR szDescription,
+    UINT *pDescriptionLength);
+
+HRESULT
+CreateDeviceCounter(
+    MTLD3D11Device *pDevice,
+    const D3D11DeviceCounterMetadata &metadata,
+    ID3D11Counter **ppCounter);
 
 template <typename Query>
 class MTLD3DQueryBase : public MTLD3D11DeviceChild<Query> {
