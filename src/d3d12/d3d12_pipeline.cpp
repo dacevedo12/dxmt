@@ -290,17 +290,110 @@ IsDxilContainer(const D3D12_SHADER_BYTECODE &bytecode) {
          container.hasPart(dxil::fourcc::Dxil);
 }
 
+constexpr uint32_t
+FourCC(char a, char b, char c, char d) {
+  return uint32_t(uint8_t(a)) | (uint32_t(uint8_t(b)) << 8) |
+         (uint32_t(uint8_t(c)) << 16) | (uint32_t(uint8_t(d)) << 24);
+}
+
+uint32_t
+ReadLe32(const uint8_t *data) {
+  return uint32_t(data[0]) | (uint32_t(data[1]) << 8) |
+         (uint32_t(data[2]) << 16) | (uint32_t(data[3]) << 24);
+}
+
+bool
+FindDxbcShaderBlob(const void *data, size_t size,
+                   const uint8_t **blob, uint32_t *blob_size) {
+  if (!data || size < 32)
+    return false;
+
+  const auto *bytes = static_cast<const uint8_t *>(data);
+  if (ReadLe32(bytes) != FourCC('D', 'X', 'B', 'C'))
+    return false;
+
+  const auto container_size = ReadLe32(bytes + 24);
+  const auto blob_count = ReadLe32(bytes + 28);
+  if (container_size > size || blob_count > (container_size - 32) / 4)
+    return false;
+
+  for (uint32_t i = 0; i < blob_count; i++) {
+    const auto offset = ReadLe32(bytes + 32 + i * 4);
+    if (offset > container_size || container_size - offset < 8)
+      return false;
+
+    const auto fourcc = ReadLe32(bytes + offset);
+    const auto length = ReadLe32(bytes + offset + 4);
+    if (length > container_size - offset - 8)
+      return false;
+
+    if (fourcc == FourCC('S', 'H', 'D', 'R') ||
+        fourcc == FourCC('S', 'H', 'E', 'X')) {
+      *blob = bytes + offset + 8;
+      *blob_size = length;
+      return true;
+    }
+  }
+
+  return false;
+}
+
+uint32_t
+ExpectedDxbcShaderType(PipelineShaderStage stage) {
+  switch (stage) {
+  case PipelineShaderStage::Pixel:
+    return 0;
+  case PipelineShaderStage::Vertex:
+    return 1;
+  case PipelineShaderStage::Geometry:
+    return 2;
+  case PipelineShaderStage::Hull:
+    return 3;
+  case PipelineShaderStage::Domain:
+    return 4;
+  case PipelineShaderStage::Compute:
+    return 5;
+  }
+  return UINT32_MAX;
+}
+
+bool
+ValidateDxbcShaderStage(PipelineShaderStage stage,
+                        const D3D12_SHADER_BYTECODE &bytecode) {
+  const uint8_t *shader_blob = nullptr;
+  uint32_t shader_blob_size = 0;
+  if (!FindDxbcShaderBlob(bytecode.pShaderBytecode, bytecode.BytecodeLength,
+                          &shader_blob, &shader_blob_size) ||
+      shader_blob_size < 4)
+    return false;
+
+  const auto token = ReadLe32(shader_blob);
+  const auto actual_type = token >> 16;
+  const auto expected_type = ExpectedDxbcShaderType(stage);
+  return expected_type == UINT32_MAX || actual_type == expected_type;
+}
+
+D3D12_ROOT_SIGNATURE_FLAGS
+GetRootSignatureFlags(ID3D12RootSignature *root_signature) {
+  auto *rs = dynamic_cast<RootSignature *>(root_signature);
+  if (!rs)
+    return D3D12_ROOT_SIGNATURE_FLAG_NONE;
+
+  const auto &desc = rs->GetVersionedDesc();
+  return desc.Version == D3D_ROOT_SIGNATURE_VERSION_1_0
+             ? desc.Desc_1_0.Flags
+             : desc.Desc_1_1.Flags;
+}
+
 HRESULT
-ParseDxilShader(PipelineShaderStage stage,
-                IMTLD3D12Device *device,
-                const D3D12_SHADER_BYTECODE &bytecode,
-                PipelineDxilShader &shader) {
+ParsePipelineShader(PipelineShaderStage stage,
+                    IMTLD3D12Device *device,
+                    const D3D12_SHADER_BYTECODE &bytecode,
+                    PipelineDxilShader &shader) {
   if (!bytecode.pShaderBytecode && bytecode.BytecodeLength)
     return E_INVALIDARG;
   if (!HasBytecode(bytecode))
     return S_FALSE;
-  if (!IsDxilContainer(bytecode))
-    return E_NOTIMPL;
 
   shader = {};
   shader.stage = stage;
@@ -308,29 +401,44 @@ ParseDxilShader(PipelineShaderStage stage,
   std::memcpy(shader.bytecode.data(), bytecode.pShaderBytecode,
               bytecode.BytecodeLength);
 
+  const bool is_dxil = IsDxilContainer(bytecode);
+  shader.kind = is_dxil ? PipelineShaderBytecodeKind::Dxil
+                        : PipelineShaderBytecodeKind::Dxbc;
+
   const auto status = shader.parser.parse(shader.bytecode.data(),
                                           shader.bytecode.size());
-  if (status != dxil::ParseStatus::Ok) {
+  if (is_dxil && status != dxil::ParseStatus::Ok) {
     WARN("D3D12PipelineState: failed to parse ", ShaderStageName(stage),
          " DXIL bytecode: ", dxil::StatusName(status));
     return E_INVALIDARG;
   }
 
   const auto &program = shader.parser.dxilProgram();
-  const auto expected_kind = ExpectedShaderKind(stage);
-  if (program && expected_kind != UINT32_MAX &&
-      program->shader_kind() != expected_kind) {
-    WARN("D3D12PipelineState: ", ShaderStageName(stage),
-         " bytecode contains ", dxil::PsvShaderKindName(program->shader_kind()),
-         " shader");
+  if (is_dxil) {
+    const auto expected_kind = ExpectedShaderKind(stage);
+    if (program && expected_kind != UINT32_MAX &&
+        program->shader_kind() != expected_kind) {
+      WARN("D3D12PipelineState: ", ShaderStageName(stage),
+           " bytecode contains ", dxil::PsvShaderKindName(program->shader_kind()),
+           " shader");
+      return E_INVALIDARG;
+    }
+  } else if (!ValidateDxbcShaderStage(stage, bytecode)) {
+    WARN("D3D12PipelineState: invalid or mismatched ",
+         ShaderStageName(stage), " DXBC bytecode");
     return E_INVALIDARG;
   }
 
   sm50_error_t error = nullptr;
-  if (DXILInitialize(shader.bytecode.data(), shader.bytecode.size(),
-                     &shader.shader, &shader.reflection, &error)) {
+  const auto initialize_failed =
+      is_dxil ? DXILInitialize(shader.bytecode.data(), shader.bytecode.size(),
+                               &shader.shader, &shader.reflection, &error)
+              : SM50Initialize(shader.bytecode.data(), shader.bytecode.size(),
+                               &shader.shader, &shader.reflection, &error);
+  if (initialize_failed) {
     WARN("D3D12PipelineState: failed to initialize ", ShaderStageName(stage),
-         " DXIL shader: ", SM50GetErrorMessageString(error));
+         is_dxil ? " DXIL shader: " : " DXBC shader: ",
+         SM50GetErrorMessageString(error));
     SM50FreeError(error);
     return E_INVALIDARG;
   }
@@ -339,24 +447,28 @@ ParseDxilShader(PipelineShaderStage stage,
       shader.reflection.NumConstantBuffers + shader.reflection.NumArguments;
   shader.argument_info.resize(argument_count);
   if (argument_count) {
-    DXILGetArgumentsInfo(
-        shader.shader,
-        shader.argument_info.empty() ? nullptr : shader.argument_info.data(),
+    auto *constant_buffers =
+        shader.argument_info.empty() ? nullptr : shader.argument_info.data();
+    auto *arguments =
         shader.argument_info.size() <= shader.reflection.NumConstantBuffers
             ? nullptr
-            : shader.argument_info.data() + shader.reflection.NumConstantBuffers);
+            : shader.argument_info.data() + shader.reflection.NumConstantBuffers;
+    if (is_dxil)
+      DXILGetArgumentsInfo(shader.shader, constant_buffers, arguments);
+    else
+      SM50GetArgumentsInfo(shader.shader, constant_buffers, arguments);
   }
 
   return S_OK;
 }
 
 HRESULT
-AppendDxilShader(PipelineShaderStage stage,
-                 IMTLD3D12Device *device,
-                 const D3D12_SHADER_BYTECODE &bytecode,
-                 std::vector<PipelineDxilShader> &shaders) {
+AppendPipelineShader(PipelineShaderStage stage,
+                     IMTLD3D12Device *device,
+                     const D3D12_SHADER_BYTECODE &bytecode,
+                     std::vector<PipelineDxilShader> &shaders) {
   PipelineDxilShader shader = {};
-  const auto hr = ParseDxilShader(stage, device, bytecode, shader);
+  const auto hr = ParsePipelineShader(stage, device, bytecode, shader);
   if (hr == S_FALSE)
     return S_OK;
   if (FAILED(hr))
@@ -614,7 +726,7 @@ HashVector(Sha1HashState &hash, const std::vector<T> &values) {
 }
 
 void
-HashDxilShaders(Sha1HashState &hash,
+HashPipelineShaders(Sha1HashState &hash,
                 const std::vector<PipelineDxilShader> &shaders) {
   const auto count = uint32_t(shaders.size());
   HashValue(hash, count);
@@ -625,7 +737,7 @@ HashDxilShaders(Sha1HashState &hash,
 }
 
 std::string
-DxilShaderDigest(const PipelineDxilShader &shader) {
+PipelineShaderDigest(const PipelineDxilShader &shader) {
   return Sha1HashState::compute(shader.bytecode.data(), shader.bytecode.size())
       .string();
 }
@@ -676,7 +788,7 @@ D3D12DebugShaderName(const std::vector<PipelineDxilShader> &shaders,
     return "null";
 
   std::stringstream stream;
-  stream << DxilShaderDigest(*shader) << "/" << shader->bytecode.size();
+  stream << PipelineShaderDigest(*shader) << "/" << shader->bytecode.size();
   return stream.str();
 }
 
@@ -829,7 +941,7 @@ D3D12PipelineShaderFilterMatches(
   if (!shader)
     return filter == "null";
 
-  return D3D12PipelineFilterMatches(std::move(filter), DxilShaderDigest(*shader));
+  return D3D12PipelineFilterMatches(std::move(filter), PipelineShaderDigest(*shader));
 }
 
 bool
@@ -922,7 +1034,7 @@ D3D12DumpPipelineShaders(const char *kind, std::string_view shader_cache_key,
              << "\n";
 
   for (const auto &shader : shaders) {
-    const auto digest = DxilShaderDigest(shader);
+    const auto digest = PipelineShaderDigest(shader);
     const auto stage = ShaderStageName(shader.stage);
     const auto filename = env::getExeBaseName() + "_d3d12_" + key_prefix +
                           "_" + stage + "_" + digest.substr(0, 16) + ".dxil";
@@ -986,7 +1098,7 @@ BuildShaderCacheKey(PipelineStateType type,
   HashString(hash, type == PipelineStateType::Graphics
                        ? "dxmt-d3d12-graphics-pipeline-cache-v2"
                        : "dxmt-d3d12-compute-pipeline-cache-v2");
-  HashDxilShaders(hash, shaders);
+  HashPipelineShaders(hash, shaders);
   if (type == PipelineStateType::Graphics) {
     HashGraphicsInputElements(hash, graphics_state);
     HashGraphicsStreamOutput(hash, graphics_state);
@@ -1031,10 +1143,13 @@ BuildCachedShaderBlob(PipelineStateType type,
 }
 
 void
-DestroyDxilShaders(std::vector<PipelineDxilShader> &shaders) {
+DestroyPipelineShaders(std::vector<PipelineDxilShader> &shaders) {
   for (auto &shader : shaders) {
     if (shader.shader) {
-      DXILDestroy(shader.shader);
+      if (shader.kind == PipelineShaderBytecodeKind::Dxil)
+        DXILDestroy(shader.shader);
+      else
+        SM50Destroy(shader.shader);
       shader.shader = nullptr;
     }
   }
@@ -1066,9 +1181,17 @@ CompileMetalFunction(IMTLD3D12Device *device, PipelineDxilShader &shader,
                      PipelineMetalShader &out) {
   sm50_bitcode_t bitcode_handle = nullptr;
   sm50_error_t error = nullptr;
-  if (DXILCompile(shader.shader, args, function_name, &bitcode_handle, &error)) {
+  const auto compile_failed =
+      shader.kind == PipelineShaderBytecodeKind::Dxil
+          ? DXILCompile(shader.shader, args, function_name, &bitcode_handle,
+                        &error)
+          : SM50Compile(shader.shader, args, function_name, &bitcode_handle,
+                        &error);
+  if (compile_failed) {
     WARN("D3D12PipelineState: failed to compile ", ShaderStageName(shader.stage),
-         " DXIL shader: ", SM50GetErrorMessageString(error));
+         shader.kind == PipelineShaderBytecodeKind::Dxil ? " DXIL shader: "
+                                                         : " DXBC shader: ",
+         SM50GetErrorMessageString(error));
     SM50FreeError(error);
     return false;
   }
@@ -1638,8 +1761,22 @@ CloneGraphicsState(const D3D12_GRAPHICS_PIPELINE_STATE_DESC &desc,
     return E_INVALIDARG;
   }
   if (desc.StreamOutput.NumEntries || desc.StreamOutput.NumStrides) {
-    WARN("D3D12PipelineState: stream output is unsupported");
-    return E_INVALIDARG;
+    if (!(GetRootSignatureFlags(desc.pRootSignature) &
+          D3D12_ROOT_SIGNATURE_FLAG_ALLOW_STREAM_OUTPUT)) {
+      WARN("D3D12PipelineState: stream output requires root signature support");
+      return E_INVALIDARG;
+    }
+  }
+  for (UINT i = desc.NumRenderTargets; i < D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT; i++) {
+    if (desc.RTVFormats[i] != DXGI_FORMAT_UNKNOWN)
+      return E_INVALIDARG;
+  }
+  for (UINT i = 0; i < D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT; i++) {
+    const auto &rt = desc.BlendState.RenderTarget[i];
+    if (rt.BlendEnable && rt.LogicOpEnable)
+      return E_INVALIDARG;
+    if (rt.LogicOpEnable && desc.BlendState.IndependentBlendEnable)
+      return E_INVALIDARG;
   }
   if (desc.PrimitiveTopologyType == D3D12_PRIMITIVE_TOPOLOGY_TYPE_UNDEFINED ||
       desc.PrimitiveTopologyType == D3D12_PRIMITIVE_TOPOLOGY_TYPE_PATCH) {
@@ -1723,6 +1860,11 @@ AlignStreamOffset(size_t value) {
 }
 
 size_t
+AlignStreamOffset(size_t value, size_t alignment) {
+  return (value + alignment - 1) & ~(alignment - 1);
+}
+
+size_t
 PipelineStreamPayloadSize(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE type) {
   switch (type) {
   case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE:
@@ -1771,13 +1913,77 @@ PipelineStreamPayloadSize(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE type) {
   }
 }
 
+size_t
+PipelineStreamPayloadAlignment(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE type) {
+  switch (type) {
+  case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE:
+    return alignof(ID3D12RootSignature *);
+  case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS:
+  case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS:
+  case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DS:
+  case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_HS:
+  case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_GS:
+  case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CS:
+    return alignof(D3D12_SHADER_BYTECODE);
+  case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_STREAM_OUTPUT:
+    return alignof(D3D12_STREAM_OUTPUT_DESC);
+  case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND:
+    return alignof(D3D12_BLEND_DESC);
+  case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK:
+    return alignof(UINT);
+  case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER:
+    return alignof(D3D12_RASTERIZER_DESC);
+  case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL:
+    return alignof(D3D12_DEPTH_STENCIL_DESC);
+  case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL1:
+    return alignof(D3D12_DEPTH_STENCIL_DESC1);
+  case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_INPUT_LAYOUT:
+    return alignof(D3D12_INPUT_LAYOUT_DESC);
+  case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_IB_STRIP_CUT_VALUE:
+    return alignof(D3D12_INDEX_BUFFER_STRIP_CUT_VALUE);
+  case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY:
+    return alignof(D3D12_PRIMITIVE_TOPOLOGY_TYPE);
+  case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS:
+    return alignof(D3D12_RT_FORMAT_ARRAY);
+  case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL_FORMAT:
+    return alignof(DXGI_FORMAT);
+  case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_DESC:
+    return alignof(DXGI_SAMPLE_DESC);
+  case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_NODE_MASK:
+    return alignof(UINT);
+  case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CACHED_PSO:
+    return alignof(D3D12_CACHED_PIPELINE_STATE);
+  case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_FLAGS:
+    return alignof(D3D12_PIPELINE_STATE_FLAGS);
+  case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VIEW_INSTANCING:
+    return alignof(D3D12_VIEW_INSTANCING_DESC);
+  default:
+    return 0;
+  }
+}
+
+HRESULT
+FailPipelineStreamParse(const char *reason,
+                        D3D12_PIPELINE_STATE_SUBOBJECT_TYPE type,
+                        size_t offset, HRESULT hr = E_INVALIDARG) {
+  if (D3D12PipelineDiagShouldLog())
+    INFO("D3D12 diagnostic: pipeline stream parse failed",
+         " reason=", reason,
+         " type=", uint32_t(type),
+         " offset=", offset,
+         " hr=0x", std::hex, uint32_t(hr), std::dec);
+  return hr;
+}
+
 HRESULT
 ParsePipelineStateStream(const D3D12_PIPELINE_STATE_STREAM_DESC &stream,
                          D3D12_GRAPHICS_PIPELINE_STATE_DESC &graphics,
                          D3D12_COMPUTE_PIPELINE_STATE_DESC &compute,
                          bool &has_compute_shader) {
   if (!stream.pPipelineStateSubobjectStream || !stream.SizeInBytes)
-    return E_INVALIDARG;
+    return FailPipelineStreamParse("empty stream",
+                                   D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MAX_VALID,
+                                   0);
 
   graphics = {};
   graphics.SampleMask = UINT_MAX;
@@ -1785,22 +1991,33 @@ ParsePipelineStateStream(const D3D12_PIPELINE_STATE_STREAM_DESC &stream,
   graphics.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
   compute = {};
   has_compute_shader = false;
+  bool seen_subobjects[D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VIEW_INSTANCING + 1] = {};
 
   const auto *bytes =
       static_cast<const uint8_t *>(stream.pPipelineStateSubobjectStream);
   size_t offset = 0;
   while (offset < stream.SizeInBytes) {
     if (stream.SizeInBytes - offset < sizeof(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE))
-      return E_INVALIDARG;
+      return FailPipelineStreamParse("truncated type",
+                                     D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MAX_VALID,
+                                     offset);
 
     auto type = *reinterpret_cast<const D3D12_PIPELINE_STATE_SUBOBJECT_TYPE *>(
         bytes + offset);
+    const size_t type_offset = offset;
     offset += sizeof(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE);
-    offset = AlignStreamOffset(offset);
 
     const size_t payload_size = PipelineStreamPayloadSize(type);
-    if (!payload_size || stream.SizeInBytes - offset < payload_size)
-      return E_INVALIDARG;
+    const size_t payload_alignment = PipelineStreamPayloadAlignment(type);
+    if (!payload_size || !payload_alignment)
+      return FailPipelineStreamParse("unknown type", type, type_offset);
+    offset = AlignStreamOffset(offset, payload_alignment);
+    if (stream.SizeInBytes - offset < payload_size)
+      return FailPipelineStreamParse("truncated payload", type, type_offset);
+    const auto type_index = static_cast<uint32_t>(type);
+    if (type_index >= std::size(seen_subobjects) || seen_subobjects[type_index])
+      return FailPipelineStreamParse("duplicate subobject", type, type_offset);
+    seen_subobjects[type_index] = true;
 
     const void *payload = bytes + offset;
     switch (type) {
@@ -1826,7 +2043,7 @@ ParsePipelineStateStream(const D3D12_PIPELINE_STATE_STREAM_DESC &stream,
       break;
     case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CS:
       compute.CS = *static_cast<const D3D12_SHADER_BYTECODE *>(payload);
-      has_compute_shader = HasBytecode(compute.CS);
+      has_compute_shader |= HasBytecode(compute.CS);
       break;
     case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_STREAM_OUTPUT:
       graphics.StreamOutput =
@@ -1886,7 +2103,7 @@ ParsePipelineStateStream(const D3D12_PIPELINE_STATE_STREAM_DESC &stream,
         return E_INVALIDARG;
       graphics.NumRenderTargets = formats.NumRenderTargets;
       for (UINT i = 0; i < formats.NumRenderTargets; i++)
-        graphics.RTVFormats[i] = formats.RTFormats[i];
+      graphics.RTVFormats[i] = formats.RTFormats[i];
       break;
     }
     case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL_FORMAT:
@@ -1912,21 +2129,23 @@ ParsePipelineStateStream(const D3D12_PIPELINE_STATE_STREAM_DESC &stream,
       const auto &view_instancing =
           *static_cast<const D3D12_VIEW_INSTANCING_DESC *>(payload);
       if (view_instancing.ViewInstanceCount)
-        return E_NOTIMPL;
+        return FailPipelineStreamParse("view instancing unsupported", type,
+                                       type_offset, E_NOTIMPL);
       break;
     }
     default:
-      return E_INVALIDARG;
+      return FailPipelineStreamParse("unknown type", type, type_offset);
     }
 
     offset = AlignStreamOffset(offset + payload_size);
   }
 
   if (has_compute_shader &&
-      (HasBytecode(graphics.VS) || HasBytecode(graphics.PS) ||
-       HasBytecode(graphics.DS) || HasBytecode(graphics.HS) ||
-       HasBytecode(graphics.GS)))
-    return E_INVALIDARG;
+      (HasBytecode(graphics.VS) || HasBytecode(graphics.DS) ||
+       HasBytecode(graphics.HS) || HasBytecode(graphics.GS)))
+    return FailPipelineStreamParse("compute stream has incompatible shader",
+                                   D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CS,
+                                   stream.SizeInBytes);
 
   return S_OK;
 }
@@ -1994,7 +2213,7 @@ public:
 
   HRESULT STDMETHODCALLTYPE SetName(const WCHAR *name) override {
     name_ = name ? str::fromws(name) : std::string();
-    return S_OK;
+    return private_data_.setName(name);
   }
 
   HRESULT STDMETHODCALLTYPE GetDevice(REFIID riid, void **device) override {
@@ -2151,7 +2370,8 @@ public:
                     std::vector<PipelineSignatureLink> &&signature_links,
                     PipelineGraphicsState &&graphics_state,
                     PipelineComputeState &&compute_state)
-      : device_(device), type_(type), root_signature_(root_signature),
+      : device_(device), type_(type),
+        root_signature_(dynamic_cast<RootSignature *>(root_signature)),
         shaders_(std::move(shaders)),
         signature_links_(std::move(signature_links)),
         graphics_state_(std::move(graphics_state)),
@@ -2160,14 +2380,14 @@ public:
     FixComputeStatePointers(compute_state_, shaders_);
     shader_cache_key_ = BuildShaderCacheKey(type_, shaders_, graphics_state_,
                                             compute_state_,
-                                            root_signature_.ptr());
+                                            GetRootSignature());
     cached_shader_blob_ =
         BuildCachedShaderBlob(type_, graphics_state_, compute_state_,
                               shader_cache_key_);
   }
 
   ~PipelineStateImpl() {
-    DestroyDxilShaders(shaders_);
+    DestroyPipelineShaders(shaders_);
   }
 
   HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void **object) override {
@@ -2206,7 +2426,7 @@ public:
 
   HRESULT STDMETHODCALLTYPE SetName(const WCHAR *name) override {
     name_ = name ? str::fromws(name) : std::string();
-    return S_OK;
+    return private_data_.setName(name);
   }
 
   HRESULT STDMETHODCALLTYPE GetDevice(REFIID riid, void **device) override {
@@ -2227,7 +2447,9 @@ public:
   }
 
   ID3D12RootSignature *GetRootSignature() const override {
-    return root_signature_.ptr();
+    return root_signature_.ptr()
+               ? dynamic_cast<ID3D12RootSignature *>(root_signature_.ptr())
+               : nullptr;
   }
 
   const std::vector<PipelineDxilShader> &GetDxilShaders() const override {
@@ -2283,7 +2505,7 @@ public:
 private:
   Com<IMTLD3D12Device> device_;
   PipelineStateType type_;
-  Com<ID3D12RootSignature> root_signature_;
+  Com<RootSignature, false> root_signature_;
   std::vector<PipelineDxilShader> shaders_;
   std::vector<PipelineSignatureLink> signature_links_;
   PipelineGraphicsState graphics_state_;
@@ -2325,6 +2547,13 @@ StoreStatus(HRESULT *status, HRESULT value) {
     *status = value;
 }
 
+void
+LogPipelineCreateFailure(const char *where, HRESULT value) {
+  if (D3D12PipelineDiagShouldLog())
+    INFO("D3D12 diagnostic: pipeline create failed",
+         " where=", where, " hr=0x", std::hex, uint32_t(value), std::dec);
+}
+
 } // namespace
 
 Com<ID3D12PipelineState>
@@ -2339,6 +2568,7 @@ CreateGraphicsPipelineState(IMTLD3D12Device *device,
   PipelineGraphicsState graphics_state = {};
   HRESULT hr = CloneGraphicsState(*desc, graphics_state);
   if (FAILED(hr)) {
+    LogPipelineCreateFailure("CloneGraphicsState", hr);
     StoreStatus(status, hr);
     return nullptr;
   }
@@ -2346,38 +2576,40 @@ CreateGraphicsPipelineState(IMTLD3D12Device *device,
   std::vector<PipelineDxilShader> shaders;
   shaders.reserve(5);
 
-  hr = AppendDxilShader(PipelineShaderStage::Vertex, device, desc->VS, shaders);
+  hr = AppendPipelineShader(PipelineShaderStage::Vertex, device, desc->VS, shaders);
   if (FAILED(hr)) {
-    DestroyDxilShaders(shaders);
+    DestroyPipelineShaders(shaders);
+    LogPipelineCreateFailure("AppendVertexShader", hr);
     StoreStatus(status, hr);
     return nullptr;
   }
-  hr = AppendDxilShader(PipelineShaderStage::Pixel, device, desc->PS, shaders);
+  hr = AppendPipelineShader(PipelineShaderStage::Pixel, device, desc->PS, shaders);
   if (FAILED(hr)) {
-    DestroyDxilShaders(shaders);
+    DestroyPipelineShaders(shaders);
+    LogPipelineCreateFailure("AppendPixelShader", hr);
     StoreStatus(status, hr);
     return nullptr;
   }
-  hr = AppendDxilShader(PipelineShaderStage::Geometry, device, desc->GS, shaders);
+  hr = AppendPipelineShader(PipelineShaderStage::Geometry, device, desc->GS, shaders);
   if (FAILED(hr)) {
-    DestroyDxilShaders(shaders);
+    DestroyPipelineShaders(shaders);
     StoreStatus(status, hr);
     return nullptr;
   }
-  hr = AppendDxilShader(PipelineShaderStage::Hull, device, desc->HS, shaders);
+  hr = AppendPipelineShader(PipelineShaderStage::Hull, device, desc->HS, shaders);
   if (FAILED(hr)) {
-    DestroyDxilShaders(shaders);
+    DestroyPipelineShaders(shaders);
     StoreStatus(status, hr);
     return nullptr;
   }
-  hr = AppendDxilShader(PipelineShaderStage::Domain, device, desc->DS, shaders);
+  hr = AppendPipelineShader(PipelineShaderStage::Domain, device, desc->DS, shaders);
   if (FAILED(hr)) {
-    DestroyDxilShaders(shaders);
+    DestroyPipelineShaders(shaders);
     StoreStatus(status, hr);
     return nullptr;
   }
   if (shaders.empty()) {
-    DestroyDxilShaders(shaders);
+    DestroyPipelineShaders(shaders);
     StoreStatus(status, E_INVALIDARG);
     return nullptr;
   }
@@ -2403,20 +2635,22 @@ CreateComputePipelineState(IMTLD3D12Device *device,
   PipelineComputeState compute_state = {};
   HRESULT hr = CloneComputeState(*desc, compute_state);
   if (FAILED(hr)) {
+    LogPipelineCreateFailure("CloneComputeState", hr);
     StoreStatus(status, hr);
     return nullptr;
   }
 
   std::vector<PipelineDxilShader> shaders;
   shaders.reserve(1);
-  hr = AppendDxilShader(PipelineShaderStage::Compute, device, desc->CS, shaders);
+  hr = AppendPipelineShader(PipelineShaderStage::Compute, device, desc->CS, shaders);
   if (FAILED(hr)) {
-    DestroyDxilShaders(shaders);
+    DestroyPipelineShaders(shaders);
+    LogPipelineCreateFailure("AppendComputeShader", hr);
     StoreStatus(status, hr);
     return nullptr;
   }
   if (shaders.empty()) {
-    DestroyDxilShaders(shaders);
+    DestroyPipelineShaders(shaders);
     StoreStatus(status, E_INVALIDARG);
     return nullptr;
   }

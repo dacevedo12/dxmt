@@ -27,8 +27,15 @@ enum class PipelineShaderStage {
   Compute,
 };
 
+enum class PipelineShaderBytecodeKind {
+  Unknown,
+  Dxbc,
+  Dxil,
+};
+
 struct PipelineDxilShader {
   PipelineShaderStage stage = PipelineShaderStage::Vertex;
+  PipelineShaderBytecodeKind kind = PipelineShaderBytecodeKind::Unknown;
   std::vector<uint8_t> bytecode;
   dxil::Parser parser;
   dxil_shader_t shader = nullptr;
