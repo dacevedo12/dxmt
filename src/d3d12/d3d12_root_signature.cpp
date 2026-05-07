@@ -4,6 +4,7 @@
 #include "com/com_guid.hpp"
 #include "com/com_object.hpp"
 #include "com/com_private_data.hpp"
+#include "d3d12_agility.hpp"
 #include "log/log.hpp"
 #include "util_string.hpp"
 #include <algorithm>
@@ -85,11 +86,15 @@ CheckedEnd(size_t offset, size_t size, size_t limit, size_t &end) {
 
 uint32_t
 VersionValue(D3D_ROOT_SIGNATURE_VERSION version) {
+  if (version == D3D_ROOT_SIGNATURE_VERSION_1_2)
+    return 3u;
   return version == D3D_ROOT_SIGNATURE_VERSION_1_1 ? 2u : 1u;
 }
 
 D3D_ROOT_SIGNATURE_VERSION
 VersionFromValue(uint32_t version) {
+  if (version == 3u)
+    return D3D_ROOT_SIGNATURE_VERSION_1_2;
   return version == 2u ? D3D_ROOT_SIGNATURE_VERSION_1_1
                        : D3D_ROOT_SIGNATURE_VERSION_1_0;
 }
@@ -145,7 +150,7 @@ struct RootSignatureStorage {
         static_samplers.empty() ? nullptr : static_samplers.data();
 
     versioned_desc.Version = version;
-    if (version == D3D_ROOT_SIGNATURE_VERSION_1_1)
+    if (version != D3D_ROOT_SIGNATURE_VERSION_1_0)
       versioned_desc.Desc_1_1 = desc_1_1;
     else
       versioned_desc.Desc_1_0 = desc_1_0;
@@ -160,14 +165,14 @@ NormalizeDescriptorCount(UINT count) {
 void
 BuildBindingParameters(RootSignatureStorage &storage) {
   storage.parameters.clear();
-  const auto count = storage.version == D3D_ROOT_SIGNATURE_VERSION_1_1
-                         ? storage.parameters_1_1.size()
-                         : storage.parameters_1_0.size();
+  const auto count = storage.version == D3D_ROOT_SIGNATURE_VERSION_1_0
+                         ? storage.parameters_1_0.size()
+                         : storage.parameters_1_1.size();
   storage.parameters.resize(count);
 
   for (size_t i = 0; i < count; i++) {
     auto &dst = storage.parameters[i];
-    if (storage.version == D3D_ROOT_SIGNATURE_VERSION_1_1) {
+    if (storage.version != D3D_ROOT_SIGNATURE_VERSION_1_0) {
       const auto &src = storage.parameters_1_1[i];
       dst.parameter_type = src.ParameterType;
       dst.visibility = src.ShaderVisibility;
@@ -243,7 +248,45 @@ ValidateDesc0(const D3D12_ROOT_SIGNATURE_DESC &desc) {
         parameter.DescriptorTable.NumDescriptorRanges &&
         !parameter.DescriptorTable.pDescriptorRanges)
       return false;
+    if (parameter.ParameterType == D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE &&
+        parameter.DescriptorTable.NumDescriptorRanges) {
+      bool sampler = false;
+      bool non_sampler = false;
+      for (UINT j = 0; j < parameter.DescriptorTable.NumDescriptorRanges; j++) {
+        const auto &range = parameter.DescriptorTable.pDescriptorRanges[j];
+        if (range.NumDescriptors == 0)
+          return false;
+        if (range.RangeType == D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER)
+          sampler = true;
+        else
+          non_sampler = true;
+      }
+      if (sampler && non_sampler)
+        return false;
+    }
   }
+
+  UINT root_cost = 0;
+  for (UINT i = 0; i < desc.NumParameters; i++) {
+    const auto &parameter = desc.pParameters[i];
+    switch (parameter.ParameterType) {
+    case D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE:
+      root_cost += 1;
+      break;
+    case D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS:
+      root_cost += parameter.Constants.Num32BitValues + 1;
+      break;
+    case D3D12_ROOT_PARAMETER_TYPE_CBV:
+    case D3D12_ROOT_PARAMETER_TYPE_SRV:
+    case D3D12_ROOT_PARAMETER_TYPE_UAV:
+      root_cost += 2;
+      break;
+    default:
+      return false;
+    }
+  }
+  if (root_cost > D3D12_MAX_ROOT_COST)
+    return false;
 
   return true;
 }
@@ -261,7 +304,45 @@ ValidateDesc1(const D3D12_ROOT_SIGNATURE_DESC1 &desc) {
         parameter.DescriptorTable.NumDescriptorRanges &&
         !parameter.DescriptorTable.pDescriptorRanges)
       return false;
+    if (parameter.ParameterType == D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE &&
+        parameter.DescriptorTable.NumDescriptorRanges) {
+      bool sampler = false;
+      bool non_sampler = false;
+      for (UINT j = 0; j < parameter.DescriptorTable.NumDescriptorRanges; j++) {
+        const auto &range = parameter.DescriptorTable.pDescriptorRanges[j];
+        if (range.NumDescriptors == 0)
+          return false;
+        if (range.RangeType == D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER)
+          sampler = true;
+        else
+          non_sampler = true;
+      }
+      if (sampler && non_sampler)
+        return false;
+    }
   }
+
+  UINT root_cost = 0;
+  for (UINT i = 0; i < desc.NumParameters; i++) {
+    const auto &parameter = desc.pParameters[i];
+    switch (parameter.ParameterType) {
+    case D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE:
+      root_cost += 1;
+      break;
+    case D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS:
+      root_cost += parameter.Constants.Num32BitValues + 1;
+      break;
+    case D3D12_ROOT_PARAMETER_TYPE_CBV:
+    case D3D12_ROOT_PARAMETER_TYPE_SRV:
+    case D3D12_ROOT_PARAMETER_TYPE_UAV:
+      root_cost += 2;
+      break;
+    default:
+      return false;
+    }
+  }
+  if (root_cost > D3D12_MAX_ROOT_COST)
+    return false;
 
   return true;
 }
@@ -406,6 +487,10 @@ CloneFromVersionedDesc(const D3D12_VERSIONED_ROOT_SIGNATURE_DESC &desc) {
     if (!ValidateDesc1(desc.Desc_1_1))
       return std::nullopt;
     return CloneFromDesc1(desc.Desc_1_1, D3D_ROOT_SIGNATURE_VERSION_1_1);
+  case D3D_ROOT_SIGNATURE_VERSION_1_2:
+    if (!ValidateDesc1(desc.Desc_1_1))
+      return std::nullopt;
+    return CloneFromDesc1(desc.Desc_1_1, D3D_ROOT_SIGNATURE_VERSION_1_2);
   default:
     return std::nullopt;
   }
@@ -442,7 +527,7 @@ ParseRts0(std::span<const std::byte> rts0, RootSignatureStorage &storage) {
     return false;
 
   const auto version_value = ReadU32(rts0, 0);
-  if (version_value != 1 && version_value != 2)
+  if (version_value != 1 && version_value != 2 && version_value != 3)
     return false;
 
   const auto parameter_count = ReadU32(rts0, 4);
@@ -602,9 +687,9 @@ std::vector<std::byte>
 SerializeRts0(const RootSignatureStorage &storage,
               D3D_ROOT_SIGNATURE_VERSION version) {
   const auto version_value = VersionValue(version);
-  const auto parameter_count = version == D3D_ROOT_SIGNATURE_VERSION_1_1
-                                   ? storage.parameters_1_1.size()
-                                   : storage.parameters_1_0.size();
+  const auto parameter_count = version == D3D_ROOT_SIGNATURE_VERSION_1_0
+                                   ? storage.parameters_1_0.size()
+                                   : storage.parameters_1_1.size();
   std::vector<std::byte> data;
   data.reserve(kRts0HeaderSize + parameter_count * kRts0ParameterHeaderSize);
 
@@ -620,13 +705,13 @@ SerializeRts0(const RootSignatureStorage &storage,
   parameter_offset_patches.reserve(parameter_count);
   for (size_t i = 0; i < parameter_count; i++) {
     const auto parameter_type =
-        version == D3D_ROOT_SIGNATURE_VERSION_1_1
-            ? storage.parameters_1_1[i].ParameterType
-            : storage.parameters_1_0[i].ParameterType;
+        version == D3D_ROOT_SIGNATURE_VERSION_1_0
+            ? storage.parameters_1_0[i].ParameterType
+            : storage.parameters_1_1[i].ParameterType;
     const auto shader_visibility =
-        version == D3D_ROOT_SIGNATURE_VERSION_1_1
-            ? storage.parameters_1_1[i].ShaderVisibility
-            : storage.parameters_1_0[i].ShaderVisibility;
+        version == D3D_ROOT_SIGNATURE_VERSION_1_0
+            ? storage.parameters_1_0[i].ShaderVisibility
+            : storage.parameters_1_1[i].ShaderVisibility;
     WriteU32(data, uint32_t(parameter_type));
     WriteU32(data, uint32_t(shader_visibility));
     parameter_offset_patches.push_back(data.size());
@@ -636,18 +721,18 @@ SerializeRts0(const RootSignatureStorage &storage,
   for (size_t i = 0; i < parameter_count; i++) {
     PatchU32(data, parameter_offset_patches[i], uint32_t(data.size()));
     const auto parameter_type =
-        version == D3D_ROOT_SIGNATURE_VERSION_1_1
-            ? storage.parameters_1_1[i].ParameterType
-            : storage.parameters_1_0[i].ParameterType;
+        version == D3D_ROOT_SIGNATURE_VERSION_1_0
+            ? storage.parameters_1_0[i].ParameterType
+            : storage.parameters_1_1[i].ParameterType;
     switch (parameter_type) {
     case D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE: {
       const auto &ranges0 = storage.ranges_1_0[i];
       const auto &ranges1 = storage.ranges_1_1[i];
-      WriteU32(data, uint32_t(version == D3D_ROOT_SIGNATURE_VERSION_1_1
-                                  ? ranges1.size()
-                                  : ranges0.size()));
+      WriteU32(data, uint32_t(version == D3D_ROOT_SIGNATURE_VERSION_1_0
+                                  ? ranges0.size()
+                                  : ranges1.size()));
       WriteU32(data, uint32_t(data.size() + sizeof(uint32_t)));
-      if (version == D3D_ROOT_SIGNATURE_VERSION_1_1) {
+      if (version != D3D_ROOT_SIGNATURE_VERSION_1_0) {
         for (const auto &range : ranges1) {
           WriteU32(data, uint32_t(range.RangeType));
           WriteU32(data, range.NumDescriptors);
@@ -675,7 +760,7 @@ SerializeRts0(const RootSignatureStorage &storage,
     case D3D12_ROOT_PARAMETER_TYPE_CBV:
     case D3D12_ROOT_PARAMETER_TYPE_SRV:
     case D3D12_ROOT_PARAMETER_TYPE_UAV:
-      if (version == D3D_ROOT_SIGNATURE_VERSION_1_1) {
+      if (version != D3D_ROOT_SIGNATURE_VERSION_1_0) {
         const auto &descriptor = storage.parameters_1_1[i].Descriptor;
         WriteU32(data, descriptor.ShaderRegister);
         WriteU32(data, descriptor.RegisterSpace);
@@ -799,6 +884,15 @@ public:
       : device_(device), storage_(std::move(storage)),
         serialized_blob_(std::move(serialized_blob)) {}
 
+  ULONG STDMETHODCALLTYPE AddRefPrivate() override {
+    ComObjectWithInitialRef<ID3D12RootSignature>::AddRefPrivate();
+    return 0;
+  }
+
+  void STDMETHODCALLTYPE ReleasePrivate() override {
+    ComObjectWithInitialRef<ID3D12RootSignature>::ReleasePrivate();
+  }
+
   HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void **object) override {
     if (!object)
       return E_POINTER;
@@ -833,7 +927,7 @@ public:
 
   HRESULT STDMETHODCALLTYPE SetName(const WCHAR *name) override {
     name_ = name ? str::fromws(name) : std::string();
-    return S_OK;
+    return private_data_.setName(name);
   }
 
   HRESULT STDMETHODCALLTYPE GetDevice(REFIID riid, void **device) override {
@@ -930,8 +1024,8 @@ private:
 };
 
 HRESULT
-CreateRootSignatureDeserializer(std::span<const std::byte> blob, REFIID iid,
-                                void **deserializer) {
+CreateRootSignatureDeserializerImpl(std::span<const std::byte> blob,
+                                    REFIID iid, void **deserializer) {
   InitReturnPtr(deserializer);
   if (!deserializer)
     return E_POINTER;
@@ -943,6 +1037,42 @@ CreateRootSignatureDeserializer(std::span<const std::byte> blob, REFIID iid,
   auto object = Com<ID3D12VersionedRootSignatureDeserializer>::transfer(
       new RootSignatureDeserializerImpl(std::move(storage)));
   return object->QueryInterface(iid, deserializer);
+}
+
+HRESULT
+CreateRootSignatureDeserializerFromStorage(RootSignatureStorage &&storage,
+                                           REFIID iid, void **deserializer) {
+  InitReturnPtr(deserializer);
+  if (!deserializer)
+    return E_POINTER;
+
+  auto object = Com<ID3D12VersionedRootSignatureDeserializer>::transfer(
+      new RootSignatureDeserializerImpl(std::move(storage)));
+  return object->QueryInterface(iid, deserializer);
+}
+
+HRESULT
+SerializeVersionedRootSignatureImpl(
+    const D3D12_VERSIONED_ROOT_SIGNATURE_DESC *root_signature_desc,
+    ID3DBlob **blob, ID3DBlob **error_blob) {
+  InitReturnPtr(blob);
+  InitReturnPtr(error_blob);
+  if (!blob)
+    return E_POINTER;
+  if (!root_signature_desc) {
+    SetErrorBlob(error_blob, "Root signature desc is null");
+    return E_INVALIDARG;
+  }
+
+  auto storage = CloneFromVersionedDesc(*root_signature_desc);
+  if (!storage) {
+    SetErrorBlob(error_blob, "Invalid root signature desc");
+    return E_INVALIDARG;
+  }
+
+  auto serialized = SerializeRootSignature(*storage, root_signature_desc->Version);
+  *blob = CreateBlob(std::move(serialized)).takeOwnership();
+  return S_OK;
 }
 
 } // namespace
@@ -958,6 +1088,61 @@ CreateRootSignatureFromBlob(IMTLD3D12Device *device,
   return Com<ID3D12RootSignature>::transfer(
       new RootSignatureImpl(device, std::move(storage),
                             std::move(serialized_blob)));
+}
+
+HRESULT
+CreateRootSignatureDeserializer(std::span<const std::byte> blob, REFIID iid,
+                                void **deserializer) {
+  return CreateRootSignatureDeserializerImpl(blob, iid, deserializer);
+}
+
+HRESULT
+CreateRootSignatureDeserializerFromSubobjectInLibrary(
+    std::span<const std::byte> library_blob, const WCHAR *subobject_name,
+    REFIID iid, void **deserializer) {
+  InitReturnPtr(deserializer);
+  if (!deserializer)
+    return E_POINTER;
+  if ((!library_blob.data() && library_blob.size()) || !subobject_name)
+    return E_INVALIDARG;
+
+  dxil::ContainerInfo container = {};
+  auto status = dxil::ParseContainer(library_blob.data(), library_blob.size(), container);
+  if (status != dxil::ParseStatus::Ok)
+    return E_INVALIDARG;
+
+  const auto *rdat_part = container.findPart(dxil::fourcc::RuntimeData);
+  if (!rdat_part)
+    return E_INVALIDARG;
+
+  dxil::RuntimeDataInfo rdat = {};
+  status = dxil::ParseRuntimeData(*rdat_part, rdat);
+  if (status != dxil::ParseStatus::Ok)
+    return E_INVALIDARG;
+
+  const std::string requested = str::fromws(subobject_name);
+  for (const auto &subobject : rdat.subobjects) {
+    if ((subobject.kind == 1 || subobject.kind == 2) &&
+        subobject.name == requested && !subobject.root_signature.empty()) {
+      std::span<const std::byte> root_signature(
+          reinterpret_cast<const std::byte *>(subobject.root_signature.data()),
+          subobject.root_signature.size());
+      RootSignatureStorage storage = {};
+      if (!ParseRootSignatureBlob(root_signature, storage))
+        return E_INVALIDARG;
+      return CreateRootSignatureDeserializerFromStorage(std::move(storage), iid,
+                                                        deserializer);
+    }
+  }
+
+  return E_INVALIDARG;
+}
+
+HRESULT
+SerializeVersionedRootSignature(
+    const D3D12_VERSIONED_ROOT_SIGNATURE_DESC *root_signature_desc,
+    ID3DBlob **blob, ID3DBlob **error_blob) {
+  return SerializeVersionedRootSignatureImpl(root_signature_desc, blob, error_blob);
 }
 
 } // namespace dxmt::d3d12
@@ -980,28 +1165,23 @@ D3D12CreateVersionedRootSignatureDeserializer(const void *data, SIZE_T data_size
 }
 
 extern "C" HRESULT __stdcall
+DXMTCreateRootSignatureDeserializerFromSubobjectInLibrary(
+    const void *library_blob, SIZE_T size, LPCWSTR subobject_name,
+    REFIID iid, void **deserializer) {
+  if (!library_blob && size)
+    return E_INVALIDARG;
+  return dxmt::d3d12::CreateRootSignatureDeserializerFromSubobjectInLibrary(
+      std::span<const std::byte>(
+          static_cast<const std::byte *>(library_blob), size),
+      subobject_name, iid, deserializer);
+}
+
+extern "C" HRESULT __stdcall
 D3D12SerializeVersionedRootSignature(
     const D3D12_VERSIONED_ROOT_SIGNATURE_DESC *root_signature_desc,
     ID3DBlob **blob, ID3DBlob **error_blob) {
-  dxmt::InitReturnPtr(blob);
-  dxmt::InitReturnPtr(error_blob);
-  if (!blob)
-    return E_POINTER;
-  if (!root_signature_desc) {
-    dxmt::d3d12::SetErrorBlob(error_blob, "Root signature desc is null");
-    return E_INVALIDARG;
-  }
-
-  auto storage = dxmt::d3d12::CloneFromVersionedDesc(*root_signature_desc);
-  if (!storage) {
-    dxmt::d3d12::SetErrorBlob(error_blob, "Invalid root signature desc");
-    return E_INVALIDARG;
-  }
-
-  auto serialized = dxmt::d3d12::SerializeRootSignature(
-      *storage, root_signature_desc->Version);
-  *blob = dxmt::d3d12::CreateBlob(std::move(serialized)).takeOwnership();
-  return S_OK;
+  return dxmt::d3d12::SerializeVersionedRootSignature(
+      root_signature_desc, blob, error_blob);
 }
 
 extern "C" HRESULT __stdcall
