@@ -663,14 +663,14 @@ static void test_get_copyable_footprints(void)
   desc = texture_desc(4, 4, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_FLAG_NONE);
   device->GetCopyableFootprints(&desc, 0, 1, 1, layouts, row_counts,
                                 row_sizes, &total_size);
-  check_true(layouts[0].Offset == D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT);
+  check_true(layouts[0].Offset == 1);
   check_true(layouts[0].Footprint.Format == DXGI_FORMAT_R8G8B8A8_UNORM);
   check_true(layouts[0].Footprint.Width == 4);
   check_true(layouts[0].Footprint.Height == 4);
   check_true(layouts[0].Footprint.RowPitch == D3D12_TEXTURE_DATA_PITCH_ALIGNMENT);
   check_true(row_counts[0] == 4);
   check_true(row_sizes[0] == 16);
-  check_true(total_size >= D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT + 4 * D3D12_TEXTURE_DATA_PITCH_ALIGNMENT);
+  check_true(total_size == 3 * D3D12_TEXTURE_DATA_PITCH_ALIGNMENT + 16);
 
   desc = texture_desc(4, 4, DXGI_FORMAT_BC1_UNORM, D3D12_RESOURCE_FLAG_NONE);
   device->GetCopyableFootprints(&desc, 0, 1, 0, layouts, row_counts,
@@ -680,7 +680,7 @@ static void test_get_copyable_footprints(void)
   check_true(layouts[0].Footprint.RowPitch == D3D12_TEXTURE_DATA_PITCH_ALIGNMENT);
   check_true(row_counts[0] == 1);
   check_true(row_sizes[0] == 8);
-  check_true(total_size >= D3D12_TEXTURE_DATA_PITCH_ALIGNMENT);
+  check_true(total_size == 8);
 
 done:
   release_object(&device);

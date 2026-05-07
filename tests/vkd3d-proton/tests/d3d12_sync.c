@@ -1753,7 +1753,7 @@ static void test_fence_pending_signal_cpu_rewind(bool use_shared)
 
     create_root_signature(context.device, &rs_desc, &context.root_signature);
     context.pipeline_state = create_compute_pipeline_state(
-        context.device, context.root_signature, gpu_load_dxbc);
+        context.device, context.root_signature, gpu_load_dxil);
 
     heap = create_gpu_descriptor_heap(context.device,
         D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 256 * ARRAY_SIZE(dummy_resources));
@@ -1927,7 +1927,7 @@ static void test_fence_ping_pong_deadlock_stress(bool use_shared)
 
     create_root_signature(context.device, &rs_desc, &context.root_signature);
     context.pipeline_state = create_compute_pipeline_state(
-        context.device, context.root_signature, gpu_load_dxbc);
+        context.device, context.root_signature, gpu_load_dxil);
 
     heap = create_gpu_descriptor_heap(context.device,
         D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 256 * ARRAY_SIZE(early_resources));
