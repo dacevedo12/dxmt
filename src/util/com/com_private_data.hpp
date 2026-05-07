@@ -12,7 +12,6 @@
 #include <mutex>
 #include <vector>
 #include <unknwn.h>
-#include <windef.h>
 
 namespace dxmt {
 
