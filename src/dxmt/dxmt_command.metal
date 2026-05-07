@@ -566,6 +566,55 @@ struct linear_texture_desc {
   }
 }
 
+[[kernel]] void cs_copy_depth_to_texture_r32_float(
+    texture2d<float, access::read> src [[texture(0)]],
+    texture2d<float, access::write> dst [[texture(1)]],
+    ushort2 pos [[thread_position_in_grid]]
+) {
+  if (pos.x < src.get_width() && pos.y < src.get_height() &&
+      pos.x < dst.get_width() && pos.y < dst.get_height()) {
+    dst.write(src.read(pos).xxxx, pos);
+  }
+}
+
+[[kernel]] void cs_copy_stencil_to_texture_r8_uint(
+    texture2d<uint, access::read> src [[texture(0)]],
+    texture2d<uint, access::write> dst [[texture(1)]],
+    ushort2 pos [[thread_position_in_grid]]
+) {
+  if (pos.x < src.get_width() && pos.y < src.get_height() &&
+      pos.x < dst.get_width() && pos.y < dst.get_height()) {
+    dst.write(src.read(pos).yyyy, pos);
+  }
+}
+
+[[kernel]] void cs_copy_depth_to_buffer_r32_float(
+    texture2d<float, access::read> src [[texture(0)]],
+    device float *buffer [[buffer(0)]],
+    constant linear_texture_desc &desc [[buffer(1)]],
+    ushort2 pos [[thread_position_in_grid]]
+) {
+  uint width = src.get_width();
+  uint height = src.get_height();
+  uint row_pitch = desc.bytes_per_row / sizeof(float);
+  if (width > pos.x && height > pos.y) {
+    buffer[pos.y * row_pitch + pos.x] = src.read(pos).x;
+  }
+}
+
+[[kernel]] void cs_copy_stencil_to_buffer_r8_uint(
+    texture2d<uint, access::read> src [[texture(0)]],
+    device uchar *buffer [[buffer(0)]],
+    constant linear_texture_desc &desc [[buffer(1)]],
+    ushort2 pos [[thread_position_in_grid]]
+) {
+  uint width = src.get_width();
+  uint height = src.get_height();
+  if (width > pos.x && height > pos.y) {
+    buffer[pos.y * desc.bytes_per_row + pos.x] = uchar(src.read(pos).y);
+  }
+}
+
 struct DXMTClearFloatMetadata {
   float4 value;
   uint2 offset;

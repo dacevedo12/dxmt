@@ -103,7 +103,8 @@ ResourceInitializer::initWithZero(BufferAllocation *buffer, uint64_t offset, uin
 
 uint64_t
 ResourceInitializer::initDepthStencilWithZero(
-    const Texture *texture, TextureAllocation *allocation, uint32_t slice, uint32_t level, uint32_t dsv_planar
+    const Texture *texture, TextureAllocation *allocation, uint32_t slice, uint32_t level, uint32_t dsv_planar,
+    float depth, uint8_t stencil
 ) {
   auto width_sub = std::max(1u, texture->width() >> level);
   auto height_sub = std::max(1u, texture->height() >> level);
@@ -113,12 +114,13 @@ ResourceInitializer::initDepthStencilWithZero(
     RETAIN(allocation);
     ALLOC_CLEAR(info);
 
-    info->render_target_array_length = 0;
+    info->render_target_array_length = 1;
     info->render_target_width = width_sub;
     info->render_target_height = height_sub;
+    info->default_raster_sample_count = texture->sampleCount();
     if (dsv_planar & 1) {
       info->depth.texture = allocation->texture();
-      info->depth.clear_depth = 0;
+      info->depth.clear_depth = depth;
       info->depth.load_action = WMTLoadActionClear;
       info->depth.store_action = WMTStoreActionStore;
       info->depth.slice = slice;
@@ -126,7 +128,7 @@ ResourceInitializer::initDepthStencilWithZero(
     }
     if (dsv_planar & 2) {
       info->stencil.texture = allocation->texture();
-      info->stencil.clear_stencil = 0;
+      info->stencil.clear_stencil = stencil;
       info->stencil.load_action = WMTLoadActionClear;
       info->stencil.store_action = WMTStoreActionStore;
       info->stencil.slice = slice;
@@ -140,7 +142,8 @@ ResourceInitializer::initDepthStencilWithZero(
 
 uint64_t
 ResourceInitializer::initRenderTargetWithZero(
-    const Texture *texture, TextureAllocation *allocation, uint32_t slice, uint32_t level
+    const Texture *texture, TextureAllocation *allocation, uint32_t slice, uint32_t level,
+    WMTClearColor color
 ) {
   auto width_sub = std::max(1u, texture->width() >> level);
   auto height_sub = std::max(1u, texture->height() >> level);
@@ -150,12 +153,16 @@ ResourceInitializer::initRenderTargetWithZero(
     RETAIN(allocation);
     ALLOC_CLEAR(info);
 
-    info->render_target_array_length = texture->textureType() == WMTTextureType3D ? (texture->depth() >> level) : 0;
+    info->render_target_array_length =
+        texture->textureType() == WMTTextureType3D
+            ? std::max(1u, texture->depth() >> level)
+            : 1;
     info->render_target_width = width_sub;
     info->render_target_height = height_sub;
+    info->default_raster_sample_count = texture->sampleCount();
     info->colors[0].texture = allocation->texture();
     info->colors[0].load_action = WMTLoadActionClear;
-    info->colors[0].clear_color = {0, 0, 0, 0};
+    info->colors[0].clear_color = color;
     info->colors[0].store_action = WMTStoreActionStore;
     info->colors[0].slice = slice;
     info->colors[0].level = level;

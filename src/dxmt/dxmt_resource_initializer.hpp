@@ -22,10 +22,12 @@ public:
   uint64_t initWithZero(BufferAllocation *buffer, uint64_t offset, uint64_t length);
 
   uint64_t initDepthStencilWithZero(
-      const Texture *texture, TextureAllocation *allocation, uint32_t slice, uint32_t level, uint32_t dsv_planar
+      const Texture *texture, TextureAllocation *allocation, uint32_t slice, uint32_t level, uint32_t dsv_planar,
+      float depth = 0.0f, uint8_t stencil = 0
   );
   uint64_t
-  initRenderTargetWithZero(const Texture *texture, TextureAllocation *allocation, uint32_t slice, uint32_t level);
+  initRenderTargetWithZero(const Texture *texture, TextureAllocation *allocation, uint32_t slice, uint32_t level,
+                           WMTClearColor color = {0, 0, 0, 0});
   uint64_t initWithZero(const Texture *texture, TextureAllocation *allocation, uint32_t slice, uint32_t level);
   uint64_t initWithData(
       const Texture *texture, TextureAllocation *allocation, uint32_t slice, uint32_t level, const void *data,

@@ -102,10 +102,9 @@ struct TextureSubresourceLayout {
 };
 
 static UINT
-GetMipLevels(const D3D12_RESOURCE_DESC &desc) {
-  if (desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER || desc.MipLevels)
-    return desc.MipLevels ? desc.MipLevels : 1;
-
+GetMaxMipLevels(const D3D12_RESOURCE_DESC &desc) {
+  if (desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER)
+    return 1;
   UINT64 width = std::max<UINT64>(1, desc.Width);
   UINT height = desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D
                     ? 1
@@ -121,6 +120,22 @@ GetMipLevels(const D3D12_RESOURCE_DESC &desc) {
     levels++;
   }
   return levels;
+}
+
+static UINT
+GetMipLevels(const D3D12_RESOURCE_DESC &desc) {
+  if (desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER)
+    return desc.MipLevels ? desc.MipLevels : 1;
+  if (desc.MipLevels)
+    return desc.MipLevels;
+  return GetMaxMipLevels(desc);
+}
+
+static UINT64
+GetDefaultResourceAlignment(const D3D12_RESOURCE_DESC &desc) {
+  return desc.SampleDesc.Count > 1
+             ? D3D12_DEFAULT_MSAA_RESOURCE_PLACEMENT_ALIGNMENT
+             : D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;
 }
 
 static bool
@@ -330,10 +345,19 @@ public:
                D3D12_HEAP_FLAGS heap_flags,
                const D3D12_RESOURCE_DESC &desc,
                D3D12_RESOURCE_STATES initial_state,
-               UINT64 heap_offset)
+               UINT64 heap_offset,
+               const D3D12_CLEAR_VALUE *optimized_clear_value)
       : device_(device), heap_properties_(heap_properties),
         heap_flags_(heap_flags), desc_(desc), initial_state_(initial_state),
-        heap_offset_(heap_offset) {
+        heap_offset_(heap_offset),
+        has_clear_value_(optimized_clear_value != nullptr) {
+    if (optimized_clear_value)
+      clear_value_ = *optimized_clear_value;
+    if (!desc_.Alignment)
+      desc_.Alignment = GetDefaultResourceAlignment(desc_);
+    if (desc_.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER && !desc_.MipLevels)
+      desc_.MipLevels = GetMaxMipLevels(desc_);
+
     if (desc_.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER)
       CreateBuffer();
     else
@@ -379,7 +403,7 @@ public:
 
   HRESULT STDMETHODCALLTYPE SetName(const WCHAR *name) override {
     name_ = name ? str::fromws(name) : std::string();
-    return S_OK;
+    return private_data_.setName(name);
   }
 
   HRESULT STDMETHODCALLTYPE GetDevice(REFIID riid, void **device) override {
@@ -390,7 +414,6 @@ public:
                                 void **data) override {
     if (!data)
       return E_POINTER;
-    *data = nullptr;
 
     if (desc_.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER || sub_resource != 0)
       return E_INVALIDARG;
@@ -862,7 +885,7 @@ private:
                             ? 1
                             : desc_.DepthOrArraySize;
     info.type = GetTextureType(desc_);
-    info.mipmap_level_count = GetMipLevels(desc_);
+    info.mipmap_level_count = std::min(GetMipLevels(desc_), GetMaxMipLevels(desc_));
     info.sample_count = desc_.SampleDesc.Count ? desc_.SampleDesc.Count : 1;
     info.usage = GetTextureUsage(desc_.Flags);
 
@@ -890,6 +913,58 @@ private:
     texture_allocation_ = texture_->allocate(flags);
     texture_->rename(Rc<dxmt::TextureAllocation>(texture_allocation_));
 
+    if (GetHeapType(heap_properties_) == D3D12_HEAP_TYPE_DEFAULT) {
+      InitializeTextureContents(format.PixelFormat);
+    }
+  }
+
+  void InitializeTextureContents(WMTPixelFormat pixel_format) {
+    auto &initializer = device_->GetDXMTDevice().queue().initializer;
+    const UINT mip_levels = desc_.MipLevels ? desc_.MipLevels : 1;
+    const UINT array_size =
+        desc_.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D
+            ? 1
+            : desc_.DepthOrArraySize;
+    const auto dsv_planar = DepthStencilPlanarFlags(pixel_format);
+
+    if (dsv_planar &&
+        (desc_.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL)) {
+      const float depth = has_clear_value_ ? clear_value_.DepthStencil.Depth : 0.0f;
+      const uint8_t stencil = has_clear_value_ ? clear_value_.DepthStencil.Stencil : 0;
+      for (UINT slice = 0; slice < array_size; ++slice) {
+        for (UINT level = 0; level < mip_levels; ++level) {
+          initializer.initDepthStencilWithZero(
+              texture_.ptr(), texture_->current(), slice, level, dsv_planar,
+              depth, stencil);
+        }
+      }
+      return;
+    }
+
+    if ((texture_->usage() & WMTTextureUsageRenderTarget) &&
+        (desc_.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET)) {
+      WMTClearColor color = {0, 0, 0, 0};
+      if (has_clear_value_) {
+        color.r = clear_value_.Color[0];
+        color.g = clear_value_.Color[1];
+        color.b = clear_value_.Color[2];
+        color.a = clear_value_.Color[3];
+      }
+      for (UINT slice = 0; slice < array_size; ++slice) {
+        for (UINT level = 0; level < mip_levels; ++level) {
+          initializer.initRenderTargetWithZero(
+              texture_.ptr(), texture_->current(), slice, level, color);
+        }
+      }
+      return;
+    }
+
+    for (UINT slice = 0; slice < array_size; ++slice) {
+      for (UINT level = 0; level < mip_levels; ++level) {
+        initializer.initWithZero(texture_.ptr(), texture_->current(),
+                                 slice, level);
+      }
+    }
   }
 
   Com<IMTLD3D12Device> device_;
@@ -899,6 +974,8 @@ private:
   D3D12_RESOURCE_DESC desc_ = {};
   D3D12_RESOURCE_STATES initial_state_ = D3D12_RESOURCE_STATE_COMMON;
   UINT64 heap_offset_ = 0;
+  D3D12_CLEAR_VALUE clear_value_ = {};
+  bool has_clear_value_ = false;
   Rc<dxmt::Buffer> buffer_;
   Rc<dxmt::BufferAllocation> buffer_allocation_;
   Rc<dxmt::Texture> texture_;
@@ -979,10 +1056,11 @@ Com<ID3D12Resource>
 CreateResource(IMTLD3D12Device *device,
                const D3D12_HEAP_PROPERTIES *heap_properties,
                D3D12_HEAP_FLAGS heap_flags, const D3D12_RESOURCE_DESC *desc,
-               D3D12_RESOURCE_STATES initial_state, UINT64 heap_offset) {
+               D3D12_RESOURCE_STATES initial_state, UINT64 heap_offset,
+               const D3D12_CLEAR_VALUE *optimized_clear_value) {
   return Com<ID3D12Resource>::transfer(
       new ResourceImpl(device, *heap_properties, heap_flags, *desc,
-                       initial_state, heap_offset));
+                       initial_state, heap_offset, optimized_clear_value));
 }
 
 } // namespace dxmt::d3d12

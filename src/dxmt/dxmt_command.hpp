@@ -292,6 +292,11 @@ public:
       uint64_t dst_length, uint32_t bytes_per_row, uint32_t bytes_per_image, bool to_d24s8
   );
 
+  void copyPlaneToBuffer(
+      const Rc<Texture> &src, TextureViewKey src_view, Rc<Buffer> dst, uint64_t dst_offset,
+      uint64_t dst_length, uint32_t bytes_per_row, uint32_t bytes_per_image, bool stencil_plane
+  );
+
 private:
   ArgumentEncodingContext &ctx_;
   WMT::Device device_;
@@ -300,6 +305,8 @@ private:
   WMT::Reference<WMT::RenderPipelineState> pso_copy_d32s8_;
   WMT::Reference<WMT::ComputePipelineState> pso_copy_to_buffer_d24s8_;
   WMT::Reference<WMT::ComputePipelineState> pso_copy_to_buffer_d32s8_;
+  WMT::Reference<WMT::ComputePipelineState> pso_copy_depth_to_buffer_r32_;
+  WMT::Reference<WMT::ComputePipelineState> pso_copy_stencil_to_buffer_r8_;
 };
 
 class ClearResourceKernelContext {

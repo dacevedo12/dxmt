@@ -233,6 +233,9 @@ struct ClearEncoderData : EncoderData {
   unsigned array_length;
   unsigned width;
   unsigned height;
+  uint16_t level = 0;
+  uint16_t slice = 0;
+  uint32_t depth_plane = 0;
 
   ClearEncoderData() {}
 };

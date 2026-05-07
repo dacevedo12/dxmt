@@ -29,7 +29,8 @@ public:
 Com<ID3D12Resource>
 CreateResource(IMTLD3D12Device *device, const D3D12_HEAP_PROPERTIES *heap_properties,
                D3D12_HEAP_FLAGS heap_flags, const D3D12_RESOURCE_DESC *desc,
-               D3D12_RESOURCE_STATES initial_state, UINT64 heap_offset);
+               D3D12_RESOURCE_STATES initial_state, UINT64 heap_offset,
+               const D3D12_CLEAR_VALUE *optimized_clear_value);
 
 bool IsSupportedResourceDesc(const D3D12_RESOURCE_DESC &desc);
 

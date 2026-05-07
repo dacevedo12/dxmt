@@ -352,6 +352,8 @@ DepthStencilBlitContext::DepthStencilBlitContext(
   auto fs_copy_d32s8 = library.newFunction("fs_copy_from_buffer_d32s8");
   auto cs_copy_d24s8 = library.newFunction("cs_copy_to_buffer_d24s8");
   auto cs_copy_d32s8 = library.newFunction("cs_copy_to_buffer_d32s8");
+  auto cs_copy_depth_to_buffer_r32 = library.newFunction("cs_copy_depth_to_buffer_r32_float");
+  auto cs_copy_stencil_to_buffer_r8 = library.newFunction("cs_copy_stencil_to_buffer_r8_uint");
 
   WMTRenderPipelineInfo pipeline_info;
   WMT::InitializeRenderPipelineInfo(pipeline_info);
@@ -389,6 +391,8 @@ DepthStencilBlitContext::DepthStencilBlitContext(
 
   pso_copy_to_buffer_d24s8_ = device_.newComputePipelineState(cs_copy_d24s8, err);
   pso_copy_to_buffer_d32s8_ = device_.newComputePipelineState(cs_copy_d32s8, err);
+  pso_copy_depth_to_buffer_r32_ = device_.newComputePipelineState(cs_copy_depth_to_buffer_r32, err);
+  pso_copy_stencil_to_buffer_r8_ = device_.newComputePipelineState(cs_copy_stencil_to_buffer_r8, err);
 }
 
 struct linear_texture_desc {
@@ -516,7 +520,7 @@ DepthStencilBlitContext::copyFromTexture(
   view_desc.intendedUsage = WMTTextureUsageRenderTarget;
   auto depth_view = depth_stencil->createView(view_desc);
 
-  view_desc.format = WMTPixelFormatX32_Stencil8;
+  view_desc.format = WMTPixelFormatX32G8X32;
   auto stencil_view = depth_stencil->createView(view_desc);
 
   ctx_.startComputePass(0);
@@ -556,6 +560,49 @@ DepthStencilBlitContext::copyFromTexture(
 
   auto width = depth_stencil->width(depth_view);
   auto height = depth_stencil->height(depth_view);
+  auto &dispatch = ctx_.encodeComputeCommand<wmtcmd_compute_dispatch>();
+  dispatch.type = WMTComputeCommandDispatchThreads;
+  dispatch.size = {width, height, 1};
+
+  ctx_.endPass();
+}
+
+void
+DepthStencilBlitContext::copyPlaneToBuffer(
+    const Rc<Texture> &src, TextureViewKey src_view, Rc<Buffer> dst, uint64_t dst_offset,
+    uint64_t dst_length, uint32_t bytes_per_row, uint32_t bytes_per_image, bool stencil_plane
+) {
+  ctx_.startComputePass(0);
+  auto src_texture = ctx_.access(src, src_view, ResourceAccess::Read).texture;
+  auto [dst_buffer, dst_sub_offset] = ctx_.access(dst, dst_offset, dst_length, ResourceAccess::Write);
+
+  auto &setpso = ctx_.encodeComputeCommand<wmtcmd_compute_setpso>();
+  setpso.type = WMTComputeCommandSetPSO;
+  setpso.pso = stencil_plane ? pso_copy_stencil_to_buffer_r8_ : pso_copy_depth_to_buffer_r32_;
+  setpso.threadgroup_size = {8, 8, 1};
+
+  auto &setsrc = ctx_.encodeComputeCommand<wmtcmd_compute_settexture>();
+  setsrc.type = WMTComputeCommandSetTexture;
+  setsrc.texture = src_texture;
+  setsrc.index = 0;
+
+  linear_texture_desc desc{bytes_per_row, bytes_per_image};
+  auto &setdesc = ctx_.encodeComputeCommand<wmtcmd_compute_setbytes>();
+  setdesc.type = WMTComputeCommandSetBytes;
+  void *temp = ctx_.allocate_cpu_heap(sizeof(desc), 16);
+  memcpy(temp, &desc, sizeof(desc));
+  setdesc.bytes.set(temp);
+  setdesc.length = sizeof(desc);
+  setdesc.index = 1;
+
+  auto &setbuf = ctx_.encodeComputeCommand<wmtcmd_compute_setbuffer>();
+  setbuf.type = WMTComputeCommandSetBuffer;
+  setbuf.buffer = dst_buffer->buffer();
+  setbuf.index = 0;
+  setbuf.offset = dst_offset + dst_sub_offset;
+
+  auto width = src->width(src_view);
+  auto height = src->height(src_view);
   auto &dispatch = ctx_.encodeComputeCommand<wmtcmd_compute_dispatch>();
   dispatch.type = WMTComputeCommandDispatchThreads;
   dispatch.size = {width, height, 1};

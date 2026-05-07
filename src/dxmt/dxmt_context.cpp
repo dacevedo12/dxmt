@@ -1102,6 +1102,9 @@ DebugLogClearPassInfo(uint64_t frame_id, uint64_t seq_id, uint64_t encoder_id,
       " size=", data->width, "x", data->height,
       " array_length=", uint32_t(data->array_length),
       " clear_dsv=", uint32_t(data->clear_dsv),
+      " level=", uint32_t(data->level),
+      " slice=", uint32_t(data->slice),
+      " depth_plane=", uint32_t(data->depth_plane),
       " texture=", uint64_t(texture),
       " view=", data->attachment ? uint64_t(data->attachment->key) : data->buffer_view_id,
       " color=", data->color.r, ",", data->color.g, ",", data->color.b, ",", data->color.a,
@@ -1650,6 +1653,9 @@ ArgumentEncodingContext::clearColor(Rc<Texture> &&texture, uint64_t viewId, unsi
   encoder_current = encoder_info;
 
   encoder_info->attachment = access(texture, viewId, ResourceAccess::Write);
+  encoder_info->level = 0;
+  encoder_info->slice = 0;
+  encoder_info->depth_plane = 0;
 
   currentFrameStatistics().clear_pass_count++;
 
@@ -1701,6 +1707,9 @@ ArgumentEncodingContext::clearDepthStencil(
   encoder_current = encoder_info;
 
   encoder_info->attachment = access(texture, viewId, ResourceAccess::Write);
+  encoder_info->level = 0;
+  encoder_info->slice = 0;
+  encoder_info->depth_plane = 0;
 
   currentFrameStatistics().clear_pass_count++;
   
@@ -2433,12 +2442,18 @@ ArgumentEncodingContext::flushCommands(WMT::CommandBuffer cmdbuf, uint64_t seqId
           if (data->clear_dsv & 1) {
             info.depth.clear_depth = data->depth_stencil.first;
             info.depth.texture = data->attachment.texture();
+            info.depth.level = data->level;
+            info.depth.slice = data->slice;
+            info.depth.depth_plane = data->depth_plane;
             info.depth.load_action = WMTLoadActionClear;
             info.depth.store_action = WMTStoreActionStore;
           }
           if (data->clear_dsv & 2) {
             info.stencil.clear_stencil = data->depth_stencil.second;
             info.stencil.texture = data->attachment.texture();
+            info.stencil.level = data->level;
+            info.stencil.slice = data->slice;
+            info.stencil.depth_plane = data->depth_plane;
             info.stencil.load_action = WMTLoadActionClear;
             info.stencil.store_action = WMTStoreActionStore;
           }
@@ -2462,6 +2477,9 @@ ArgumentEncodingContext::flushCommands(WMT::CommandBuffer cmdbuf, uint64_t seqId
           }
           info.colors[0].clear_color = data->color;
           info.colors[0].texture = color_texture;
+          info.colors[0].level = data->level;
+          info.colors[0].slice = data->slice;
+          info.colors[0].depth_plane = data->depth_plane;
           info.colors[0].load_action = WMTLoadActionClear;
           info.colors[0].store_action = WMTStoreActionStore;
         }
@@ -2779,9 +2797,15 @@ ArgumentEncodingContext::checkEncoderRelation(EncoderData *former, EncoderData *
       r1->depth.load_action = r0->depth.load_action;
       r1->depth.clear_depth = r0->depth.clear_depth;
       r1->depth.store_action = r0->depth.store_action;
+      r1->depth.level = r0->depth.level;
+      r1->depth.slice = r0->depth.slice;
+      r1->depth.depth_plane = r0->depth.depth_plane;
       r1->stencil.load_action = r0->stencil.load_action;
       r1->stencil.clear_stencil = r0->stencil.clear_stencil;
       r1->stencil.store_action = r0->stencil.store_action;
+      r1->stencil.level = r0->stencil.level;
+      r1->stencil.slice = r0->stencil.slice;
+      r1->stencil.depth_plane = r0->stencil.depth_plane;
 
       if ((void *)r0->cmd_tail != &r0->cmd_head) {
         if (r0->allocated_argbuf != r1->allocated_argbuf) {
@@ -2887,6 +2911,9 @@ ArgumentEncodingContext::isEncoderSignatureMatched(RenderEncoderData *r0, Render
   if (r0->dsv_planar_flags & 1) {
     if (r0->depth.attachment != r1->depth.attachment)
       return false;
+    if (r0->depth.level != r1->depth.level || r0->depth.slice != r1->depth.slice ||
+        r0->depth.depth_plane != r1->depth.depth_plane)
+      return false;
     if (r0->dsv_readonly_flags & 1) {
       if (r1->depth.load_action == WMTLoadActionClear)
         return false;
@@ -2899,6 +2926,9 @@ ArgumentEncodingContext::isEncoderSignatureMatched(RenderEncoderData *r0, Render
   }
   if (r0->dsv_planar_flags & 2) {
     if (r0->stencil.attachment != r1->stencil.attachment)
+      return false;
+    if (r0->stencil.level != r1->stencil.level || r0->stencil.slice != r1->stencil.slice ||
+        r0->stencil.depth_plane != r1->stencil.depth_plane)
       return false;
     if (r0->dsv_readonly_flags & 2) {
       if (r1->stencil.load_action == WMTLoadActionClear)
@@ -2953,6 +2983,9 @@ ArgumentEncodingContext::isClearDepthSignatureMatched(ClearEncoderData *clear, R
     return nullptr;
   if (render->depth.attachment != clear->attachment)
     return nullptr;
+  if (render->depth.level != clear->level || render->depth.slice != clear->slice ||
+      render->depth.depth_plane != clear->depth_plane)
+    return nullptr;
   return &render->depth;
 }
 
@@ -2961,6 +2994,9 @@ ArgumentEncodingContext::isClearStencilSignatureMatched(ClearEncoderData *clear,
   if ((clear->clear_dsv & 2) == 0)
     return nullptr;
   if (render->stencil.attachment != clear->attachment)
+    return nullptr;
+  if (render->stencil.level != clear->level || render->stencil.slice != clear->slice ||
+      render->stencil.depth_plane != clear->depth_plane)
     return nullptr;
   return &render->stencil;
 }
