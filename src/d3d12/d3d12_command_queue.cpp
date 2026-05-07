@@ -3996,6 +3996,10 @@ private:
                                            srv.Format, offset, byte_size,
                                            WMTTextureUsageShaderRead);
                 if (!view_id) {
+                  // TODO(d3d12): typed buffer SRV shaders that reflect as
+                  // texture arguments need a real typed Metal texture-buffer
+                  // view. The raw-buffer fallback cannot preserve typed load
+                  // conversion for all formats.
                   WARN("D3D12CommandQueue: typed buffer SRV failed to create Metal texture buffer view format=",
                        uint32_t(srv.Format),
                        "; falling back to raw buffer binding");
@@ -4130,6 +4134,9 @@ private:
                                            WMTTextureUsageShaderRead |
                                                WMTTextureUsageShaderWrite);
                 if (!view_id) {
+                  // TODO(d3d12): typed buffer UAV shaders that reflect as
+                  // texture arguments need a real typed Metal texture-buffer
+                  // view. The raw-buffer fallback loses typed UAV semantics.
                   WARN("D3D12CommandQueue: typed buffer UAV failed to create Metal texture buffer view format=",
                        uint32_t(uav.Format),
                        "; falling back to raw buffer binding");
@@ -4377,6 +4384,9 @@ private:
                 lower < range.base_shader_register)
               continue;
             const auto first = lower - range.base_shader_register;
+            // TODO(d3d12): unbounded descriptor ranges are currently clamped
+            // to reflected shader usage. Bindless tests need full descriptor
+            // table residency and dynamic indexing beyond reflected slots.
             const auto size =
                 arg_count == UINT_MAX ? 1u : std::max<UINT>(arg_count, 1u);
             count = std::max(count, first + size);
@@ -6430,6 +6440,8 @@ private:
       }
 
       if (!view_id && !raw_buffer) {
+        // TODO(d3d12): support formatted/structured UAV buffer clears when a
+        // Metal texture-buffer view cannot be created for the requested UAV.
         WARN("D3D12CommandQueue: ClearUnorderedAccessView buffer view is unsupported");
         return;
       }

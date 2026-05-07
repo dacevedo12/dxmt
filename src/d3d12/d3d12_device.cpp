@@ -39,6 +39,91 @@ SubresourceMipSlice(UINT sub_resource, UINT mip_levels) {
   return mip_levels ? sub_resource % mip_levels : 0;
 }
 
+static UINT
+GetD3D12FormatPlaneCount(DXGI_FORMAT format) {
+  switch (format) {
+  case DXGI_FORMAT_R32G8X24_TYPELESS:
+  case DXGI_FORMAT_D32_FLOAT_S8X24_UINT:
+  case DXGI_FORMAT_R24G8_TYPELESS:
+  case DXGI_FORMAT_D24_UNORM_S8_UINT:
+  case DXGI_FORMAT_NV12:
+  case DXGI_FORMAT_P010:
+  case DXGI_FORMAT_P016:
+    return 2;
+  default:
+    return 1;
+  }
+}
+
+static DXGI_FORMAT
+GetD3D12FootprintFormat(DXGI_FORMAT format, UINT plane) {
+  switch (format) {
+  case DXGI_FORMAT_R32G8X24_TYPELESS:
+  case DXGI_FORMAT_D32_FLOAT_S8X24_UINT:
+  case DXGI_FORMAT_R24G8_TYPELESS:
+  case DXGI_FORMAT_D24_UNORM_S8_UINT:
+  case DXGI_FORMAT_R24_UNORM_X8_TYPELESS:
+    return plane ? DXGI_FORMAT_R8_TYPELESS : DXGI_FORMAT_R32_TYPELESS;
+  case DXGI_FORMAT_NV12:
+    return plane ? DXGI_FORMAT_R8G8_TYPELESS : DXGI_FORMAT_R8_TYPELESS;
+  case DXGI_FORMAT_P010:
+  case DXGI_FORMAT_P016:
+    return plane ? DXGI_FORMAT_R16G16_TYPELESS : DXGI_FORMAT_R16_TYPELESS;
+  case DXGI_FORMAT_420_OPAQUE:
+    return DXGI_FORMAT_R8_TYPELESS;
+  default:
+    return format;
+  }
+}
+
+static UINT
+GetD3D12FormatPlaneElementSize(DXGI_FORMAT format, UINT plane,
+                               const MTL_DXGI_FORMAT_DESC &format_desc) {
+  switch (format) {
+  case DXGI_FORMAT_R32G8X24_TYPELESS:
+  case DXGI_FORMAT_D32_FLOAT_S8X24_UINT:
+  case DXGI_FORMAT_R24G8_TYPELESS:
+  case DXGI_FORMAT_D24_UNORM_S8_UINT:
+  case DXGI_FORMAT_R24_UNORM_X8_TYPELESS:
+    return plane ? 1 : 4;
+  case DXGI_FORMAT_NV12:
+    return plane ? 2 : 1;
+  case DXGI_FORMAT_P010:
+  case DXGI_FORMAT_P016:
+    return plane ? 4 : 2;
+  default:
+    return (format_desc.Flag & MTL_DXGI_FORMAT_BC)
+               ? format_desc.BlockSize
+               : format_desc.BytesPerTexel;
+  }
+}
+
+static UINT
+GetD3D12FormatBlockWidth(const MTL_DXGI_FORMAT_DESC &format_desc) {
+  return (format_desc.Flag & MTL_DXGI_FORMAT_BC) ? 4 : 1;
+}
+
+static UINT
+GetD3D12FormatBlockHeight(const MTL_DXGI_FORMAT_DESC &format_desc) {
+  return (format_desc.Flag & MTL_DXGI_FORMAT_BC) ? 4 : 1;
+}
+
+static void
+GetD3D12FormatSubsampleLog2(DXGI_FORMAT format, UINT plane, UINT &x, UINT &y) {
+  switch (format) {
+  case DXGI_FORMAT_NV12:
+  case DXGI_FORMAT_P010:
+  case DXGI_FORMAT_P016:
+    x = plane;
+    y = plane;
+    break;
+  default:
+    x = 0;
+    y = 0;
+    break;
+  }
+}
+
 static UINT64
 MipSize(UINT64 value, UINT mip_slice) {
   return std::max<UINT64>(1, value >> mip_slice);
@@ -61,6 +146,40 @@ HasInvalidCpuVisibleBufferFlags(const D3D12_RESOURCE_DESC &desc,
   return desc.Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET |
                        D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS |
                        D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS);
+}
+
+static bool
+IsValidCrossAdapterTextureDesc(const D3D12_HEAP_PROPERTIES &heap_properties,
+                               D3D12_HEAP_FLAGS heap_flags,
+                               const D3D12_RESOURCE_DESC &desc) {
+  const bool cross_adapter =
+      desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER;
+  const bool cross_adapter_heap =
+      heap_flags & D3D12_HEAP_FLAG_SHARED_CROSS_ADAPTER;
+
+  if (!cross_adapter && !cross_adapter_heap)
+    return true;
+
+  if (!cross_adapter || !cross_adapter_heap ||
+      !(heap_flags & D3D12_HEAP_FLAG_SHARED))
+    return false;
+  if (d3d12::GetHeapType(heap_properties) != D3D12_HEAP_TYPE_DEFAULT)
+    return false;
+  return desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
+         desc.Layout == D3D12_TEXTURE_LAYOUT_ROW_MAJOR &&
+         desc.MipLevels <= 1 && desc.DepthOrArraySize == 1 &&
+         desc.SampleDesc.Count == 1;
+}
+
+static bool
+IsValidCopyableFootprintDesc(const D3D12_RESOURCE_DESC &desc) {
+  if (desc.Width == 0 || desc.Height == 0 || desc.DepthOrArraySize == 0)
+    return false;
+  if (desc.SampleDesc.Count == 0)
+    return false;
+  if (desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER)
+    return desc.Format == DXGI_FORMAT_UNKNOWN;
+  return desc.Format != DXGI_FORMAT_UNKNOWN;
 }
 
 static bool
@@ -194,7 +313,7 @@ GetD3D12FormatSupport2(FormatCapability caps) {
 }
 
 static UINT8
-GetD3D12FormatPlaneCount(DXGI_FORMAT dxgi_format,
+GetD3D12FormatPlaneCountForFeatureData(DXGI_FORMAT dxgi_format,
                          const MTL_DXGI_FORMAT_DESC &format) {
   switch (dxgi_format) {
   case DXGI_FORMAT_R32G8X24_TYPELESS:
@@ -938,7 +1057,7 @@ public:
         return S_OK;
       }
 
-      data->PlaneCount = GetD3D12FormatPlaneCount(data->Format, format);
+      data->PlaneCount = GetD3D12FormatPlaneCountForFeatureData(data->Format, format);
       return S_OK;
     }
     case D3D12_FEATURE_GPU_VIRTUAL_ADDRESS_SUPPORT: {
@@ -1869,7 +1988,7 @@ private:
                                        : desc.DepthOrArraySize);
         UINT64 total_bytes = 0;
         GetCopyableFootprintsImpl(&desc, 0, subresources, 0, nullptr, nullptr,
-                                  nullptr, &total_bytes);
+                                  nullptr, &total_bytes, false);
         size = total_bytes;
       }
       if (!info.Alignment)
@@ -1926,12 +2045,18 @@ private:
       }
       if (desc->Flags & D3D12_HEAP_FLAG_ALLOW_DISPLAY)
         return false;
+      if ((desc->Flags & D3D12_HEAP_FLAG_SHARED_CROSS_ADAPTER) &&
+          desc->Properties.CPUPageProperty !=
+              D3D12_CPU_PAGE_PROPERTY_NOT_AVAILABLE)
+        return false;
       return true;
     }
     if (desc->Properties.CPUPageProperty != D3D12_CPU_PAGE_PROPERTY_UNKNOWN ||
         desc->Properties.MemoryPoolPreference != D3D12_MEMORY_POOL_UNKNOWN)
       return false;
     if (desc->Flags & D3D12_HEAP_FLAG_ALLOW_DISPLAY)
+      return false;
+    if (desc->Flags & D3D12_HEAP_FLAG_SHARED_CROSS_ADAPTER)
       return false;
     switch (desc->Properties.Type) {
     case D3D12_HEAP_TYPE_DEFAULT:
@@ -2028,6 +2153,8 @@ private:
       return false;
 
     const auto heap_type = d3d12::GetHeapType(*heap_properties);
+    if (!IsValidCrossAdapterTextureDesc(*heap_properties, heap_flags, *desc))
+      return false;
     if (HasInvalidCpuVisibleBufferFlags(*desc, heap_type))
       return false;
     if (heap_type == D3D12_HEAP_TYPE_UPLOAD ||
@@ -2072,6 +2199,9 @@ private:
       return false;
 
     const auto heap_type = heap.GetHeapType();
+    if (!IsValidCrossAdapterTextureDesc(heap.GetHeapDesc().Properties,
+                                        heap.GetHeapDesc().Flags, *desc))
+      return false;
     if (HasInvalidCpuVisibleBufferFlags(*desc, heap_type))
       return false;
     if ((heap_type == D3D12_HEAP_TYPE_UPLOAD ||
@@ -2101,9 +2231,29 @@ private:
       const D3D12_RESOURCE_DESC *desc, UINT first_sub_resource,
       UINT sub_resource_count, UINT64 base_offset,
       D3D12_PLACED_SUBRESOURCE_FOOTPRINT *layouts, UINT *row_count,
-      UINT64 *row_size, UINT64 *total_bytes) const {
+      UINT64 *row_size, UINT64 *total_bytes,
+      bool strict_resource_desc = true) const {
     UINT64 offset = 0;
     UINT64 total = 0;
+
+    auto set_invalid = [&]() {
+      for (UINT i = 0; i < sub_resource_count; i++) {
+        if (layouts) {
+          layouts[i].Offset = UINT64_MAX;
+          layouts[i].Footprint.Format = static_cast<DXGI_FORMAT>(~0u);
+          layouts[i].Footprint.Width = ~0u;
+          layouts[i].Footprint.Height = ~0u;
+          layouts[i].Footprint.Depth = ~0u;
+          layouts[i].Footprint.RowPitch = ~0u;
+        }
+        if (row_count)
+          row_count[i] = ~0u;
+        if (row_size)
+          row_size[i] = UINT64_MAX;
+      }
+      if (total_bytes)
+        *total_bytes = UINT64_MAX;
+    };
 
     if (!desc || sub_resource_count == 0) {
       if (total_bytes)
@@ -2111,23 +2261,48 @@ private:
       return;
     }
 
+    if (!(strict_resource_desc ? d3d12::IsSupportedResourceDesc(*desc)
+                               : IsValidCopyableFootprintDesc(*desc))) {
+      set_invalid();
+      return;
+    }
+
     MTL_DXGI_FORMAT_DESC format = {};
     if (desc->Dimension != D3D12_RESOURCE_DIMENSION_BUFFER &&
         FAILED(MTLQueryDXGIFormat(device_->device(), desc->Format, format))) {
-      if (total_bytes)
-        *total_bytes = 0;
+      set_invalid();
       return;
     }
 
     const UINT mip_levels = desc->MipLevels ? desc->MipLevels : 1;
+    const UINT array_size =
+        desc->Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D
+            ? 1
+            : desc->DepthOrArraySize;
+    const UINT plane_count =
+        desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER
+            ? 1
+            : GetD3D12FormatPlaneCount(desc->Format);
+    const UINT subresources_per_plane = mip_levels * array_size;
+    const UINT max_subresources = subresources_per_plane * plane_count;
+    if (first_sub_resource >= max_subresources ||
+        sub_resource_count > max_subresources - first_sub_resource) {
+      set_invalid();
+      return;
+    }
     for (UINT i = 0; i < sub_resource_count; i++) {
       const UINT subresource = first_sub_resource + i;
+      const UINT plane =
+          subresources_per_plane ? subresource / subresources_per_plane : 0;
+      const UINT plane_subresource =
+          subresources_per_plane ? subresource % subresources_per_plane
+                                 : subresource;
       D3D12_SUBRESOURCE_FOOTPRINT footprint = {};
       UINT rows = 1;
       UINT64 unpadded_row_size = desc->Width;
       UINT64 subresource_size = desc->Width;
 
-      footprint.Format = desc->Format;
+      footprint.Format = GetD3D12FootprintFormat(desc->Format, plane);
 
       if (desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
         footprint.Width = static_cast<UINT>(desc->Width);
@@ -2137,34 +2312,49 @@ private:
             static_cast<UINT>(Align(desc->Width, D3D12_TEXTURE_DATA_PITCH_ALIGNMENT));
         subresource_size = desc->Width;
       } else {
-        const UINT mip_slice = SubresourceMipSlice(subresource, mip_levels);
-        const UINT64 width = MipSize(desc->Width, mip_slice);
-        const UINT height = static_cast<UINT>(MipSize(desc->Height, mip_slice));
+        if (plane >= plane_count) {
+          WARN("D3D12Device: GetCopyableFootprints subresource plane out of range subresource=",
+               subresource, " plane=", plane, " plane_count=", plane_count);
+          break;
+        }
+
+        const UINT mip_slice = SubresourceMipSlice(plane_subresource, mip_levels);
+        UINT subsample_x_log2 = 0;
+        UINT subsample_y_log2 = 0;
+        GetD3D12FormatSubsampleLog2(desc->Format, plane, subsample_x_log2,
+                                    subsample_y_log2);
+        const UINT64 width =
+            Align(MipSize(desc->Width, mip_slice + subsample_x_log2),
+                  GetD3D12FormatBlockWidth(format));
+        const UINT height = static_cast<UINT>(
+            Align(MipSize(desc->Height, mip_slice + subsample_y_log2),
+                  GetD3D12FormatBlockHeight(format)));
         const UINT depth = desc->Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D
                                ? static_cast<UINT>(MipSize(desc->DepthOrArraySize, mip_slice))
                                : 1;
+        const UINT block_width = GetD3D12FormatBlockWidth(format);
+        const UINT block_height = GetD3D12FormatBlockHeight(format);
+        const UINT element_size =
+            GetD3D12FormatPlaneElementSize(desc->Format, plane, format);
+        const UINT num_planes = std::max(1u, plane_count);
 
         footprint.Width = static_cast<UINT>(width);
         footprint.Height = height;
         footprint.Depth = depth;
 
-        if (format.Flag & MTL_DXGI_FORMAT_BC) {
-          const UINT block_width = static_cast<UINT>((width + 3) / 4);
-          const UINT block_height = (height + 3) / 4;
-          rows = std::max(1u, block_height);
-          unpadded_row_size = block_width * format.BlockSize;
-        } else {
-          rows = height;
-          unpadded_row_size = width * format.BytesPerTexel;
-        }
+        rows = std::max(1u, height / block_height);
+        unpadded_row_size = (width / block_width) * element_size;
 
+        UINT64 row_alignment = D3D12_TEXTURE_DATA_PITCH_ALIGNMENT;
+        if (num_planes == 2 || desc->Format == DXGI_FORMAT_420_OPAQUE)
+          row_alignment *= 2;
         footprint.RowPitch = static_cast<UINT>(
-            Align(unpadded_row_size, D3D12_TEXTURE_DATA_PITCH_ALIGNMENT));
+            Align(unpadded_row_size, row_alignment));
         const UINT64 row_span =
             rows > 1 ? (rows - 1) * UINT64(footprint.RowPitch) + unpadded_row_size
                      : unpadded_row_size;
         const UINT64 slice_pitch =
-            Align(row_span, D3D12_TEXTURE_DATA_PITCH_ALIGNMENT);
+            Align(row_span, D3D12_TEXTURE_DATA_PITCH_ALIGNMENT * num_planes);
         subresource_size =
             depth > 1 ? (depth - 1) * slice_pitch + row_span : row_span;
       }

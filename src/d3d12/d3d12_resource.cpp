@@ -175,6 +175,22 @@ IsCpuLinearTextureSubresource(const D3D12_RESOURCE_DESC &desc,
          desc.DepthOrArraySize == 1 && desc.SampleDesc.Count == 1;
 }
 
+static bool
+IsTextureSubresourceMappable(const D3D12_RESOURCE_DESC &desc,
+                             UINT sub_resource,
+                             const D3D12_HEAP_PROPERTIES &heap_properties) {
+  const auto heap_type = GetHeapType(heap_properties);
+
+  if (heap_type == D3D12_HEAP_TYPE_DEFAULT)
+    return false;
+  if (desc.Layout == D3D12_TEXTURE_LAYOUT_ROW_MAJOR)
+    return false;
+  if (desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D &&
+      GetMipLevels(desc) > 1)
+    return false;
+  return sub_resource < GetTextureSubresourceCount(desc);
+}
+
 static HRESULT
 GetTextureSubresourceLayout(WMT::Device device,
                             const D3D12_RESOURCE_DESC &desc,
@@ -412,16 +428,32 @@ public:
 
   HRESULT STDMETHODCALLTYPE Map(UINT sub_resource, const D3D12_RANGE *read_range,
                                 void **data) override {
+    if (sub_resource >= GetTextureSubresourceCount(desc_))
+      return E_INVALIDARG;
+
+    if (desc_.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
+      if (sub_resource != 0 || !buffer_allocation_ ||
+          !buffer_allocation_->mappedMemory(0))
+        return E_INVALIDARG;
+
+      if (data)
+        *data = static_cast<char *>(buffer_allocation_->mappedMemory(0)) +
+                heap_offset_;
+      return S_OK;
+    }
+
+    if (!texture_allocation_ ||
+        !IsTextureSubresourceMappable(desc_, sub_resource, heap_properties_))
+      return E_INVALIDARG;
+
     if (!data)
-      return E_POINTER;
+      return S_OK;
 
-    if (desc_.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER || sub_resource != 0)
-      return E_INVALIDARG;
-    if (!buffer_allocation_ || !buffer_allocation_->mappedMemory(0))
+    if (!texture_allocation_->mappedMemory ||
+        !IsCpuLinearTextureSubresource(desc_, sub_resource))
       return E_INVALIDARG;
 
-    *data = static_cast<char *>(buffer_allocation_->mappedMemory(0)) +
-            heap_offset_;
+    *data = texture_allocation_->mappedMemory;
     return S_OK;
   }
 
@@ -467,8 +499,7 @@ public:
       return E_POINTER;
 
     if (desc_.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER)
-      return WriteBufferSubresource(dst_sub_resource, dst_box, src_data,
-                                    src_row_pitch, src_slice_pitch);
+      return E_INVALIDARG;
 
     return WriteTextureSubresource(dst_sub_resource, dst_box, src_data,
                                    src_row_pitch, src_slice_pitch);
@@ -481,8 +512,7 @@ public:
       return E_POINTER;
 
     if (desc_.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER)
-      return ReadBufferSubresource(dst_data, dst_row_pitch, dst_slice_pitch,
-                                   src_sub_resource, src_box);
+      return E_INVALIDARG;
 
     return ReadTextureSubresource(dst_data, dst_row_pitch, dst_slice_pitch,
                                   src_sub_resource, src_box);
@@ -539,94 +569,6 @@ public:
   }
 
 private:
-  HRESULT WriteBufferSubresource(UINT dst_sub_resource,
-                                 const D3D12_BOX *dst_box,
-                                 const void *src_data, UINT src_row_pitch,
-                                 UINT src_slice_pitch) {
-    if (dst_sub_resource != 0 || !buffer_allocation_ ||
-        !buffer_allocation_->mappedMemory(0))
-      return E_INVALIDARG;
-
-    const UINT64 begin = dst_box ? dst_box->left : 0;
-    const UINT64 end = dst_box ? dst_box->right : desc_.Width;
-    if (begin >= end || end > desc_.Width)
-      return E_INVALIDARG;
-
-    const UINT64 row_size = end - begin;
-    if (row_size > UINT32_MAX)
-      return E_INVALIDARG;
-
-    UINT row_count = 1;
-    if (dst_box) {
-      if (dst_box->top >= dst_box->bottom ||
-          dst_box->front >= dst_box->back)
-        return E_INVALIDARG;
-      row_count = (dst_box->bottom - dst_box->top) *
-                  (dst_box->back - dst_box->front);
-      if (row_size * row_count > desc_.Width - begin)
-        return E_INVALIDARG;
-    }
-    if (FAILED(ValidateTextureCopyPitches(row_size, row_count,
-                                          src_row_pitch ? src_row_pitch
-                                                        : static_cast<UINT>(row_size),
-                                          src_slice_pitch)))
-      return E_INVALIDARG;
-
-    auto *dst = static_cast<char *>(buffer_allocation_->mappedMemory(0)) +
-                heap_offset_ + begin;
-    const auto *src = static_cast<const char *>(src_data);
-    const UINT dst_row_pitch = static_cast<UINT>(row_size);
-    const UINT src_pitch = src_row_pitch ? src_row_pitch : dst_row_pitch;
-    for (UINT row = 0; row < row_count; row++)
-      std::memcpy(dst + row * dst_row_pitch, src + row * src_pitch,
-                  static_cast<size_t>(row_size));
-
-    buffer_allocation_->flushCpuShadow(heap_offset_ + begin, row_size * row_count);
-    return S_OK;
-  }
-
-  HRESULT ReadBufferSubresource(void *dst_data, UINT dst_row_pitch,
-                                UINT dst_slice_pitch, UINT src_sub_resource,
-                                const D3D12_BOX *src_box) {
-    if (src_sub_resource != 0 || !buffer_allocation_ ||
-        !buffer_allocation_->mappedMemory(0))
-      return E_INVALIDARG;
-
-    const UINT64 begin = src_box ? src_box->left : 0;
-    const UINT64 end = src_box ? src_box->right : desc_.Width;
-    if (begin >= end || end > desc_.Width)
-      return E_INVALIDARG;
-
-    const UINT64 row_size = end - begin;
-    if (row_size > UINT32_MAX)
-      return E_INVALIDARG;
-
-    UINT row_count = 1;
-    if (src_box) {
-      if (src_box->top >= src_box->bottom ||
-          src_box->front >= src_box->back)
-        return E_INVALIDARG;
-      row_count = (src_box->bottom - src_box->top) *
-                  (src_box->back - src_box->front);
-      if (row_size * row_count > desc_.Width - begin)
-        return E_INVALIDARG;
-    }
-    const UINT dst_pitch =
-        dst_row_pitch ? dst_row_pitch : static_cast<UINT>(row_size);
-    if (FAILED(ValidateTextureCopyPitches(row_size, row_count, dst_pitch,
-                                          dst_slice_pitch)))
-      return E_INVALIDARG;
-
-    const auto *src =
-        static_cast<const char *>(buffer_allocation_->mappedMemory(0)) +
-        heap_offset_ + begin;
-    auto *dst = static_cast<char *>(dst_data);
-    for (UINT row = 0; row < row_count; row++)
-      std::memcpy(dst + row * dst_pitch, src + row * row_size,
-                  static_cast<size_t>(row_size));
-    return S_OK;
-  }
-
   HRESULT WriteTextureSubresource(UINT dst_sub_resource,
                                   const D3D12_BOX *dst_box,
                                   const void *src_data, UINT src_row_pitch,
@@ -898,6 +840,9 @@ private:
                                              desc_, 0, layout));
 
     if (linear_cpu_texture) {
+      // TODO(d3d12): extend CPU-linear custom heap textures beyond the
+      // single-subresource 2D case so ReadFromSubresource/WriteToSubresource
+      // can cover the full D3D12 custom-heap texture surface.
       texture_ = new dxmt::Texture(layout.slice_pitch, layout.row_pitch, info,
                                    device_->GetDXMTDevice().device());
     } else {
