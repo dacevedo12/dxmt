@@ -850,6 +850,7 @@ public:
       record.src = resolve.src;
       record.src_subresource = resolve.src_subresource;
       record.format = resolve.format;
+      record.mode = resolve.mode;
       AddRecord(std::move(record));
     }
     pending_render_pass_resolves_.clear();
@@ -1069,7 +1070,7 @@ private:
       pending_render_pass_resolves_.push_back(PendingRenderPassResolve{
           resolve.pSrcResource, resolve.pDstResource,
           subresource.SrcSubresource, subresource.DstSubresource,
-          resolve.Format});
+          resolve.Format, resolve.ResolveMode});
     }
   }
 #endif

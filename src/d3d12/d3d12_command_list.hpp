@@ -92,6 +92,7 @@ struct PendingRenderPassResolve {
   UINT src_subresource = 0;
   UINT dst_subresource = 0;
   DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
+  D3D12_RESOLVE_MODE mode = D3D12_RESOLVE_MODE_AVERAGE;
 };
 
 struct WriteBufferImmediateRecord {

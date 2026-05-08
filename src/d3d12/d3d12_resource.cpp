@@ -984,7 +984,7 @@ IsSupportedResourceDesc(const D3D12_RESOURCE_DESC &desc) {
           desc.MipLevels > 1)
         return false;
     } else if (desc.SampleDesc.Count > 1) {
-      if (desc.DepthOrArraySize != 1 || desc.MipLevels != 1)
+      if (desc.MipLevels != 1)
         return false;
     }
     return true;

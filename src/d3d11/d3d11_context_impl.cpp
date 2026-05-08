@@ -4580,12 +4580,7 @@ public:
             stencil.store_action = WMTStoreActionStore;
           }
         }
-        if (effective_render_target == 0) {
-          if (uav_only) {
-            info.default_raster_sample_count = sample_count;
-          }
-        }
-
+        info.default_raster_sample_count = sample_count;
         info.render_target_height = render_target_height;
         info.render_target_width = render_target_width;
         info.render_target_array_length = render_target_array;
