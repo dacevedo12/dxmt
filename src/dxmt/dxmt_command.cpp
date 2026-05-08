@@ -6,9 +6,17 @@
 
 #include "dxmt_command.h"
 
-#define CREATE_PIPELINE(name)                                                                                          \
-  auto name##_function = library.newFunction(#name);           \
-  name##_pipeline = device.newComputePipelineState(name##_function, error);
+#define CREATE_PIPELINE(function_name, member_name)                                                                     \
+  auto member_name##_function = library.newFunction(#function_name);                                                    \
+  if (!member_name##_function) {                                                                                        \
+    ERR("Failed to find internal compute function: " #function_name);                                                   \
+    abort();                                                                                                            \
+  }                                                                                                                     \
+  member_name##_pipeline = device.newComputePipelineState(member_name##_function, error);                               \
+  if (error) {                                                                                                          \
+    ERR("Failed to create internal compute pipeline: " #function_name ": ", error.description().getUTF8String());       \
+    abort();                                                                                                            \
+  }
 
 namespace dxmt {
 
@@ -29,20 +37,22 @@ EmulatedCommandContext::EmulatedCommandContext(WMT::Device device, InternalComma
 
   WMT::Reference<WMT::Error> error;
 
-  CREATE_PIPELINE(clear_texture_1d_uint);
-  CREATE_PIPELINE(clear_texture_1d_array_uint);
-  CREATE_PIPELINE(clear_texture_2d_uint);
-  CREATE_PIPELINE(clear_texture_2d_array_uint);
-  CREATE_PIPELINE(clear_texture_3d_uint);
-  CREATE_PIPELINE(clear_texture_buffer_uint);
-  CREATE_PIPELINE(clear_buffer_uint);
-  CREATE_PIPELINE(clear_texture_1d_float);
-  CREATE_PIPELINE(clear_texture_1d_array_float);
-  CREATE_PIPELINE(clear_texture_2d_float);
-  CREATE_PIPELINE(clear_texture_2d_array_float);
-  CREATE_PIPELINE(clear_texture_3d_float);
-  CREATE_PIPELINE(clear_texture_buffer_float);
-  CREATE_PIPELINE(cs_prepare_counted_indirect_args);
+  CREATE_PIPELINE(clear_texture_1d_uint, clear_texture_1d_uint);
+  CREATE_PIPELINE(clear_texture_1d_array_uint, clear_texture_1d_array_uint);
+  CREATE_PIPELINE(clear_texture_2d_uint, clear_texture_2d_uint);
+  CREATE_PIPELINE(clear_texture_2d_array_uint, clear_texture_2d_array_uint);
+  CREATE_PIPELINE(clear_texture_3d_uint, clear_texture_3d_uint);
+  CREATE_PIPELINE(clear_texture_buffer_uint, clear_texture_buffer_uint);
+  CREATE_PIPELINE(clear_buffer_uint, clear_buffer_uint);
+  CREATE_PIPELINE(clear_texture_1d_float, clear_texture_1d_float);
+  CREATE_PIPELINE(clear_texture_1d_array_float, clear_texture_1d_array_float);
+  CREATE_PIPELINE(clear_texture_2d_float, clear_texture_2d_float);
+  CREATE_PIPELINE(clear_texture_2d_array_float, clear_texture_2d_array_float);
+  CREATE_PIPELINE(clear_texture_3d_float, clear_texture_3d_float);
+  CREATE_PIPELINE(clear_texture_buffer_float, clear_texture_buffer_float);
+  CREATE_PIPELINE(cs_prepare_counted_indirect_args, cs_prepare_counted_indirect_args);
+  CREATE_PIPELINE(cs_copy_buffer_bytes, copy_buffer_bytes);
+  CREATE_PIPELINE(copy_buffer_regions, copy_buffer_regions);
 
 
   auto gs_draw_arguments_marshal_vs = library.newFunction("gs_draw_arguments_marshal");

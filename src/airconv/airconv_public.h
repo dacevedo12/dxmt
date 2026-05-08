@@ -68,6 +68,7 @@ struct MTL_SM50_SHADER_ARGUMENT {
   uint32_t RegisterSpace;
   uint32_t RegisterLowerBound;
   uint32_t RegisterCount;
+  uint32_t CBufferSizeInVec4;
 };
 
 enum MTL_TESSELLATOR_OUTPUT_PRIMITIVE {

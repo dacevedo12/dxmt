@@ -165,6 +165,7 @@ BuildDxilArgumentInfo(DXILShaderInternal &shader) {
           .RegisterSpace = resource.space,
           .RegisterLowerBound = resource.lower_bound,
           .RegisterCount = resource.bind_count ? resource.bind_count : 1,
+          .CBufferSizeInVec4 = 4096,
       });
       break;
     }

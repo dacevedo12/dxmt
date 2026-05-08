@@ -691,6 +691,63 @@ struct DXMTClearUintMetadata {
   buffer[meta.offset.x + pos] = meta.value.x;
 }
 
+[[kernel]] void cs_copy_buffer_bytes(
+    device const uchar* src [[buffer(0)]],
+    device uchar* dst [[buffer(1)]],
+    constant uint& byte_length [[buffer(2)]],
+    uint pos [[thread_position_in_grid]]
+) {
+  uint byte_offset = pos << 4;
+  if (byte_offset >= byte_length)
+    return;
+
+  uint remaining = byte_length - byte_offset;
+  device const uchar* src_ptr = src + byte_offset;
+  device uchar* dst_ptr = dst + byte_offset;
+  if (remaining >= 16) {
+    *reinterpret_cast<device uint4*>(dst_ptr) = *reinterpret_cast<device const uint4*>(src_ptr);
+  } else {
+    for (uint i = 0; i < remaining; i++)
+      dst_ptr[i] = src_ptr[i];
+  }
+}
+
+struct DXMTBufferCopyRegion {
+  uint src_offset;
+  uint dst_offset;
+  uint byte_length;
+  uint reserved;
+};
+
+[[kernel]] void copy_buffer_regions(
+    device const uchar* src [[buffer(0)]],
+    device uchar* dst [[buffer(1)]],
+    constant DXMTBufferCopyRegion* regions [[buffer(2)]],
+    constant uint& region_count [[buffer(3)]],
+    constant ulong& src_base [[buffer(4)]],
+    constant ulong& dst_base [[buffer(5)]],
+    uint2 pos [[thread_position_in_grid]]
+) {
+  uint region_index = pos.y;
+  if (region_index >= region_count)
+    return;
+
+  auto region = regions[region_index];
+  uint byte_offset = pos.x << 4;
+  if (byte_offset >= region.byte_length)
+    return;
+
+  uint remaining = region.byte_length - byte_offset;
+  device const uchar* src_ptr = src + src_base + region.src_offset + byte_offset;
+  device uchar* dst_ptr = dst + dst_base + region.dst_offset + byte_offset;
+  if (remaining >= 16) {
+    *reinterpret_cast<device uint4*>(dst_ptr) = *reinterpret_cast<device const uint4*>(src_ptr);
+  } else {
+    for (uint i = 0; i < remaining; i++)
+      dst_ptr[i] = src_ptr[i];
+  }
+}
+
 struct DXMTIndirectCountedCopyMetadata {
   uint argument_bytes;
   uint command_index;

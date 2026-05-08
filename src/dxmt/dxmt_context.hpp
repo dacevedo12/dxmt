@@ -59,7 +59,13 @@ struct VertexBufferBinding {
 
 struct ConstantBufferBinding {
   Rc<Buffer> buffer;
+  WMT::Buffer direct_buffer;
   unsigned offset;
+  uint64_t direct_gpu_address = 0;
+  uint32_t direct_length = 0;
+  uint64_t inline_data_offset = 0;
+  uint32_t inline_data_length = 0;
+  const void *inline_data = nullptr;
 };
 
 struct SamplerBinding {
@@ -423,6 +429,12 @@ public:
     auto &entry = cbuf_[idx];
     entry.offset = offset;
     entry.buffer = std::move(buffer);
+    entry.direct_buffer = {};
+    entry.direct_gpu_address = 0;
+    entry.direct_length = 0;
+    entry.inline_data_offset = 0;
+    entry.inline_data_length = 0;
+    entry.inline_data = nullptr;
   }
 
   template <PipelineStage stage>
@@ -832,6 +844,7 @@ public:
 private:
   DXMT_ENCODER_LIST_OP checkEncoderRelation(EncoderData* former, EncoderData* latter);
   bool hasDataDependency(EncoderData* from, EncoderData* to);
+  bool tryMergeBlitEncoders(BlitEncoderData* former, BlitEncoderData* latter);
   bool isEncoderSignatureMatched(RenderEncoderData* former, RenderEncoderData* latter);
   RenderEncoderColorAttachmentData *isClearColorSignatureMatched(ClearEncoderData* former, RenderEncoderData* latter);
   RenderEncoderDepthAttachmentData *isClearDepthSignatureMatched(ClearEncoderData* former, RenderEncoderData* latter);

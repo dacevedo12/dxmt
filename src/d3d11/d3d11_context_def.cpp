@@ -56,6 +56,12 @@ DeferredContextBase::AllocateStagingBuffer(size_t size, size_t alignment) {
 }
 
 template <>
+AllocatedTempBufferSlice
+DeferredContextBase::AllocateStagingBuffer1(size_t size, size_t alignment) {
+  return ctx_state.current_cmdlist->AllocateStagingBuffer1(size, alignment);
+}
+
+template <>
 void DeferredContextBase::UseCopyDestination(Rc<StagingResource> &staging) {
   ctx_state.current_cmdlist->written_staging_resources.push_back(staging);
 }
@@ -428,6 +434,7 @@ public:
   HRESULT 
   STDMETHODCALLTYPE
   FinishCommandList(BOOL RestoreDeferredContextState, ID3D11CommandList **ppCommandList) override {
+    FlushAllPendingBufferUpdates();
     ResetEncodingContextState();
 
     ctx_state.current_cmdlist->promote_flush = promote_flush;

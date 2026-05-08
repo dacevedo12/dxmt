@@ -4,6 +4,9 @@
 #include "dxmt_dynamic.hpp"
 #include "dxmt_format.hpp"
 #include "d3d11_resource.hpp"
+#include <cstddef>
+#include <cstring>
+#include <vector>
 
 namespace dxmt {
 
@@ -24,6 +27,8 @@ private:
   bool allow_raw_view;
 
   Rc<DynamicBuffer> dynamic_;
+  std::vector<std::byte> constant_buffer_shadow_;
+  uint64_t constant_buffer_shadow_version_ = 0;
 
   using SRVBase = TResourceViewBase<tag_shader_resource_view<D3D11Buffer>>;
 
@@ -119,6 +124,12 @@ public:
     D3D11_ASSERT(_.ptr() == nullptr);
     structured = pDesc->MiscFlags & D3D11_RESOURCE_MISC_BUFFER_STRUCTURED;
     allow_raw_view = pDesc->MiscFlags & D3D11_RESOURCE_MISC_BUFFER_ALLOW_RAW_VIEWS;
+    if (pDesc->Usage == D3D11_USAGE_DEFAULT &&
+        pDesc->BindFlags == D3D11_BIND_CONSTANT_BUFFER) {
+      constant_buffer_shadow_.resize(pDesc->ByteWidth);
+      if (pInitialData)
+        std::memcpy(constant_buffer_shadow_.data(), pInitialData->pSysMem, pDesc->ByteWidth);
+    }
     if (!(desc.BindFlags & kD3D11OutputBindFlags)) {
       dynamic_ = new DynamicBuffer(buffer_.ptr(), flags);
     }
@@ -161,6 +172,31 @@ public:
   dynamicTexture(UINT , UINT *, UINT *) final {
     return {};
   };
+
+  std::span<std::byte>
+  constantBufferShadow() override {
+    return constant_buffer_shadow_;
+  }
+
+  WMT::Buffer
+  constantBufferShadowBuffer() override {
+    return {};
+  }
+
+  uint64_t
+  constantBufferShadowGpuAddress() override {
+    return 0;
+  }
+
+  uint64_t
+  constantBufferShadowVersion() override {
+    return constant_buffer_shadow_version_;
+  }
+
+  void
+  bumpConstantBufferShadowVersion() override {
+    constant_buffer_shadow_version_++;
+  }
 
   HRESULT
   STDMETHODCALLTYPE

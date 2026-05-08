@@ -27,6 +27,10 @@ since it is for internal use only
 #include "util_flags.hpp"
 #include "util_math.hpp"
 #include "util_win32_compat.h"
+#include <algorithm>
+#include <map>
+#include <unordered_set>
+#include <vector>
 
 namespace dxmt {
 
@@ -592,6 +596,49 @@ template <typename ContextInternalState> class MTLD3D11DeviceContextImplBase : p
   friend class MTLD3D11ContextExt;
 
   using mutex_t = ContextInternalState::device_mutex_t;
+protected:
+  struct PendingBufferUpdate {
+    Rc<Buffer> dst;
+    WMT::Buffer staging;
+    uint64_t staging_offset;
+    uint32_t dst_offset;
+    uint32_t length;
+    bool allow_compute_pack;
+    moveonly_list<char> payload;
+  };
+
+  struct PendingBufferUpdateBatchInfo {
+    uint32_t count = 0;
+    uint64_t packed_bytes = 0;
+    uint32_t max_region_bytes = 0;
+    bool can_pack_regions = true;
+    struct Segment {
+      size_t update_index;
+      uint32_t src_offset;
+      uint32_t dst_offset;
+      uint32_t length;
+    };
+    std::vector<Segment> segments;
+  };
+
+  struct PendingConstantBufferShadowWriteback {
+    Com<D3D11ResourceCommon, false> resource;
+    Rc<Buffer> dst;
+    uint32_t dst_offset;
+    uint32_t length;
+    uint64_t version;
+  };
+
+  struct ConstantBufferUploadSlice {
+    WMT::Buffer buffer;
+    uint64_t offset = 0;
+    uint64_t gpu_address = 0;
+    uint32_t length = 0;
+    const std::byte *inline_data = nullptr;
+  };
+
+  std::vector<PendingConstantBufferShadowWriteback> pending_cb_shadow_writebacks_;
+
 public:
   HRESULT
   STDMETHODCALLTYPE
@@ -663,6 +710,8 @@ public:
   void
   STDMETHODCALLTYPE
   ClearUnorderedAccessViewUint(D3D11UnorderedAccessView *pUAV, const UINT Values[4]) {
+    if (auto buffer = pUAV->buffer())
+      FlushPendingBufferUpdatesFor(buffer.ptr());
     InvalidateCurrentPass(true);
     SwitchToComputeEncoder();
     D3D11_UNORDERED_ACCESS_VIEW_DESC desc;
@@ -733,6 +782,8 @@ public:
   void
   STDMETHODCALLTYPE
   ClearUnorderedAccessViewFloat(D3D11UnorderedAccessView *pUAV, const FLOAT Values[4])  {
+    if (auto buffer = pUAV->buffer())
+      FlushPendingBufferUpdatesFor(buffer.ptr());
     InvalidateCurrentPass(true);
     SwitchToComputeEncoder();
     D3D11_UNORDERED_ACCESS_VIEW_DESC desc;
@@ -930,6 +981,7 @@ public:
       if (desc.ViewDimension == D3D11_SRV_DIMENSION_BUFFER || desc.ViewDimension == D3D11_SRV_DIMENSION_BUFFEREX) {
         return;
       }
+      ctx_state.cmd_queue.CurrentFrameStatistics().d3d11_generate_mips_count++;
       SwitchToBlitEncoder(CommandBufferState::BlitEncoderActive);
       EmitOP([tex = srv->texture(), viewId = srv->viewId()](ArgumentEncodingContext &enc) {
         // workaround: mipmap generation of a8unorm is borked, so use a r8unorm view
@@ -983,6 +1035,7 @@ public:
       ERR("ResolveSubresource: invalid format ", Format);
       return;
     }
+    ctx_state.cmd_queue.CurrentFrameStatistics().d3d11_resolve_subresource_count++;
     InvalidateCurrentPass();
     EmitOP([src = static_cast<D3D11ResourceCommon *>(pSrcResource)->texture(),
             dst = static_cast<D3D11ResourceCommon *>(pDstResource)->texture(),
@@ -1110,6 +1163,7 @@ public:
 
     if (auto dst_bind = GetResourceCommon(pDstBuffer)) {
       if (auto uav = static_cast<D3D11UnorderedAccessView *>(pSrcView)) {
+        ctx_state.cmd_queue.CurrentFrameStatistics().d3d11_copy_structure_count++;
         SwitchToBlitEncoder(CommandBufferState::BlitEncoderActive);
         EmitOP([=, dst = dst_bind->buffer(), counter = uav->counter()](ArgumentEncodingContext &enc) {
           auto [dst_buffer, dst_offset] = enc.access(dst, DstAlignedByteOffset, 4, ResourceAccess::Write);
@@ -1162,9 +1216,30 @@ public:
       }
       UINT buffer_len = 0;
       UINT unused_bind_flag = 0;
+      auto &update_stats = ctx_state.cmd_queue.CurrentFrameStatistics();
+      update_stats.d3d11_update_buffer_bytes += copy_len;
+      if (copy_len <= 256)
+        update_stats.d3d11_update_buffer_small_count++;
+      else if (copy_len <= 4096)
+        update_stats.d3d11_update_buffer_medium_count++;
+      else
+        update_stats.d3d11_update_buffer_large_count++;
+      if (desc.BindFlags & D3D11_BIND_CONSTANT_BUFFER)
+        update_stats.d3d11_update_buffer_bind_constant_count++;
+      if (desc.BindFlags & D3D11_BIND_VERTEX_BUFFER)
+        update_stats.d3d11_update_buffer_bind_vertex_count++;
+      if (desc.BindFlags & D3D11_BIND_INDEX_BUFFER)
+        update_stats.d3d11_update_buffer_bind_index_count++;
+      if (desc.BindFlags & D3D11_BIND_SHADER_RESOURCE)
+        update_stats.d3d11_update_buffer_bind_srv_count++;
+      if (desc.BindFlags & kD3D11OutputBindFlags)
+        update_stats.d3d11_update_buffer_bind_output_count++;
+
       if (auto dynamic = GetDynamicBuffer(pDstResource, &buffer_len, &unused_bind_flag)) {
+        update_stats.d3d11_update_buffer_dynamic_candidate_count++;
         D3D11_MAPPED_SUBRESOURCE mapped;
         if ((CopyFlags & D3D11_COPY_DISCARD) || (copy_len == buffer_len && copy_offset == 0)) {
+          update_stats.d3d11_update_buffer_dynamic_full_count++;
           Map(pDstResource, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
           auto [allocation, sub] = GetDynamicBufferAllocation(dynamic);
           allocation->updateContents(copy_offset, pSrcData, copy_len, sub);
@@ -1172,12 +1247,15 @@ public:
           return;
         }
         if (CopyFlags & D3D11_COPY_NO_OVERWRITE) {
+          update_stats.d3d11_update_buffer_dynamic_no_overwrite_count++;
           Map(pDstResource, 0, D3D11_MAP_WRITE_NO_OVERWRITE, 0, &mapped);
           auto [allocation, sub] = GetDynamicBufferAllocation(dynamic);
           allocation->updateContents(copy_offset, pSrcData, copy_len, sub);
           Unmap(pDstResource, 0);
           return;
         }
+      } else {
+        update_stats.d3d11_update_buffer_no_dynamic_count++;
       }
       if (auto staging = GetStagingResource(pDstResource, DstSubresource); unlikely(staging)) {
         // Per MSDN: The CPU copies data from memory to a subresource created in non-mappable memory.
@@ -1186,19 +1264,29 @@ public:
         // So it's legal?
         UNIMPLEMENTED("update buffer: staging");
       } else if (auto bindable = GetResourceCommon(pDstResource)) {
+        ctx_state.cmd_queue.CurrentFrameStatistics().d3d11_update_buffer_count++;
+        auto shadow = bindable->constantBufferShadow();
+        if (!shadow.empty()) {
+          if (copy_offset <= shadow.size() && copy_len <= shadow.size() - copy_offset) {
+            std::memcpy(shadow.data() + copy_offset, pSrcData, copy_len);
+            bindable->bumpConstantBufferShadowVersion();
+            QueuePendingConstantBufferShadowWriteback(bindable, copy_offset, copy_len);
+            return;
+          }
+        }
         auto [staging_buffer, offset] = AllocateStagingBuffer(copy_len, 16);
         staging_buffer.updateContents(offset, pSrcData, copy_len);
-        SwitchToBlitEncoder(CommandBufferState::UpdateBlitEncoderActive);
-        EmitOP([staging_buffer, offset, dst = bindable->buffer(), copy_offset, copy_len](ArgumentEncodingContext &enc) {
-          auto [dst_buffer, dst_offset] = enc.access(dst, copy_offset, copy_len, ResourceAccess::Write);
-          auto &cmd = enc.encodeBlitCommand<wmtcmd_blit_copy_from_buffer_to_buffer>();
-          cmd.type = WMTBlitCommandCopyFromBufferToBuffer;
-          cmd.copy_length = copy_len;
-          cmd.src = staging_buffer;
-          cmd.src_offset = offset;
-          cmd.dst = dst_buffer->buffer();
-          cmd.dst_offset = copy_offset + dst_offset;
-        });
+        const bool allow_compute_pack = (desc.BindFlags & (D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS)) != 0;
+        auto payload = [&]() {
+          if (!allow_compute_pack)
+            return moveonly_list<char>(nullptr, 0);
+          auto payload = AllocateCommandData<char>(copy_len);
+          std::memcpy(payload.data(), pSrcData, copy_len);
+          return payload;
+        }();
+        QueuePendingBufferUpdate(
+            bindable->buffer(), staging_buffer, offset, copy_offset, copy_len, allow_compute_pack, std::move(payload)
+        );
       } else {
         UNREACHABLE
       }
@@ -1570,6 +1658,7 @@ public:
         state_.InputAssembler.IndexBufferFormat == DXGI_FORMAT_R32_UINT ? WMTIndexTypeUInt32 : WMTIndexTypeUInt16;
     auto IndexBufferOffset = state_.InputAssembler.IndexBufferOffset;
     if (auto bindable = GetResourceCommon(pBufferForArgs)) {
+      FlushPendingBufferUpdatesFor(bindable->buffer().ptr());
       EmitOP([IndexType, IndexBufferOffset, Primitive, ArgBuffer = bindable->buffer(),
               AlignedByteOffsetForArgs](ArgumentEncodingContext &enc) {
         auto [buffer, buffer_offset] = enc.access<PipelineStage::Vertex>(
@@ -1609,6 +1698,7 @@ public:
       return TessellationDrawIndirect(ControlPointCount, pBufferForArgs, AlignedByteOffsetForArgs);
     }
     if (auto bindable = GetResourceCommon(pBufferForArgs)) {
+      FlushPendingBufferUpdatesFor(bindable->buffer().ptr());
       EmitOP([Primitive, ArgBuffer = bindable->buffer(), AlignedByteOffsetForArgs](ArgumentEncodingContext &enc) {
         auto [buffer, buffer_offset] = enc.access<PipelineStage::Vertex>(
             ArgBuffer, AlignedByteOffsetForArgs, sizeof(DXMT_DRAW_ARGUMENTS), ResourceAccess::Read
@@ -1630,6 +1720,7 @@ public:
   ) {
     auto max_object_threadgroups = max_object_threadgroups_;
     if (auto bindable = GetResourceCommon(pBufferForArgs)) {
+      FlushPendingBufferUpdatesFor(bindable->buffer().ptr());
       EmitOP([=, topo = state_.InputAssembler.Topology, ArgBuffer = bindable->buffer()](ArgumentEncodingContext &enc) {
         auto [buffer, buffer_offset] = enc.access<PipelineStage::Vertex>(
             ArgBuffer, AlignedByteOffsetForArgs, sizeof(DXMT_DRAW_ARGUMENTS), ResourceAccess::Read
@@ -1664,6 +1755,7 @@ public:
     auto max_object_threadgroups = max_object_threadgroups_;
 
     if (auto bindable = GetResourceCommon(pBufferForArgs)) {
+      FlushPendingBufferUpdatesFor(bindable->buffer().ptr());
       EmitOP([=, topo = state_.InputAssembler.Topology, ArgBuffer = bindable->buffer()](ArgumentEncodingContext &enc) {
         auto [buffer, buffer_offset] = enc.access<PipelineStage::Vertex>(
             ArgBuffer, AlignedByteOffsetForArgs, sizeof(DXMT_DRAW_INDEXED_ARGUMENTS), ResourceAccess::Read
@@ -1699,6 +1791,7 @@ public:
   ) {
     auto max_object_threadgroups = max_object_threadgroups_;
     if (auto bindable = GetResourceCommon(pBufferForArgs)) {
+      FlushPendingBufferUpdatesFor(bindable->buffer().ptr());
       EmitOP([=, ArgBuffer = bindable->buffer()](ArgumentEncodingContext &enc) {
         auto [buffer, buffer_offset] = enc.access<PipelineStage::Vertex>(
             ArgBuffer, AlignedByteOffsetForArgs, sizeof(DXMT_DRAW_ARGUMENTS), ResourceAccess::Read
@@ -1736,6 +1829,7 @@ public:
     auto max_object_threadgroups = max_object_threadgroups_;
 
     if (auto bindable = GetResourceCommon(pBufferForArgs)) {
+      FlushPendingBufferUpdatesFor(bindable->buffer().ptr());
       EmitOP([=, ArgBuffer = bindable->buffer()](ArgumentEncodingContext &enc) {
         auto [buffer, buffer_offset] = enc.access<PipelineStage::Vertex>(
             ArgBuffer, AlignedByteOffsetForArgs, sizeof(DXMT_DRAW_INDEXED_ARGUMENTS), ResourceAccess::Read
@@ -1799,6 +1893,7 @@ public:
     if (!PreDispatch())
       return;
     if (auto bindable = GetResourceCommon(pBufferForArgs)) {
+      FlushPendingBufferUpdatesFor(bindable->buffer().ptr());
       EmitOP([AlignedByteOffsetForArgs, ArgBuffer = bindable->buffer()](ArgumentEncodingContext &enc) {
         auto [buffer, buffer_offset] = enc.access(ArgBuffer, AlignedByteOffsetForArgs, 12, ResourceAccess::Read);
         enc.resolveComputePassBarrier();
@@ -2783,6 +2878,7 @@ public:
 
     if (NumRTVs != D3D11_KEEP_RENDER_TARGETS_AND_DEPTH_STENCIL) {
       if (!ValidateSetRenderTargets(NumRTVs, ppRenderTargetViews, pDepthStencilView)) {
+        ctx_state.cmd_queue.CurrentFrameStatistics().d3d11_invalid_render_target_count++;
         WARN("OMSetRenderTargets: invalid render targets");
         return;
       }
@@ -3215,11 +3311,96 @@ public:
   template <typename T> moveonly_list<T> AllocateCommandData(size_t n = 1);
 
   std::tuple<WMT::Buffer, uint64_t> AllocateStagingBuffer(size_t size, size_t alignment);
+  virtual AllocatedTempBufferSlice AllocateStagingBuffer1(size_t size, size_t alignment) {
+    auto [buffer, offset] = AllocateStagingBuffer(size, alignment);
+    return {buffer, offset, 0};
+  }
   void UseCopyDestination(Rc<StagingResource> &);
   void UseCopySource(Rc<StagingResource> &);
 
   std::pair<BufferAllocation *, uint32_t>
   GetDynamicBufferAllocation(Rc<DynamicBuffer> &dynamic);
+
+  virtual bool
+  TryUpdateDynamicBufferPartial(
+      const Rc<DynamicBuffer> &dynamic, UINT buffer_len, UINT bind_flags,
+      uint32_t copy_offset, uint32_t copy_len, const void *src_data
+  ) {
+    return false;
+  }
+
+  void
+  RefreshDirtyConstantBufferBindings(PipelineStage stage, uint64_t slot_mask) {
+    auto &bindings = state_.ShaderStages[stage].ConstantBuffers;
+    if (!slot_mask)
+      return;
+    for (const auto &[slot, entry] : bindings) {
+      if (slot >= 64 || !(slot_mask & (uint64_t(1) << slot)) || !entry.Buffer)
+        continue;
+      auto version = entry.Buffer->constantBufferShadowVersion();
+      if (version != entry.ShadowVersion) {
+        bindings.at(slot).ShadowVersion = version;
+        bindings.set_dirty(slot);
+      }
+    }
+  }
+
+  void
+  UpdateConstantBufferShadowBacking(
+      D3D11ResourceCommon *resource, uint32_t offset, const void *data, uint32_t length
+  ) {
+    if (auto buffer = resource ? resource->constantBufferShadowBuffer() : WMT::Buffer{})
+      buffer.updateContents(offset, data, length);
+  }
+
+  void
+  QueuePendingConstantBufferShadowWriteback(
+      D3D11ResourceCommon *resource, uint32_t dst_offset, uint32_t length
+  ) {
+    if (!resource || !length)
+      return;
+    uint32_t end = dst_offset + length;
+    for (auto &writeback : pending_cb_shadow_writebacks_) {
+      if (writeback.resource.ptr() != resource)
+        continue;
+      uint32_t existing_end = writeback.dst_offset + writeback.length;
+      if (end < writeback.dst_offset || dst_offset > existing_end)
+        continue;
+      uint32_t merged_begin = std::min(writeback.dst_offset, dst_offset);
+      uint32_t merged_end = std::max(existing_end, end);
+      writeback.dst_offset = merged_begin;
+      writeback.length = merged_end - merged_begin;
+      return;
+    }
+    pending_cb_shadow_writebacks_.push_back({
+        .resource = resource,
+        .dst = resource->buffer(),
+        .dst_offset = dst_offset,
+        .length = length,
+        .version = 0,
+    });
+  }
+
+  ConstantBufferUploadSlice
+  UploadConstantBufferShadow(const CONSTANT_BUFFER_B &entry, const MTL_SM50_SHADER_ARGUMENT &arg) {
+    ConstantBufferUploadSlice ret;
+    auto shadow = entry.Buffer ? entry.Buffer->constantBufferShadow() : std::span<std::byte>{};
+    if (shadow.empty())
+      return ret;
+    auto shader_byte_length = arg.CBufferSizeInVec4 ? arg.CBufferSizeInVec4 << 4 : entry.NumConstants << 4;
+    uint32_t offset = entry.FirstConstant << 4;
+    uint32_t byte_length = std::min<uint32_t>(entry.NumConstants << 4, shader_byte_length);
+    if (!byte_length || offset > shadow.size())
+      return ret;
+    byte_length = std::min<uint32_t>(byte_length, shadow.size() - offset);
+    if (!byte_length)
+      return ret;
+
+    ret.offset = offset;
+    ret.length = byte_length;
+    ret.inline_data = shadow.data() + offset;
+    return ret;
+  }
 
   uint64_t *allocated_encoder_argbuf_size_ = nullptr;
 
@@ -3242,6 +3423,7 @@ public:
 
     auto managed_shader = ShaderStage.Shader->GetManagedShader();
     const MTL_SHADER_REFLECTION *reflection = &managed_shader->reflection();
+    RefreshDirtyConstantBufferBindings(stage, reflection->ConstantBufferSlotMask);
 
     bool dirty_cbuffer = ShaderStage.ConstantBuffers.any_dirty_masked(reflection->ConstantBufferSlotMask);
     bool dirty_sampler = ShaderStage.Samplers.any_dirty_masked(reflection->SamplerSlotMask);
@@ -3278,8 +3460,25 @@ public:
           continue;
 
         auto &entry = ShaderStage.ConstantBuffers.at(slot);
-        cbuffer_bindings[i].buffer = entry.Buffer->buffer();
-        cbuffer_bindings[i].offset = entry.FirstConstant << 4;
+        if (auto upload = UploadConstantBufferShadow(entry, arg); upload.inline_data || upload.buffer) {
+          if (upload.inline_data) {
+            cbuffer_bindings[i].inline_data_offset = PreAllocateArgumentBuffer(upload.length, 16);
+            cbuffer_bindings[i].inline_data_length = upload.length;
+            cbuffer_bindings[i].inline_data = upload.inline_data;
+            cbuffer_bindings[i].direct_buffer = {};
+            cbuffer_bindings[i].buffer = {};
+            cbuffer_bindings[i].offset = 0;
+          } else {
+            cbuffer_bindings[i].direct_buffer = upload.buffer;
+            cbuffer_bindings[i].buffer = {};
+            cbuffer_bindings[i].direct_gpu_address = upload.gpu_address;
+            cbuffer_bindings[i].direct_length = upload.offset + upload.length;
+            cbuffer_bindings[i].offset = upload.offset;
+          }
+        } else {
+          cbuffer_bindings[i].buffer = entry.Buffer->buffer();
+          cbuffer_bindings[i].offset = entry.FirstConstant << 4;
+        }
       }
       EmitST([=, cb = cbuffer_info, cbuffer_bindings = std::move(cbuffer_bindings)](
                  ArgumentEncodingContext &enc
@@ -3490,6 +3689,7 @@ public:
           entry.NumConstants = desc.ByteWidth >> 4;
         }
         entry.Buffer = GetResourceCommon(pConstantBuffer);
+        entry.ShadowVersion = entry.Buffer ? entry.Buffer->constantBufferShadowVersion() : 0;
       } else {
         // BIND NULL
         ShaderStage.ConstantBuffers.unbind(slot);
@@ -3809,6 +4009,12 @@ public:
       ID3D11Buffer *pDstResource, uint32_t DstSubresource, uint32_t DstX, uint32_t DstY, uint32_t DstZ,
       ID3D11Buffer *pSrcResource, uint32_t SrcSubresource, const D3D11_BOX *pSrcBox
   ) {
+    if (pDstResource) if (auto dst_common = GetResourceCommon(pDstResource))
+      FlushPendingBufferUpdatesFor(dst_common->buffer().ptr());
+    if (pSrcResource) if (auto src_common = GetResourceCommon(pSrcResource))
+      FlushPendingBufferUpdatesFor(src_common->buffer().ptr());
+
+    ctx_state.cmd_queue.CurrentFrameStatistics().d3d11_copy_buffer_count++;
     D3D11_BUFFER_DESC dst_desc;
     D3D11_BUFFER_DESC src_desc;
     pDstResource->GetDesc(&dst_desc);
@@ -3903,6 +4109,7 @@ public:
   CopyTexture(TextureCopyCommand &&cmd) {
     if (cmd.Invalid)
       return;
+    ctx_state.cmd_queue.CurrentFrameStatistics().d3d11_copy_texture_count++;
     if ((cmd.SrcFormat.Flag & MTL_DXGI_FORMAT_BC) != (cmd.DstFormat.Flag & MTL_DXGI_FORMAT_BC)) {
       if (cmd.SrcFormat.Flag & MTL_DXGI_FORMAT_BC) {
         return CopyTextureFromCompressed(std::move(cmd));
@@ -4208,7 +4415,9 @@ public:
 
     std::lock_guard<mutex_t> lock(mutex);
 
+    FlushAllPendingBufferUpdates();
     if (auto dst = GetTexture(cmd.pDst)) {
+      ctx_state.cmd_queue.CurrentFrameStatistics().d3d11_update_texture_count++;
       auto bytes_per_depth_slice = cmd.EffectiveRows * cmd.EffectiveBytesPerRow;
       auto [staging_buffer, offset] = AllocateStagingBuffer(bytes_per_depth_slice * cmd.DstSize.depth, 16);
       if (cmd.EffectiveBytesPerRow == SrcRowPitch) {
@@ -4259,8 +4468,10 @@ public:
 
     std::lock_guard<mutex_t> lock(mutex);
 
+    FlushAllPendingBufferUpdates();
     if (auto dst = GetTexture(cmd.pDst)) {
 
+      ctx_state.cmd_queue.CurrentFrameStatistics().d3d11_update_texture_count++;
       SwitchToBlitEncoder(CommandBufferState::UpdateBlitEncoderActive);
       EmitOP([=, src = std::move(src), dst = std::move(dst), cmd = std::move(cmd)](ArgumentEncodingContext &enc) {
         auto [src_buffer, src_offset] = enc.access(src, 0, src->length(), ResourceAccess::Read);
@@ -4373,6 +4584,8 @@ public:
 
   void
   ClearRenderTargetView(D3D11RenderTargetView *pRenderTargetView, const FLOAT ColorRGBA[4]) {
+    if (pRenderTargetView->isBufferView())
+      FlushPendingBufferUpdatesFor(pRenderTargetView->buffer().ptr());
     InvalidateCurrentPass();
     auto clear_color = WMTClearColor{ColorRGBA[0], ColorRGBA[1], ColorRGBA[2], ColorRGBA[3]};
     auto &props = pRenderTargetView->description();
@@ -4601,6 +4814,22 @@ public:
     if (cmdbuf_state == BlitKind)
       return;
 
+    auto &statistics = ctx_state.cmd_queue.CurrentFrameStatistics();
+    statistics.d3d11_blit_switch_count++;
+    switch (BlitKind) {
+    case CommandBufferState::BlitEncoderActive:
+      statistics.d3d11_blit_switch_generic_count++;
+      break;
+    case CommandBufferState::UpdateBlitEncoderActive:
+      statistics.d3d11_blit_switch_update_count++;
+      break;
+    case CommandBufferState::ReadbackBlitEncoderActive:
+      statistics.d3d11_blit_switch_readback_count++;
+      break;
+    default:
+      break;
+    }
+
     /**
     Don't flush if it's a readback/upload blit pass
      */
@@ -4818,8 +5047,9 @@ public:
 
     MTL_GRAPHICS_PIPELINE_DESC pipelineDesc;
     InitializeGraphicsPipelineDesc<IndexedDraw>(pipelineDesc);
-    DEBUG("DXMT diagnostic: finalize tessellation pipeline: ",
-          DebugPipelineDesc("tessellation", pipelineDesc));
+    if (DebugShouldLogPipelineFinalize())
+      DEBUG("DXMT diagnostic: finalize tessellation pipeline: ",
+            DebugPipelineDesc("tessellation", pipelineDesc));
     DebugDumpPipeline("tessellation", pipelineDesc, "finalize tessellation pipeline", false);
     WarnMissingMeshFragmentFunction("tessellation", pipelineDesc);
 
@@ -4878,8 +5108,9 @@ public:
 
     MTL_GRAPHICS_PIPELINE_DESC pipelineDesc;
     InitializeGraphicsPipelineDesc<IndexedDraw>(pipelineDesc);
-    DEBUG("DXMT diagnostic: finalize geometry pipeline: ",
-          DebugPipelineDesc("geometry", pipelineDesc));
+    if (DebugShouldLogPipelineFinalize())
+      DEBUG("DXMT diagnostic: finalize geometry pipeline: ",
+            DebugPipelineDesc("geometry", pipelineDesc));
     DebugDumpPipeline("geometry", pipelineDesc, "finalize geometry pipeline", false);
     WarnMissingMeshFragmentFunction("geometry", pipelineDesc);
     device->CreateGeometryPipeline(&pipelineDesc, &pipeline);
@@ -4943,8 +5174,9 @@ public:
 
     MTL_GRAPHICS_PIPELINE_DESC pipelineDesc;
     InitializeGraphicsPipelineDesc<IndexedDraw>(pipelineDesc);
-    DEBUG("DXMT diagnostic: finalize graphics pipeline: ",
-          DebugPipelineDesc("graphics", pipelineDesc));
+    if (DebugShouldLogPipelineFinalize())
+      DEBUG("DXMT diagnostic: finalize graphics pipeline: ",
+            DebugPipelineDesc("graphics", pipelineDesc));
     DebugDumpPipeline("graphics", pipelineDesc, "finalize graphics pipeline", false);
 
     device->CreateGraphicsPipeline(&pipelineDesc, &pipeline);
@@ -4981,6 +5213,7 @@ public:
   DrawCallStatus
   PreDraw() {
     DrawCallStatus status;
+    FlushPendingBufferUpdatesForDrawBindings();
     if constexpr (IndexedDraw) {
       if (!state_.InputAssembler.IndexBuffer)
         return DrawCallStatus::Invalid;
@@ -5130,6 +5363,7 @@ public:
 
   bool
   PreDispatch() {
+    FlushPendingBufferUpdatesForComputeBindings();
     if (!FinalizeCurrentComputePipeline()) {
       return false;
     }
@@ -5270,6 +5504,7 @@ public:
   }
 
   void ResetEncodingContextState() {
+    FlushAllPendingBufferUpdates();
     InvalidateCurrentPass(true);
     // TODO: optimize by clearing only bound resource
     EmitST([](ArgumentEncodingContext& enc) {
@@ -5310,6 +5545,679 @@ protected:
   D3D11UserDefinedAnnotation annotation_;
   MTLD3D11ContextExt<ContextInternalState> ext_;
   uint64_t max_object_threadgroups_;
+  std::vector<PendingBufferUpdate> pending_buffer_updates_;
+
+  void
+  QueuePendingBufferUpdate(
+      const Rc<Buffer> &dst, WMT::Buffer staging, uint64_t staging_offset, uint32_t dst_offset, uint32_t length,
+      bool allow_compute_pack, moveonly_list<char> payload
+  ) {
+    auto &statistics = ctx_state.cmd_queue.CurrentFrameStatistics();
+    statistics.d3d11_update_buffer_deferred_count++;
+    statistics.d3d11_update_buffer_deferred_bytes += length;
+    pending_buffer_updates_.push_back(
+        {dst, staging, staging_offset, dst_offset, length, allow_compute_pack, std::move(payload)}
+    );
+  }
+
+  PendingBufferUpdateBatchInfo
+  AnalyzePendingBufferUpdateBatch(Buffer *buffer) const {
+    PendingBufferUpdateBatchInfo info;
+    std::map<uint32_t, uint32_t> covered_ranges;
+
+    auto add_covered_range = [&covered_ranges](uint32_t start, uint32_t end) {
+      auto it = covered_ranges.lower_bound(start);
+      if (it != covered_ranges.begin()) {
+        auto prev = std::prev(it);
+        if (prev->second >= start) {
+          start = std::min(start, prev->first);
+          end = std::max(end, prev->second);
+          it = covered_ranges.erase(prev);
+        }
+      }
+      while (it != covered_ranges.end() && it->first <= end) {
+        end = std::max(end, it->second);
+        it = covered_ranges.erase(it);
+      }
+      covered_ranges.emplace(start, end);
+    };
+
+    for (size_t index = pending_buffer_updates_.size(); index-- > 0;) {
+      const auto &update = pending_buffer_updates_[index];
+      if (update.dst.ptr() != buffer)
+        continue;
+
+      info.count++;
+      if (!update.allow_compute_pack || !update.payload.data())
+        info.can_pack_regions = false;
+
+      uint32_t end = update.dst_offset + update.length;
+      if (end < update.dst_offset) {
+        info.can_pack_regions = false;
+      } else {
+        uint32_t cursor = update.dst_offset;
+        auto it = covered_ranges.lower_bound(update.dst_offset);
+        if (it != covered_ranges.begin()) {
+          auto prev = std::prev(it);
+          if (prev->second > cursor)
+            it = prev;
+        }
+        while (it != covered_ranges.end() && it->first < end) {
+          if (cursor < it->first) {
+            uint32_t segment_end = std::min(it->first, end);
+            info.segments.push_back({
+                .update_index = index,
+                .src_offset = cursor - update.dst_offset,
+                .dst_offset = cursor,
+                .length = segment_end - cursor,
+            });
+          }
+          cursor = std::max(cursor, it->second);
+          if (cursor >= end)
+            break;
+          ++it;
+        }
+        if (cursor < end) {
+          info.segments.push_back({
+              .update_index = index,
+              .src_offset = cursor - update.dst_offset,
+              .dst_offset = cursor,
+              .length = end - cursor,
+          });
+        }
+        add_covered_range(update.dst_offset, end);
+      }
+    }
+
+    if (info.can_pack_regions) {
+      for (const auto &segment : info.segments) {
+        info.packed_bytes += segment.length;
+        info.max_region_bytes = std::max(info.max_region_bytes, segment.length);
+        if (info.packed_bytes > UINT32_MAX) {
+          info.can_pack_regions = false;
+          break;
+        }
+      }
+    }
+
+    return info;
+  }
+
+  void
+  EmitPendingBufferUpdateSegment(
+      const PendingBufferUpdate &update, uint32_t src_offset, uint32_t dst_offset, uint32_t length
+  ) {
+    EmitOP([staging_buffer = update.staging, offset = update.staging_offset,
+            dst = update.dst, src_offset, copy_offset = dst_offset, copy_len = length](
+               ArgumentEncodingContext &enc) {
+      auto [dst_buffer, dst_offset] = enc.access(dst, copy_offset, copy_len, ResourceAccess::Write);
+      auto &cmd = enc.encodeBlitCommand<wmtcmd_blit_copy_from_buffer_to_buffer>();
+      cmd.type = WMTBlitCommandCopyFromBufferToBuffer;
+      cmd.copy_length = copy_len;
+      cmd.src = staging_buffer;
+      cmd.src_offset = offset + src_offset;
+      cmd.dst = dst_buffer->buffer();
+      cmd.dst_offset = copy_offset + dst_offset;
+    });
+  }
+
+  void
+  EmitPendingBufferUpdate(const PendingBufferUpdate &update) {
+    EmitPendingBufferUpdateSegment(update, 0, update.dst_offset, update.length);
+  }
+
+  void
+  EmitPendingBufferUpdateBatchBlit(Buffer *buffer, const PendingBufferUpdateBatchInfo &info) {
+    if (!info.segments.empty()) {
+      for (const auto &segment : info.segments) {
+        const auto &update = pending_buffer_updates_[segment.update_index];
+        EmitPendingBufferUpdateSegment(update, segment.src_offset, segment.dst_offset, segment.length);
+      }
+      return;
+    }
+
+    for (const auto &update : pending_buffer_updates_) {
+      if (update.dst.ptr() == buffer)
+        EmitPendingBufferUpdate(update);
+    }
+  }
+
+  void
+  RemovePendingBufferUpdatesFor(Buffer *buffer, uint32_t count) {
+    std::vector<PendingBufferUpdate> remaining;
+    remaining.reserve(pending_buffer_updates_.size() - count);
+    for (auto &update : pending_buffer_updates_) {
+      if (update.dst.ptr() != buffer)
+        remaining.push_back(std::move(update));
+    }
+    pending_buffer_updates_.swap(remaining);
+  }
+
+  void
+  RecordPendingBufferFlush(uint32_t flushed, bool all_flush = false) {
+    auto &statistics = ctx_state.cmd_queue.CurrentFrameStatistics();
+    statistics.d3d11_update_buffer_deferred_flush_count++;
+    statistics.d3d11_update_buffer_deferred_flushed_count += flushed;
+    statistics.d3d11_update_buffer_deferred_max_batch =
+        std::max(statistics.d3d11_update_buffer_deferred_max_batch, flushed);
+    if (all_flush)
+      statistics.d3d11_update_buffer_deferred_all_flush_count++;
+  }
+
+  PendingBufferUpdate
+  MakeConstantBufferShadowWritebackUpdate(const PendingConstantBufferShadowWriteback &writeback) {
+    auto shadow = writeback.resource ? writeback.resource->constantBufferShadow() : std::span<std::byte>{};
+    if (shadow.empty() || writeback.dst_offset > shadow.size() ||
+        writeback.length > shadow.size() - writeback.dst_offset)
+      return PendingBufferUpdate{
+          .dst = {},
+          .staging = {},
+          .staging_offset = 0,
+          .dst_offset = 0,
+          .length = 0,
+          .allow_compute_pack = false,
+          .payload = moveonly_list<char>(nullptr, 0),
+      };
+
+    auto [staging_buffer, staging_offset] = AllocateStagingBuffer(writeback.length, 16);
+    staging_buffer.updateContents(staging_offset, shadow.data() + writeback.dst_offset, writeback.length);
+    return {
+        .dst = writeback.dst,
+        .staging = staging_buffer,
+        .staging_offset = staging_offset,
+        .dst_offset = writeback.dst_offset,
+        .length = writeback.length,
+        .allow_compute_pack = false,
+        .payload = moveonly_list<char>(nullptr, 0),
+    };
+  }
+
+  void
+  FlushPendingConstantBufferShadowWritebacksFor(Buffer *buffer) {
+    if (!buffer || pending_cb_shadow_writebacks_.empty())
+      return;
+
+    std::vector<PendingBufferUpdate> updates;
+    std::vector<PendingConstantBufferShadowWriteback> remaining;
+    updates.reserve(pending_cb_shadow_writebacks_.size());
+    remaining.reserve(pending_cb_shadow_writebacks_.size());
+
+    for (auto &writeback : pending_cb_shadow_writebacks_) {
+      if (writeback.dst.ptr() != buffer) {
+        remaining.push_back(std::move(writeback));
+        continue;
+      }
+      auto update = MakeConstantBufferShadowWritebackUpdate(writeback);
+      if (update.length)
+        updates.push_back(std::move(update));
+    }
+    pending_cb_shadow_writebacks_.swap(remaining);
+    if (updates.empty())
+      return;
+
+    RecordPendingBufferFlush(static_cast<uint32_t>(updates.size()));
+    ctx_state.cmd_queue.CurrentFrameStatistics().d3d11_update_buffer_deferred_blit_flush_count++;
+    SwitchToBlitEncoder(CommandBufferState::UpdateBlitEncoderActive);
+    for (auto &update : updates)
+      EmitPendingBufferUpdate(update);
+  }
+
+  void
+  FlushAllPendingConstantBufferShadowWritebacks() {
+    // Constant-buffer shadow contents are authoritative for CB bindings. The
+    // original resource backing only needs synchronization when a non-CB path
+    // consumes that specific buffer, so a global flush would create useless
+    // blits for update-only/no-consume workloads.
+  }
+
+  void
+  EmitPackedPendingBufferUpdateBatch(Buffer *buffer, const PendingBufferUpdateBatchInfo &info) {
+    ctx_state.cmd_queue.CurrentFrameStatistics().d3d11_update_buffer_deferred_compute_packed_count++;
+    auto [packed_staging, packed_offset] = AllocateStagingBuffer(info.packed_bytes, 16);
+    auto region_count = static_cast<uint32_t>(info.segments.size());
+    auto [region_buffer, region_offset] = AllocateStagingBuffer(sizeof(BufferCopyRegion) * region_count, alignof(BufferCopyRegion));
+    auto regions = AllocateCommandData<BufferCopyRegion>(region_count);
+    uint64_t cursor = 0;
+    for (uint32_t region_index = 0; region_index < region_count; region_index++) {
+      const auto &segment = info.segments[region_index];
+      const auto &update = pending_buffer_updates_[segment.update_index];
+      packed_staging.updateContents(packed_offset + cursor, update.payload.data() + segment.src_offset, segment.length);
+      regions[region_index] = {
+          .src_offset = static_cast<uint32_t>(cursor),
+          .dst_offset = segment.dst_offset,
+          .byte_length = segment.length,
+          .reserved = 0,
+      };
+      cursor += segment.length;
+    }
+
+    std::vector<PendingBufferUpdate> remaining;
+    remaining.reserve(pending_buffer_updates_.size() - info.count);
+    for (auto &update : pending_buffer_updates_) {
+      if (update.dst.ptr() != buffer)
+        remaining.push_back(std::move(update));
+    }
+    region_buffer.updateContents(region_offset, regions.data(), sizeof(BufferCopyRegion) * region_count);
+    auto dst = Rc(buffer);
+    EmitOP([packed_staging, packed_offset, region_buffer, region_offset, dst,
+            region_count, max_region_bytes = info.max_region_bytes](
+               ArgumentEncodingContext &enc) mutable {
+      auto [dst_buffer, dst_offset] = enc.access(dst, 0, dst->length(), ResourceAccess::Write);
+      enc.resolveComputePassBarrier();
+      enc.emulated_cmd.CopyBufferRegions(
+          packed_staging, packed_offset, dst_buffer->buffer(), dst_offset, region_buffer, region_offset,
+          region_count, max_region_bytes
+      );
+      enc.resolveComputePassBarrier();
+    });
+    pending_buffer_updates_.swap(remaining);
+  }
+
+  void
+  FlushPendingBufferUpdatesFor(Buffer *buffer) {
+    if (!buffer)
+      return;
+
+    FlushPendingConstantBufferShadowWritebacksFor(buffer);
+
+    if (pending_buffer_updates_.empty())
+      return;
+
+    auto batch = AnalyzePendingBufferUpdateBatch(buffer);
+    if (!batch.count)
+      return;
+
+    RecordPendingBufferFlush(batch.count);
+    ctx_state.cmd_queue.CurrentFrameStatistics().d3d11_update_buffer_deferred_blit_flush_count++;
+    SwitchToBlitEncoder(CommandBufferState::UpdateBlitEncoderActive);
+
+    EmitPendingBufferUpdateBatchBlit(buffer, batch);
+    RemovePendingBufferUpdatesFor(buffer, batch.count);
+  }
+
+  void
+  FlushPendingBufferUpdatesForMany(const std::vector<Buffer *> &buffers) {
+    if (buffers.empty())
+      return;
+
+    std::unordered_set<Buffer *> targets;
+    targets.reserve(buffers.size());
+    for (auto buffer : buffers) {
+      if (buffer)
+        targets.insert(buffer);
+    }
+    if (targets.empty())
+      return;
+
+    for (auto buffer : targets)
+      FlushPendingConstantBufferShadowWritebacksFor(buffer);
+
+    if (pending_buffer_updates_.empty())
+      return;
+
+    uint32_t flush_count = 0;
+    for (const auto &update : pending_buffer_updates_) {
+      if (targets.contains(update.dst.ptr()))
+        flush_count++;
+    }
+    if (!flush_count)
+      return;
+
+    RecordPendingBufferFlush(flush_count);
+    ctx_state.cmd_queue.CurrentFrameStatistics().d3d11_update_buffer_deferred_blit_flush_count++;
+    SwitchToBlitEncoder(CommandBufferState::UpdateBlitEncoderActive);
+
+    for (auto buffer : targets) {
+      if (pending_buffer_updates_.empty())
+        break;
+      auto batch = AnalyzePendingBufferUpdateBatch(buffer);
+      if (!batch.count)
+        continue;
+      EmitPendingBufferUpdateBatchBlit(buffer, batch);
+      RemovePendingBufferUpdatesFor(buffer, batch.count);
+    }
+  }
+
+  void
+  FlushPendingBufferUpdatesForCompute(Buffer *buffer) {
+    if (!buffer)
+      return;
+
+    FlushPendingConstantBufferShadowWritebacksFor(buffer);
+
+    if (pending_buffer_updates_.empty())
+      return;
+
+    auto batch = AnalyzePendingBufferUpdateBatch(buffer);
+    if (!batch.count)
+      return;
+
+    RecordPendingBufferFlush(batch.count);
+    ctx_state.cmd_queue.CurrentFrameStatistics().d3d11_update_buffer_deferred_compute_flush_count++;
+    SwitchToComputeEncoder();
+
+    if (batch.can_pack_regions && batch.count > 1) {
+      EmitPackedPendingBufferUpdateBatch(buffer, batch);
+      InvalidateComputePipeline();
+      return;
+    }
+
+    std::vector<PendingBufferUpdate> remaining;
+    remaining.reserve(pending_buffer_updates_.size() - batch.count);
+    for (auto &update : pending_buffer_updates_) {
+          if (update.dst.ptr() == buffer) {
+        EmitOP([staging_buffer = update.staging, offset = update.staging_offset,
+                dst = update.dst, copy_offset = update.dst_offset, copy_len = update.length](
+                   ArgumentEncodingContext &enc) {
+          auto [dst_buffer, dst_offset] = enc.access(dst, copy_offset, copy_len, ResourceAccess::Write);
+          enc.resolveComputePassBarrier();
+          enc.emulated_cmd.CopyBufferBytes(
+              staging_buffer, offset, dst_buffer->buffer(), copy_offset + dst_offset, copy_len
+          );
+          enc.resolveComputePassBarrier();
+        });
+      } else {
+        remaining.push_back(std::move(update));
+      }
+    }
+    pending_buffer_updates_.swap(remaining);
+    InvalidateComputePipeline();
+  }
+
+  void
+  FlushAllPendingBufferUpdatesForCompute() {
+    if (pending_buffer_updates_.empty())
+      return;
+
+    RecordPendingBufferFlush(static_cast<uint32_t>(pending_buffer_updates_.size()), true);
+    ctx_state.cmd_queue.CurrentFrameStatistics().d3d11_update_buffer_deferred_compute_flush_count++;
+    SwitchToComputeEncoder();
+
+    while (!pending_buffer_updates_.empty()) {
+      Buffer *buffer = pending_buffer_updates_.front().dst.ptr();
+      auto batch = AnalyzePendingBufferUpdateBatch(buffer);
+      if (batch.can_pack_regions && batch.count > 1) {
+        EmitPackedPendingBufferUpdateBatch(buffer, batch);
+      } else {
+        for (auto &update : pending_buffer_updates_) {
+          if (update.dst.ptr() == buffer) {
+            EmitOP([staging_buffer = update.staging, offset = update.staging_offset,
+                    dst = update.dst, copy_offset = update.dst_offset, copy_len = update.length](
+                       ArgumentEncodingContext &enc) {
+              auto [dst_buffer, dst_offset] = enc.access(dst, copy_offset, copy_len, ResourceAccess::Write);
+              enc.resolveComputePassBarrier();
+              enc.emulated_cmd.CopyBufferBytes(
+                  staging_buffer, offset, dst_buffer->buffer(), copy_offset + dst_offset, copy_len
+              );
+              enc.resolveComputePassBarrier();
+            });
+          }
+        }
+        std::vector<PendingBufferUpdate> remaining;
+        remaining.reserve(pending_buffer_updates_.size() - batch.count);
+        for (auto &update : pending_buffer_updates_) {
+          if (update.dst.ptr() != buffer)
+            remaining.push_back(std::move(update));
+        }
+        pending_buffer_updates_.swap(remaining);
+      }
+    }
+    InvalidateComputePipeline();
+  }
+
+  void
+  FlushAllPendingBufferUpdates() {
+    FlushAllPendingConstantBufferShadowWritebacks();
+
+    if (pending_buffer_updates_.empty())
+      return;
+
+    RecordPendingBufferFlush(static_cast<uint32_t>(pending_buffer_updates_.size()), true);
+    SwitchToBlitEncoder(CommandBufferState::UpdateBlitEncoderActive);
+    while (!pending_buffer_updates_.empty()) {
+      Buffer *buffer = pending_buffer_updates_.front().dst.ptr();
+      auto batch = AnalyzePendingBufferUpdateBatch(buffer);
+      EmitPendingBufferUpdateBatchBlit(buffer, batch);
+      RemovePendingBufferUpdatesFor(buffer, batch.count);
+    }
+  }
+
+  void
+  FlushPendingBufferUpdatesForResource(const Com<D3D11ResourceCommon, false> &resource) {
+    if (resource && resource->buffer().ptr())
+      FlushPendingBufferUpdatesFor(resource->buffer().ptr());
+  }
+
+  void
+  FlushPendingBufferUpdatesForComputeResource(const Com<D3D11ResourceCommon, false> &resource) {
+    if (resource && resource->buffer().ptr())
+      FlushPendingBufferUpdatesForCompute(resource->buffer().ptr());
+  }
+
+  void
+  FlushPendingBufferUpdatesForSRV(const SRV_B &srv) {
+    if (srv.Buffer.ptr())
+      FlushPendingBufferUpdatesFor(srv.Buffer.ptr());
+  }
+
+  void
+  FlushPendingBufferUpdatesForUAV(const UAV_B &uav) {
+    if (!uav.View)
+      return;
+    if (auto buffer = uav.View->buffer())
+      FlushPendingBufferUpdatesFor(buffer.ptr());
+  }
+
+  void
+  FlushPendingBufferUpdatesForComputeSRV(const SRV_B &srv) {
+    if (srv.Buffer.ptr())
+      FlushPendingBufferUpdatesForCompute(srv.Buffer.ptr());
+  }
+
+  void
+  FlushPendingBufferUpdatesForComputeUAV(const UAV_B &uav) {
+    if (!uav.View)
+      return;
+    if (auto buffer = uav.View->buffer())
+      FlushPendingBufferUpdatesForCompute(buffer.ptr());
+  }
+
+  bool
+  HasPendingConstantBufferShadowWritebackFor(Buffer *buffer) const {
+    if (!buffer)
+      return false;
+    for (const auto &writeback : pending_cb_shadow_writebacks_) {
+      if (writeback.dst.ptr() == buffer)
+        return true;
+    }
+    return false;
+  }
+
+  bool
+  HasPendingBufferUpdateFor(Buffer *buffer) const {
+    if (!buffer)
+      return false;
+    for (const auto &update : pending_buffer_updates_) {
+      if (update.dst.ptr() == buffer)
+        return true;
+    }
+    return false;
+  }
+
+  template <PipelineStage Stage>
+  void
+  CollectPendingBufferUpdateDrawShaderStage(std::vector<Buffer *> &buffers) {
+    auto &stage = state_.ShaderStages[Stage];
+    if (!stage.Shader)
+      return;
+
+    auto managed_shader = stage.Shader->GetManagedShader();
+    if (!managed_shader)
+      return;
+
+    const auto &reflection = managed_shader->reflection();
+    if (reflection.ConstantBufferSlotMask) {
+      for (const auto &[slot, entry] : stage.ConstantBuffers) {
+        if (slot >= 64 || !(reflection.ConstantBufferSlotMask & (uint64_t(1) << slot)))
+          continue;
+        if (entry.Buffer && !entry.Buffer->constantBufferShadow().empty())
+          continue;
+        if (entry.Buffer && entry.Buffer->buffer().ptr())
+          buffers.push_back(entry.Buffer->buffer().ptr());
+      }
+    }
+    if (reflection.SRVSlotMaskLo || reflection.SRVSlotMaskHi) {
+      for (const auto &[slot, entry] : stage.SRVs) {
+        bool used = slot < 64
+            ? (reflection.SRVSlotMaskLo & (uint64_t(1) << slot))
+            : (reflection.SRVSlotMaskHi & (uint64_t(1) << (slot - 64)));
+        if (used && entry.Buffer.ptr())
+          buffers.push_back(entry.Buffer.ptr());
+      }
+    }
+  }
+
+  template <PipelineStage Stage>
+  bool
+  DrawShaderStageHasPendingNonConstantBufferUpdate() const {
+    auto &stage = state_.ShaderStages[Stage];
+    if (!stage.Shader)
+      return false;
+
+    auto managed_shader = stage.Shader->GetManagedShader();
+    if (!managed_shader)
+      return false;
+
+    const auto &reflection = managed_shader->reflection();
+    if (reflection.SRVSlotMaskLo || reflection.SRVSlotMaskHi) {
+      for (const auto &[slot, entry] : stage.SRVs) {
+        bool used = slot < 64
+            ? (reflection.SRVSlotMaskLo & (uint64_t(1) << slot))
+            : (reflection.SRVSlotMaskHi & (uint64_t(1) << (slot - 64)));
+        if (used && entry.Buffer.ptr() &&
+            (HasPendingBufferUpdateFor(entry.Buffer.ptr()) ||
+             HasPendingConstantBufferShadowWritebackFor(entry.Buffer.ptr())))
+          return true;
+      }
+    }
+    return false;
+  }
+
+  bool
+  DrawBindingsHavePendingNonConstantBufferUpdate() const {
+    for (const auto &[slot, entry] : state_.InputAssembler.VertexBuffers) {
+      auto buffer = entry.Buffer ? entry.Buffer->buffer().ptr() : nullptr;
+      if (HasPendingBufferUpdateFor(buffer) || HasPendingConstantBufferShadowWritebackFor(buffer))
+        return true;
+    }
+    if (auto buffer = state_.InputAssembler.IndexBuffer ? state_.InputAssembler.IndexBuffer->buffer().ptr() : nullptr) {
+      if (HasPendingBufferUpdateFor(buffer) || HasPendingConstantBufferShadowWritebackFor(buffer))
+        return true;
+    }
+
+    if (DrawShaderStageHasPendingNonConstantBufferUpdate<PipelineStage::Vertex>() ||
+        DrawShaderStageHasPendingNonConstantBufferUpdate<PipelineStage::Pixel>() ||
+        DrawShaderStageHasPendingNonConstantBufferUpdate<PipelineStage::Geometry>() ||
+        DrawShaderStageHasPendingNonConstantBufferUpdate<PipelineStage::Hull>() ||
+        DrawShaderStageHasPendingNonConstantBufferUpdate<PipelineStage::Domain>())
+      return true;
+
+    for (auto &rtv : state_.OutputMerger.RTVs) {
+      auto buffer = (rtv && rtv->isBufferView()) ? rtv->buffer().ptr() : nullptr;
+      if (HasPendingBufferUpdateFor(buffer) || HasPendingConstantBufferShadowWritebackFor(buffer))
+        return true;
+    }
+    for (const auto &[slot, entry] : state_.OutputMerger.UAVs) {
+      if (entry.View) {
+        if (auto buffer = entry.View->buffer()) {
+          if (HasPendingBufferUpdateFor(buffer.ptr()) || HasPendingConstantBufferShadowWritebackFor(buffer.ptr()))
+            return true;
+        }
+      }
+    }
+    for (const auto &[slot, entry] : state_.StreamOutput.Targets) {
+      auto buffer = entry.Buffer ? entry.Buffer->buffer().ptr() : nullptr;
+      if (HasPendingBufferUpdateFor(buffer) || HasPendingConstantBufferShadowWritebackFor(buffer))
+        return true;
+    }
+    return false;
+  }
+
+  bool
+  ComputeBindingsHavePendingNonConstantBufferUpdate() const {
+    auto &stage = state_.ShaderStages[PipelineStage::Compute];
+    for (const auto &[slot, entry] : stage.SRVs) {
+      if (entry.Buffer.ptr() &&
+          (HasPendingBufferUpdateFor(entry.Buffer.ptr()) ||
+           HasPendingConstantBufferShadowWritebackFor(entry.Buffer.ptr())))
+        return true;
+    }
+    for (const auto &[slot, entry] : state_.ComputeStageUAV.UAVs) {
+      if (!entry.View)
+        continue;
+      if (auto buffer = entry.View->buffer()) {
+        if (HasPendingBufferUpdateFor(buffer.ptr()) || HasPendingConstantBufferShadowWritebackFor(buffer.ptr()))
+          return true;
+      }
+    }
+    return false;
+  }
+
+  void
+  FlushPendingBufferUpdatesForComputeBindings() {
+    if (pending_buffer_updates_.empty() && pending_cb_shadow_writebacks_.empty())
+      return;
+    if (!ComputeBindingsHavePendingNonConstantBufferUpdate())
+      return;
+
+    auto &stage = state_.ShaderStages[PipelineStage::Compute];
+    for (const auto &[slot, entry] : stage.ConstantBuffers) {
+      if (entry.Buffer && !entry.Buffer->constantBufferShadow().empty())
+        continue;
+      FlushPendingBufferUpdatesForComputeResource(entry.Buffer);
+    }
+    for (const auto &[slot, entry] : stage.SRVs)
+      FlushPendingBufferUpdatesForComputeSRV(entry);
+    for (const auto &[slot, entry] : state_.ComputeStageUAV.UAVs)
+      FlushPendingBufferUpdatesForComputeUAV(entry);
+  }
+
+  void
+  FlushPendingBufferUpdatesForDrawBindings() {
+    if (pending_buffer_updates_.empty() && pending_cb_shadow_writebacks_.empty())
+      return;
+    if (!DrawBindingsHavePendingNonConstantBufferUpdate())
+      return;
+
+    std::vector<Buffer *> buffers;
+    for (const auto &[slot, entry] : state_.InputAssembler.VertexBuffers)
+      if (entry.Buffer && entry.Buffer->buffer().ptr())
+        buffers.push_back(entry.Buffer->buffer().ptr());
+    if (state_.InputAssembler.IndexBuffer && state_.InputAssembler.IndexBuffer->buffer().ptr())
+      buffers.push_back(state_.InputAssembler.IndexBuffer->buffer().ptr());
+
+    CollectPendingBufferUpdateDrawShaderStage<PipelineStage::Vertex>(buffers);
+    CollectPendingBufferUpdateDrawShaderStage<PipelineStage::Pixel>(buffers);
+    CollectPendingBufferUpdateDrawShaderStage<PipelineStage::Geometry>(buffers);
+    CollectPendingBufferUpdateDrawShaderStage<PipelineStage::Hull>(buffers);
+    CollectPendingBufferUpdateDrawShaderStage<PipelineStage::Domain>(buffers);
+
+    for (auto &rtv : state_.OutputMerger.RTVs) {
+      if (rtv && rtv->isBufferView())
+        buffers.push_back(rtv->buffer().ptr());
+    }
+    for (const auto &[slot, entry] : state_.OutputMerger.UAVs) {
+      if (entry.View) {
+        if (auto buffer = entry.View->buffer())
+          buffers.push_back(buffer.ptr());
+      }
+    }
+    for (const auto &[slot, entry] : state_.StreamOutput.Targets)
+      if (entry.Buffer && entry.Buffer->buffer().ptr())
+        buffers.push_back(entry.Buffer->buffer().ptr());
+
+    FlushPendingBufferUpdatesForMany(buffers);
+  }
 
 public:
   MTLD3D11DeviceContextImplBase(MTLD3D11Device *pDevice, ContextInternalState &ctx_state, ContextInternalState::device_mutex_t &mutex) :
@@ -5654,6 +6562,12 @@ public:
   AllocateStagingBuffer(size_t size, size_t alignment) {
     auto [block, offset] = staging_allocator.allocate(1, 0, size, alignment);
     return {block.buffer, offset};
+  }
+
+  AllocatedTempBufferSlice
+  AllocateStagingBuffer1(size_t size, size_t alignment) {
+    auto [block, offset] = staging_allocator.allocate(1, 0, size, alignment);
+    return {block.buffer, offset, block.gpu_address};
   }
 
   void *

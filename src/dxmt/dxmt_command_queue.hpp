@@ -249,6 +249,12 @@ public:
     return {block.buffer, offset};
   }
 
+  AllocatedTempBufferSlice
+  AllocateStagingBuffer1(size_t size, size_t alignment) {
+    auto [block, offset] = staging_allocator.allocate(ready_for_encode, cpu_coherent.signaledValue(), size, alignment);
+    return {block.buffer, offset, block.gpu_address};
+  }
+
   std::pair<WMT::Buffer, uint64_t>
   AllocateTempBuffer(uint64_t seq, size_t size, size_t alignment) {
     auto [block, offset] = copy_temp_allocator.allocate(seq, cpu_coherent.signaledValue(), size, alignment);

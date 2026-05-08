@@ -16,6 +16,8 @@
 #include <type_traits>
 #include <random>
 #include <cstdio>
+#include <cstddef>
+#include <span>
 
 DEFINE_COM_INTERFACE("9a6f6549-d4b1-45ea-8794-8503d190d3d1",
                      IMTLMinLODClampable)
@@ -133,6 +135,19 @@ struct D3D11ResourceCommon : ID3D11Resource {
   virtual Rc<DynamicBuffer> dynamicBuffer(UINT *pBufferLength, UINT *pBindFlags) = 0;
   virtual Rc<DynamicLinearTexture> dynamicLinearTexture(UINT *pBytesPerRow, UINT *pBytesPerImage) = 0;
   virtual Rc<DynamicBuffer> dynamicTexture(UINT Subresource, UINT *pBytesPerRow, UINT *pBytesPerImage) = 0;
+  virtual std::span<std::byte> constantBufferShadow() {
+    return {};
+  }
+  virtual WMT::Buffer constantBufferShadowBuffer() {
+    return {};
+  }
+  virtual uint64_t constantBufferShadowGpuAddress() {
+    return 0;
+  }
+  virtual uint64_t constantBufferShadowVersion() {
+    return 0;
+  }
+  virtual void bumpConstantBufferShadowVersion() {}
 
   Rc<Buffer> buffer_{};
   Rc<Texture> texture_{};

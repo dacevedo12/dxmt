@@ -240,20 +240,42 @@ DebugShaderHashMatchesFilter(ManagedShader shader, std::string filter) {
 
 inline bool
 DebugShouldDumpPipeline(const MTL_GRAPHICS_PIPELINE_DESC &desc, bool problem) {
-  std::string mode = env::getEnvVar("DXMT_DUMP_PIPELINES");
+  struct DumpConfig {
+    std::string mode;
+    std::string key;
+    std::string vs;
+    std::string ps;
+    std::string gs;
+    std::string hs;
+    std::string ds;
+  };
+
+  static const DumpConfig config = [] {
+    DumpConfig config;
+    config.mode = env::getEnvVar("DXMT_DUMP_PIPELINES");
+    config.key = env::getEnvVar("DXMT_DUMP_PIPELINE_KEY");
+    config.vs = env::getEnvVar("DXMT_DUMP_PIPELINE_VS");
+    config.ps = env::getEnvVar("DXMT_DUMP_PIPELINE_PS");
+    config.gs = env::getEnvVar("DXMT_DUMP_PIPELINE_GS");
+    config.hs = env::getEnvVar("DXMT_DUMP_PIPELINE_HS");
+    config.ds = env::getEnvVar("DXMT_DUMP_PIPELINE_DS");
+    if (config.key.starts_with("0x") || config.key.starts_with("0X"))
+      config.key = config.key.substr(2);
+    return config;
+  }();
+
+  auto mode = config.mode;
   if (mode == "0" || mode == "none" || mode == "false")
     return false;
 
-  std::string key = env::getEnvVar("DXMT_DUMP_PIPELINE_KEY");
-  std::string vs = env::getEnvVar("DXMT_DUMP_PIPELINE_VS");
-  std::string ps = env::getEnvVar("DXMT_DUMP_PIPELINE_PS");
-  std::string gs = env::getEnvVar("DXMT_DUMP_PIPELINE_GS");
-  std::string hs = env::getEnvVar("DXMT_DUMP_PIPELINE_HS");
-  std::string ds = env::getEnvVar("DXMT_DUMP_PIPELINE_DS");
+  auto key = config.key;
+  auto &vs = config.vs;
+  auto &ps = config.ps;
+  auto &gs = config.gs;
+  auto &hs = config.hs;
+  auto &ds = config.ds;
 
   if (!key.empty()) {
-    if (key.starts_with("0x") || key.starts_with("0X"))
-      key = key.substr(2);
     if (key != DebugPipelineKey(desc))
       return false;
   }
@@ -286,15 +308,27 @@ DebugShouldDumpPipeline(const MTL_GRAPHICS_PIPELINE_DESC &desc, bool problem) {
 }
 
 inline bool
+DebugShouldLogPipelineFinalize() {
+  static const bool enabled = [] {
+    std::string mode = env::getEnvVar("DXMT_DIAG_PIPELINE_FINALIZE");
+    return mode == "1" || mode == "true" || mode == "yes" || mode == "trace";
+  }();
+  return enabled;
+}
+
+inline bool
 DebugShouldDumpComputeShader(ManagedShader shader) {
-  std::string filter = env::getEnvVar("DXMT_DUMP_COMPUTE_SHADERS");
+  static const std::string filter = [] {
+    auto value = env::getEnvVar("DXMT_DUMP_COMPUTE_SHADERS");
+    if (value.empty())
+      value = env::getEnvVar("DXMT_DUMP_PIPELINE_CS");
+    return value;
+  }();
   if (filter == "0" || filter == "none" || filter == "false")
     return false;
   if (filter == "1" || filter == "all")
     return true;
 
-  if (filter.empty())
-    filter = env::getEnvVar("DXMT_DUMP_PIPELINE_CS");
   return DebugShaderHashMatchesFilter(shader, filter);
 }
 

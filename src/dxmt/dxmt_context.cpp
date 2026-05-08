@@ -921,9 +921,6 @@ DebugPipelineStageName(PipelineStage stage) {
 static void
 DebugAccumulateRenderCommands(FrameStatistics &statistics,
                               const wmtcmd_render_nop *cmd_head) {
-  if (!DebugShouldLogRenderCommands())
-    return;
-
   auto command = reinterpret_cast<const wmtcmd_base *>(cmd_head->next.ptr);
   while (command) {
     statistics.render_command_count++;
@@ -960,6 +957,82 @@ DebugAccumulateRenderCommands(FrameStatistics &statistics,
       break;
     }
     command = static_cast<const wmtcmd_base *>(command->next.ptr);
+  }
+}
+
+static void
+DebugAccumulateRenderPassStats(FrameStatistics &statistics,
+                               const RenderEncoderData *data) {
+  const auto samples = std::max<uint32_t>(1, data->default_raster_sample_count);
+  const auto width = data->render_target_width;
+  const auto height = data->render_target_height;
+  const uint64_t pixels = uint64_t(width) * uint64_t(height);
+
+  statistics.render_pixel_count += pixels;
+  statistics.render_max_width = std::max(statistics.render_max_width, width);
+  statistics.render_max_height = std::max(statistics.render_max_height, height);
+  statistics.render_max_sample_count = std::max(statistics.render_max_sample_count, samples);
+
+  if (samples > 1) {
+    statistics.render_msaa_pass_count++;
+    statistics.render_msaa_pixel_count += pixels * samples;
+  }
+}
+
+static void
+DebugAccumulateClearPassStats(FrameStatistics &statistics,
+                              const WMTRenderPassInfo &info) {
+  const auto samples = std::max<uint32_t>(1, info.default_raster_sample_count);
+  if (samples > 1)
+    statistics.clear_msaa_pass_count++;
+}
+
+static void
+DebugAccumulateResolvePassStats(FrameStatistics &statistics,
+                                const WMTRenderPassInfo &info, bool shader_resolve) {
+  const auto width = info.render_target_width;
+  const auto height = info.render_target_height;
+
+  statistics.resolve_pass_count++;
+  if (shader_resolve)
+    statistics.resolve_shader_pass_count++;
+  else
+    statistics.resolve_fixed_pass_count++;
+
+  statistics.resolve_pixel_count += uint64_t(width) * uint64_t(height);
+  statistics.resolve_max_width = std::max(statistics.resolve_max_width, width);
+  statistics.resolve_max_height = std::max(statistics.resolve_max_height, height);
+}
+
+static void
+DebugAccumulateBlitCommands(FrameStatistics &statistics,
+                            const wmtcmd_blit_nop *cmd_head) {
+  auto command = reinterpret_cast<const wmtcmd_base *>(cmd_head->next.ptr);
+  while (command) {
+    statistics.blit_command_count++;
+    switch (command->type) {
+    case WMTBlitCommandCopyFromBufferToBuffer:
+      statistics.blit_copy_buffer_to_buffer_count++;
+      break;
+    case WMTBlitCommandCopyFromBufferToTexture:
+      statistics.blit_copy_buffer_to_texture_count++;
+      break;
+    case WMTBlitCommandCopyFromTextureToBuffer:
+      statistics.blit_copy_texture_to_buffer_count++;
+      break;
+    case WMTBlitCommandCopyFromTextureToTexture:
+      statistics.blit_copy_texture_to_texture_count++;
+      break;
+    case WMTBlitCommandGenerateMipmaps:
+      statistics.blit_generate_mipmaps_count++;
+      break;
+    case WMTBlitCommandFillBuffer:
+      statistics.blit_fill_buffer_count++;
+      break;
+    default:
+      break;
+    }
+    command = reinterpret_cast<const wmtcmd_base *>(command->next.ptr);
   }
 }
 
@@ -1153,6 +1226,7 @@ DebugLogConstantBufferBinding(
       " register_lower=", arg.RegisterLowerBound,
       " register_count=", arg.RegisterCount,
       " register_space=", arg.RegisterSpace,
+      " cbuffer_vec4=", arg.CBufferSizeInVec4,
       " buffer=", uint64_t(binding.buffer.ptr()),
       " offset=", uint32_t(binding.offset),
       " length=", valid_length,
@@ -1204,6 +1278,26 @@ ArgumentEncodingContext::encodeConstantBuffers(
     case SM50BindingType::ConstantBuffer: {
       auto &cbuf = bindings[i];
       if (!cbuf.buffer.ptr()) {
+        if (cbuf.inline_data && cbuf.inline_data_length) {
+          auto data = getMappedArgumentBuffer<std::byte, stage == PipelineStage::Compute>(cbuf.inline_data_offset);
+          std::memcpy(data, cbuf.inline_data, cbuf.inline_data_length);
+          encoded_buffer[arg.StructurePtrOffset] = getFinalArgumentBufferOffset<stage == PipelineStage::Compute>(
+              cbuf.inline_data_offset
+          );
+          DebugLogConstantBufferBinding<stage, kind>(
+              "", arg, cbuf, encoded_buffer[arg.StructurePtrOffset], cbuf.inline_data_length, encoder_id, false
+          );
+          continue;
+        }
+        if (cbuf.direct_buffer) {
+          encoded_buffer[arg.StructurePtrOffset] = cbuf.direct_gpu_address + cbuf.offset;
+          DebugLogConstantBufferBinding<stage, kind>(
+              "", arg, cbuf, encoded_buffer[arg.StructurePtrOffset],
+              cbuf.direct_length > cbuf.offset ? cbuf.direct_length - cbuf.offset : 0, encoder_id, false);
+          makeResident<stage, kind>(
+              cbuf.direct_buffer, GetResidencyMask<kind>(stage, true, false));
+          continue;
+        }
         encoded_buffer[arg.StructurePtrOffset] = dummy_cbuffer_info_.gpu_address;
         DebugLogConstantBufferBinding<stage, kind>(
             "", arg, cbuf, dummy_cbuffer_info_.gpu_address, 0, encoder_id,
@@ -2144,14 +2238,18 @@ ArgumentEncodingContext::flushCommands(WMT::CommandBuffer cmdbuf, uint64_t seqId
   if (encoder_count > 1) {
     unsigned j, i;
     for (j = encoder_count - 2; j != ~0u; j--) {
-      // TODO(fences): we don't actively move encoders other than clear and render
-      if (encoders[j]->type != EncoderType::Clear && encoders[j]->type != EncoderType::Render)
+      if (encoders[j]->type != EncoderType::Clear &&
+          encoders[j]->type != EncoderType::Render &&
+          encoders[j]->type != EncoderType::Blit)
         continue;
       for (i = j + 1; i < encoder_count; i++) {
         if (encoders[i]->type == EncoderType::Null)
           continue;
-        if (checkEncoderRelation(encoders[j], encoders[i]) == DXMT_ENCODER_LIST_OP_SYNCHRONIZE)
+        if (checkEncoderRelation(encoders[j], encoders[i]) == DXMT_ENCODER_LIST_OP_SYNCHRONIZE) {
+          if (encoders[j]->type == EncoderType::Blit)
+            currentFrameStatistics().blit_merge_blocked_count++;
           break;
+        }
       }
     }
   }
@@ -2244,6 +2342,7 @@ ArgumentEncodingContext::flushCommands(WMT::CommandBuffer cmdbuf, uint64_t seqId
         break;
       }
       NormalizeRenderPassInfo(render_pass_info);
+      DebugAccumulateRenderPassStats(currentFrameStatistics(), data);
       FlushRenderEncoderArgumentBuffer(data);
       auto gpu_buffer_ = data->allocated_argbuf;
       const bool sample_render_readback = DebugShouldSampleRenderReadback(frame_id_);
@@ -2380,6 +2479,7 @@ ArgumentEncodingContext::flushCommands(WMT::CommandBuffer cmdbuf, uint64_t seqId
     }
     case EncoderType::Blit: {
       auto data = static_cast<BlitEncoderData *>(current);
+      DebugAccumulateBlitCommands(currentFrameStatistics(), &data->cmd_head);
       auto encoder = cmdbuf.blitCommandEncoder();
       data->fence_wait.forEach([&](auto id) { encoder.waitForFence(fence_pool_[id]); });
       encoder.encodeCommands(&data->cmd_head);
@@ -2485,6 +2585,7 @@ ArgumentEncodingContext::flushCommands(WMT::CommandBuffer cmdbuf, uint64_t seqId
         }
         info.render_target_array_length = data->array_length;
         NormalizeRenderPassInfo(info);
+        DebugAccumulateClearPassStats(currentFrameStatistics(), info);
         auto encoder = cmdbuf.renderCommandEncoder(info);
         encoder.setLabel(WMT::String::string("ClearPass", WMTUTF8StringEncoding));
         data->fence_wait.forEach([&](auto id) { encoder.waitForFence(fence_pool_[id], WMTRenderStageFragment); });
@@ -2532,6 +2633,7 @@ ArgumentEncodingContext::flushCommands(WMT::CommandBuffer cmdbuf, uint64_t seqId
         }
 
         NormalizeRenderPassInfo(info);
+        DebugAccumulateResolvePassStats(currentFrameStatistics(), info, bool(data->pso));
         auto encoder = cmdbuf.renderCommandEncoder(info);
         encoder.setLabel(WMT::String::string("ResolvePass", WMTUTF8StringEncoding));
         data->fence_wait.forEach([&](auto id) { encoder.waitForFence(fence_pool_[id], WMTRenderStageFragment); });
@@ -2697,6 +2799,17 @@ ArgumentEncodingContext::checkEncoderRelation(EncoderData *former, EncoderData *
   if (latter->type == EncoderType::SampleTimestamp)
     return DXMT_ENCODER_LIST_OP_SYNCHRONIZE;
 
+  if (former->type == EncoderType::Blit && latter->type == EncoderType::Blit) {
+    if (tryMergeBlitEncoders(
+            reinterpret_cast<BlitEncoderData *>(former),
+            reinterpret_cast<BlitEncoderData *>(latter)
+        ))
+      return DXMT_ENCODER_LIST_OP_SWAP;
+
+    currentFrameStatistics().blit_merge_blocked_count++;
+    return DXMT_ENCODER_LIST_OP_SYNCHRONIZE;
+  }
+
   while (former->type != latter->type) {
     if (former->type == EncoderType::Clear && latter->type == EncoderType::Render) {
       auto render = reinterpret_cast<RenderEncoderData *>(latter);
@@ -2784,9 +2897,9 @@ ArgumentEncodingContext::checkEncoderRelation(EncoderData *former, EncoderData *
     auto r1 = reinterpret_cast<RenderEncoderData *>(latter);
     auto r0 = reinterpret_cast<RenderEncoderData *>(former);
 
-    if (isEncoderSignatureMatched(r0, r1) &&
-        // can't merge if latter's vertex wait for former's fragment
-        !r1->fence_wait_vertex.intersectedWith(r0->fence_update)) {
+    bool signature_matched = isEncoderSignatureMatched(r0, r1);
+    bool vertex_wait_blocked = signature_matched && r1->fence_wait_vertex.intersectedWith(r0->fence_update);
+    if (signature_matched && !vertex_wait_blocked) {
       for (unsigned i = 0; i < r0->render_target_count; i++) {
         auto &a0 = r0->colors[i];
         auto &a1 = r1->colors[i];
@@ -2868,9 +2981,40 @@ ArgumentEncodingContext::checkEncoderRelation(EncoderData *former, EncoderData *
 
       return DXMT_ENCODER_LIST_OP_SYNCHRONIZE;
     }
+    if (vertex_wait_blocked)
+      currentFrameStatistics().render_merge_blocked_vertex_wait_count++;
   }
 
-  return hasDataDependency(latter, former) ? DXMT_ENCODER_LIST_OP_SYNCHRONIZE : DXMT_ENCODER_LIST_OP_SWAP;
+  if (hasDataDependency(latter, former)) {
+    currentFrameStatistics().encoder_relation_data_dependency_count++;
+    return DXMT_ENCODER_LIST_OP_SYNCHRONIZE;
+  }
+  return DXMT_ENCODER_LIST_OP_SWAP;
+}
+
+bool
+ArgumentEncodingContext::tryMergeBlitEncoders(BlitEncoderData *former, BlitEncoderData *latter) {
+  if (hasDataDependency(latter, former))
+    return false;
+
+  if ((void *)former->cmd_tail != &former->cmd_head) {
+    former->cmd_tail->next.set(latter->cmd_head.next.get());
+    latter->cmd_head.next.set(former->cmd_head.next.get());
+    if ((void *)latter->cmd_tail == &latter->cmd_head)
+      latter->cmd_tail = former->cmd_tail;
+    former->cmd_head.next.set(nullptr);
+    former->cmd_tail = reinterpret_cast<wmtcmd_base *>(&former->cmd_head);
+  }
+
+  latter->fence_update.merge(former->fence_update);
+  latter->fence_wait.merge(former->fence_wait);
+  latter->fence_wait.subtract(former->fence_update);
+
+  currentFrameStatistics().blit_pass_optimized++;
+  former->~BlitEncoderData();
+  former->next = nullptr;
+  former->type = EncoderType::Null;
+  return true;
 }
 
 bool
@@ -2899,64 +3043,71 @@ ArgumentEncodingContext::hasDataDependency(EncoderData *latter, EncoderData *for
 
 bool
 ArgumentEncodingContext::isEncoderSignatureMatched(RenderEncoderData *r0, RenderEncoderData *r1) {
+  auto &statistics = currentFrameStatistics();
+  auto mismatch = [&](uint32_t &counter) {
+    statistics.render_merge_signature_mismatch_count++;
+    counter++;
+    return false;
+  };
+
   // FIXME: it can be different?
   if (r0->render_target_count != r1->render_target_count)
-    return false;
+    return mismatch(statistics.render_merge_mismatch_rtv_count);
   if (r0->dsv_planar_flags != r1->dsv_planar_flags)
-    return false;
+    return mismatch(statistics.render_merge_mismatch_dsv_count);
   if (r0->dsv_readonly_flags != r1->dsv_readonly_flags)
-    return false;
+    return mismatch(statistics.render_merge_mismatch_dsv_count);
   if (r0->render_target_array_length != r1->render_target_array_length)
-    return false;
+    return mismatch(statistics.render_merge_mismatch_array_count);
   if (r0->dsv_planar_flags & 1) {
     if (r0->depth.attachment != r1->depth.attachment)
-      return false;
+      return mismatch(statistics.render_merge_mismatch_depth_count);
     if (r0->depth.level != r1->depth.level || r0->depth.slice != r1->depth.slice ||
         r0->depth.depth_plane != r1->depth.depth_plane)
-      return false;
+      return mismatch(statistics.render_merge_mismatch_depth_count);
     if (r0->dsv_readonly_flags & 1) {
       if (r1->depth.load_action == WMTLoadActionClear)
-        return false;
+        return mismatch(statistics.render_merge_mismatch_load_store_count);
     } else {
       if (r0->depth.store_action != WMTStoreActionStore)
-        return false;
+        return mismatch(statistics.render_merge_mismatch_load_store_count);
       if (r1->depth.load_action != WMTLoadActionLoad)
-        return false;
+        return mismatch(statistics.render_merge_mismatch_load_store_count);
     }
   }
   if (r0->dsv_planar_flags & 2) {
     if (r0->stencil.attachment != r1->stencil.attachment)
-      return false;
+      return mismatch(statistics.render_merge_mismatch_stencil_count);
     if (r0->stencil.level != r1->stencil.level || r0->stencil.slice != r1->stencil.slice ||
         r0->stencil.depth_plane != r1->stencil.depth_plane)
-      return false;
+      return mismatch(statistics.render_merge_mismatch_stencil_count);
     if (r0->dsv_readonly_flags & 2) {
       if (r1->stencil.load_action == WMTLoadActionClear)
-        return false;
+        return mismatch(statistics.render_merge_mismatch_load_store_count);
     } else {
       if (r0->stencil.store_action != WMTStoreActionStore)
-        return false;
+        return mismatch(statistics.render_merge_mismatch_load_store_count);
       if (r1->stencil.load_action != WMTLoadActionLoad)
-        return false;
+        return mismatch(statistics.render_merge_mismatch_load_store_count);
     }
   }
   for (unsigned i = 0; i < r0->render_target_count; i++) {
     auto &a0 = r0->colors[i];
     auto &a1 = r1->colors[i];
     if (a0.attachment != a1.attachment)
-      return false;
+      return mismatch(statistics.render_merge_mismatch_color_count);
     if (a0.buffer_attachment.ptr() != a1.buffer_attachment.ptr())
-      return false;
+      return mismatch(statistics.render_merge_mismatch_color_count);
     if (a0.buffer_view_id != a1.buffer_view_id)
-      return false;
+      return mismatch(statistics.render_merge_mismatch_color_count);
     if (a0.depth_plane != a1.depth_plane)
-      return false;
+      return mismatch(statistics.render_merge_mismatch_color_count);
     if (!a0.attachment && !a0.buffer_texture)
       continue;
     if (a0.store_action != WMTStoreActionStore)
-      return false;
+      return mismatch(statistics.render_merge_mismatch_load_store_count);
     if (a1.load_action != WMTLoadActionLoad)
-      return false;
+      return mismatch(statistics.render_merge_mismatch_load_store_count);
   }
   return true;
 }

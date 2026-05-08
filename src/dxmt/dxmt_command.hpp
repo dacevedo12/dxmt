@@ -9,6 +9,13 @@
 #include <unordered_map>
 
 namespace dxmt {
+struct BufferCopyRegion {
+  uint32_t src_offset;
+  uint32_t dst_offset;
+  uint32_t byte_length;
+  uint32_t reserved;
+};
+
 struct TileBarrierPSOKey {
   WMTPixelFormat color_formats[8];
   unsigned raster_sample_count;
@@ -154,6 +161,39 @@ public:
     dispatchThreads({texture.width(), texture.height(), texture.depth()});
   }
 
+  void
+  CopyBufferBytes(
+      WMT::Buffer src, uint64_t src_offset, WMT::Buffer dst, uint64_t dst_offset, uint64_t byte_length
+  ) {
+    if (!byte_length)
+      return;
+    uint32_t copy_length = static_cast<uint32_t>(byte_length);
+    setComputePipelineState(copy_buffer_bytes_pipeline, {64, 1, 1});
+    setComputeBuffer(src, src_offset, 0);
+    setComputeBuffer(dst, dst_offset, 1);
+    setComputeBytes(&copy_length, sizeof(copy_length), 2);
+    dispatchThreads({(byte_length + 15) >> 4, 1, 1});
+  }
+
+  void
+  CopyBufferRegions(
+      WMT::Buffer src, uint64_t src_offset, WMT::Buffer dst, uint64_t dst_offset, WMT::Buffer regions, uint64_t regions_offset,
+      uint32_t region_count, uint32_t max_region_bytes
+  ) {
+    if (!region_count || !max_region_bytes)
+      return;
+    setComputePipelineState(copy_buffer_regions_pipeline, {64, 1, 1});
+    setComputeBuffer(src, 0, 0);
+    setComputeBuffer(dst, 0, 1);
+    setComputeBuffer(regions, regions_offset, 2);
+    setComputeBytes(&region_count, sizeof(region_count), 3);
+    auto src_base = src_offset;
+    auto dst_base = dst_offset;
+    setComputeBytes(&src_base, sizeof(src_base), 4);
+    setComputeBytes(&dst_base, sizeof(dst_base), 5);
+    dispatchThreads({(max_region_bytes + 15) >> 4, region_count, 1});
+  }
+
   void PrepareCountedIndirectArguments(
       WMT::Buffer count_buffer, uint64_t count_offset, WMT::Buffer src,
       uint64_t src_offset, WMT::Buffer dst, uint64_t dst_offset,
@@ -203,6 +243,8 @@ private:
   WMT::Reference<WMT::ComputePipelineState> clear_texture_3d_float_pipeline;
   WMT::Reference<WMT::ComputePipelineState> clear_texture_buffer_float_pipeline;
   WMT::Reference<WMT::ComputePipelineState> cs_prepare_counted_indirect_args_pipeline;
+  WMT::Reference<WMT::ComputePipelineState> copy_buffer_bytes_pipeline;
+  WMT::Reference<WMT::ComputePipelineState> copy_buffer_regions_pipeline;
 
   WMT::Reference<WMT::RenderPipelineState> gs_draw_arguments_marshal;
   WMT::Reference<WMT::RenderPipelineState> ts_draw_arguments_marshal;

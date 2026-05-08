@@ -1310,6 +1310,7 @@ AIRCONV_API int SM50Initialize(
       .RegisterSpace = cbv.range.space,
       .RegisterLowerBound = cbv.range.lower_bound,
       .RegisterCount = cbv.range.size ? cbv.range.size : 1,
+      .CBufferSizeInVec4 = cbv.size_in_vec4,
     });
     if (binding_slot < 16)
       binding_cbuffer_mask |= (1 << binding_slot);

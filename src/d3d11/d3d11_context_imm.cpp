@@ -53,6 +53,12 @@ ImmediateContextBase::AllocateStagingBuffer(size_t size, size_t alignment) {
 }
 
 template <>
+AllocatedTempBufferSlice
+ImmediateContextBase::AllocateStagingBuffer1(size_t size, size_t alignment) {
+  return ctx_state.cmd_queue.AllocateStagingBuffer1(size, alignment);
+}
+
+template <>
 void
 ImmediateContextBase::UseCopyDestination(Rc<StagingResource> &staging) {
   staging->useCopyDestination(ctx_state.cmd_queue.CurrentSeqId());
@@ -141,6 +147,8 @@ public:
 
     if (unlikely(!pResource || !pMappedResource))
       return E_INVALIDARG;
+    if (auto common = GetResourceCommon(pResource))
+      FlushPendingBufferUpdatesFor(common->buffer().ptr());
     UINT buffer_length = 0, &row_pitch = buffer_length;
     UINT bind_flag = 0, &depth_pitch = bind_flag;
     auto current_seq_id = cmd_queue.CurrentSeqId();
@@ -322,6 +330,7 @@ public:
 
     std::lock_guard<d3d11_device_mutex> lock(mutex);
 
+    FlushAllPendingBufferUpdates();
     if (auto counter = com_cast<IMTLD3D11CounterExt>(pAsync)) {
       counter->BeginCounter();
       EmitOP([counter = std::move(counter)](ArgumentEncodingContext &enc) mutable {
@@ -380,7 +389,9 @@ public:
     switch (desc.Query) {
     case D3D11_QUERY_TIMESTAMP_DISJOINT:
     case D3D11_QUERY_EVENT: {
-      if (ctx_state.has_dirty_op_since_last_event) {
+    if (!pending_buffer_updates_.empty() || !pending_cb_shadow_writebacks_.empty() ||
+        ctx_state.has_dirty_op_since_last_event) {
+        FlushAllPendingBufferUpdates();
         auto event_id = cmd_queue.GetNextEventSeqId();
         static_cast<MTLD3D11EventQuery *>(pAsync)->Issue(event_id);
         InvalidateCurrentPass(true);
@@ -527,7 +538,9 @@ public:
   Flush1(D3D11_CONTEXT_TYPE Type, HANDLE hEvent) override {
     std::lock_guard<d3d11_device_mutex> lock(mutex);
 
-    if (ctx_state.has_dirty_op_since_last_event || promote_flush) {
+    if (!pending_buffer_updates_.empty() || !pending_cb_shadow_writebacks_.empty() ||
+        ctx_state.has_dirty_op_since_last_event || promote_flush) {
+      FlushAllPendingBufferUpdates();
       InvalidateCurrentPass(true);
       Commit();
     }
@@ -540,6 +553,7 @@ public:
   }
 
   void PrepareFlush() override {
+    FlushAllPendingBufferUpdates();
     InvalidateCurrentPass(true);
   }
 
@@ -618,6 +632,7 @@ public:
 
   virtual void
   WaitUntilGPUIdle() override {
+    FlushAllPendingBufferUpdates();
     uint64_t seq = cmd_queue.CurrentSeqId();
     if(!InvalidateCurrentPass())
       Commit();
@@ -635,6 +650,7 @@ public:
   HRESULT STDMETHODCALLTYPE Signal(ID3D11Fence *pFence, UINT64 Value) override {
     auto fence = static_cast<MTLD3D11Fence *>(pFence);
 
+    FlushAllPendingBufferUpdates();
     InvalidateCurrentPass();
     EmitOP([event = fence->event, Value](ArgumentEncodingContext &enc) mutable {
       enc.signalEvent(std::move(event), Value);
@@ -647,6 +663,7 @@ public:
   HRESULT STDMETHODCALLTYPE Wait(ID3D11Fence *pFence, UINT64 Value) override {
     auto fence = static_cast<MTLD3D11Fence *>(pFence);
 
+    FlushAllPendingBufferUpdates();
     Flush();
     EmitOP([event = fence->event, Value](ArgumentEncodingContext &enc) mutable {
       enc.waitEvent(std::move(event), Value);
