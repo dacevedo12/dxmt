@@ -488,6 +488,10 @@ struct depth_stencil_out {
   uint stencil [[stencil]]; 
 };
 
+struct stencil_out {
+  uint stencil [[stencil]];
+};
+
 struct packed_d32s8x24 {
   float depth;
   uchar stencil;
@@ -497,6 +501,7 @@ struct packed_d32s8x24 {
 struct linear_texture_desc {
   uint bytes_per_row;
   uint bytes_per_image;
+  uint2 origin;
 };
 
 [[fragment]] depth_stencil_out fs_copy_from_buffer_d32s8(
@@ -526,6 +531,30 @@ struct linear_texture_desc {
   uint data = *reinterpret_cast<device uint *>(buffer + buffer_offset);
   result.depth = float(data & 0xffffff) / float(0xffffff);
   result.stencil = data >> 24;
+  return result;
+}
+
+[[fragment]] depth_out fs_copy_depth_from_buffer_r32_float(
+  present_data input [[stage_in]],
+  device char* buffer [[buffer(0)]],
+  constant linear_texture_desc& desc [[buffer(1)]]
+) {
+  uint2 pos = uint2(input.position.xy) - desc.origin;
+  uint buffer_offset = pos.x * sizeof(float) + pos.y * desc.bytes_per_row;
+  depth_out result;
+  result.depth = *reinterpret_cast<device float *>(buffer + buffer_offset);
+  return result;
+}
+
+[[fragment]] stencil_out fs_copy_stencil_from_buffer_r8_uint(
+  present_data input [[stage_in]],
+  device char* buffer [[buffer(0)]],
+  constant linear_texture_desc& desc [[buffer(1)]]
+) {
+  uint2 pos = uint2(input.position.xy) - desc.origin;
+  uint buffer_offset = pos.x + pos.y * desc.bytes_per_row;
+  stencil_out result;
+  result.stencil = *reinterpret_cast<device uchar *>(buffer + buffer_offset);
   return result;
 }
 
@@ -597,8 +626,9 @@ struct linear_texture_desc {
   uint width = src.get_width();
   uint height = src.get_height();
   uint row_pitch = desc.bytes_per_row / sizeof(float);
-  if (width > pos.x && height > pos.y) {
-    buffer[pos.y * row_pitch + pos.x] = src.read(pos).x;
+  uint2 tex_pos = uint2(pos) + desc.origin;
+  if (width > tex_pos.x && height > tex_pos.y) {
+    buffer[pos.y * row_pitch + pos.x] = src.read(tex_pos).x;
   }
 }
 
@@ -610,8 +640,9 @@ struct linear_texture_desc {
 ) {
   uint width = src.get_width();
   uint height = src.get_height();
-  if (width > pos.x && height > pos.y) {
-    buffer[pos.y * desc.bytes_per_row + pos.x] = uchar(src.read(pos).y);
+  uint2 tex_pos = uint2(pos) + desc.origin;
+  if (width > tex_pos.x && height > tex_pos.y) {
+    buffer[pos.y * desc.bytes_per_row + pos.x] = uchar(src.read(tex_pos).y);
   }
 }
 

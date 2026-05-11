@@ -111,6 +111,38 @@ GetTextureBackingPlaneIndex(const D3D12_RESOURCE_DESC &desc, UINT plane) {
   return UsesSplitPlaneBacking(desc) ? plane : 0;
 }
 
+static bool
+IsDepthStencilResourceFormat(DXGI_FORMAT format) {
+  return GetDXGIFormatTraits(format).flags & DXGI_FORMAT_TRAIT_DEPTH_STENCIL;
+}
+
+static TextureViewKey
+CreateDepthStencilPlaneReadView(dxmt::Texture *texture, UINT plane, UINT level,
+                                UINT slice) {
+  if (!texture)
+    return {};
+
+  TextureViewDescriptor view = {};
+  switch (texture->textureType()) {
+  case WMTTextureType2D:
+  case WMTTextureType2DArray:
+  case WMTTextureTypeCube:
+  case WMTTextureTypeCubeArray:
+    view.type = WMTTextureType2D;
+    break;
+  default:
+    return {};
+  }
+  view.format = plane ? WMTPixelFormatX32G8X32
+                      : WMTPixelFormatDepth32Float_Stencil8;
+  view.firstMiplevel = level;
+  view.miplevelCount = 1;
+  view.firstArraySlice = slice;
+  view.arraySize = 1;
+  view.intendedUsage = WMTTextureUsageShaderRead;
+  return texture->createView(view);
+}
+
 static UINT64
 GetTexturePlaneWidth(const D3D12_RESOURCE_DESC &desc, UINT plane) {
   const auto &traits = GetDXGIFormatTraits(desc.Format);
@@ -830,6 +862,50 @@ private:
                                   UINT dst_sub_resource,
                                   Rc<dxmt::Texture> texture) {
     const UINT staging_slice_pitch = layout.row_pitch * row_count;
+    const UINT dst_slice = GetTextureSubresourceArraySlice(desc_, dst_sub_resource);
+    const UINT dst_level = GetTextureSubresourceMipLevel(desc_, dst_sub_resource);
+    const UINT dst_plane = GetTextureSubresourcePlane(desc_, dst_sub_resource);
+    const UINT origin_z =
+        desc_.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D ? box.front : 0;
+    const UINT bytes_per_image =
+        desc_.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D
+            ? staging_slice_pitch
+            : 0;
+
+    if (IsDepthStencilResourceFormat(desc_.Format)) {
+      if (depth_count != 1 || dst_plane > 1)
+        return E_INVALIDARG;
+
+      Flags<dxmt::BufferAllocationFlag> flags;
+      flags.set(dxmt::BufferAllocationFlag::CpuWriteCombined);
+      Rc<dxmt::Buffer> buffer =
+          new dxmt::Buffer(staging_slice_pitch,
+                           device_->GetDXMTDevice().device());
+      auto allocation = buffer->allocate(flags);
+      buffer->rename(Rc<dxmt::BufferAllocation>(allocation));
+      auto *mapped = static_cast<char *>(allocation->mappedMemory(0));
+      if (!mapped)
+        return E_FAIL;
+
+      std::memset(mapped, 0, static_cast<size_t>(staging_slice_pitch));
+      const auto *src = static_cast<const char *>(src_data);
+      for (UINT row = 0; row < row_count; row++)
+        std::memcpy(mapped + row * layout.row_pitch,
+                    src + row * src_row_pitch,
+                    static_cast<size_t>(row_size));
+
+      const WMTOrigin origin = {box.left, box.top, origin_z};
+      const WMTSize size = {box.right - box.left, box.bottom - box.top, 1};
+      return SubmitSynchronousDxmtBlit(
+          [buffer = std::move(buffer), texture = std::move(texture),
+           row_pitch = layout.row_pitch, bytes_per_image, dst_slice, dst_level,
+           dst_plane, origin, size](ArgumentEncodingContext &enc) mutable {
+            enc.blit_depth_stencil_cmd.copyPlaneFromBuffer(
+                buffer, 0, buffer->length(), row_pitch, bytes_per_image,
+                texture, dst_level, dst_slice, dst_plane == 1, origin, size);
+          });
+    }
+
     WMTBufferInfo buffer_info = {};
     buffer_info.length = staging_slice_pitch * depth_count;
     buffer_info.options = WMTResourceHazardTrackingModeUntracked |
@@ -850,14 +926,6 @@ private:
                     static_cast<size_t>(row_size));
     }
 
-    const UINT dst_slice = GetTextureSubresourceArraySlice(desc_, dst_sub_resource);
-    const UINT dst_level = GetTextureSubresourceMipLevel(desc_, dst_sub_resource);
-    const UINT origin_z =
-        desc_.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D ? box.front : 0;
-    const UINT bytes_per_image =
-        desc_.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D
-            ? staging_slice_pitch
-            : 0;
     return SubmitSynchronousDxmtBlit(
         [buffer, texture, box, row_pitch = layout.row_pitch,
          bytes_per_image, dst_slice, dst_level, origin_z, depth_count](
@@ -890,6 +958,54 @@ private:
                                  UINT src_sub_resource,
                                  Rc<dxmt::Texture> texture) {
     const UINT staging_slice_pitch = layout.row_pitch * row_count;
+    const UINT src_slice = GetTextureSubresourceArraySlice(desc_, src_sub_resource);
+    const UINT src_level = GetTextureSubresourceMipLevel(desc_, src_sub_resource);
+    const UINT src_plane = GetTextureSubresourcePlane(desc_, src_sub_resource);
+    const UINT origin_z =
+        desc_.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D ? box.front : 0;
+    const UINT bytes_per_image =
+        desc_.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D
+            ? staging_slice_pitch
+            : 0;
+
+    if (IsDepthStencilResourceFormat(desc_.Format)) {
+      if (depth_count != 1 || src_plane > 1)
+        return E_INVALIDARG;
+
+      Rc<dxmt::Buffer> buffer =
+          new dxmt::Buffer(staging_slice_pitch,
+                           device_->GetDXMTDevice().device());
+      Flags<dxmt::BufferAllocationFlag> flags;
+      auto allocation = buffer->allocate(flags);
+      buffer->rename(Rc<dxmt::BufferAllocation>(allocation));
+      if (!allocation->mappedMemory(0))
+        return E_FAIL;
+
+      const auto view =
+          CreateDepthStencilPlaneReadView(texture.ptr(), src_plane, src_level,
+                                          src_slice);
+      if (!view)
+        return E_INVALIDARG;
+
+      const WMTOrigin origin = {box.left, box.top, origin_z};
+      const WMTSize size = {box.right - box.left, box.bottom - box.top, 1};
+      HRESULT hr = SubmitSynchronousDxmtBlit(
+          [buffer, texture, view, row_pitch = layout.row_pitch,
+           bytes_per_image, src_plane, origin, size](
+              ArgumentEncodingContext &enc) mutable {
+            enc.blit_depth_stencil_cmd.copyPlaneToBuffer(
+                texture, view, buffer, 0, buffer->length(), row_pitch,
+                bytes_per_image, src_plane == 1, origin, size);
+          });
+      if (FAILED(hr))
+        return hr;
+
+      return CopyTextureRowsToMemory(dst_data, dst_row_pitch, dst_slice_pitch,
+                                     allocation->mappedMemory(0),
+                                     layout.row_pitch, staging_slice_pitch,
+                                     row_size, row_count, depth_count);
+    }
+
     WMTBufferInfo buffer_info = {};
     buffer_info.length = staging_slice_pitch * depth_count;
     buffer_info.options = WMTResourceHazardTrackingModeUntracked;
@@ -897,14 +1013,6 @@ private:
     if (!buffer || !buffer_info.memory.get())
       return E_FAIL;
 
-    const UINT src_slice = GetTextureSubresourceArraySlice(desc_, src_sub_resource);
-    const UINT src_level = GetTextureSubresourceMipLevel(desc_, src_sub_resource);
-    const UINT origin_z =
-        desc_.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D ? box.front : 0;
-    const UINT bytes_per_image =
-        desc_.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D
-            ? staging_slice_pitch
-            : 0;
     HRESULT hr = SubmitSynchronousDxmtBlit(
         [buffer, texture, box, row_pitch = layout.row_pitch, bytes_per_image,
          src_slice, src_level, origin_z, depth_count](

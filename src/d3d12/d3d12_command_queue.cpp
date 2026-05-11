@@ -616,6 +616,38 @@ GetPlaneCount(const Resource &resource) {
   return traits.planeCount ? traits.planeCount : 1;
 }
 
+static bool
+IsDepthStencilResourceFormat(DXGI_FORMAT format) {
+  return GetDXGIFormatTraits(format).flags & DXGI_FORMAT_TRAIT_DEPTH_STENCIL;
+}
+
+static TextureViewKey
+CreateDepthStencilPlaneReadView(dxmt::Texture *texture, UINT plane, UINT level,
+                                UINT slice) {
+  if (!texture)
+    return {};
+
+  TextureViewDescriptor view = {};
+  switch (texture->textureType()) {
+  case WMTTextureType2D:
+  case WMTTextureType2DArray:
+  case WMTTextureTypeCube:
+  case WMTTextureTypeCubeArray:
+    view.type = WMTTextureType2D;
+    break;
+  default:
+    return {};
+  }
+  view.format = plane ? WMTPixelFormatX32G8X32
+                      : WMTPixelFormatDepth32Float_Stencil8;
+  view.firstMiplevel = level;
+  view.miplevelCount = 1;
+  view.firstArraySlice = slice;
+  view.arraySize = 1;
+  view.intendedUsage = WMTTextureUsageShaderRead;
+  return texture->createView(view);
+}
+
 static UINT
 GetSubresourcePlane(const Resource &resource, UINT subresource) {
   const auto plane_count = GetPlaneCount(resource);
@@ -6255,6 +6287,38 @@ private:
              " texture_mips=", texture_mips,
              " texture_samples=", texture_samples);
       }
+    }
+
+    if (IsDepthStencilResourceFormat(texture_resource.GetResourceDesc().Format)) {
+      if (size.depth != 1 || plane > 1) {
+        WARN("D3D12CommandQueue: depth/stencil buffer texture copy has unsupported plane/depth plane=",
+             uint32_t(plane), " depth=", uint32_t(size.depth));
+        return;
+      }
+
+      TextureViewKey read_view = {};
+      if (dst_is_buffer) {
+        read_view =
+            CreateDepthStencilPlaneReadView(texture.ptr(), plane, level, slice);
+        if (!read_view)
+          return;
+      }
+
+      chunk->emitcc([dst_is_buffer, buffer = std::move(buffer),
+                     texture = std::move(texture), read_view, buffer_offset,
+                     row_pitch, image_pitch, size, origin, slice, level,
+                     plane](ArgumentEncodingContext &enc) mutable {
+        if (dst_is_buffer) {
+          enc.blit_depth_stencil_cmd.copyPlaneToBuffer(
+              texture, read_view, buffer, buffer_offset, image_pitch,
+              row_pitch, image_pitch, plane == 1, origin, size);
+        } else {
+          enc.blit_depth_stencil_cmd.copyPlaneFromBuffer(
+              buffer, buffer_offset, image_pitch, row_pitch, image_pitch,
+              texture, level, slice, plane == 1, origin, size);
+        }
+      });
+      return;
     }
 
     chunk->emitcc([dst_is_buffer, buffer = std::move(buffer),

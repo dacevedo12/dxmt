@@ -336,7 +336,14 @@ public:
 
   void copyPlaneToBuffer(
       const Rc<Texture> &src, TextureViewKey src_view, Rc<Buffer> dst, uint64_t dst_offset,
-      uint64_t dst_length, uint32_t bytes_per_row, uint32_t bytes_per_image, bool stencil_plane
+      uint64_t dst_length, uint32_t bytes_per_row, uint32_t bytes_per_image, bool stencil_plane,
+      WMTOrigin origin, WMTSize size
+  );
+
+  void copyPlaneFromBuffer(
+      const Rc<Buffer> &src, uint64_t src_offset, uint64_t src_length, uint32_t bytes_per_row,
+      uint32_t bytes_per_image, const Rc<Texture> &dst, uint32_t level, uint32_t slice,
+      bool stencil_plane, WMTOrigin origin, WMTSize size
   );
 
 private:
@@ -345,6 +352,8 @@ private:
   WMT::Reference<WMT::DepthStencilState> depth_stencil_state_;
   WMT::Reference<WMT::RenderPipelineState> pso_copy_d24s8_;
   WMT::Reference<WMT::RenderPipelineState> pso_copy_d32s8_;
+  WMT::Reference<WMT::RenderPipelineState> pso_copy_depth_from_buffer_r32_;
+  WMT::Reference<WMT::RenderPipelineState> pso_copy_stencil_from_buffer_r8_;
   WMT::Reference<WMT::ComputePipelineState> pso_copy_to_buffer_d24s8_;
   WMT::Reference<WMT::ComputePipelineState> pso_copy_to_buffer_d32s8_;
   WMT::Reference<WMT::ComputePipelineState> pso_copy_depth_to_buffer_r32_;

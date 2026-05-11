@@ -236,6 +236,7 @@ struct ClearEncoderData : EncoderData {
   uint16_t level = 0;
   uint16_t slice = 0;
   uint32_t depth_plane = 0;
+  uint32_t stencil_depth_plane = 0;
 
   ClearEncoderData() {}
 };
