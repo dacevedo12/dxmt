@@ -61,10 +61,11 @@ public:
   }
 
   /**
-  NOTE: we assume the view format is in the same 'format family' of resource allocation format, so that we can conclude
-  the total planar count from view format. This is not really the case for video format (e.g. NV12, YUY2), where the
-  view format can be ordinary format like RG8 or R16
-  So don't use this constructor for video textures/views (which is not implemented yet).
+  Plane membership is derived from the view descriptor's Metal format. Video
+  allocation formats such as NV12/P010/P016 can expose ordinary per-plane view
+  formats (R8/RG8/R16/RG16), so callers that know the allocation DXGI format
+  must pass an explicit ignored/selected plane mask instead of assuming the view
+  format family identifies the whole allocation.
   */
   ResourceSubsetState(const TextureViewDescriptor *desc, uint32_t total_mip_count, uint32_t total_array_size, uint32_t ignore_planar_mask = 0);
 

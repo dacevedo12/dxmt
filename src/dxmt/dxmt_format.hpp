@@ -58,6 +58,44 @@ struct MTL_DXGI_FORMAT_DESC {
   uint32_t Flag;
 };
 
+enum class DXGIFormatClass : uint32_t {
+  Native,
+  Emulated,
+  Mask,
+  Unsupported,
+};
+
+enum DXGIFormatTraitFlags : uint32_t {
+  DXGI_FORMAT_TRAIT_NONE = 0,
+  DXGI_FORMAT_TRAIT_MULTIPLANE = 1u << 0,
+  DXGI_FORMAT_TRAIT_VIDEO = 1u << 1,
+  DXGI_FORMAT_TRAIT_DEPTH_STENCIL = 1u << 2,
+};
+
+struct DXGIFormatPlaneTraits {
+  uint32_t backingFormat = 0;
+  uint32_t viewFormat = 0;
+  uint32_t footprintFormat = 0;
+  uint32_t elementSize = 0;
+  uint32_t subsampleXLog2 = 0;
+  uint32_t subsampleYLog2 = 0;
+};
+
+struct DXGIFormatTraits {
+  uint32_t format = 0;
+  DXGIFormatClass classification = DXGIFormatClass::Unsupported;
+  uint32_t planeCount = 0;
+  uint32_t flags = DXGI_FORMAT_TRAIT_NONE;
+  DXGIFormatPlaneTraits planes[3] = {};
+};
+
+const DXGIFormatTraits &GetDXGIFormatTraits(uint32_t format);
+
+bool IsDXGIFormatSupportedByTraits(uint32_t format);
+
+bool IsDXGIFormatPlaneCompatible(uint32_t allocation_format, uint32_t view_or_copy_format,
+                                 uint32_t plane);
+
 int32_t MTLQueryDXGIFormat(WMT::Device device, uint32_t format, MTL_DXGI_FORMAT_DESC &description);
 
 uint32_t MTLGetTexelSize(WMTPixelFormat format);

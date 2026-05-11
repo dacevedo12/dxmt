@@ -612,23 +612,8 @@ GetPlaneCount(const Resource &resource) {
   const auto &desc = resource.GetResourceDesc();
   if (desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER)
     return 1;
-  switch (desc.Format) {
-  case DXGI_FORMAT_R32G8X24_TYPELESS:
-  case DXGI_FORMAT_D32_FLOAT_S8X24_UINT:
-  case DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS:
-  case DXGI_FORMAT_X32_TYPELESS_G8X24_UINT:
-  case DXGI_FORMAT_D24_UNORM_S8_UINT:
-  case DXGI_FORMAT_R24G8_TYPELESS:
-  case DXGI_FORMAT_R24_UNORM_X8_TYPELESS:
-  case DXGI_FORMAT_X24_TYPELESS_G8_UINT:
-  case DXGI_FORMAT_NV12:
-  case DXGI_FORMAT_P010:
-  case DXGI_FORMAT_P016:
-  case DXGI_FORMAT_NV11:
-    return 2;
-  default:
-    return 1;
-  }
+  const auto &traits = GetDXGIFormatTraits(desc.Format);
+  return traits.planeCount ? traits.planeCount : 1;
 }
 
 static UINT
@@ -665,8 +650,14 @@ GetSubresourceSize(const Resource &resource, UINT subresource,
 
   const auto &desc = resource.GetResourceDesc();
   const auto mip = GetMipLevel(resource, subresource);
-  return {std::max<UINT64>(1, desc.Width >> mip),
-          std::max<UINT64>(1, desc.Height >> mip),
+  const auto &traits = GetDXGIFormatTraits(desc.Format);
+  const UINT plane = GetSubresourcePlane(resource, subresource);
+  const UINT subsample_x =
+      plane < traits.planeCount ? traits.planes[plane].subsampleXLog2 : 0;
+  const UINT subsample_y =
+      plane < traits.planeCount ? traits.planes[plane].subsampleYLog2 : 0;
+  return {std::max<UINT64>(1, desc.Width >> (mip + subsample_x)),
+          std::max<UINT64>(1, desc.Height >> (mip + subsample_y)),
           desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D
               ? std::max<UINT64>(1, desc.DepthOrArraySize >> mip)
               : 1};
@@ -5990,6 +5981,13 @@ private:
             ? record.dst.subresource_index
             : 0;
 
+    const auto &src_traits = GetDXGIFormatTraits(src->GetResourceDesc().Format);
+    if ((src_traits.flags & DXGI_FORMAT_TRAIT_VIDEO) && src->GetTexture() &&
+        dst->GetTexture()) {
+      WARN("D3D12CommandQueue: video texture-to-texture plane copy is not supported yet");
+      return;
+    }
+
     if (src_planar && src->GetTexture() && dst->GetTexture()) {
       if (!IsFullSubresourceBox(*src, src_subresource,
                                 record.src_box ? &*record.src_box : nullptr) ||
@@ -6005,8 +6003,8 @@ private:
       const UINT dst_slice = GetArraySlice(*dst, dst_subresource);
       const DXGI_FORMAT dst_format = dst->GetResourceDesc().Format;
 
-      if ((src_plane == 0 && dst_format != DXGI_FORMAT_R32_FLOAT) ||
-          (src_plane != 0 && dst_format != DXGI_FORMAT_R8_UINT)) {
+      if (!IsDXGIFormatPlaneCompatible(src->GetResourceDesc().Format,
+                                       dst_format, src_plane)) {
         WARN("D3D12CommandQueue: planar copy destination format mismatch src_plane=",
              src_plane, " dst_format=", uint32_t(dst_format));
         return;
@@ -6196,6 +6194,7 @@ private:
             : 0;
     const UINT slice = GetArraySlice(texture_resource, subresource);
     const UINT level = GetMipLevel(texture_resource, subresource);
+    const UINT plane = GetSubresourcePlane(texture_resource, subresource);
     const auto size =
         GetSubresourceSize(texture_resource, subresource,
                            record.src_box ? &*record.src_box : nullptr);
@@ -6210,6 +6209,14 @@ private:
     const UINT64 buffer_offset =
         buffer_resource.GetHeapOffset() + buffer_location.placed_footprint.Offset;
     const UINT row_pitch = footprint.RowPitch;
+    if (!IsDXGIFormatPlaneCompatible(texture_resource.GetResourceDesc().Format,
+                                     footprint.Format, plane)) {
+      WARN("D3D12CommandQueue: buffer texture copy format is not plane compatible resource_format=",
+           uint32_t(texture_resource.GetResourceDesc().Format),
+           " footprint_format=", uint32_t(footprint.Format),
+           " plane=", uint32_t(plane));
+      return;
+    }
     MTL_DXGI_FORMAT_DESC footprint_format_desc = {};
     const bool footprint_format_known =
         SUCCEEDED(MTLQueryDXGIFormat(device_->GetMTLDevice(), footprint.Format,

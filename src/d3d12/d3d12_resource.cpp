@@ -62,6 +62,10 @@ GetTextureUsage(D3D12_RESOURCE_FLAGS flags) {
 
 DXGI_FORMAT
 ResolveTextureBackingFormat(const D3D12_RESOURCE_DESC &desc) {
+  const auto &traits = GetDXGIFormatTraits(desc.Format);
+  if ((traits.flags & DXGI_FORMAT_TRAIT_VIDEO) && traits.planeCount)
+    return static_cast<DXGI_FORMAT>(traits.planes[0].backingFormat);
+
   if (!(desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL))
     return desc.Format;
 
@@ -147,16 +151,48 @@ IsSupportedSampleCount(UINT sample_count) {
 static UINT
 GetTextureSubresourceCount(const D3D12_RESOURCE_DESC &desc) {
   const UINT mip_levels = GetMipLevels(desc);
+  const auto &traits = GetDXGIFormatTraits(desc.Format);
+  const UINT plane_count = desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER
+                               ? 1u
+                               : std::max(1u, traits.planeCount);
   return mip_levels *
+         (desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D
+              ? 1
+              : desc.DepthOrArraySize) *
+         plane_count;
+}
+
+static UINT
+GetTextureSubresourcesPerPlane(const D3D12_RESOURCE_DESC &desc) {
+  return GetMipLevels(desc) *
          (desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D
               ? 1
               : desc.DepthOrArraySize);
 }
 
 static UINT
+GetTextureSubresourcePlane(const D3D12_RESOURCE_DESC &desc,
+                           UINT sub_resource) {
+  const UINT subresources_per_plane = GetTextureSubresourcesPerPlane(desc);
+  if (!subresources_per_plane)
+    return 0;
+  return sub_resource / subresources_per_plane;
+}
+
+static UINT
+GetTextureSubresourcePlaneLocalIndex(const D3D12_RESOURCE_DESC &desc,
+                                     UINT sub_resource) {
+  const UINT subresources_per_plane = GetTextureSubresourcesPerPlane(desc);
+  if (!subresources_per_plane)
+    return sub_resource;
+  return sub_resource % subresources_per_plane;
+}
+
+static UINT
 GetTextureSubresourceMipLevel(const D3D12_RESOURCE_DESC &desc,
                               UINT sub_resource) {
-  return sub_resource % GetMipLevels(desc);
+  return GetTextureSubresourcePlaneLocalIndex(desc, sub_resource) %
+         GetMipLevels(desc);
 }
 
 static UINT
@@ -164,7 +200,8 @@ GetTextureSubresourceArraySlice(const D3D12_RESOURCE_DESC &desc,
                                 UINT sub_resource) {
   if (desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D)
     return 0;
-  return sub_resource / GetMipLevels(desc);
+  return GetTextureSubresourcePlaneLocalIndex(desc, sub_resource) /
+         GetMipLevels(desc);
 }
 
 static bool
@@ -200,14 +237,28 @@ GetTextureSubresourceLayout(WMT::Device device,
     return E_INVALIDARG;
 
   MTL_DXGI_FORMAT_DESC format = {};
-  if (FAILED(MTLQueryDXGIFormat(device, desc.Format, format)))
+  const auto &traits = GetDXGIFormatTraits(desc.Format);
+  const UINT plane = GetTextureSubresourcePlane(desc, sub_resource);
+  if (plane >= std::max(1u, traits.planeCount))
     return E_INVALIDARG;
+  if (traits.flags & DXGI_FORMAT_TRAIT_VIDEO) {
+    const auto plane_format =
+        static_cast<DXGI_FORMAT>(traits.planes[plane].footprintFormat);
+    if (FAILED(MTLQueryDXGIFormat(device, plane_format, format)))
+      return E_INVALIDARG;
+  } else if (FAILED(MTLQueryDXGIFormat(device, desc.Format, format))) {
+    return E_INVALIDARG;
+  }
 
   const UINT mip = GetTextureSubresourceMipLevel(desc, sub_resource);
-  layout.width = std::max<UINT64>(1, desc.Width >> mip);
+  const UINT x_subsample =
+      plane < traits.planeCount ? traits.planes[plane].subsampleXLog2 : 0;
+  const UINT y_subsample =
+      plane < traits.planeCount ? traits.planes[plane].subsampleYLog2 : 0;
+  layout.width = std::max<UINT64>(1, desc.Width >> (mip + x_subsample));
   layout.height = desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D
                       ? 1
-                      : std::max<UINT>(1, desc.Height >> mip);
+                      : std::max<UINT>(1, desc.Height >> (mip + y_subsample));
   layout.depth = desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D
                      ? std::max<UINT>(1, desc.DepthOrArraySize >> mip)
                      : 1;
@@ -215,9 +266,11 @@ GetTextureSubresourceLayout(WMT::Device device,
   layout.block_height = (format.Flag & MTL_DXGI_FORMAT_BC) ? 4 : 1;
   layout.row_count = std::max<UINT>(
       1, (layout.height + layout.block_height - 1) / layout.block_height);
-  layout.element_size = (format.Flag & MTL_DXGI_FORMAT_BC)
-                            ? format.BlockSize
-                            : format.BytesPerTexel;
+  layout.element_size =
+      plane < traits.planeCount && traits.planes[plane].elementSize
+          ? traits.planes[plane].elementSize
+          : ((format.Flag & MTL_DXGI_FORMAT_BC) ? format.BlockSize
+                                                 : format.BytesPerTexel);
   if (!layout.element_size)
     return E_INVALIDARG;
 
@@ -961,6 +1014,16 @@ IsSupportedResourceDesc(const D3D12_RESOURCE_DESC &desc) {
   }
   if (desc.Format == DXGI_FORMAT_UNKNOWN)
     return false;
+  const auto &traits = GetDXGIFormatTraits(desc.Format);
+  if (traits.classification == DXGIFormatClass::Mask)
+    return false;
+  if (traits.flags & DXGI_FORMAT_TRAIT_VIDEO) {
+    if (desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D ||
+        desc.SampleDesc.Count != 1 || desc.DepthOrArraySize == 0)
+      return false;
+    if ((desc.Width & 1) || (desc.Height & 1))
+      return false;
+  }
 
   const bool layout_row_major =
       desc.Layout == D3D12_TEXTURE_LAYOUT_ROW_MAJOR;

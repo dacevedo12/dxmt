@@ -9,6 +9,208 @@
 
 namespace dxmt {
 
+namespace {
+
+constexpr DXGIFormatTraits kUnsupportedFormatTraits = {};
+
+constexpr DXGIFormatTraits
+SinglePlaneNative(uint32_t format) {
+  return {
+      .format = format,
+      .classification = DXGIFormatClass::Native,
+      .planeCount = 1,
+      .flags = DXGI_FORMAT_TRAIT_NONE,
+      .planes = {{
+          .backingFormat = format,
+          .viewFormat = format,
+          .footprintFormat = format,
+      }},
+  };
+}
+
+constexpr DXGIFormatTraits
+DepthStencilTraits(uint32_t format, uint32_t depth_format,
+                   uint32_t stencil_format) {
+  return {
+      .format = format,
+      .classification = DXGIFormatClass::Native,
+      .planeCount = stencil_format ? 2u : 1u,
+      .flags = DXGI_FORMAT_TRAIT_DEPTH_STENCIL,
+      .planes = {{
+                     .backingFormat = depth_format,
+                     .viewFormat = depth_format,
+                     .footprintFormat = depth_format,
+                     .elementSize = 4,
+                 },
+                 {
+                     .backingFormat = stencil_format,
+                     .viewFormat = stencil_format,
+                     .footprintFormat = stencil_format,
+                     .elementSize = 1,
+                 }},
+  };
+}
+
+constexpr DXGIFormatTraits
+Video420Traits(uint32_t format, uint32_t y_format, uint32_t uv_format,
+               uint32_t y_element_size, uint32_t uv_element_size) {
+  return {
+      .format = format,
+      .classification = DXGIFormatClass::Emulated,
+      .planeCount = 2,
+      .flags = DXGI_FORMAT_TRAIT_MULTIPLANE | DXGI_FORMAT_TRAIT_VIDEO,
+      .planes = {{
+                     .backingFormat = y_format,
+                     .viewFormat = y_format,
+                     .footprintFormat = y_format,
+                     .elementSize = y_element_size,
+                 },
+                 {
+                     .backingFormat = uv_format,
+                     .viewFormat = uv_format,
+                     .footprintFormat = uv_format,
+                     .elementSize = uv_element_size,
+                     .subsampleXLog2 = 1,
+                     .subsampleYLog2 = 1,
+                 }},
+  };
+}
+
+constexpr DXGIFormatTraits
+MaskFormatTraits(uint32_t format) {
+  return {
+      .format = format,
+      .classification = DXGIFormatClass::Mask,
+      .planeCount = 1,
+      .flags = DXGI_FORMAT_TRAIT_NONE,
+      .planes = {{
+          .backingFormat = format,
+          .viewFormat = format,
+          .footprintFormat = format,
+      }},
+  };
+}
+
+bool
+IsDepthStencilDXGIFormat(uint32_t format) {
+  switch (format) {
+  case DXGI_FORMAT_R32G8X24_TYPELESS:
+  case DXGI_FORMAT_D32_FLOAT_S8X24_UINT:
+  case DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS:
+  case DXGI_FORMAT_X32_TYPELESS_G8X24_UINT:
+  case DXGI_FORMAT_D24_UNORM_S8_UINT:
+  case DXGI_FORMAT_R24G8_TYPELESS:
+  case DXGI_FORMAT_R24_UNORM_X8_TYPELESS:
+  case DXGI_FORMAT_X24_TYPELESS_G8_UINT:
+  case DXGI_FORMAT_D32_FLOAT:
+  case DXGI_FORMAT_D16_UNORM:
+    return true;
+  default:
+    return false;
+  }
+}
+
+} // namespace
+
+const DXGIFormatTraits &
+GetDXGIFormatTraits(uint32_t format) {
+  switch (format) {
+  case DXGI_FORMAT_R32G8X24_TYPELESS:
+  case DXGI_FORMAT_D32_FLOAT_S8X24_UINT:
+  case DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS:
+  case DXGI_FORMAT_X32_TYPELESS_G8X24_UINT:
+    static constexpr auto d32s8 =
+        DepthStencilTraits(DXGI_FORMAT_D32_FLOAT_S8X24_UINT,
+                           DXGI_FORMAT_R32_TYPELESS, DXGI_FORMAT_R8_TYPELESS);
+    return d32s8;
+  case DXGI_FORMAT_D24_UNORM_S8_UINT:
+  case DXGI_FORMAT_R24G8_TYPELESS:
+  case DXGI_FORMAT_R24_UNORM_X8_TYPELESS:
+  case DXGI_FORMAT_X24_TYPELESS_G8_UINT:
+    static constexpr auto d24s8 =
+        DepthStencilTraits(DXGI_FORMAT_D24_UNORM_S8_UINT,
+                           DXGI_FORMAT_R32_TYPELESS, DXGI_FORMAT_R8_TYPELESS);
+    return d24s8;
+  case DXGI_FORMAT_D32_FLOAT:
+    static constexpr auto d32 =
+        DepthStencilTraits(DXGI_FORMAT_D32_FLOAT, DXGI_FORMAT_R32_FLOAT,
+                           DXGI_FORMAT_UNKNOWN);
+    return d32;
+  case DXGI_FORMAT_D16_UNORM:
+    static constexpr auto d16 =
+        DepthStencilTraits(DXGI_FORMAT_D16_UNORM, DXGI_FORMAT_R16_UNORM,
+                           DXGI_FORMAT_UNKNOWN);
+    return d16;
+  case DXGI_FORMAT_NV12:
+    static constexpr auto nv12 =
+        Video420Traits(DXGI_FORMAT_NV12, DXGI_FORMAT_R8_TYPELESS,
+                       DXGI_FORMAT_R8G8_TYPELESS, 1, 2);
+    return nv12;
+  case DXGI_FORMAT_P010:
+    static constexpr auto p010 =
+        Video420Traits(DXGI_FORMAT_P010, DXGI_FORMAT_R16_TYPELESS,
+                       DXGI_FORMAT_R16G16_TYPELESS, 2, 4);
+    return p010;
+  case DXGI_FORMAT_P016:
+    static constexpr auto p016 =
+        Video420Traits(DXGI_FORMAT_P016, DXGI_FORMAT_R16_TYPELESS,
+                       DXGI_FORMAT_R16G16_TYPELESS, 2, 4);
+    return p016;
+  case DXGI_FORMAT_R1_UNORM:
+    static constexpr auto r1 = MaskFormatTraits(DXGI_FORMAT_R1_UNORM);
+    return r1;
+  case DXGI_FORMAT_UNKNOWN:
+  case DXGI_FORMAT_FORCE_UINT:
+    return kUnsupportedFormatTraits;
+  default:
+    static thread_local DXGIFormatTraits native;
+    native = SinglePlaneNative(format);
+    return native;
+  }
+}
+
+bool
+IsDXGIFormatSupportedByTraits(uint32_t format) {
+  const auto &traits = GetDXGIFormatTraits(format);
+  return traits.classification == DXGIFormatClass::Native ||
+         traits.classification == DXGIFormatClass::Emulated;
+}
+
+bool
+IsDXGIFormatPlaneCompatible(uint32_t allocation_format,
+                            uint32_t view_or_copy_format, uint32_t plane) {
+  const auto &traits = GetDXGIFormatTraits(allocation_format);
+  if (!traits.planeCount || plane >= traits.planeCount)
+    return false;
+
+  if (view_or_copy_format == allocation_format ||
+      view_or_copy_format == traits.planes[plane].viewFormat ||
+      view_or_copy_format == traits.planes[plane].footprintFormat ||
+      view_or_copy_format == traits.planes[plane].backingFormat)
+    return true;
+
+  switch (allocation_format) {
+  case DXGI_FORMAT_NV12:
+    return plane == 0 ? view_or_copy_format == DXGI_FORMAT_R8_UNORM ||
+                            view_or_copy_format == DXGI_FORMAT_R8_TYPELESS
+                      : view_or_copy_format == DXGI_FORMAT_R8G8_UNORM ||
+                            view_or_copy_format == DXGI_FORMAT_R8G8_TYPELESS;
+  case DXGI_FORMAT_P010:
+  case DXGI_FORMAT_P016:
+    return plane == 0 ? view_or_copy_format == DXGI_FORMAT_R16_UNORM ||
+                            view_or_copy_format == DXGI_FORMAT_R16_TYPELESS
+                      : view_or_copy_format == DXGI_FORMAT_R16G16_UNORM ||
+                            view_or_copy_format == DXGI_FORMAT_R16G16_TYPELESS;
+  default:
+    break;
+  }
+
+  if (IsDepthStencilDXGIFormat(allocation_format))
+    return IsDepthStencilDXGIFormat(view_or_copy_format);
+
+  return false;
+}
+
 constexpr FormatCapability ALL_CAP = static_cast<FormatCapability>(
     FormatCapability::Filter | FormatCapability::Write | FormatCapability::Color | FormatCapability::MSAA |
     FormatCapability::Blend | FormatCapability::Sparse | FormatCapability::Resolve
@@ -1032,12 +1234,20 @@ MTLQueryDXGIFormat(WMT::Device device, uint32_t format, MTL_DXGI_FORMAT_DESC &de
     description.BytesPerTexel = 2;
     break;
   }
+  case DXGI_FORMAT_NV12:
+    description.PixelFormat = WMTPixelFormatR8Unorm;
+    description.BytesPerTexel = 1;
+    description.Flag = MTL_DXGI_FORMAT_TYPELESS;
+    break;
+  case DXGI_FORMAT_P010:
+  case DXGI_FORMAT_P016:
+    description.PixelFormat = WMTPixelFormatR16Unorm;
+    description.BytesPerTexel = 2;
+    description.Flag = MTL_DXGI_FORMAT_TYPELESS;
+    break;
   case DXGI_FORMAT_AYUV:
   case DXGI_FORMAT_Y410:
   case DXGI_FORMAT_Y416:
-  case DXGI_FORMAT_NV12:
-  case DXGI_FORMAT_P010:
-  case DXGI_FORMAT_P016:
   case DXGI_FORMAT_420_OPAQUE:
   case DXGI_FORMAT_YUY2:
   case DXGI_FORMAT_Y210:

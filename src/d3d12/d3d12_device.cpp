@@ -41,61 +41,27 @@ SubresourceMipSlice(UINT sub_resource, UINT mip_levels) {
 
 static UINT
 GetD3D12FormatPlaneCount(DXGI_FORMAT format) {
-  switch (format) {
-  case DXGI_FORMAT_R32G8X24_TYPELESS:
-  case DXGI_FORMAT_D32_FLOAT_S8X24_UINT:
-  case DXGI_FORMAT_R24G8_TYPELESS:
-  case DXGI_FORMAT_D24_UNORM_S8_UINT:
-  case DXGI_FORMAT_NV12:
-  case DXGI_FORMAT_P010:
-  case DXGI_FORMAT_P016:
-    return 2;
-  default:
-    return 1;
-  }
+  const auto &traits = GetDXGIFormatTraits(format);
+  return traits.planeCount ? traits.planeCount : 1;
 }
 
 static DXGI_FORMAT
 GetD3D12FootprintFormat(DXGI_FORMAT format, UINT plane) {
-  switch (format) {
-  case DXGI_FORMAT_R32G8X24_TYPELESS:
-  case DXGI_FORMAT_D32_FLOAT_S8X24_UINT:
-  case DXGI_FORMAT_R24G8_TYPELESS:
-  case DXGI_FORMAT_D24_UNORM_S8_UINT:
-  case DXGI_FORMAT_R24_UNORM_X8_TYPELESS:
-    return plane ? DXGI_FORMAT_R8_TYPELESS : DXGI_FORMAT_R32_TYPELESS;
-  case DXGI_FORMAT_NV12:
-    return plane ? DXGI_FORMAT_R8G8_TYPELESS : DXGI_FORMAT_R8_TYPELESS;
-  case DXGI_FORMAT_P010:
-  case DXGI_FORMAT_P016:
-    return plane ? DXGI_FORMAT_R16G16_TYPELESS : DXGI_FORMAT_R16_TYPELESS;
-  case DXGI_FORMAT_420_OPAQUE:
-    return DXGI_FORMAT_R8_TYPELESS;
-  default:
-    return format;
-  }
+  const auto &traits = GetDXGIFormatTraits(format);
+  if (plane < traits.planeCount && traits.planes[plane].footprintFormat)
+    return static_cast<DXGI_FORMAT>(traits.planes[plane].footprintFormat);
+  return format;
 }
 
 static UINT
 GetD3D12FormatPlaneElementSize(DXGI_FORMAT format, UINT plane,
                                const MTL_DXGI_FORMAT_DESC &format_desc) {
-  switch (format) {
-  case DXGI_FORMAT_R32G8X24_TYPELESS:
-  case DXGI_FORMAT_D32_FLOAT_S8X24_UINT:
-  case DXGI_FORMAT_R24G8_TYPELESS:
-  case DXGI_FORMAT_D24_UNORM_S8_UINT:
-  case DXGI_FORMAT_R24_UNORM_X8_TYPELESS:
-    return plane ? 1 : 4;
-  case DXGI_FORMAT_NV12:
-    return plane ? 2 : 1;
-  case DXGI_FORMAT_P010:
-  case DXGI_FORMAT_P016:
-    return plane ? 4 : 2;
-  default:
-    return (format_desc.Flag & MTL_DXGI_FORMAT_BC)
-               ? format_desc.BlockSize
-               : format_desc.BytesPerTexel;
-  }
+  const auto &traits = GetDXGIFormatTraits(format);
+  if (plane < traits.planeCount && traits.planes[plane].elementSize)
+    return traits.planes[plane].elementSize;
+  return (format_desc.Flag & MTL_DXGI_FORMAT_BC)
+             ? format_desc.BlockSize
+             : format_desc.BytesPerTexel;
 }
 
 static UINT
@@ -110,17 +76,13 @@ GetD3D12FormatBlockHeight(const MTL_DXGI_FORMAT_DESC &format_desc) {
 
 static void
 GetD3D12FormatSubsampleLog2(DXGI_FORMAT format, UINT plane, UINT &x, UINT &y) {
-  switch (format) {
-  case DXGI_FORMAT_NV12:
-  case DXGI_FORMAT_P010:
-  case DXGI_FORMAT_P016:
-    x = plane;
-    y = plane;
-    break;
-  default:
+  const auto &traits = GetDXGIFormatTraits(format);
+  if (plane < traits.planeCount) {
+    x = traits.planes[plane].subsampleXLog2;
+    y = traits.planes[plane].subsampleYLog2;
+  } else {
     x = 0;
     y = 0;
-    break;
   }
 }
 
@@ -315,26 +277,36 @@ GetD3D12FormatSupport2(FormatCapability caps) {
 static UINT8
 GetD3D12FormatPlaneCountForFeatureData(DXGI_FORMAT dxgi_format,
                          const MTL_DXGI_FORMAT_DESC &format) {
-  switch (dxgi_format) {
-  case DXGI_FORMAT_R32G8X24_TYPELESS:
-  case DXGI_FORMAT_D32_FLOAT_S8X24_UINT:
-  case DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS:
-  case DXGI_FORMAT_X32_TYPELESS_G8X24_UINT:
-  case DXGI_FORMAT_D24_UNORM_S8_UINT:
-  case DXGI_FORMAT_R24G8_TYPELESS:
-  case DXGI_FORMAT_R24_UNORM_X8_TYPELESS:
-  case DXGI_FORMAT_X24_TYPELESS_G8_UINT:
-  case DXGI_FORMAT_NV12:
-  case DXGI_FORMAT_P010:
-  case DXGI_FORMAT_P016:
-  case DXGI_FORMAT_NV11:
-    return 2;
-  default:
-    break;
-  }
-
+  const auto &traits = GetDXGIFormatTraits(dxgi_format);
+  if (traits.planeCount)
+    return traits.planeCount;
   const uint32_t planes = DepthStencilPlanarFlags(format.PixelFormat);
   return planes == 3 ? 2 : 1;
+}
+
+static D3D12_FORMAT_SUPPORT1
+GetD3D12TraitFormatSupport1(const DXGIFormatTraits &traits) {
+  if (traits.classification == DXGIFormatClass::Mask ||
+      traits.classification == DXGIFormatClass::Unsupported)
+    return D3D12_FORMAT_SUPPORT1_NONE;
+
+  if (traits.flags & DXGI_FORMAT_TRAIT_VIDEO) {
+    return D3D12_FORMAT_SUPPORT1_TEXTURE2D |
+           D3D12_FORMAT_SUPPORT1_SHADER_LOAD |
+           D3D12_FORMAT_SUPPORT1_SHADER_SAMPLE |
+           D3D12_FORMAT_SUPPORT1_SHADER_GATHER |
+           D3D12_FORMAT_SUPPORT1_CAST_WITHIN_BIT_LAYOUT;
+  }
+
+  return D3D12_FORMAT_SUPPORT1_NONE;
+}
+
+static D3D12_FORMAT_SUPPORT2
+GetD3D12TraitFormatSupport2(const DXGIFormatTraits &traits) {
+  if (traits.classification == DXGIFormatClass::Mask ||
+      traits.classification == DXGIFormatClass::Unsupported)
+    return D3D12_FORMAT_SUPPORT2_NONE;
+  return D3D12_FORMAT_SUPPORT2_NONE;
 }
 
 static bool
@@ -993,6 +965,16 @@ public:
         return S_OK;
       }
 
+      const auto &traits = GetDXGIFormatTraits(data->Format);
+      if (traits.classification == DXGIFormatClass::Mask) {
+        return S_OK;
+      }
+      if (traits.flags & DXGI_FORMAT_TRAIT_VIDEO) {
+        data->Support1 = GetD3D12TraitFormatSupport1(traits);
+        data->Support2 = GetD3D12TraitFormatSupport2(traits);
+        return S_OK;
+      }
+
       MTL_DXGI_FORMAT_DESC format = {};
       if (FAILED(MTLQueryDXGIFormat(device_->device(), data->Format, format))) {
         WARN("D3D12Device: CheckFeatureSupport(FORMAT_SUPPORT) unsupported format ",
@@ -1047,8 +1029,13 @@ public:
         data->PlaneCount = 1;
         return S_OK;
       }
-      if (data->Format == DXGI_FORMAT_R1_UNORM)
+      const auto &traits = GetDXGIFormatTraits(data->Format);
+      if (traits.classification == DXGIFormatClass::Mask)
         return E_INVALIDARG;
+      if (traits.flags & DXGI_FORMAT_TRAIT_VIDEO) {
+        data->PlaneCount = traits.planeCount;
+        return S_OK;
+      }
 
       MTL_DXGI_FORMAT_DESC format = {};
       if (FAILED(MTLQueryDXGIFormat(device_->device(), data->Format, format))) {
@@ -1982,10 +1969,12 @@ private:
         size = desc.Width;
       } else {
         const UINT mip_levels = desc.MipLevels ? desc.MipLevels : 1;
+        const UINT plane_count = GetD3D12FormatPlaneCount(desc.Format);
         const UINT subresources = mip_levels *
                                   (desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D
                                        ? 1
-                                       : desc.DepthOrArraySize);
+                                       : desc.DepthOrArraySize) *
+                                  plane_count;
         UINT64 total_bytes = 0;
         GetCopyableFootprintsImpl(&desc, 0, subresources, 0, nullptr, nullptr,
                                   nullptr, &total_bytes, false);
@@ -2267,8 +2256,16 @@ private:
       return;
     }
 
+    const auto &traits = GetDXGIFormatTraits(desc->Format);
+    const bool trait_layout_format =
+        desc->Dimension != D3D12_RESOURCE_DIMENSION_BUFFER &&
+        traits.classification != DXGIFormatClass::Unsupported &&
+        traits.classification != DXGIFormatClass::Mask &&
+        traits.planeCount;
+
     MTL_DXGI_FORMAT_DESC format = {};
     if (desc->Dimension != D3D12_RESOURCE_DIMENSION_BUFFER &&
+        !trait_layout_format &&
         FAILED(MTLQueryDXGIFormat(device_->device(), desc->Format, format))) {
       set_invalid();
       return;

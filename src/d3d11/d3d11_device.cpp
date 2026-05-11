@@ -477,6 +477,20 @@ public:
       return S_OK;
     }
 
+    const auto &traits = GetDXGIFormatTraits(Format);
+    if (traits.classification == DXGIFormatClass::Mask)
+      return E_INVALIDARG;
+    if (traits.flags & DXGI_FORMAT_TRAIT_VIDEO) {
+      if (pFormatSupport) {
+        *pFormatSupport = D3D11_FORMAT_SUPPORT_TEXTURE2D |
+                          D3D11_FORMAT_SUPPORT_SHADER_LOAD |
+                          D3D11_FORMAT_SUPPORT_SHADER_SAMPLE |
+                          D3D11_FORMAT_SUPPORT_SHADER_GATHER |
+                          D3D11_FORMAT_SUPPORT_CAST_WITHIN_BIT_LAYOUT;
+      }
+      return S_OK;
+    }
+
     MTL_DXGI_FORMAT_DESC metal_format;
     if (FAILED(MTLQueryDXGIFormat(GetMTLDevice(), Format, metal_format))) {
       return E_INVALIDARG;
@@ -633,6 +647,12 @@ public:
             D3D11_FORMAT_SUPPORT2_SHAREABLE;
         return S_OK;
       }
+
+      const auto &traits = GetDXGIFormatTraits(info->InFormat);
+      if (traits.classification == DXGIFormatClass::Mask)
+        return E_INVALIDARG;
+      if (traits.flags & DXGI_FORMAT_TRAIT_VIDEO)
+        return S_OK;
 
       MTL_DXGI_FORMAT_DESC metal_format;
       if (FAILED(MTLQueryDXGIFormat(GetMTLDevice(), info->InFormat,

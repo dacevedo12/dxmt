@@ -307,6 +307,16 @@ CreateMTLTextureDescriptorInternal(
     return E_INVALIDARG;
 
   MTL_DXGI_FORMAT_DESC metal_format;
+  const auto &traits = GetDXGIFormatTraits(Format);
+  if (traits.classification == DXGIFormatClass::Mask) {
+    ERR("CreateMTLTextureDescriptorInternal: R1_UNORM bitmask emulation is not implemented");
+    return E_FAIL;
+  }
+  if (traits.flags & DXGI_FORMAT_TRAIT_VIDEO) {
+    ERR("CreateMTLTextureDescriptorInternal: video multi-plane texture backing is not implemented yet: ",
+        Format);
+    return E_FAIL;
+  }
   if (FAILED(MTLQueryDXGIFormat(pDevice->GetMTLDevice(), Format, metal_format))) {
     ERR("CreateMTLTextureDescriptorInternal: creating a texture of invalid "
         "format: ",

@@ -176,6 +176,10 @@ CreateDynamicLinearTexture2D(
     return E_FAIL;
   if (pDesc->ArraySize > 1)
     return E_FAIL;
+  const auto &traits = GetDXGIFormatTraits(pDesc->Format);
+  if (traits.flags & DXGI_FORMAT_TRAIT_VIDEO ||
+      traits.classification == DXGIFormatClass::Mask)
+    return E_FAIL;
   MTL_DXGI_FORMAT_DESC format;
   MTLQueryDXGIFormat(pDevice->GetMTLDevice(), pDesc->Format, format);
   if (format.Flag & MTL_DXGI_FORMAT_BC) {
@@ -212,6 +216,10 @@ CreateDynamicLinearTexture1D(
     ID3D11Texture1D **ppTexture
 ) {
   if (pDesc->ArraySize > 1)
+    return E_FAIL;
+  const auto &traits = GetDXGIFormatTraits(pDesc->Format);
+  if (traits.flags & DXGI_FORMAT_TRAIT_VIDEO ||
+      traits.classification == DXGIFormatClass::Mask)
     return E_FAIL;
   MTL_DXGI_FORMAT_DESC format;
   MTLQueryDXGIFormat(pDevice->GetMTLDevice(), pDesc->Format, format);
