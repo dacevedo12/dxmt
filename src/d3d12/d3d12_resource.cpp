@@ -86,11 +86,29 @@ ResolveTextureBackingFormat(const D3D12_RESOURCE_DESC &desc, UINT plane = 0) {
 }
 
 static UINT
-GetTexturePlaneCount(const D3D12_RESOURCE_DESC &desc) {
+GetTextureLogicalPlaneCount(const D3D12_RESOURCE_DESC &desc) {
   if (desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER)
     return 1;
   const auto &traits = GetDXGIFormatTraits(desc.Format);
   return std::max(1u, traits.planeCount);
+}
+
+static bool
+UsesSplitPlaneBacking(const D3D12_RESOURCE_DESC &desc) {
+  const auto &traits = GetDXGIFormatTraits(desc.Format);
+  return (traits.flags & DXGI_FORMAT_TRAIT_VIDEO) && traits.planeCount > 1;
+}
+
+static UINT
+GetTextureBackingPlaneCount(const D3D12_RESOURCE_DESC &desc) {
+  if (desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER)
+    return 1;
+  return UsesSplitPlaneBacking(desc) ? GetTextureLogicalPlaneCount(desc) : 1;
+}
+
+static UINT
+GetTextureBackingPlaneIndex(const D3D12_RESOURCE_DESC &desc, UINT plane) {
+  return UsesSplitPlaneBacking(desc) ? plane : 0;
 }
 
 static UINT64
@@ -646,8 +664,12 @@ public:
   }
 
   dxmt::Texture *GetTexture(UINT plane) const override {
-    return plane < plane_textures_.size() ? plane_textures_[plane].ptr()
-                                          : nullptr;
+    if (plane >= GetTextureLogicalPlaneCount(desc_))
+      return nullptr;
+    const auto backing_plane = GetTextureBackingPlaneIndex(desc_, plane);
+    return backing_plane < plane_textures_.size()
+               ? plane_textures_[backing_plane].ptr()
+               : nullptr;
   }
 
   dxmt::TextureAllocation *GetTextureAllocation() const override {
@@ -655,8 +677,12 @@ public:
   }
 
   dxmt::TextureAllocation *GetTextureAllocation(UINT plane) const override {
-    return plane < plane_allocations_.size() ? plane_allocations_[plane].ptr()
-                                             : nullptr;
+    if (plane >= GetTextureLogicalPlaneCount(desc_))
+      return nullptr;
+    const auto backing_plane = GetTextureBackingPlaneIndex(desc_, plane);
+    return backing_plane < plane_allocations_.size()
+               ? plane_allocations_[backing_plane].ptr()
+               : nullptr;
   }
 
   ID3D12Resource *GetD3D12Resource() override {
@@ -665,12 +691,20 @@ public:
 
 private:
   Rc<dxmt::Texture> GetTextureRef(UINT plane) const {
-    return plane < plane_textures_.size() ? plane_textures_[plane] : nullptr;
+    if (plane >= GetTextureLogicalPlaneCount(desc_))
+      return nullptr;
+    const auto backing_plane = GetTextureBackingPlaneIndex(desc_, plane);
+    return backing_plane < plane_textures_.size() ? plane_textures_[backing_plane]
+                                                  : nullptr;
   }
 
   Rc<dxmt::TextureAllocation> GetTextureAllocationRef(UINT plane) const {
-    return plane < plane_allocations_.size() ? plane_allocations_[plane]
-                                             : nullptr;
+    if (plane >= GetTextureLogicalPlaneCount(desc_))
+      return nullptr;
+    const auto backing_plane = GetTextureBackingPlaneIndex(desc_, plane);
+    return backing_plane < plane_allocations_.size()
+               ? plane_allocations_[backing_plane]
+               : nullptr;
   }
 
   HRESULT WriteTextureSubresource(UINT dst_sub_resource,
@@ -931,14 +965,14 @@ private:
       flags.set(dxmt::TextureAllocationFlag::CpuWriteCombined);
     }
 
-    const UINT plane_count = GetTexturePlaneCount(desc_);
+    const UINT plane_count = GetTextureBackingPlaneCount(desc_);
     if (plane_count > plane_textures_.size()) {
       WARN("D3D12Resource: unsupported texture plane count ", plane_count);
       return;
     }
 
     const bool cpu_linear_candidate =
-        plane_count == 1 &&
+        GetTextureLogicalPlaneCount(desc_) == 1 &&
         GetHeapType(heap_properties_) != D3D12_HEAP_TYPE_DEFAULT &&
         IsCpuLinearTextureSubresource(desc_, 0);
 
@@ -1007,7 +1041,7 @@ private:
             ? 1
             : desc_.DepthOrArraySize;
     const auto dsv_planar = DepthStencilPlanarFlags(pixel_format);
-    const UINT plane_count = GetTexturePlaneCount(desc_);
+    const UINT plane_count = GetTextureBackingPlaneCount(desc_);
 
     for (UINT plane = 0; plane < plane_count; ++plane) {
       auto texture = plane_textures_[plane];

@@ -1013,6 +1013,96 @@ done:
   release_object(&device);
 }
 
+static void test_depth_stencil_planar_resource_creation(void)
+{
+  static const DXGI_FORMAT formats[] = {
+    DXGI_FORMAT_D24_UNORM_S8_UINT,
+    DXGI_FORMAT_D32_FLOAT_S8X24_UINT,
+  };
+
+  ID3D12Device *device = nullptr;
+  ID3D12CommandQueue *queue = nullptr;
+  ID3D12CommandAllocator *allocator = nullptr;
+  ID3D12GraphicsCommandList *list = nullptr;
+  ID3D12DescriptorHeap *dsv_heap = nullptr;
+  D3D12_HEAP_PROPERTIES default_heap = {};
+  D3D12_HEAP_PROPERTIES heap = {};
+  D3D12_RESOURCE_DESC desc = {};
+  D3D12_DESCRIPTOR_HEAP_DESC heap_desc = {};
+  HRESULT hr = create_device(&device);
+  check_hr(hr);
+  if (FAILED(hr))
+    goto done;
+
+  check_hr(create_queue(device, &queue));
+  check_hr(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
+                                          __uuidof(ID3D12CommandAllocator),
+                                          (void **)&allocator));
+  check_hr(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator,
+                                     nullptr, __uuidof(ID3D12GraphicsCommandList),
+                                     (void **)&list));
+
+  default_heap = heap_properties(D3D12_HEAP_TYPE_DEFAULT);
+  heap = default_heap;
+
+  heap_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_DSV;
+  heap_desc.NumDescriptors = ARRAYSIZE(formats);
+  check_hr(device->CreateDescriptorHeap(&heap_desc, __uuidof(ID3D12DescriptorHeap),
+                                        (void **)&dsv_heap));
+
+  if (!queue || !allocator || !list || !dsv_heap)
+    goto done;
+
+  for (UINT i = 0; i < ARRAYSIZE(formats); ++i) {
+    ID3D12Resource *texture = nullptr;
+    D3D12_CLEAR_VALUE clear_value = {};
+    D3D12_DEPTH_STENCIL_VIEW_DESC dsv = {};
+    D3D12_CPU_DESCRIPTOR_HANDLE handle = {};
+
+    desc = texture_desc(8, 6, formats[i],
+                        D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL);
+    clear_value.Format = formats[i];
+    clear_value.DepthStencil.Depth = 1.0f;
+    clear_value.DepthStencil.Stencil = 0x7f;
+
+    check_hr(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
+                                             D3D12_RESOURCE_STATE_DEPTH_WRITE,
+                                             &clear_value, __uuidof(ID3D12Resource),
+                                             (void **)&texture));
+    if (!texture)
+      continue;
+
+    dsv.Format = DXGI_FORMAT_UNKNOWN;
+    dsv.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2D;
+    dsv.Flags = D3D12_DSV_FLAG_NONE;
+    handle = dsv_heap->GetCPUDescriptorHandleForHeapStart();
+    handle.ptr += i * device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_DSV);
+    device->CreateDepthStencilView(texture, &dsv, handle);
+
+    if (list) {
+      list->ClearDepthStencilView(handle,
+                                  D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL,
+                                  0.5f, 3, 0, nullptr);
+    }
+
+    release_object(&texture);
+  }
+
+  check_hr(list->Close());
+  if (queue) {
+    ID3D12CommandList *lists[] = { list };
+    queue->ExecuteCommandLists(1, lists);
+    check_hr(wait_queue_idle(device, queue));
+  }
+
+done:
+  release_object(&dsv_heap);
+  release_object(&list);
+  release_object(&allocator);
+  release_object(&queue);
+  release_object(&device);
+}
+
 static void test_resource_allocation_info(void)
 {
   ID3D12Device *device = nullptr;
@@ -1717,6 +1807,7 @@ int main(int argc, char **argv)
   bool run_footprints = true;
   bool run_planar_formats = true;
   bool run_planar_resource = true;
+  bool run_depth_stencil_planar_resource = true;
   bool run_allocation_info = true;
   bool run_committed_resource = true;
   bool run_command_list = true;
@@ -1739,6 +1830,7 @@ int main(int argc, char **argv)
       puts("get-copyable-footprints");
       puts("planar-format-traits");
       puts("planar-format-resource-creation");
+      puts("depth-stencil-planar-resource-creation");
       puts("resource-allocation-info");
       puts("create-committed-resource");
       puts("command-list-basics");
@@ -1762,6 +1854,8 @@ int main(int argc, char **argv)
       run_footprints = strstr("get-copyable-footprints", filter) != nullptr;
       run_planar_formats = strstr("planar-format-traits", filter) != nullptr;
       run_planar_resource = strstr("planar-format-resource-creation", filter) != nullptr;
+      run_depth_stencil_planar_resource =
+          strstr("depth-stencil-planar-resource-creation", filter) != nullptr;
       run_allocation_info = strstr("resource-allocation-info", filter) != nullptr;
       run_committed_resource = strstr("create-committed-resource", filter) != nullptr;
       run_command_list = strstr("command-list-basics", filter) != nullptr;
@@ -1796,6 +1890,8 @@ int main(int argc, char **argv)
     test_planar_format_traits();
   if (run_planar_resource)
     test_planar_format_resource_creation();
+  if (run_depth_stencil_planar_resource)
+    test_depth_stencil_planar_resource_creation();
   if (run_allocation_info)
     test_resource_allocation_info();
   if (run_committed_resource)

@@ -2769,21 +2769,22 @@ private:
     }
 
     if (resource.GetTexture()) {
-      Rc<Texture> texture = resource.GetTexture();
-      std::vector<std::tuple<UINT, UINT, UINT>> subresources;
+      std::vector<std::tuple<Rc<Texture>, UINT, UINT>> subresources;
       subresources.reserve(subresource_count);
       for (UINT i = 0; i < subresource_count; i++) {
         const UINT subresource = first_subresource + i;
-        subresources.push_back({GetMipLevel(resource, subresource),
-                                GetArraySlice(resource, subresource),
-                                GetSubresourcePlane(resource, subresource)});
+        const UINT plane = GetSubresourcePlane(resource, subresource);
+        Rc<Texture> texture = Rc<Texture>(resource.GetTexture(plane));
+        if (!texture)
+          continue;
+        subresources.push_back({std::move(texture),
+                                GetMipLevel(resource, subresource),
+                                GetArraySlice(resource, subresource)});
       }
-      chunk->emitcc([texture = std::move(texture),
-                     subresources = std::move(subresources),
+      chunk->emitcc([subresources = std::move(subresources),
                      access](ArgumentEncodingContext &enc) mutable {
         enc.startBlitPass();
-        for (const auto &[level, slice, plane] : subresources) {
-          (void)plane;
+        for (const auto &[texture, level, slice] : subresources) {
           enc.access(texture, level, slice, access);
         }
         enc.endPass();
@@ -4944,7 +4945,7 @@ private:
         TextureViewKey view = attachments.depth_stencil->view;
         stencil.level = view.mip_start;
         stencil.slice = view.array_start;
-        stencil.depth_plane = 0;
+        stencil.depth_plane = 1;
         stencil.load_action = WMTLoadActionLoad;
         stencil.store_action = WMTStoreActionStore;
       }
