@@ -10,6 +10,7 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <d3d11_1.h>
+#include <d3d11_3.h>
 #include <dxgi1_2.h>
 
 #include <stdint.h>
@@ -19,6 +20,7 @@
 static int g_failures;
 
 #define check_hr(expr) check_hr_(__LINE__, #expr, (expr))
+#define check_hr_eq(expr, expected) check_hr_eq_(__LINE__, #expr, (expr), (expected))
 #define check_true(expr) check_true_(__LINE__, #expr, !!(expr))
 
 static void check_hr_(int line, const char *expr, HRESULT hr)
@@ -29,6 +31,18 @@ static void check_hr_(int line, const char *expr, HRESULT hr)
   }
 
   printf("not ok %d - %s hr=%#lx\n", line, expr, (unsigned long)hr);
+  ++g_failures;
+}
+
+static void check_hr_eq_(int line, const char *expr, HRESULT hr, HRESULT expected)
+{
+  if (hr == expected) {
+    printf("ok %d - %s hr=%#lx\n", line, expr, (unsigned long)hr);
+    return;
+  }
+
+  printf("not ok %d - %s hr=%#lx expected=%#lx\n",
+         line, expr, (unsigned long)hr, (unsigned long)expected);
   ++g_failures;
 }
 
@@ -184,17 +198,77 @@ done:
   release_object(&factory);
 }
 
+static void test_video_format_queries(void)
+{
+  static const DXGI_FORMAT formats[] = {
+    DXGI_FORMAT_NV12,
+    DXGI_FORMAT_P010,
+    DXGI_FORMAT_P016,
+  };
+
+  ID3D11Device *device = nullptr;
+  ID3D11DeviceContext *context = nullptr;
+  ID3D11Texture2D *texture = nullptr;
+  HRESULT hr = create_device(&device, &context);
+  check_hr(hr);
+  if (FAILED(hr))
+    goto done;
+
+  for (UINT i = 0; i < ARRAYSIZE(formats); ++i) {
+    UINT support = 0xdeadbeef;
+    D3D11_FEATURE_DATA_FORMAT_SUPPORT feature_support = {};
+    D3D11_FEATURE_DATA_FORMAT_SUPPORT2 feature_support2 = {};
+    D3D11_TEXTURE2D_DESC desc = {};
+
+    hr = device->CheckFormatSupport(formats[i], &support);
+    check_hr(hr);
+    check_true(support == 0);
+
+    feature_support.InFormat = formats[i];
+    feature_support.OutFormatSupport = 0xdeadbeef;
+    hr = device->CheckFeatureSupport(D3D11_FEATURE_FORMAT_SUPPORT,
+                                     &feature_support, sizeof(feature_support));
+    check_hr(hr);
+    check_true(feature_support.OutFormatSupport == 0);
+
+    feature_support2.InFormat = formats[i];
+    feature_support2.OutFormatSupport2 = 0xdeadbeef;
+    hr = device->CheckFeatureSupport(D3D11_FEATURE_FORMAT_SUPPORT2,
+                                     &feature_support2, sizeof(feature_support2));
+    check_hr(hr);
+    check_true(feature_support2.OutFormatSupport2 == 0);
+
+    desc.Width = 16;
+    desc.Height = 16;
+    desc.MipLevels = 1;
+    desc.ArraySize = 1;
+    desc.Format = formats[i];
+    desc.SampleDesc.Count = 1;
+    desc.Usage = D3D11_USAGE_DEFAULT;
+    desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    check_hr_eq(device->CreateTexture2D(&desc, nullptr, &texture), E_INVALIDARG);
+    check_true(texture == nullptr);
+  }
+
+done:
+  release_object(&texture);
+  release_object(&context);
+  release_object(&device);
+}
+
 int main(int argc, char **argv)
 {
   bool run_device = true;
   bool run_clear = true;
   bool run_dxgi = true;
+  bool run_video_formats = true;
 
   for (int i = 1; i < argc; ++i) {
     if (!strcmp(argv[i], "--list")) {
       puts("device-and-buffer");
       puts("clear-and-readback");
       puts("dxgi-factory");
+      puts("video-format-queries");
       return 0;
     }
     if (!strcmp(argv[i], "--filter") && i + 1 < argc) {
@@ -202,6 +276,7 @@ int main(int argc, char **argv)
       run_device = strstr("device-and-buffer", filter) != nullptr;
       run_clear = strstr("clear-and-readback", filter) != nullptr;
       run_dxgi = strstr("dxgi-factory", filter) != nullptr;
+      run_video_formats = strstr("video-format-queries", filter) != nullptr;
     }
   }
 
@@ -211,6 +286,8 @@ int main(int argc, char **argv)
     test_clear_and_readback();
   if (run_dxgi)
     test_dxgi_factory();
+  if (run_video_formats)
+    test_video_format_queries();
 
   printf("dx11_smoke: %s (%d failures)\n", g_failures ? "FAIL" : "PASS", g_failures);
   return g_failures ? 1 : 0;
