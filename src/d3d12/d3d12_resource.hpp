@@ -22,7 +22,9 @@ public:
   virtual dxmt::Buffer *GetBuffer() const = 0;
   virtual dxmt::BufferAllocation *GetBufferAllocation() const = 0;
   virtual dxmt::Texture *GetTexture() const = 0;
+  virtual dxmt::Texture *GetTexture(UINT plane) const = 0;
   virtual dxmt::TextureAllocation *GetTextureAllocation() const = 0;
+  virtual dxmt::TextureAllocation *GetTextureAllocation(UINT plane) const = 0;
   virtual ID3D12Resource *GetD3D12Resource() = 0;
 };
 
