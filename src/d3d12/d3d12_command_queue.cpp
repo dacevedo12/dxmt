@@ -664,17 +664,6 @@ GetSubresourceSize(const Resource &resource, UINT subresource,
 }
 
 static bool
-IsFullSubresourceBox(const Resource &resource, UINT subresource,
-                     const D3D12_BOX *box) {
-  if (!box)
-    return true;
-  const auto size = GetSubresourceSize(resource, subresource, nullptr);
-  return box->left == 0 && box->top == 0 && box->front == 0 &&
-         box->right == size.width && box->bottom == size.height &&
-         box->back == size.depth;
-}
-
-static bool
 StateHasWriteAccess(D3D12_RESOURCE_STATES state) {
   constexpr uint32_t kWriteStates =
       uint32_t(D3D12_RESOURCE_STATE_UNORDERED_ACCESS) |
@@ -1008,10 +997,19 @@ GetMipDepth(const Resource &resource, UINT mip_slice) {
   return static_cast<UINT>(std::max<UINT64>(1, desc.DepthOrArraySize >> mip_slice));
 }
 
+struct TextureViewBinding {
+  Rc<Texture> texture;
+  TextureViewKey view;
+
+  explicit operator bool() const {
+    return texture && uint64_t(view);
+  }
+};
+
 static WMTPixelFormat
 ResolveTextureViewFormat(WMT::Device device, Resource &resource,
-                         DXGI_FORMAT format) {
-  auto *texture = resource.GetTexture();
+                         DXGI_FORMAT format, UINT plane) {
+  auto *texture = resource.GetTexture(plane);
   if (!texture)
     return WMTPixelFormatInvalid;
   if (format == DXGI_FORMAT_UNKNOWN)
@@ -1094,7 +1092,7 @@ ValidateTextureViewRange(const char *context, TextureViewDescriptor &view,
   return true;
 }
 
-static TextureViewKey
+static TextureViewBinding
 CreateShaderResourceTextureView(WMT::Device device, Resource &resource,
                                 const DescriptorRecord &descriptor) {
   auto *texture = resource.GetTexture();
@@ -1113,11 +1111,36 @@ CreateShaderResourceTextureView(WMT::Device device, Resource &resource,
   if (!descriptor.has_desc) {
     auto key = texture->createView(view);
     D3D12DiagLogTextureView("SRV", resource, descriptor, view, key);
-    return key;
+    return {Rc<Texture>(texture), key};
   }
 
   const auto &srv = descriptor.desc.srv;
-  view.format = ResolveTextureViewFormat(device, resource, srv.Format);
+  UINT plane = 0;
+  switch (srv.ViewDimension) {
+  case D3D12_SRV_DIMENSION_TEXTURE2D:
+    plane = srv.Texture2D.PlaneSlice;
+    break;
+  case D3D12_SRV_DIMENSION_TEXTURE2DARRAY:
+    plane = srv.Texture2DArray.PlaneSlice;
+    break;
+  default:
+    break;
+  }
+  if (GetPlaneCount(resource) > 1 && srv.Format != DXGI_FORMAT_UNKNOWN &&
+      !IsDXGIFormatPlaneCompatible(resource.GetResourceDesc().Format,
+                                   srv.Format, plane)) {
+    WARN("D3D12CommandQueue: unsupported SRV plane format resource_format=",
+         uint32_t(resource.GetResourceDesc().Format),
+         " view_format=", uint32_t(srv.Format),
+         " plane=", uint32_t(plane));
+    return {};
+  }
+
+  auto *plane_texture = resource.GetTexture(plane);
+  if (!plane_texture)
+    return {};
+  auto plane_texture_ref = Rc<Texture>(plane_texture);
+  view.format = ResolveTextureViewFormat(device, resource, srv.Format, plane);
   if (view.format == WMTPixelFormatInvalid)
     return {};
 
@@ -1147,6 +1170,7 @@ CreateShaderResourceTextureView(WMT::Device device, Resource &resource,
     view.miplevelCount =
         NormalizeViewCount(srv.Texture2D.MipLevels, view.firstMiplevel,
                            texture->miplevelCount());
+    view.firstArraySlice = 0;
     view.arraySize = 1;
     break;
   case D3D12_SRV_DIMENSION_TEXTURE2DARRAY:
@@ -1208,12 +1232,12 @@ CreateShaderResourceTextureView(WMT::Device device, Resource &resource,
 
   if (!ValidateTextureViewRange("SRV texture view", view, resource))
     return {};
-  auto key = texture->createView(view);
+  auto key = plane_texture_ref->createView(view);
   D3D12DiagLogTextureView("SRV", resource, descriptor, view, key);
-  return key;
+  return {std::move(plane_texture_ref), key};
 }
 
-static TextureViewKey
+static TextureViewBinding
 CreateUnorderedAccessTextureView(WMT::Device device, Resource &resource,
                                  const DescriptorRecord &descriptor) {
   auto *texture = resource.GetTexture();
@@ -1233,11 +1257,36 @@ CreateUnorderedAccessTextureView(WMT::Device device, Resource &resource,
   if (!descriptor.has_desc) {
     auto key = texture->createView(view);
     D3D12DiagLogTextureView("UAV", resource, descriptor, view, key);
-    return key;
+    return {Rc<Texture>(texture), key};
   }
 
   const auto &uav = descriptor.desc.uav;
-  view.format = ResolveTextureViewFormat(device, resource, uav.Format);
+  UINT plane = 0;
+  switch (uav.ViewDimension) {
+  case D3D12_UAV_DIMENSION_TEXTURE2D:
+    plane = uav.Texture2D.PlaneSlice;
+    break;
+  case D3D12_UAV_DIMENSION_TEXTURE2DARRAY:
+    plane = uav.Texture2DArray.PlaneSlice;
+    break;
+  default:
+    break;
+  }
+  if (GetPlaneCount(resource) > 1 && uav.Format != DXGI_FORMAT_UNKNOWN &&
+      !IsDXGIFormatPlaneCompatible(resource.GetResourceDesc().Format,
+                                   uav.Format, plane)) {
+    WARN("D3D12CommandQueue: unsupported UAV plane format resource_format=",
+         uint32_t(resource.GetResourceDesc().Format),
+         " view_format=", uint32_t(uav.Format),
+         " plane=", uint32_t(plane));
+    return {};
+  }
+
+  auto *plane_texture = resource.GetTexture(plane);
+  if (!plane_texture)
+    return {};
+  auto plane_texture_ref = Rc<Texture>(plane_texture);
+  view.format = ResolveTextureViewFormat(device, resource, uav.Format, plane);
   if (view.format == WMTPixelFormatInvalid)
     return {};
 
@@ -1305,9 +1354,9 @@ CreateUnorderedAccessTextureView(WMT::Device device, Resource &resource,
 
   if (!ValidateTextureViewRange("UAV texture view", view, resource))
     return {};
-  auto key = texture->createView(view);
+  auto key = plane_texture_ref->createView(view);
   D3D12DiagLogTextureView("UAV", resource, descriptor, view, key);
-  return key;
+  return {std::move(plane_texture_ref), key};
 }
 
 static HRESULT
@@ -4051,15 +4100,18 @@ private:
       const auto view =
           CreateShaderResourceTextureView(device_->GetMTLDevice(), *resource,
                                           descriptor);
-      if (!uint64_t(view))
+      if (!view)
         return;
-      auto texture = Rc<Texture>(resource->GetTexture());
+      auto texture = std::move(view.texture);
       if (stage == PipelineStage::Compute)
-        enc.bindTexture<PipelineStage::Compute>(slot, std::move(texture), view);
+        enc.bindTexture<PipelineStage::Compute>(slot, std::move(texture),
+                                                view.view);
       else if (stage == PipelineStage::Pixel)
-        enc.bindTexture<PipelineStage::Pixel>(slot, std::move(texture), view);
+        enc.bindTexture<PipelineStage::Pixel>(slot, std::move(texture),
+                                              view.view);
       else
-        enc.bindTexture<PipelineStage::Vertex>(slot, std::move(texture), view);
+        enc.bindTexture<PipelineStage::Vertex>(slot, std::move(texture),
+                                                view.view);
     }
   }
 
@@ -4186,15 +4238,16 @@ private:
       const auto view =
           CreateUnorderedAccessTextureView(device_->GetMTLDevice(), *resource,
                                            descriptor);
-      if (!uint64_t(view))
+      if (!view)
         return;
-      auto texture = Rc<Texture>(resource->GetTexture());
+      auto texture = std::move(view.texture);
       if (stage == PipelineStage::Compute)
         enc.bindOutputTexture<PipelineStage::Compute>(slot,
-                                                      std::move(texture), view);
+                                                      std::move(texture),
+                                                      view.view);
       else
         enc.bindOutputTexture<PipelineStage::Pixel>(slot, std::move(texture),
-                                                   view);
+                                                   view.view);
     }
   }
 
@@ -5799,7 +5852,7 @@ private:
 
   TextureViewKey CreateResolveView(Resource &resource, UINT subresource,
                                    WMTPixelFormat format) {
-    auto *texture = resource.GetTexture();
+    auto *texture = resource.GetTexture(GetSubresourcePlane(resource, subresource));
     if (!texture)
       return {};
 
@@ -5971,7 +6024,6 @@ private:
     if (!dst || !src)
       return;
 
-    const bool src_planar = GetPlaneCount(*src) > 1;
     const UINT src_subresource =
         record.src.type == D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX
             ? record.src.subresource_index
@@ -5980,96 +6032,6 @@ private:
         record.dst.type == D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX
             ? record.dst.subresource_index
             : 0;
-
-    const auto &src_traits = GetDXGIFormatTraits(src->GetResourceDesc().Format);
-    if ((src_traits.flags & DXGI_FORMAT_TRAIT_VIDEO) && src->GetTexture() &&
-        dst->GetTexture()) {
-      WARN("D3D12CommandQueue: video texture-to-texture plane copy is not supported yet");
-      return;
-    }
-
-    if (src_planar && src->GetTexture() && dst->GetTexture()) {
-      if (!IsFullSubresourceBox(*src, src_subresource,
-                                record.src_box ? &*record.src_box : nullptr) ||
-          record.dst_x || record.dst_y || record.dst_z) {
-        WARN("D3D12CommandQueue: planar texture copy with subregion is not supported yet");
-        return;
-      }
-
-      const UINT src_plane = GetSubresourcePlane(*src, src_subresource);
-      const UINT src_level = GetMipLevel(*src, src_subresource);
-      const UINT src_slice = GetArraySlice(*src, src_subresource);
-      const UINT dst_level = GetMipLevel(*dst, dst_subresource);
-      const UINT dst_slice = GetArraySlice(*dst, dst_subresource);
-      const DXGI_FORMAT dst_format = dst->GetResourceDesc().Format;
-
-      if (!IsDXGIFormatPlaneCompatible(src->GetResourceDesc().Format,
-                                       dst_format, src_plane)) {
-        WARN("D3D12CommandQueue: planar copy destination format mismatch src_plane=",
-             src_plane, " dst_format=", uint32_t(dst_format));
-        return;
-      }
-
-      Rc<Texture> src_texture = src->GetTexture();
-      Rc<Texture> dst_texture = dst->GetTexture();
-      TextureViewDescriptor src_view = {};
-      src_view.format = src_plane ? WMTPixelFormatX32G8X32 : WMTPixelFormatR32X8X32;
-      src_view.type = src_texture->textureType();
-      switch (src_view.type) {
-      case WMTTextureType2DArray:
-      case WMTTextureTypeCube:
-      case WMTTextureTypeCubeArray:
-        src_view.type = WMTTextureType2D;
-        break;
-      default:
-        break;
-      }
-      src_view.firstMiplevel = src_level;
-      src_view.miplevelCount = 1;
-      src_view.firstArraySlice = src_slice;
-      src_view.arraySize = 1;
-      src_view.intendedUsage = WMTTextureUsageShaderRead;
-
-      auto src_key = src_texture->createView(src_view);
-      const auto copy_size = GetSubresourceSize(*src, src_subresource, nullptr);
-      const uint32_t bytes_per_pixel = src_plane ? 1 : 4;
-      const uint32_t bytes_per_row = uint32_t(copy_size.width) * bytes_per_pixel;
-      const uint32_t bytes_per_image = bytes_per_row * uint32_t(copy_size.height);
-      Rc<Buffer> staging = Rc<Buffer>(new Buffer(bytes_per_image, device_->GetDXMTDevice().device()));
-      Flags<BufferAllocationFlag> staging_flags;
-      staging_flags.set(BufferAllocationFlag::GpuPrivate);
-      auto staging_allocation = staging->allocate(staging_flags);
-      staging->rename(std::move(staging_allocation));
-      Rc<Buffer> staging_read = staging;
-      chunk->emitcc([src_texture = std::move(src_texture), src_key,
-                     staging = std::move(staging_read), bytes_per_row, bytes_per_image,
-                     stencil_plane = src_plane != 0](ArgumentEncodingContext &enc) mutable {
-        enc.blit_depth_stencil_cmd.copyPlaneToBuffer(std::move(src_texture), src_key,
-                                                     staging, 0, staging->length(),
-                                                     bytes_per_row, bytes_per_image,
-                                                     stencil_plane);
-      });
-      chunk->emitcc([dst_texture = std::move(dst_texture), dst_level, dst_slice,
-                     staging = staging, bytes_per_row, bytes_per_image,
-                     dst_format, copy_size](ArgumentEncodingContext &enc) mutable {
-        enc.startBlitPass();
-        auto [src_buffer, src_offset] = enc.access(staging, 0, staging->length(), ResourceAccess::Read);
-        auto dst = enc.access(dst_texture, dst_level, dst_slice, ResourceAccess::Write);
-        auto &copy = enc.encodeBlitCommand<wmtcmd_blit_copy_from_buffer_to_texture>();
-        copy.type = WMTBlitCommandCopyFromBufferToTexture;
-        copy.src = src_buffer->buffer();
-        copy.src_offset = src_offset;
-        copy.bytes_per_row = bytes_per_row;
-        copy.bytes_per_image = bytes_per_image;
-        copy.size = copy_size;
-        copy.dst = dst;
-        copy.slice = dst_slice;
-        copy.level = dst_level;
-        copy.origin = {0, 0, 0};
-        enc.endPass();
-      });
-      return;
-    }
 
     if (dst->GetTextureAllocation() && src->GetTextureAllocation() &&
         dst->GetTexture() && src->GetTexture()) {
@@ -6082,14 +6044,28 @@ private:
                                               record.src_box->front}
                                   : WMTOrigin{0, 0, 0};
       const auto dst_origin = WMTOrigin{record.dst_x, record.dst_y, record.dst_z};
-      Rc<TextureAllocation> dst_allocation = dst->GetTextureAllocation();
-      Rc<TextureAllocation> src_allocation = src->GetTextureAllocation();
+      const UINT src_plane = GetSubresourcePlane(*src, src_subresource);
+      const UINT dst_plane = GetSubresourcePlane(*dst, dst_subresource);
       const UINT dst_slice = GetArraySlice(*dst, dst_subresource);
       const UINT dst_level = GetMipLevel(*dst, dst_subresource);
       const UINT src_slice = GetArraySlice(*src, src_subresource);
       const UINT src_level = GetMipLevel(*src, src_subresource);
-      Rc<Texture> dst_texture = dst->GetTexture();
-      Rc<Texture> src_texture = src->GetTexture();
+      if (src_plane != dst_plane) {
+        WARN("D3D12CommandQueue: texture copy between different planes is not supported yet src_plane=",
+             src_plane, " dst_plane=", dst_plane);
+        return;
+      }
+      Rc<Texture> dst_texture = Rc<Texture>(dst->GetTexture(dst_plane));
+      Rc<Texture> src_texture = Rc<Texture>(src->GetTexture(src_plane));
+      if (!dst_texture || !src_texture)
+        return;
+      if (src_texture->pixelFormat() != dst_texture->pixelFormat()) {
+        WARN("D3D12CommandQueue: plane texture copy format mismatch src_format=",
+             uint32_t(src_texture->pixelFormat()),
+             " dst_format=", uint32_t(dst_texture->pixelFormat()),
+             " plane=", uint32_t(src_plane));
+        return;
+      }
       if (D3D12DiagTextureCopyEnabled()) {
         static std::atomic<uint32_t> log_count = 0;
         if (D3D12DiagShouldLog(log_count, true)) {
@@ -6102,6 +6078,7 @@ private:
                " src_texture=", src_texture && src_texture->current()
                                   ? uint64_t(src_texture->current()->texture())
                                   : 0,
+               " plane=", uint32_t(src_plane),
                " dst_subresource=", uint32_t(dst_subresource),
                " src_subresource=", uint32_t(src_subresource),
                " dst_level=", uint32_t(dst_level),
@@ -6180,8 +6157,7 @@ private:
     auto &buffer_resource = dst_is_buffer ? dst : src;
     auto &texture_resource = dst_is_buffer ? src : dst;
     Rc<Buffer> buffer = buffer_resource.GetBuffer();
-    Rc<Texture> texture = texture_resource.GetTexture();
-    if (!buffer || !texture)
+    if (!buffer)
       return;
 
     const auto &buffer_location = dst_is_buffer ? record.dst : record.src;
@@ -6195,6 +6171,9 @@ private:
     const UINT slice = GetArraySlice(texture_resource, subresource);
     const UINT level = GetMipLevel(texture_resource, subresource);
     const UINT plane = GetSubresourcePlane(texture_resource, subresource);
+    Rc<Texture> texture = Rc<Texture>(texture_resource.GetTexture(plane));
+    if (!texture)
+      return;
     const auto size =
         GetSubresourceSize(texture_resource, subresource,
                            record.src_box ? &*record.src_box : nullptr);
@@ -6209,7 +6188,8 @@ private:
     const UINT64 buffer_offset =
         buffer_resource.GetHeapOffset() + buffer_location.placed_footprint.Offset;
     const UINT row_pitch = footprint.RowPitch;
-    if (!IsDXGIFormatPlaneCompatible(texture_resource.GetResourceDesc().Format,
+    if (GetPlaneCount(texture_resource) > 1 &&
+        !IsDXGIFormatPlaneCompatible(texture_resource.GetResourceDesc().Format,
                                      footprint.Format, plane)) {
       WARN("D3D12CommandQueue: buffer texture copy format is not plane compatible resource_format=",
            uint32_t(texture_resource.GetResourceDesc().Format),
@@ -6492,29 +6472,30 @@ private:
     if (resource->GetTexture()) {
       auto view = CreateUnorderedAccessTextureView(device_->GetMTLDevice(),
                                                    *resource, record.descriptor);
-      if (!uint64_t(view))
+      if (!view)
         return;
-      auto *texture = resource->GetTexture();
-      const auto type = texture->textureType(view);
+      auto *texture = view.texture.ptr();
+      const auto key = view.view;
+      const auto type = texture->textureType(key);
       if (type != WMTTextureType2D && type != WMTTextureType2DArray) {
         WARN("D3D12CommandQueue: ClearUnorderedAccessView texture type is unsupported");
         return;
       }
       std::vector<D3D12_RECT> rects = record.rects;
       if (rects.empty()) {
-        rects.push_back({0, 0, static_cast<LONG>(texture->width(view)),
-                         static_cast<LONG>(texture->height(view))});
+        rects.push_back(D3D12_RECT{0, 0, static_cast<LONG>(texture->width(key)),
+                                   static_cast<LONG>(texture->height(key))});
       }
-      Rc<Texture> rc_texture = texture;
+      Rc<Texture> rc_texture = std::move(view.texture);
       chunk->emitcc([texture = std::move(rc_texture), view,
                      integer = record.integer,
                      uint_values = record.uint_values,
                      float_values = record.float_values,
                      rects = std::move(rects)](ArgumentEncodingContext &enc) mutable {
         if (integer)
-          enc.clear_res_cmd.begin(uint_values, Rc<Texture>(texture), view);
+          enc.clear_res_cmd.begin(uint_values, Rc<Texture>(texture), view.view);
         else
-          enc.clear_res_cmd.begin(float_values, Rc<Texture>(texture), view);
+          enc.clear_res_cmd.begin(float_values, Rc<Texture>(texture), view.view);
         for (const auto &rect : rects) {
           const auto left = uint32_t(std::max<LONG>(0, rect.left));
           const auto top = uint32_t(std::max<LONG>(0, rect.top));

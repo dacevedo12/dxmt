@@ -7,6 +7,7 @@
 #include "dxmt_format.hpp"
 #include "log/log.hpp"
 #include "util_string.hpp"
+#include <array>
 #include <algorithm>
 #include <cstring>
 #include <mutex>
@@ -15,6 +16,8 @@
 
 namespace dxmt::d3d12 {
 namespace {
+
+constexpr UINT kMaxTexturePlanes = 3;
 
 static UINT64
 Align(UINT64 value, UINT64 alignment) {
@@ -61,10 +64,13 @@ GetTextureUsage(D3D12_RESOURCE_FLAGS flags) {
 }
 
 DXGI_FORMAT
-ResolveTextureBackingFormat(const D3D12_RESOURCE_DESC &desc) {
+ResolveTextureBackingFormat(const D3D12_RESOURCE_DESC &desc, UINT plane = 0) {
   const auto &traits = GetDXGIFormatTraits(desc.Format);
-  if ((traits.flags & DXGI_FORMAT_TRAIT_VIDEO) && traits.planeCount)
-    return static_cast<DXGI_FORMAT>(traits.planes[0].backingFormat);
+  if ((traits.flags & DXGI_FORMAT_TRAIT_VIDEO) && traits.planeCount) {
+    if (plane >= traits.planeCount)
+      return DXGI_FORMAT_UNKNOWN;
+    return static_cast<DXGI_FORMAT>(traits.planes[plane].backingFormat);
+  }
 
   if (!(desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL))
     return desc.Format;
@@ -77,6 +83,32 @@ ResolveTextureBackingFormat(const D3D12_RESOURCE_DESC &desc) {
   default:
     return desc.Format;
   }
+}
+
+static UINT
+GetTexturePlaneCount(const D3D12_RESOURCE_DESC &desc) {
+  if (desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER)
+    return 1;
+  const auto &traits = GetDXGIFormatTraits(desc.Format);
+  return std::max(1u, traits.planeCount);
+}
+
+static UINT64
+GetTexturePlaneWidth(const D3D12_RESOURCE_DESC &desc, UINT plane) {
+  const auto &traits = GetDXGIFormatTraits(desc.Format);
+  const UINT subsample =
+      plane < traits.planeCount ? traits.planes[plane].subsampleXLog2 : 0;
+  return std::max<UINT64>(1, desc.Width >> subsample);
+}
+
+static UINT
+GetTexturePlaneHeight(const D3D12_RESOURCE_DESC &desc, UINT plane) {
+  if (desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D)
+    return 1;
+  const auto &traits = GetDXGIFormatTraits(desc.Format);
+  const UINT subsample =
+      plane < traits.planeCount ? traits.planes[plane].subsampleYLog2 : 0;
+  return std::max<UINT>(1, desc.Height >> subsample);
 }
 
 WMTTextureType
@@ -613,8 +645,18 @@ public:
     return texture_.ptr();
   }
 
+  dxmt::Texture *GetTexture(UINT plane) const override {
+    return plane < plane_textures_.size() ? plane_textures_[plane].ptr()
+                                          : nullptr;
+  }
+
   dxmt::TextureAllocation *GetTextureAllocation() const override {
     return texture_allocation_.ptr();
+  }
+
+  dxmt::TextureAllocation *GetTextureAllocation(UINT plane) const override {
+    return plane < plane_allocations_.size() ? plane_allocations_[plane].ptr()
+                                             : nullptr;
   }
 
   ID3D12Resource *GetD3D12Resource() override {
@@ -622,11 +664,23 @@ public:
   }
 
 private:
+  Rc<dxmt::Texture> GetTextureRef(UINT plane) const {
+    return plane < plane_textures_.size() ? plane_textures_[plane] : nullptr;
+  }
+
+  Rc<dxmt::TextureAllocation> GetTextureAllocationRef(UINT plane) const {
+    return plane < plane_allocations_.size() ? plane_allocations_[plane]
+                                             : nullptr;
+  }
+
   HRESULT WriteTextureSubresource(UINT dst_sub_resource,
                                   const D3D12_BOX *dst_box,
                                   const void *src_data, UINT src_row_pitch,
                                   UINT src_slice_pitch) {
-    if (!texture_ || !texture_allocation_)
+    const UINT plane = GetTextureSubresourcePlane(desc_, dst_sub_resource);
+    auto texture = GetTextureRef(plane);
+    auto texture_allocation = GetTextureAllocationRef(plane);
+    if (!texture || !texture_allocation)
       return E_INVALIDARG;
 
     TextureSubresourceLayout layout = {};
@@ -646,21 +700,25 @@ private:
                                           src_row_pitch, src_slice_pitch)))
       return E_INVALIDARG;
 
-    if (texture_allocation_->mappedMemory &&
+    if (texture_allocation->mappedMemory &&
         IsCpuLinearTextureSubresource(desc_, dst_sub_resource))
       return WriteMappedTextureRows(box, layout, src_data, src_row_pitch,
                                     src_slice_pitch, row_size, row_count,
-                                    depth_count);
+                                    depth_count, texture_allocation.ptr());
 
     return WriteTextureRowsViaBlit(box, layout, src_data, src_row_pitch,
                                    src_slice_pitch, row_size, row_count,
-                                   depth_count, dst_sub_resource);
+                                   depth_count, dst_sub_resource,
+                                   std::move(texture));
   }
 
   HRESULT ReadTextureSubresource(void *dst_data, UINT dst_row_pitch,
                                  UINT dst_slice_pitch, UINT src_sub_resource,
                                  const D3D12_BOX *src_box) {
-    if (!texture_ || !texture_allocation_)
+    const UINT plane = GetTextureSubresourcePlane(desc_, src_sub_resource);
+    auto texture = GetTextureRef(plane);
+    auto texture_allocation = GetTextureAllocationRef(plane);
+    if (!texture || !texture_allocation)
       return E_INVALIDARG;
 
     TextureSubresourceLayout layout = {};
@@ -680,23 +738,25 @@ private:
                                           dst_row_pitch, dst_slice_pitch)))
       return E_INVALIDARG;
 
-    if (texture_allocation_->mappedMemory &&
+    if (texture_allocation->mappedMemory &&
         IsCpuLinearTextureSubresource(desc_, src_sub_resource))
       return ReadMappedTextureRows(dst_data, dst_row_pitch, box, layout,
                                    dst_slice_pitch, row_size, row_count,
-                                   depth_count);
+                                   depth_count, texture_allocation.ptr());
 
     return ReadTextureRowsViaBlit(dst_data, dst_row_pitch, box, layout,
                                   dst_slice_pitch, row_size, row_count,
-                                  depth_count, src_sub_resource);
+                                  depth_count, src_sub_resource,
+                                  std::move(texture));
   }
 
   HRESULT WriteMappedTextureRows(const D3D12_BOX &box,
                                  const TextureSubresourceLayout &layout,
                                  const void *src_data, UINT src_row_pitch,
                                  UINT src_slice_pitch, UINT64 row_size,
-                                 UINT row_count, UINT depth_count) {
-    auto *dst = static_cast<char *>(texture_allocation_->mappedMemory);
+                                 UINT row_count, UINT depth_count,
+                                 dxmt::TextureAllocation *texture_allocation) {
+    auto *dst = static_cast<char *>(texture_allocation->mappedMemory);
     const auto *src = static_cast<const char *>(src_data);
     const UINT src_effective_slice =
         EffectiveSlicePitch(src_slice_pitch, src_row_pitch, row_count);
@@ -713,9 +773,10 @@ private:
                                 const D3D12_BOX &box,
                                 const TextureSubresourceLayout &layout,
                                 UINT dst_slice_pitch, UINT64 row_size,
-                                UINT row_count, UINT depth_count) {
+                                UINT row_count, UINT depth_count,
+                                dxmt::TextureAllocation *texture_allocation) {
     auto *dst = static_cast<char *>(dst_data);
-    const auto *src = static_cast<const char *>(texture_allocation_->mappedMemory);
+    const auto *src = static_cast<const char *>(texture_allocation->mappedMemory);
     const UINT dst_effective_slice =
         EffectiveSlicePitch(dst_slice_pitch, dst_row_pitch, row_count);
     for (UINT z = 0; z < depth_count; z++) {
@@ -732,7 +793,8 @@ private:
                                   const void *src_data, UINT src_row_pitch,
                                   UINT src_slice_pitch, UINT64 row_size,
                                   UINT row_count, UINT depth_count,
-                                  UINT dst_sub_resource) {
+                                  UINT dst_sub_resource,
+                                  Rc<dxmt::Texture> texture) {
     const UINT staging_slice_pitch = layout.row_pitch * row_count;
     WMTBufferInfo buffer_info = {};
     buffer_info.length = staging_slice_pitch * depth_count;
@@ -754,7 +816,6 @@ private:
                     static_cast<size_t>(row_size));
     }
 
-    Rc<dxmt::Texture> texture = texture_;
     const UINT dst_slice = GetTextureSubresourceArraySlice(desc_, dst_sub_resource);
     const UINT dst_level = GetTextureSubresourceMipLevel(desc_, dst_sub_resource);
     const UINT origin_z =
@@ -792,7 +853,8 @@ private:
                                  const TextureSubresourceLayout &layout,
                                  UINT dst_slice_pitch, UINT64 row_size,
                                  UINT row_count, UINT depth_count,
-                                 UINT src_sub_resource) {
+                                 UINT src_sub_resource,
+                                 Rc<dxmt::Texture> texture) {
     const UINT staging_slice_pitch = layout.row_pitch * row_count;
     WMTBufferInfo buffer_info = {};
     buffer_info.length = staging_slice_pitch * depth_count;
@@ -801,7 +863,6 @@ private:
     if (!buffer || !buffer_info.memory.get())
       return E_FAIL;
 
-    Rc<dxmt::Texture> texture = texture_;
     const UINT src_slice = GetTextureSubresourceArraySlice(desc_, src_sub_resource);
     const UINT src_level = GetTextureSubresourceMipLevel(desc_, src_sub_resource);
     const UINT origin_z =
@@ -862,57 +923,79 @@ private:
   }
 
   void CreateTexture() {
-    MTL_DXGI_FORMAT_DESC format = {};
-    if (FAILED(MTLQueryDXGIFormat(device_->GetDXMTDevice().device(),
-                                  ResolveTextureBackingFormat(desc_), format)))
-      return;
-
-    WMTTextureInfo info = {};
-    info.pixel_format = format.PixelFormat;
-    info.width = static_cast<uint32_t>(desc_.Width);
-    info.height = desc_.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D
-                      ? 1
-                      : desc_.Height;
-    info.depth = desc_.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D
-                     ? desc_.DepthOrArraySize
-                     : 1;
-    info.array_length = desc_.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D
-                            ? 1
-                            : desc_.DepthOrArraySize;
-    info.type = GetTextureType(desc_);
-    info.mipmap_level_count = std::min(GetMipLevels(desc_), GetMaxMipLevels(desc_));
-    info.sample_count = desc_.SampleDesc.Count ? desc_.SampleDesc.Count : 1;
-    info.usage = GetTextureUsage(desc_.Flags);
-
     Flags<dxmt::TextureAllocationFlag> flags;
-    TextureSubresourceLayout layout = {};
-    const bool linear_cpu_texture =
-        GetHeapType(heap_properties_) != D3D12_HEAP_TYPE_DEFAULT &&
-        IsCpuLinearTextureSubresource(desc_, 0) &&
-        SUCCEEDED(GetTextureSubresourceLayout(device_->GetDXMTDevice().device(),
-                                             desc_, 0, layout));
-
-    if (linear_cpu_texture) {
-      // TODO(d3d12): extend CPU-linear custom heap textures beyond the
-      // single-subresource 2D case so ReadFromSubresource/WriteToSubresource
-      // can cover the full D3D12 custom-heap texture surface.
-      texture_ = new dxmt::Texture(layout.slice_pitch, layout.row_pitch, info,
-                                   device_->GetDXMTDevice().device());
-    } else {
-      texture_ = new dxmt::Texture(info, device_->GetDXMTDevice().device());
-    }
-
     if (GetHeapType(heap_properties_) == D3D12_HEAP_TYPE_DEFAULT) {
       flags.set(dxmt::TextureAllocationFlag::CpuInvisible);
       flags.set(dxmt::TextureAllocationFlag::GpuPrivate);
     } else if (GetHeapType(heap_properties_) == D3D12_HEAP_TYPE_UPLOAD) {
       flags.set(dxmt::TextureAllocationFlag::CpuWriteCombined);
     }
-    texture_allocation_ = texture_->allocate(flags);
-    texture_->rename(Rc<dxmt::TextureAllocation>(texture_allocation_));
+
+    const UINT plane_count = GetTexturePlaneCount(desc_);
+    if (plane_count > plane_textures_.size()) {
+      WARN("D3D12Resource: unsupported texture plane count ", plane_count);
+      return;
+    }
+
+    const bool cpu_linear_candidate =
+        plane_count == 1 &&
+        GetHeapType(heap_properties_) != D3D12_HEAP_TYPE_DEFAULT &&
+        IsCpuLinearTextureSubresource(desc_, 0);
+
+    WMTPixelFormat first_pixel_format = WMTPixelFormatInvalid;
+    for (UINT plane = 0; plane < plane_count; ++plane) {
+      MTL_DXGI_FORMAT_DESC format = {};
+      if (FAILED(MTLQueryDXGIFormat(device_->GetDXMTDevice().device(),
+                                    ResolveTextureBackingFormat(desc_, plane),
+                                    format)))
+        return;
+
+      WMTTextureInfo info = {};
+      info.pixel_format = format.PixelFormat;
+      info.width = static_cast<uint32_t>(GetTexturePlaneWidth(desc_, plane));
+      info.height = GetTexturePlaneHeight(desc_, plane);
+      info.depth = desc_.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D
+                       ? desc_.DepthOrArraySize
+                       : 1;
+      info.array_length = desc_.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D
+                              ? 1
+                              : desc_.DepthOrArraySize;
+      info.type = GetTextureType(desc_);
+      info.mipmap_level_count =
+          std::min(GetMipLevels(desc_), GetMaxMipLevels(desc_));
+      info.sample_count = desc_.SampleDesc.Count ? desc_.SampleDesc.Count : 1;
+      info.usage = GetTextureUsage(desc_.Flags);
+
+      TextureSubresourceLayout layout = {};
+      const bool linear_cpu_texture =
+          cpu_linear_candidate &&
+          SUCCEEDED(GetTextureSubresourceLayout(device_->GetDXMTDevice().device(),
+                                               desc_, 0, layout));
+
+      if (linear_cpu_texture) {
+        // TODO(d3d12): extend CPU-linear custom heap textures beyond the
+        // single-subresource 2D case so ReadFromSubresource/WriteToSubresource
+        // can cover the full D3D12 custom-heap texture surface.
+        plane_textures_[plane] = new dxmt::Texture(
+            layout.slice_pitch, layout.row_pitch, info,
+            device_->GetDXMTDevice().device());
+      } else {
+        plane_textures_[plane] =
+            new dxmt::Texture(info, device_->GetDXMTDevice().device());
+      }
+
+      plane_allocations_[plane] = plane_textures_[plane]->allocate(flags);
+      plane_textures_[plane]->rename(
+          Rc<dxmt::TextureAllocation>(plane_allocations_[plane]));
+      if (!plane) {
+        first_pixel_format = format.PixelFormat;
+        texture_ = plane_textures_[plane];
+        texture_allocation_ = plane_allocations_[plane];
+      }
+    }
 
     if (GetHeapType(heap_properties_) == D3D12_HEAP_TYPE_DEFAULT) {
-      InitializeTextureContents(format.PixelFormat);
+      InitializeTextureContents(first_pixel_format);
     }
   }
 
@@ -924,43 +1007,51 @@ private:
             ? 1
             : desc_.DepthOrArraySize;
     const auto dsv_planar = DepthStencilPlanarFlags(pixel_format);
+    const UINT plane_count = GetTexturePlaneCount(desc_);
 
-    if (dsv_planar &&
-        (desc_.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL)) {
-      const float depth = has_clear_value_ ? clear_value_.DepthStencil.Depth : 0.0f;
-      const uint8_t stencil = has_clear_value_ ? clear_value_.DepthStencil.Stencil : 0;
+    for (UINT plane = 0; plane < plane_count; ++plane) {
+      auto texture = plane_textures_[plane];
+      auto allocation = plane_allocations_[plane];
+      if (!texture || !allocation)
+        continue;
+
+      if (!plane && dsv_planar &&
+          (desc_.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL)) {
+        const float depth = has_clear_value_ ? clear_value_.DepthStencil.Depth : 0.0f;
+        const uint8_t stencil = has_clear_value_ ? clear_value_.DepthStencil.Stencil : 0;
+        for (UINT slice = 0; slice < array_size; ++slice) {
+          for (UINT level = 0; level < mip_levels; ++level) {
+            initializer.initDepthStencilWithZero(
+                texture.ptr(), texture->current(), slice, level, dsv_planar,
+                depth, stencil);
+          }
+        }
+        continue;
+      }
+
+      if (!plane && (texture->usage() & WMTTextureUsageRenderTarget) &&
+          (desc_.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET)) {
+        WMTClearColor color = {0, 0, 0, 0};
+        if (has_clear_value_) {
+          color.r = clear_value_.Color[0];
+          color.g = clear_value_.Color[1];
+          color.b = clear_value_.Color[2];
+          color.a = clear_value_.Color[3];
+        }
+        for (UINT slice = 0; slice < array_size; ++slice) {
+          for (UINT level = 0; level < mip_levels; ++level) {
+            initializer.initRenderTargetWithZero(
+                texture.ptr(), texture->current(), slice, level, color);
+          }
+        }
+        continue;
+      }
+
       for (UINT slice = 0; slice < array_size; ++slice) {
         for (UINT level = 0; level < mip_levels; ++level) {
-          initializer.initDepthStencilWithZero(
-              texture_.ptr(), texture_->current(), slice, level, dsv_planar,
-              depth, stencil);
+          initializer.initWithZero(texture.ptr(), texture->current(),
+                                   slice, level);
         }
-      }
-      return;
-    }
-
-    if ((texture_->usage() & WMTTextureUsageRenderTarget) &&
-        (desc_.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET)) {
-      WMTClearColor color = {0, 0, 0, 0};
-      if (has_clear_value_) {
-        color.r = clear_value_.Color[0];
-        color.g = clear_value_.Color[1];
-        color.b = clear_value_.Color[2];
-        color.a = clear_value_.Color[3];
-      }
-      for (UINT slice = 0; slice < array_size; ++slice) {
-        for (UINT level = 0; level < mip_levels; ++level) {
-          initializer.initRenderTargetWithZero(
-              texture_.ptr(), texture_->current(), slice, level, color);
-        }
-      }
-      return;
-    }
-
-    for (UINT slice = 0; slice < array_size; ++slice) {
-      for (UINT level = 0; level < mip_levels; ++level) {
-        initializer.initWithZero(texture_.ptr(), texture_->current(),
-                                 slice, level);
       }
     }
   }
@@ -978,6 +1069,8 @@ private:
   Rc<dxmt::BufferAllocation> buffer_allocation_;
   Rc<dxmt::Texture> texture_;
   Rc<dxmt::TextureAllocation> texture_allocation_;
+  std::array<Rc<dxmt::Texture>, kMaxTexturePlanes> plane_textures_{};
+  std::array<Rc<dxmt::TextureAllocation>, kMaxTexturePlanes> plane_allocations_{};
   std::string name_;
 };
 
