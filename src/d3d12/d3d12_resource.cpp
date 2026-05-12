@@ -133,8 +133,7 @@ CreateDepthStencilPlaneReadView(dxmt::Texture *texture, UINT plane, UINT level,
   default:
     return {};
   }
-  view.format = plane ? WMTPixelFormatX32G8X32
-                      : WMTPixelFormatDepth32Float_Stencil8;
+  view.format = plane ? WMTPixelFormatX32G8X32 : texture->pixelFormat();
   view.firstMiplevel = level;
   view.miplevelCount = 1;
   view.firstArraySlice = slice;
@@ -872,7 +871,8 @@ private:
             ? staging_slice_pitch
             : 0;
 
-    if (IsDepthStencilResourceFormat(desc_.Format)) {
+    if (IsDepthStencilResourceFormat(desc_.Format) &&
+        DepthStencilPlanarFlags(texture->pixelFormat()) > 1) {
       if (depth_count != 1 || dst_plane > 1)
         return E_INVALIDARG;
 
@@ -968,7 +968,8 @@ private:
             ? staging_slice_pitch
             : 0;
 
-    if (IsDepthStencilResourceFormat(desc_.Format)) {
+    if (IsDepthStencilResourceFormat(desc_.Format) &&
+        DepthStencilPlanarFlags(texture->pixelFormat()) > 1) {
       if (depth_count != 1 || src_plane > 1)
         return E_INVALIDARG;
 

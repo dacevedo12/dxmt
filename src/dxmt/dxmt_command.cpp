@@ -382,6 +382,7 @@ DepthStencilBlitContext::DepthStencilBlitContext(
   pso_copy_d32s8_ = device_.newRenderPipelineState(pipeline_info, err);
 
   pipeline_info.fragment_function = fs_copy_depth_r32;
+  pipeline_info.depth_pixel_format = WMTPixelFormatDepth32Float_Stencil8;
   pipeline_info.stencil_pixel_format = WMTPixelFormatInvalid;
   pso_copy_depth_from_buffer_r32_ =
       device_.newRenderPipelineState(pipeline_info, err);
@@ -473,9 +474,6 @@ DepthStencilBlitContext::copyFromBuffer(
   stencil.load_action = WMTLoadActionLoad;
   stencil.store_action = WMTStoreActionStore;
 
-  auto [src_, src_sub_offset] =
-      ctx_.access<PipelineStage::Pixel>(src, src_offset, src_length, ResourceAccess::Read);
-
   pass_info.render_target_width = width;
   pass_info.render_target_height = height;
   pass_info.render_target_array_length = 0;
@@ -494,9 +492,13 @@ DepthStencilBlitContext::copyFromBuffer(
   setdsso.dsso = depth_stencil_state_.handle;
   setdsso.stencil_ref = 0;
 
+  auto [src_buffer, src_sub_offset] =
+      ctx_.access<PipelineStage::Pixel>(src, src_offset, src_length,
+                                        ResourceAccess::Read);
+
   auto &setbuf = ctx_.encodeRenderCommand<wmtcmd_render_setbuffer>();
   setbuf.type = WMTRenderCommandSetFragmentBuffer;
-  setbuf.buffer = src_->buffer();
+  setbuf.buffer = src_buffer->buffer();
   setbuf.index = 0;
   setbuf.offset = src_offset + src_sub_offset;
 
@@ -690,10 +692,6 @@ DepthStencilBlitContext::copyPlaneFromBuffer(
     depth.store_action = WMTStoreActionStore;
   }
 
-  auto [src_, src_sub_offset] =
-      ctx_.access<PipelineStage::Pixel>(src, src_offset, src_length,
-                                        ResourceAccess::Read);
-
   auto &setpso = ctx_.encodeRenderCommand<wmtcmd_render_setpso>();
   setpso.type = WMTRenderCommandSetPSO;
   setpso.pso = stencil_plane ? pso_copy_stencil_from_buffer_r8_
@@ -713,9 +711,13 @@ DepthStencilBlitContext::copyPlaneFromBuffer(
   setdsso.dsso = depth_stencil_state_.handle;
   setdsso.stencil_ref = 0;
 
+  auto [src_buffer, src_sub_offset] =
+      ctx_.access<PipelineStage::Pixel>(src, src_offset, src_length,
+                                        ResourceAccess::Read);
+
   auto &setbuf = ctx_.encodeRenderCommand<wmtcmd_render_setbuffer>();
   setbuf.type = WMTRenderCommandSetFragmentBuffer;
-  setbuf.buffer = src_->buffer();
+  setbuf.buffer = src_buffer->buffer();
   setbuf.index = 0;
   setbuf.offset = src_offset + src_sub_offset;
 

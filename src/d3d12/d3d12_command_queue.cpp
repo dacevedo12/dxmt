@@ -638,8 +638,7 @@ CreateDepthStencilPlaneReadView(dxmt::Texture *texture, UINT plane, UINT level,
   default:
     return {};
   }
-  view.format = plane ? WMTPixelFormatX32G8X32
-                      : WMTPixelFormatDepth32Float_Stencil8;
+  view.format = plane ? WMTPixelFormatX32G8X32 : texture->pixelFormat();
   view.firstMiplevel = level;
   view.miplevelCount = 1;
   view.firstArraySlice = slice;
@@ -6289,7 +6288,8 @@ private:
       }
     }
 
-    if (IsDepthStencilResourceFormat(texture_resource.GetResourceDesc().Format)) {
+    if (IsDepthStencilResourceFormat(texture_resource.GetResourceDesc().Format) &&
+        DepthStencilPlanarFlags(texture->pixelFormat()) > 1) {
       if (size.depth != 1 || plane > 1) {
         WARN("D3D12CommandQueue: depth/stencil buffer texture copy has unsupported plane/depth plane=",
              uint32_t(plane), " depth=", uint32_t(size.depth));

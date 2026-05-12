@@ -30,7 +30,7 @@ SinglePlaneNative(uint32_t format) {
 
 constexpr DXGIFormatTraits
 DepthStencilTraits(uint32_t format, uint32_t depth_format,
-                   uint32_t stencil_format) {
+                   uint32_t stencil_format, uint32_t depth_element_size) {
   return {
       .format = format,
       .classification = DXGIFormatClass::Native,
@@ -40,7 +40,7 @@ DepthStencilTraits(uint32_t format, uint32_t depth_format,
                      .backingFormat = depth_format,
                      .viewFormat = depth_format,
                      .footprintFormat = depth_format,
-                     .elementSize = 4,
+                     .elementSize = depth_element_size,
                  },
                  {
                      .backingFormat = stencil_format,
@@ -121,7 +121,7 @@ GetDXGIFormatTraits(uint32_t format) {
   case DXGI_FORMAT_X32_TYPELESS_G8X24_UINT:
     static constexpr auto d32s8 =
         DepthStencilTraits(DXGI_FORMAT_D32_FLOAT_S8X24_UINT,
-                           DXGI_FORMAT_R32_TYPELESS, DXGI_FORMAT_R8_TYPELESS);
+                           DXGI_FORMAT_R32_TYPELESS, DXGI_FORMAT_R8_TYPELESS, 4);
     return d32s8;
   case DXGI_FORMAT_D24_UNORM_S8_UINT:
   case DXGI_FORMAT_R24G8_TYPELESS:
@@ -129,17 +129,17 @@ GetDXGIFormatTraits(uint32_t format) {
   case DXGI_FORMAT_X24_TYPELESS_G8_UINT:
     static constexpr auto d24s8 =
         DepthStencilTraits(DXGI_FORMAT_D24_UNORM_S8_UINT,
-                           DXGI_FORMAT_R32_TYPELESS, DXGI_FORMAT_R8_TYPELESS);
+                           DXGI_FORMAT_R32_TYPELESS, DXGI_FORMAT_R8_TYPELESS, 4);
     return d24s8;
   case DXGI_FORMAT_D32_FLOAT:
     static constexpr auto d32 =
         DepthStencilTraits(DXGI_FORMAT_D32_FLOAT, DXGI_FORMAT_R32_FLOAT,
-                           DXGI_FORMAT_UNKNOWN);
+                           DXGI_FORMAT_UNKNOWN, 4);
     return d32;
   case DXGI_FORMAT_D16_UNORM:
     static constexpr auto d16 =
         DepthStencilTraits(DXGI_FORMAT_D16_UNORM, DXGI_FORMAT_R16_UNORM,
-                           DXGI_FORMAT_UNKNOWN);
+                           DXGI_FORMAT_UNKNOWN, 2);
     return d16;
   case DXGI_FORMAT_NV12:
     static constexpr auto nv12 =

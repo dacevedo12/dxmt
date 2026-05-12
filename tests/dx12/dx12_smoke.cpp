@@ -1018,6 +1018,8 @@ static void test_depth_stencil_planar_resource_creation(void)
   static const DXGI_FORMAT formats[] = {
     DXGI_FORMAT_D24_UNORM_S8_UINT,
     DXGI_FORMAT_D32_FLOAT_S8X24_UINT,
+    DXGI_FORMAT_D32_FLOAT,
+    DXGI_FORMAT_D16_UNORM,
   };
 
   ID3D12Device *device = nullptr;
@@ -1065,7 +1067,11 @@ static void test_depth_stencil_planar_resource_creation(void)
     std::vector<uint8_t> stencil_readback;
     const UINT width = 8;
     const UINT height = 6;
-    const UINT depth_row_pitch = width * sizeof(float);
+    const bool has_stencil = formats[i] == DXGI_FORMAT_D24_UNORM_S8_UINT ||
+                             formats[i] == DXGI_FORMAT_D32_FLOAT_S8X24_UINT;
+    const UINT depth_texel_size =
+        formats[i] == DXGI_FORMAT_D16_UNORM ? sizeof(uint16_t) : sizeof(float);
+    const UINT depth_row_pitch = width * depth_texel_size;
     const UINT stencil_row_pitch = width;
 
     desc = texture_desc(width, height, formats[i],
@@ -1093,27 +1099,36 @@ static void test_depth_stencil_planar_resource_creation(void)
     stencil_readback.resize(stencil_data.size());
     for (UINT y = 0; y < height; ++y) {
       for (UINT x = 0; x < width; ++x) {
-        float value = float((x + y) & 3) * 0.25f;
-        memcpy(depth_data.data() + y * depth_row_pitch + x * sizeof(float),
-               &value, sizeof(value));
-        stencil_data[y * stencil_row_pitch + x] = uint8_t(0x40 + x + y * 3);
+        if (formats[i] == DXGI_FORMAT_D16_UNORM) {
+          uint16_t value = uint16_t(((x + y) & 7) * 0x1111);
+          memcpy(depth_data.data() + y * depth_row_pitch + x * sizeof(uint16_t),
+                 &value, sizeof(value));
+        } else {
+          float value = float((x + y) & 3) * 0.25f;
+          memcpy(depth_data.data() + y * depth_row_pitch + x * sizeof(float),
+                 &value, sizeof(value));
+        }
+        if (has_stencil)
+          stencil_data[y * stencil_row_pitch + x] = uint8_t(0x40 + x + y * 3);
       }
     }
 
     check_hr(texture->WriteToSubresource(0, &box, depth_data.data(),
                                          depth_row_pitch, UINT(depth_data.size())));
-    check_hr(texture->WriteToSubresource(1, &box, stencil_data.data(),
-                                         stencil_row_pitch, UINT(stencil_data.size())));
     check_hr(texture->ReadFromSubresource(depth_readback.data(),
                                           depth_row_pitch, UINT(depth_data.size()),
                                           0, &box));
-    check_hr(texture->ReadFromSubresource(stencil_readback.data(),
-                                          stencil_row_pitch, UINT(stencil_data.size()),
-                                          1, &box));
     check_true(!memcmp(depth_readback.data(), depth_data.data(),
                        depth_data.size()));
-    check_true(!memcmp(stencil_readback.data(), stencil_data.data(),
-                       stencil_data.size()));
+    if (has_stencil) {
+      check_hr(texture->WriteToSubresource(1, &box, stencil_data.data(),
+                                           stencil_row_pitch, UINT(stencil_data.size())));
+      check_hr(texture->ReadFromSubresource(stencil_readback.data(),
+                                            stencil_row_pitch, UINT(stencil_data.size()),
+                                            1, &box));
+      check_true(!memcmp(stencil_readback.data(), stencil_data.data(),
+                         stencil_data.size()));
+    }
 
     dsv.Format = DXGI_FORMAT_UNKNOWN;
     dsv.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2D;
