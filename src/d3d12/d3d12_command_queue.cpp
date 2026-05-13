@@ -1407,22 +1407,22 @@ NormalizeQueueDesc(const D3D12_COMMAND_QUEUE_DESC *desc,
 
   if (!IsSupportedQueueType(normalized.Type)) {
     Logger::err(str::format("D3D12CommandQueue: unsupported queue type ", normalized.Type));
-    return E_INVALIDARG;
+    return WARN_E_INVALIDARG(__func__);
   }
 
   if (!IsSupportedQueuePriority(normalized.Priority)) {
     Logger::err(str::format("D3D12CommandQueue: unsupported priority ", normalized.Priority));
-    return E_INVALIDARG;
+    return WARN_E_INVALIDARG(__func__);
   }
 
   if (!IsSupportedQueueFlags(normalized.Flags)) {
     Logger::err(str::format("D3D12CommandQueue: unsupported flags ", normalized.Flags));
-    return E_INVALIDARG;
+    return WARN_E_INVALIDARG(__func__);
   }
 
   if (normalized.NodeMask > 1) {
     Logger::err(str::format("D3D12CommandQueue: unsupported node mask ", normalized.NodeMask));
-    return E_INVALIDARG;
+    return WARN_E_INVALIDARG(__func__);
   }
 
   return S_OK;
@@ -1573,11 +1573,11 @@ public:
 
   HRESULT STDMETHODCALLTYPE Signal(ID3D12Fence *fence, UINT64 value) override {
     if (!fence)
-      return E_INVALIDARG;
+      return WARN_E_INVALIDARG(__func__);
 
     auto *state = dynamic_cast<Fence *>(fence);
     if (!state)
-      return E_INVALIDARG;
+      return WARN_E_INVALIDARG(__func__);
 
     PendingOperation op;
     op.type = PendingOperationType::Signal;
@@ -1590,11 +1590,11 @@ public:
 
   HRESULT STDMETHODCALLTYPE Wait(ID3D12Fence *fence, UINT64 value) override {
     if (!fence)
-      return E_INVALIDARG;
+      return WARN_E_INVALIDARG(__func__);
 
     auto *state = dynamic_cast<Fence *>(fence);
     if (!state)
-      return E_INVALIDARG;
+      return WARN_E_INVALIDARG(__func__);
 
     PendingOperation op;
     op.type = PendingOperationType::Wait;
@@ -1607,7 +1607,7 @@ public:
 
   HRESULT STDMETHODCALLTYPE GetTimestampFrequency(UINT64 *frequency) override {
     if (!frequency)
-      return E_INVALIDARG;
+      return WARN_E_INVALIDARG(__func__);
 
     *frequency = 1'000'000'000ull;
     return S_OK;
@@ -1615,7 +1615,7 @@ public:
 
   HRESULT STDMETHODCALLTYPE GetClockCalibration(UINT64 *gpu_timestamp, UINT64 *cpu_timestamp) override {
     if (!gpu_timestamp || !cpu_timestamp)
-      return E_INVALIDARG;
+      return WARN_E_INVALIDARG(__func__);
 
     const auto now = std::chrono::steady_clock::now().time_since_epoch();
     const auto timestamp =
@@ -1838,7 +1838,7 @@ private:
 
     HRESULT STDMETHODCALLTYPE GetDesc(DXGI_SWAP_CHAIN_DESC *desc) override {
       if (!desc)
-        return E_INVALIDARG;
+        return WARN_E_INVALIDARG(__func__);
       desc->BufferDesc.Width = desc_.Width;
       desc->BufferDesc.Height = desc_.Height;
       desc->BufferDesc.RefreshRate = fullscreen_desc_.RefreshRate;
@@ -1974,7 +1974,7 @@ private:
     HRESULT STDMETHODCALLTYPE
     GetFrameStatistics(DXGI_FRAME_STATISTICS *stats) override {
       if (!stats)
-        return E_INVALIDARG;
+        return WARN_E_INVALIDARG(__func__);
       stats->PresentCount = presentation_count_;
       stats->SyncRefreshCount = presentation_count_;
       stats->PresentRefreshCount = presentation_count_;
@@ -2108,7 +2108,7 @@ private:
 
     HRESULT STDMETHODCALLTYPE GetBackgroundColor(DXGI_RGBA *color) override {
       if (!color)
-        return E_INVALIDARG;
+        return WARN_E_INVALIDARG(__func__);
       *color = background_color_;
       return S_OK;
     }
@@ -2120,14 +2120,14 @@ private:
 
     HRESULT STDMETHODCALLTYPE GetRotation(DXGI_MODE_ROTATION *rotation) override {
       if (!rotation)
-        return E_INVALIDARG;
+        return WARN_E_INVALIDARG(__func__);
       *rotation = rotation_;
       return S_OK;
     }
 
     HRESULT STDMETHODCALLTYPE SetSourceSize(UINT width, UINT height) override {
       if (!width || !height)
-        return E_INVALIDARG;
+        return WARN_E_INVALIDARG(__func__);
       source_width_ = width;
       source_height_ = height;
       return S_OK;
@@ -2143,7 +2143,7 @@ private:
 
     HRESULT STDMETHODCALLTYPE SetMaximumFrameLatency(UINT max_latency) override {
       if (!max_latency || max_latency > DXGI_MAX_SWAP_CHAIN_BUFFERS)
-        return E_INVALIDARG;
+        return WARN_E_INVALIDARG(__func__);
       if (present_semaphore_ && max_latency > frame_latency_)
         ReleaseSemaphore(present_semaphore_, max_latency - frame_latency_,
                          nullptr);
@@ -2174,7 +2174,7 @@ private:
     HRESULT STDMETHODCALLTYPE
     SetMatrixTransform(const DXGI_MATRIX_3X2_F *matrix) override {
       if (!matrix)
-        return E_INVALIDARG;
+        return WARN_E_INVALIDARG(__func__);
       matrix_ = *matrix;
       return S_OK;
     }
@@ -2182,7 +2182,7 @@ private:
     HRESULT STDMETHODCALLTYPE
     GetMatrixTransform(DXGI_MATRIX_3X2_F *matrix) override {
       if (!matrix)
-        return E_INVALIDARG;
+        return WARN_E_INVALIDARG(__func__);
       *matrix = matrix_;
       return S_OK;
     }
@@ -2200,7 +2200,7 @@ private:
     HRESULT STDMETHODCALLTYPE CheckColorSpaceSupport(
         DXGI_COLOR_SPACE_TYPE color_space, UINT *color_space_support) override {
       if (!color_space_support)
-        return E_INVALIDARG;
+        return WARN_E_INVALIDARG(__func__);
       *color_space_support =
           IsSupportedD3D12SwapChainColorSpace(color_space)
               ? DXGI_SWAP_CHAIN_COLOR_SPACE_SUPPORT_FLAG_PRESENT
@@ -6766,7 +6766,7 @@ CreateCommandQueue(IMTLD3D12Device *device, const D3D12_COMMAND_QUEUE_DESC *desc
                    REFIID riid, void **command_queue) {
   InitReturnPtr(command_queue);
   if (!command_queue)
-    return E_INVALIDARG;
+    return WARN_E_INVALIDARG(__func__);
 
   D3D12_COMMAND_QUEUE_DESC normalized = {};
   HRESULT hr = NormalizeQueueDesc(desc, normalized);

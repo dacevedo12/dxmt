@@ -165,7 +165,7 @@ CreateD3D12DeviceInstance(IUnknown *adapter, D3D_FEATURE_LEVEL minimum_feature_l
   if (adapter) {
     if (FAILED(adapter->QueryInterface(IID_PPV_ARGS(&dxgi_adapter)))) {
       dxmt::Logger::err("D3D12CreateDevice: adapter is not a DXGI adapter");
-      return E_INVALIDARG;
+      return WARN_E_INVALIDARG(__func__);
     }
   } else {
     HRESULT hr = CreateDXGIFactory1(IID_PPV_ARGS(&dxgi_factory));
@@ -180,7 +180,7 @@ CreateD3D12DeviceInstance(IUnknown *adapter, D3D_FEATURE_LEVEL minimum_feature_l
   dxmt::Com<IMTLDXGIAdapter> metal_adapter = nullptr;
   if (FAILED(dxgi_adapter->QueryInterface(IID_PPV_ARGS(&metal_adapter)))) {
     dxmt::Logger::err("D3D12CreateDevice: not a DXMT adapter");
-    return E_INVALIDARG;
+    return WARN_E_INVALIDARG(__func__);
   }
 
   const auto gate = dxmt::d3d12::CheckSupportGate(metal_adapter->GetMTLDevice());
@@ -196,7 +196,7 @@ CreateD3D12DeviceInstance(IUnknown *adapter, D3D_FEATURE_LEVEL minimum_feature_l
         "D3D12CreateDevice: requested feature level ", minimum_feature_level,
         " is outside supported D3D12 range [", D3D_FEATURE_LEVEL_11_0,
         ", ", supported_feature_level, "]"));
-    return E_INVALIDARG;
+    return WARN_E_INVALIDARG(__func__);
   }
 
   if (!device)
@@ -284,7 +284,7 @@ D3D12EnableExperimentalFeatures(UINT feature_count, const IID *iids,
                                 void *configurations,
                                 UINT *configuration_sizes) {
   if (feature_count && !iids)
-    return E_INVALIDARG;
+    return WARN_E_INVALIDARG(__func__);
 
   dxmt::Logger::warn(dxmt::str::format(
       "D3D12EnableExperimentalFeatures: experimental features are not "

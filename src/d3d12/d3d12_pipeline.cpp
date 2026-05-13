@@ -391,7 +391,7 @@ ParsePipelineShader(PipelineShaderStage stage,
                     const D3D12_SHADER_BYTECODE &bytecode,
                     PipelineDxilShader &shader) {
   if (!bytecode.pShaderBytecode && bytecode.BytecodeLength)
-    return E_INVALIDARG;
+    return WARN_E_INVALIDARG(__func__);
   if (!HasBytecode(bytecode))
     return S_FALSE;
 
@@ -410,7 +410,7 @@ ParsePipelineShader(PipelineShaderStage stage,
   if (is_dxil && status != dxil::ParseStatus::Ok) {
     WARN("D3D12PipelineState: failed to parse ", ShaderStageName(stage),
          " DXIL bytecode: ", dxil::StatusName(status));
-    return E_INVALIDARG;
+    return WARN_E_INVALIDARG(__func__);
   }
 
   const auto &program = shader.parser.dxilProgram();
@@ -421,12 +421,12 @@ ParsePipelineShader(PipelineShaderStage stage,
       WARN("D3D12PipelineState: ", ShaderStageName(stage),
            " bytecode contains ", dxil::PsvShaderKindName(program->shader_kind()),
            " shader");
-      return E_INVALIDARG;
+      return WARN_E_INVALIDARG(__func__);
     }
   } else if (!ValidateDxbcShaderStage(stage, bytecode)) {
     WARN("D3D12PipelineState: invalid or mismatched ",
          ShaderStageName(stage), " DXBC bytecode");
-    return E_INVALIDARG;
+    return WARN_E_INVALIDARG(__func__);
   }
 
   sm50_error_t error = nullptr;
@@ -440,7 +440,7 @@ ParsePipelineShader(PipelineShaderStage stage,
          is_dxil ? " DXIL shader: " : " DXBC shader: ",
          SM50GetErrorMessageString(error));
     SM50FreeError(error);
-    return E_INVALIDARG;
+    return WARN_E_INVALIDARG(__func__);
   }
 
   const auto argument_count =
@@ -1755,55 +1755,55 @@ CloneGraphicsState(const D3D12_GRAPHICS_PIPELINE_STATE_DESC &desc,
                    PipelineGraphicsState &state) {
   if (desc.NumRenderTargets > D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT ||
       desc.SampleDesc.Count == 0)
-    return E_INVALIDARG;
+    return WARN_E_INVALIDARG(__func__);
   if (desc.NodeMask > 1) {
     WARN("D3D12PipelineState: multi-node graphics PSOs are unsupported");
-    return E_INVALIDARG;
+    return WARN_E_INVALIDARG(__func__);
   }
   if (desc.StreamOutput.NumEntries || desc.StreamOutput.NumStrides) {
     if (!(GetRootSignatureFlags(desc.pRootSignature) &
           D3D12_ROOT_SIGNATURE_FLAG_ALLOW_STREAM_OUTPUT)) {
       WARN("D3D12PipelineState: stream output requires root signature support");
-      return E_INVALIDARG;
+      return WARN_E_INVALIDARG(__func__);
     }
   }
   for (UINT i = desc.NumRenderTargets; i < D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT; i++) {
     if (desc.RTVFormats[i] != DXGI_FORMAT_UNKNOWN)
-      return E_INVALIDARG;
+      return WARN_E_INVALIDARG(__func__);
   }
   for (UINT i = 0; i < D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT; i++) {
     const auto &rt = desc.BlendState.RenderTarget[i];
     if (rt.BlendEnable && rt.LogicOpEnable)
-      return E_INVALIDARG;
+      return WARN_E_INVALIDARG(__func__);
     if (rt.LogicOpEnable && desc.BlendState.IndependentBlendEnable)
-      return E_INVALIDARG;
+      return WARN_E_INVALIDARG(__func__);
   }
   if (desc.PrimitiveTopologyType == D3D12_PRIMITIVE_TOPOLOGY_TYPE_UNDEFINED ||
       desc.PrimitiveTopologyType == D3D12_PRIMITIVE_TOPOLOGY_TYPE_PATCH) {
     WARN("D3D12PipelineState: unsupported primitive topology type ",
          uint32_t(desc.PrimitiveTopologyType));
-    return E_INVALIDARG;
+    return WARN_E_INVALIDARG(__func__);
   }
   if (desc.SampleDesc.Quality != 0) {
     WARN("D3D12PipelineState: MSAA quality levels are unsupported");
-    return E_INVALIDARG;
+    return WARN_E_INVALIDARG(__func__);
   }
   if ((desc.HS.BytecodeLength || desc.HS.pShaderBytecode ||
        desc.DS.BytecodeLength || desc.DS.pShaderBytecode) &&
       (!HasBytecode(desc.HS) || !HasBytecode(desc.DS)))
-    return E_INVALIDARG;
+    return WARN_E_INVALIDARG(__func__);
   if (HasBytecode(desc.HS) || HasBytecode(desc.DS)) {
     WARN("D3D12PipelineState: tessellation shaders are unsupported");
-    return E_INVALIDARG;
+    return WARN_E_INVALIDARG(__func__);
   }
   if (HasBytecode(desc.GS)) {
     WARN("D3D12PipelineState: geometry shaders are unsupported");
-    return E_INVALIDARG;
+    return WARN_E_INVALIDARG(__func__);
   }
   if (!HasBytecode(desc.VS))
-    return E_INVALIDARG;
+    return WARN_E_INVALIDARG(__func__);
   if (desc.InputLayout.NumElements && !desc.InputLayout.pInputElementDescs)
-    return E_INVALIDARG;
+    return WARN_E_INVALIDARG(__func__);
 
   state = {};
   state.desc = desc;
@@ -1813,7 +1813,7 @@ CloneGraphicsState(const D3D12_GRAPHICS_PIPELINE_STATE_DESC &desc,
   for (UINT i = 0; i < desc.InputLayout.NumElements; i++) {
     const auto &element = desc.InputLayout.pInputElementDescs[i];
     if (!element.SemanticName)
-      return E_INVALIDARG;
+      return WARN_E_INVALIDARG(__func__);
     state.input_element_semantic_names.emplace_back(element.SemanticName);
     state.input_elements.push_back(element);
   }
@@ -1834,7 +1834,7 @@ CloneGraphicsState(const D3D12_GRAPHICS_PIPELINE_STATE_DESC &desc,
   }
 
   if (!CopyCachedBlob(desc.CachedPSO, state.cached_pso))
-    return E_INVALIDARG;
+    return WARN_E_INVALIDARG(__func__);
 
   return S_OK;
 }
@@ -1843,12 +1843,12 @@ HRESULT
 CloneComputeState(const D3D12_COMPUTE_PIPELINE_STATE_DESC &desc,
                   PipelineComputeState &state) {
   if (!HasBytecode(desc.CS))
-    return E_INVALIDARG;
+    return WARN_E_INVALIDARG(__func__);
 
   state = {};
   state.desc = desc;
   if (!CopyCachedBlob(desc.CachedPSO, state.cached_pso))
-    return E_INVALIDARG;
+    return WARN_E_INVALIDARG(__func__);
   return S_OK;
 }
 
@@ -2100,7 +2100,7 @@ ParsePipelineStateStream(const D3D12_PIPELINE_STATE_STREAM_DESC &stream,
     case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS: {
       const auto &formats = *static_cast<const D3D12_RT_FORMAT_ARRAY *>(payload);
       if (formats.NumRenderTargets > D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT)
-        return E_INVALIDARG;
+        return WARN_E_INVALIDARG(__func__);
       graphics.NumRenderTargets = formats.NumRenderTargets;
       for (UINT i = 0; i < formats.NumRenderTargets; i++)
       graphics.RTVFormats[i] = formats.RTFormats[i];
@@ -2223,11 +2223,11 @@ public:
   HRESULT STDMETHODCALLTYPE StorePipeline(const WCHAR *name,
                                           ID3D12PipelineState *pipeline) override {
     if (!name || !pipeline)
-      return E_INVALIDARG;
+      return WARN_E_INVALIDARG(__func__);
 
     auto *state = dynamic_cast<PipelineState *>(pipeline);
     if (!state)
-      return E_INVALIDARG;
+      return WARN_E_INVALIDARG(__func__);
 
     std::lock_guard lock(mutex_);
     pipelines_[PipelineLibraryNameKey(name)] = {
@@ -2245,7 +2245,7 @@ public:
     if (!pipeline_state)
       return E_POINTER;
     if (!name)
-      return E_INVALIDARG;
+      return WARN_E_INVALIDARG(__func__);
 
     auto key = PipelineLibraryNameKey(name);
     {
@@ -2253,7 +2253,7 @@ public:
       auto entry = pipelines_.find(key);
       if (entry != pipelines_.end()) {
         if (entry->second.type != PipelineStateType::Graphics)
-          return E_INVALIDARG;
+          return WARN_E_INVALIDARG(__func__);
         return entry->second.pipeline->QueryInterface(riid, pipeline_state);
       }
     }
@@ -2279,7 +2279,7 @@ public:
     if (!pipeline_state)
       return E_POINTER;
     if (!name)
-      return E_INVALIDARG;
+      return WARN_E_INVALIDARG(__func__);
 
     auto key = PipelineLibraryNameKey(name);
     {
@@ -2287,7 +2287,7 @@ public:
       auto entry = pipelines_.find(key);
       if (entry != pipelines_.end()) {
         if (entry->second.type != PipelineStateType::Compute)
-          return E_INVALIDARG;
+          return WARN_E_INVALIDARG(__func__);
         return entry->second.pipeline->QueryInterface(riid, pipeline_state);
       }
     }
@@ -2322,7 +2322,7 @@ public:
     if (!pipeline_state)
       return E_POINTER;
     if (!name)
-      return E_INVALIDARG;
+      return WARN_E_INVALIDARG(__func__);
 
     auto key = PipelineLibraryNameKey(name);
     {

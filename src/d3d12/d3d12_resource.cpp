@@ -315,20 +315,20 @@ GetTextureSubresourceLayout(WMT::Device device,
                             UINT sub_resource,
                             TextureSubresourceLayout &layout) {
   if (sub_resource >= GetTextureSubresourceCount(desc))
-    return E_INVALIDARG;
+    return WARN_E_INVALIDARG(__func__);
 
   MTL_DXGI_FORMAT_DESC format = {};
   const auto &traits = GetDXGIFormatTraits(desc.Format);
   const UINT plane = GetTextureSubresourcePlane(desc, sub_resource);
   if (plane >= std::max(1u, traits.planeCount))
-    return E_INVALIDARG;
+    return WARN_E_INVALIDARG(__func__);
   if (traits.flags & DXGI_FORMAT_TRAIT_VIDEO) {
     const auto plane_format =
         static_cast<DXGI_FORMAT>(traits.planes[plane].footprintFormat);
     if (FAILED(MTLQueryDXGIFormat(device, plane_format, format)))
-      return E_INVALIDARG;
+      return WARN_E_INVALIDARG(__func__);
   } else if (FAILED(MTLQueryDXGIFormat(device, desc.Format, format))) {
-    return E_INVALIDARG;
+    return WARN_E_INVALIDARG(__func__);
   }
 
   const UINT mip = GetTextureSubresourceMipLevel(desc, sub_resource);
@@ -353,7 +353,7 @@ GetTextureSubresourceLayout(WMT::Device device,
           : ((format.Flag & MTL_DXGI_FORMAT_BC) ? format.BlockSize
                                                  : format.BytesPerTexel);
   if (!layout.element_size)
-    return E_INVALIDARG;
+    return WARN_E_INVALIDARG(__func__);
 
   const UINT64 block_columns =
       (layout.width + layout.block_width - 1) / layout.block_width;
@@ -438,12 +438,12 @@ static HRESULT
 ValidateTextureCopyPitches(UINT64 row_size, UINT row_count, UINT row_pitch,
                            UINT slice_pitch) {
   if (row_pitch < row_size)
-    return E_INVALIDARG;
+    return WARN_E_INVALIDARG(__func__);
   if (slice_pitch && row_count > 1 &&
       slice_pitch < row_pitch * (row_count - 1) + row_size)
-    return E_INVALIDARG;
+    return WARN_E_INVALIDARG(__func__);
   if (row_count == 1 && slice_pitch && slice_pitch < row_size)
-    return E_INVALIDARG;
+    return WARN_E_INVALIDARG(__func__);
   return S_OK;
 }
 
@@ -452,9 +452,9 @@ ValidateTextureCopyPitches(UINT64 row_size, UINT row_count, UINT depth_count,
                            UINT row_pitch, UINT slice_pitch) {
   if (FAILED(ValidateTextureCopyPitches(row_size, row_count, row_pitch,
                                         slice_pitch)))
-    return E_INVALIDARG;
+    return WARN_E_INVALIDARG(__func__);
   if (depth_count > 1 && slice_pitch < row_pitch * (row_count - 1) + row_size)
-    return E_INVALIDARG;
+    return WARN_E_INVALIDARG(__func__);
   return S_OK;
 }
 
@@ -470,7 +470,7 @@ CopyTextureRowsToMemory(void *dst_data, UINT dst_row_pitch,
                                         src_row_pitch, src_slice_pitch)) ||
       FAILED(ValidateTextureCopyPitches(row_size, row_count, depth_count,
                                         dst_row_pitch, dst_slice_pitch)))
-    return E_INVALIDARG;
+    return WARN_E_INVALIDARG(__func__);
 
   auto *dst = static_cast<char *>(dst_data);
   const auto *src = static_cast<const char *>(src_data);
@@ -563,12 +563,12 @@ public:
   HRESULT STDMETHODCALLTYPE Map(UINT sub_resource, const D3D12_RANGE *read_range,
                                 void **data) override {
     if (sub_resource >= GetTextureSubresourceCount(desc_))
-      return E_INVALIDARG;
+      return WARN_E_INVALIDARG(__func__);
 
     if (desc_.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
       if (sub_resource != 0 || !buffer_allocation_ ||
           !buffer_allocation_->mappedMemory(0))
-        return E_INVALIDARG;
+        return WARN_E_INVALIDARG(__func__);
 
       if (data)
         *data = static_cast<char *>(buffer_allocation_->mappedMemory(0)) +
@@ -578,14 +578,14 @@ public:
 
     if (!texture_allocation_ ||
         !IsTextureSubresourceMappable(desc_, sub_resource, heap_properties_))
-      return E_INVALIDARG;
+      return WARN_E_INVALIDARG(__func__);
 
     if (!data)
       return S_OK;
 
     if (!texture_allocation_->mappedMemory ||
         !IsCpuLinearTextureSubresource(desc_, sub_resource))
-      return E_INVALIDARG;
+      return WARN_E_INVALIDARG(__func__);
 
     *data = texture_allocation_->mappedMemory;
     return S_OK;
@@ -633,7 +633,7 @@ public:
       return E_POINTER;
 
     if (desc_.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER)
-      return E_INVALIDARG;
+      return WARN_E_INVALIDARG(__func__);
 
     return WriteTextureSubresource(dst_sub_resource, dst_box, src_data,
                                    src_row_pitch, src_slice_pitch);
@@ -646,7 +646,7 @@ public:
       return E_POINTER;
 
     if (desc_.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER)
-      return E_INVALIDARG;
+      return WARN_E_INVALIDARG(__func__);
 
     return ReadTextureSubresource(dst_data, dst_row_pitch, dst_slice_pitch,
                                   src_sub_resource, src_box);
@@ -746,7 +746,7 @@ private:
     auto texture = GetTextureRef(plane);
     auto texture_allocation = GetTextureAllocationRef(plane);
     if (!texture || !texture_allocation)
-      return E_INVALIDARG;
+      return WARN_E_INVALIDARG(__func__);
 
     TextureSubresourceLayout layout = {};
     HRESULT hr = GetTextureSubresourceLayout(device_->GetDXMTDevice().device(),
@@ -756,14 +756,14 @@ private:
 
     D3D12_BOX box = {};
     if (!NormalizeTextureBox(desc_, layout, dst_box, box))
-      return E_INVALIDARG;
+      return WARN_E_INVALIDARG(__func__);
 
     const UINT row_count = TextureBoxRowCount(box, layout);
     const UINT depth_count = TextureBoxDepthCount(box);
     const UINT64 row_size = TextureBoxRowSize(box, layout);
     if (FAILED(ValidateTextureCopyPitches(row_size, row_count, depth_count,
                                           src_row_pitch, src_slice_pitch)))
-      return E_INVALIDARG;
+      return WARN_E_INVALIDARG(__func__);
 
     if (texture_allocation->mappedMemory &&
         IsCpuLinearTextureSubresource(desc_, dst_sub_resource))
@@ -784,7 +784,7 @@ private:
     auto texture = GetTextureRef(plane);
     auto texture_allocation = GetTextureAllocationRef(plane);
     if (!texture || !texture_allocation)
-      return E_INVALIDARG;
+      return WARN_E_INVALIDARG(__func__);
 
     TextureSubresourceLayout layout = {};
     HRESULT hr = GetTextureSubresourceLayout(device_->GetDXMTDevice().device(),
@@ -794,14 +794,14 @@ private:
 
     D3D12_BOX box = {};
     if (!NormalizeTextureBox(desc_, layout, src_box, box))
-      return E_INVALIDARG;
+      return WARN_E_INVALIDARG(__func__);
 
     const UINT row_count = TextureBoxRowCount(box, layout);
     const UINT depth_count = TextureBoxDepthCount(box);
     const UINT64 row_size = TextureBoxRowSize(box, layout);
     if (FAILED(ValidateTextureCopyPitches(row_size, row_count, depth_count,
                                           dst_row_pitch, dst_slice_pitch)))
-      return E_INVALIDARG;
+      return WARN_E_INVALIDARG(__func__);
 
     if (texture_allocation->mappedMemory &&
         IsCpuLinearTextureSubresource(desc_, src_sub_resource))
@@ -874,7 +874,7 @@ private:
     if (IsDepthStencilResourceFormat(desc_.Format) &&
         DepthStencilPlanarFlags(texture->pixelFormat()) > 1) {
       if (depth_count != 1 || dst_plane > 1)
-        return E_INVALIDARG;
+        return WARN_E_INVALIDARG(__func__);
 
       Flags<dxmt::BufferAllocationFlag> flags;
       flags.set(dxmt::BufferAllocationFlag::CpuWriteCombined);
@@ -971,7 +971,7 @@ private:
     if (IsDepthStencilResourceFormat(desc_.Format) &&
         DepthStencilPlanarFlags(texture->pixelFormat()) > 1) {
       if (depth_count != 1 || src_plane > 1)
-        return E_INVALIDARG;
+        return WARN_E_INVALIDARG(__func__);
 
       Rc<dxmt::Buffer> buffer =
           new dxmt::Buffer(staging_slice_pitch,
@@ -986,7 +986,7 @@ private:
           CreateDepthStencilPlaneReadView(texture.ptr(), src_plane, src_level,
                                           src_slice);
       if (!view)
-        return E_INVALIDARG;
+        return WARN_E_INVALIDARG(__func__);
 
       const WMTOrigin origin = {box.left, box.top, origin_z};
       const WMTSize size = {box.right - box.left, box.bottom - box.top, 1};

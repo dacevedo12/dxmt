@@ -144,7 +144,7 @@ public:
                                                        void *configs,
                                                        UINT *config_sizes) override {
     if (feature_count && !iids)
-      return E_INVALIDARG;
+      return WARN_E_INVALIDARG(__func__);
     return DXGI_ERROR_UNSUPPORTED;
   }
 
@@ -174,7 +174,7 @@ public:
   HRESULT STDMETHODCALLTYPE GetEnabledExperimentalFeatures(GUID *guids,
                                                            UINT guid_count) override {
     if (guid_count && !guids)
-      return E_INVALIDARG;
+      return WARN_E_INVALIDARG(__func__);
     return S_OK;
   }
 

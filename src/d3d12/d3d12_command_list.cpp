@@ -254,21 +254,21 @@ public:
   HRESULT STDMETHODCALLTYPE Reset(ID3D12CommandAllocator *allocator,
                                   ID3D12PipelineState *initial_state) override {
     if (!allocator)
-      return E_INVALIDARG;
+      return WARN_E_INVALIDARG(__func__);
 
     auto allocator_state = dynamic_cast<CommandAllocatorObject *>(allocator);
     if (!allocator_state || allocator_state->GetCommandListType() != type_)
-      return E_INVALIDARG;
+      return WARN_E_INVALIDARG(__func__);
     if (!IsPipelineStateCompatible(initial_state))
-      return E_INVALIDARG;
+      return WARN_E_INVALIDARG(__func__);
 
     if (allocator_.ptr() == allocator_state) {
       allocator_->EndCommandListRecording(this);
       if (!allocator_state->BeginCommandListRecording(this))
-        return E_INVALIDARG;
+        return WARN_E_INVALIDARG(__func__);
     } else {
       if (!allocator_state->BeginCommandListRecording(this))
-        return E_INVALIDARG;
+        return WARN_E_INVALIDARG(__func__);
       if (allocator_)
         allocator_->EndCommandListRecording(this);
     }
@@ -298,7 +298,7 @@ public:
       D3D12_COMMAND_LIST_TYPE queue_type,
       std::vector<SubmittedCommandAllocatorUse> &allocator_uses) override {
     if (!closed_ || type_ != queue_type)
-      return E_INVALIDARG;
+      return WARN_E_INVALIDARG(__func__);
 
     submitted_ = true;
     if (allocator_) {

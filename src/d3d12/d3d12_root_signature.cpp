@@ -1009,7 +1009,7 @@ public:
       *desc = &converted_desc_;
       return S_OK;
     default:
-      return E_INVALIDARG;
+      return WARN_E_INVALIDARG(__func__);
     }
   }
 
@@ -1032,7 +1032,7 @@ CreateRootSignatureDeserializerImpl(std::span<const std::byte> blob,
 
   RootSignatureStorage storage = {};
   if (!ParseRootSignatureBlob(blob, storage))
-    return E_INVALIDARG;
+    return WARN_E_INVALIDARG(__func__);
 
   auto object = Com<ID3D12VersionedRootSignatureDeserializer>::transfer(
       new RootSignatureDeserializerImpl(std::move(storage)));
@@ -1061,13 +1061,13 @@ SerializeVersionedRootSignatureImpl(
     return E_POINTER;
   if (!root_signature_desc) {
     SetErrorBlob(error_blob, "Root signature desc is null");
-    return E_INVALIDARG;
+    return WARN_E_INVALIDARG(__func__);
   }
 
   auto storage = CloneFromVersionedDesc(*root_signature_desc);
   if (!storage) {
     SetErrorBlob(error_blob, "Invalid root signature desc");
-    return E_INVALIDARG;
+    return WARN_E_INVALIDARG(__func__);
   }
 
   auto serialized = SerializeRootSignature(*storage, root_signature_desc->Version);
@@ -1104,21 +1104,21 @@ CreateRootSignatureDeserializerFromSubobjectInLibrary(
   if (!deserializer)
     return E_POINTER;
   if ((!library_blob.data() && library_blob.size()) || !subobject_name)
-    return E_INVALIDARG;
+    return WARN_E_INVALIDARG(__func__);
 
   dxil::ContainerInfo container = {};
   auto status = dxil::ParseContainer(library_blob.data(), library_blob.size(), container);
   if (status != dxil::ParseStatus::Ok)
-    return E_INVALIDARG;
+    return WARN_E_INVALIDARG(__func__);
 
   const auto *rdat_part = container.findPart(dxil::fourcc::RuntimeData);
   if (!rdat_part)
-    return E_INVALIDARG;
+    return WARN_E_INVALIDARG(__func__);
 
   dxil::RuntimeDataInfo rdat = {};
   status = dxil::ParseRuntimeData(*rdat_part, rdat);
   if (status != dxil::ParseStatus::Ok)
-    return E_INVALIDARG;
+    return WARN_E_INVALIDARG(__func__);
 
   const std::string requested = str::fromws(subobject_name);
   for (const auto &subobject : rdat.subobjects) {
@@ -1129,13 +1129,13 @@ CreateRootSignatureDeserializerFromSubobjectInLibrary(
           subobject.root_signature.size());
       RootSignatureStorage storage = {};
       if (!ParseRootSignatureBlob(root_signature, storage))
-        return E_INVALIDARG;
+        return WARN_E_INVALIDARG(__func__);
       return CreateRootSignatureDeserializerFromStorage(std::move(storage), iid,
                                                         deserializer);
     }
   }
 
-  return E_INVALIDARG;
+  return WARN_E_INVALIDARG(__func__);
 }
 
 HRESULT
@@ -1152,7 +1152,7 @@ D3D12CreateRootSignatureDeserializer(const void *data, SIZE_T data_size,
                                      REFIID iid, void **deserializer) {
   dxmt::InitReturnPtr(deserializer);
   if (!data && data_size)
-    return E_INVALIDARG;
+    return WARN_E_INVALIDARG(__func__);
   return dxmt::d3d12::CreateRootSignatureDeserializer(
       std::span<const std::byte>(static_cast<const std::byte *>(data), data_size),
       iid, deserializer);
@@ -1169,7 +1169,7 @@ DXMTCreateRootSignatureDeserializerFromSubobjectInLibrary(
     const void *library_blob, SIZE_T size, LPCWSTR subobject_name,
     REFIID iid, void **deserializer) {
   if (!library_blob && size)
-    return E_INVALIDARG;
+    return WARN_E_INVALIDARG(__func__);
   return dxmt::d3d12::CreateRootSignatureDeserializerFromSubobjectInLibrary(
       std::span<const std::byte>(
           static_cast<const std::byte *>(library_blob), size),
@@ -1194,11 +1194,11 @@ D3D12SerializeRootSignature(const D3D12_ROOT_SIGNATURE_DESC *root_signature_desc
     return E_POINTER;
   if (version != D3D_ROOT_SIGNATURE_VERSION_1_0) {
     dxmt::d3d12::SetErrorBlob(error_blob, "Unsupported root signature version");
-    return E_INVALIDARG;
+    return WARN_E_INVALIDARG(__func__);
   }
   if (!root_signature_desc) {
     dxmt::d3d12::SetErrorBlob(error_blob, "Root signature desc is null");
-    return E_INVALIDARG;
+    return WARN_E_INVALIDARG(__func__);
   }
 
   D3D12_VERSIONED_ROOT_SIGNATURE_DESC versioned = {};

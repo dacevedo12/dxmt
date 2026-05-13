@@ -80,6 +80,13 @@ private:
 
 #define WARN(...) Logger::warn(str::format(__VA_ARGS__))
 
+#define WARN_E_INVALIDARG(method)                                              \
+  ([&]() -> HRESULT {                                                          \
+    dxmt::Logger::warn(                                                        \
+        dxmt::str::format(method, " returning E_INVALIDARG"));                 \
+    return E_INVALIDARG;                                                       \
+  }())
+
 #define ERR(...) Logger::err(str::format(__VA_ARGS__))
 
 #define ERR_ONCE(...)                                                          \

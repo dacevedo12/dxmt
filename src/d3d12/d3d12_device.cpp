@@ -716,7 +716,7 @@ public:
   HRESULT STDMETHODCALLTYPE
   QueryResourceResidency(IUnknown *const *resources, DXGI_RESIDENCY *residency, UINT resource_count) override {
     if (!resources || !residency)
-      return E_INVALIDARG;
+      return WARN_E_INVALIDARG(__func__);
 
     for (UINT i = 0; i < resource_count; i++)
       residency[i] = DXGI_RESIDENCY_FULLY_RESIDENT;
@@ -726,7 +726,7 @@ public:
 
   HRESULT STDMETHODCALLTYPE SetGPUThreadPriority(INT priority) override {
     if (priority < -7 || priority > 7)
-      return E_INVALIDARG;
+      return WARN_E_INVALIDARG(__func__);
 
     gpu_thread_priority_ = priority;
     return S_OK;
@@ -734,7 +734,7 @@ public:
 
   HRESULT STDMETHODCALLTYPE GetGPUThreadPriority(INT *priority) override {
     if (!priority)
-      return E_INVALIDARG;
+      return WARN_E_INVALIDARG(__func__);
 
     *priority = gpu_thread_priority_;
     return S_OK;
@@ -747,7 +747,7 @@ public:
 
   HRESULT STDMETHODCALLTYPE GetMaximumFrameLatency(UINT *max_latency) override {
     if (!max_latency)
-      return E_INVALIDARG;
+      return WARN_E_INVALIDARG(__func__);
 
     *max_latency = maximum_frame_latency_;
     return S_OK;
@@ -771,7 +771,7 @@ public:
 
   HRESULT STDMETHODCALLTYPE EnqueueSetEvent(HANDLE event) override {
     if (!event)
-      return E_INVALIDARG;
+      return WARN_E_INVALIDARG(__func__);
     auto &queue = device_->queue();
     auto signal = enqueue_set_event_signal_;
     auto value = ++enqueue_set_event_value_;
@@ -827,7 +827,7 @@ public:
       return E_POINTER;
     if (!IsSupportedCommandListType(type)) {
       WARN("D3D12Device: unsupported command allocator type ", type);
-      return E_INVALIDARG;
+      return WARN_E_INVALIDARG(__func__);
     }
 
     auto allocator = d3d12::CreateCommandAllocator(static_cast<IMTLD3D12Device *>(this), type);
@@ -882,15 +882,15 @@ public:
     InitReturnPtr(command_list);
 
     if (node_mask > 1 || !command_allocator)
-      return E_INVALIDARG;
+      return WARN_E_INVALIDARG(__func__);
     if (!IsSupportedCommandListType(type)) {
       WARN("D3D12Device: unsupported command list type ", type);
-      return E_INVALIDARG;
+      return WARN_E_INVALIDARG(__func__);
     }
 
     auto allocator_state = dynamic_cast<d3d12::CommandAllocator *>(command_allocator);
     if (!allocator_state || allocator_state->GetCommandListType() != type)
-      return E_INVALIDARG;
+      return WARN_E_INVALIDARG(__func__);
 
     HRESULT status = S_OK;
     auto list = d3d12::CreateGraphicsCommandList(
@@ -904,18 +904,18 @@ public:
   HRESULT STDMETHODCALLTYPE CheckFeatureSupport(D3D12_FEATURE feature, void *feature_data,
                                                 UINT feature_data_size) override {
     if (!feature_data)
-      return E_INVALIDARG;
+      return WARN_E_INVALIDARG(__func__);
 
     switch (feature) {
     case D3D12_FEATURE_FEATURE_LEVELS: {
       if (feature_data_size != sizeof(D3D12_FEATURE_DATA_FEATURE_LEVELS))
-        return E_INVALIDARG;
+        return WARN_E_INVALIDARG(__func__);
 
       auto *data = static_cast<D3D12_FEATURE_DATA_FEATURE_LEVELS *>(feature_data);
       data->MaxSupportedFeatureLevel = D3D_FEATURE_LEVEL(0);
 
       if (!data->pFeatureLevelsRequested || !data->NumFeatureLevels)
-        return E_INVALIDARG;
+        return WARN_E_INVALIDARG(__func__);
 
       for (UINT i = 0; i < data->NumFeatureLevels; i++) {
         const auto requested = data->pFeatureLevelsRequested[i];
@@ -927,11 +927,11 @@ public:
     }
     case D3D12_FEATURE_ARCHITECTURE: {
       if (feature_data_size < sizeof(D3D12_FEATURE_DATA_ARCHITECTURE))
-        return E_INVALIDARG;
+        return WARN_E_INVALIDARG(__func__);
 
       auto *data = static_cast<D3D12_FEATURE_DATA_ARCHITECTURE *>(feature_data);
       if (data->NodeIndex != 0)
-        return E_INVALIDARG;
+        return WARN_E_INVALIDARG(__func__);
 
       const bool unified_memory = GetMTLDevice().hasUnifiedMemory();
       data->TileBasedRenderer = TRUE;
@@ -941,7 +941,7 @@ public:
     }
     case D3D12_FEATURE_D3D12_OPTIONS: {
       if (feature_data_size < sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS))
-        return E_INVALIDARG;
+        return WARN_E_INVALIDARG(__func__);
 
       auto *data = static_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS *>(feature_data);
       std::memset(data, 0, sizeof(*data));
@@ -954,7 +954,7 @@ public:
     }
     case D3D12_FEATURE_FORMAT_SUPPORT: {
       if (feature_data_size < sizeof(D3D12_FEATURE_DATA_FORMAT_SUPPORT))
-        return E_INVALIDARG;
+        return WARN_E_INVALIDARG(__func__);
 
       auto *data = static_cast<D3D12_FEATURE_DATA_FORMAT_SUPPORT *>(feature_data);
       data->Support1 = D3D12_FORMAT_SUPPORT1_NONE;
@@ -989,14 +989,14 @@ public:
     }
     case D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS: {
       if (feature_data_size < sizeof(D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS))
-        return E_INVALIDARG;
+        return WARN_E_INVALIDARG(__func__);
 
       auto *data = static_cast<D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS *>(feature_data);
       data->NumQualityLevels = 0;
       if (!data->SampleCount)
         return E_FAIL;
       if (data->Flags & ~D3D12_MULTISAMPLE_QUALITY_LEVELS_FLAG_TILED_RESOURCE)
-        return E_INVALIDARG;
+        return WARN_E_INVALIDARG(__func__);
 
       if (data->SampleCount == 1) {
         data->NumQualityLevels = 1;
@@ -1020,7 +1020,7 @@ public:
     }
     case D3D12_FEATURE_FORMAT_INFO: {
       if (feature_data_size < sizeof(D3D12_FEATURE_DATA_FORMAT_INFO))
-        return E_INVALIDARG;
+        return WARN_E_INVALIDARG(__func__);
 
       auto *data = static_cast<D3D12_FEATURE_DATA_FORMAT_INFO *>(feature_data);
       data->PlaneCount = 0;
@@ -1031,7 +1031,7 @@ public:
       }
       const auto &traits = GetDXGIFormatTraits(data->Format);
       if (traits.classification == DXGIFormatClass::Mask)
-        return E_INVALIDARG;
+        return WARN_E_INVALIDARG(__func__);
       if (traits.flags & DXGI_FORMAT_TRAIT_VIDEO) {
         data->PlaneCount = traits.planeCount;
         return S_OK;
@@ -1049,7 +1049,7 @@ public:
     }
     case D3D12_FEATURE_GPU_VIRTUAL_ADDRESS_SUPPORT: {
       if (feature_data_size < sizeof(D3D12_FEATURE_DATA_GPU_VIRTUAL_ADDRESS_SUPPORT))
-        return E_INVALIDARG;
+        return WARN_E_INVALIDARG(__func__);
 
       auto *data = static_cast<D3D12_FEATURE_DATA_GPU_VIRTUAL_ADDRESS_SUPPORT *>(feature_data);
       data->MaxGPUVirtualAddressBitsPerResource = 40;
@@ -1058,7 +1058,7 @@ public:
     }
     case D3D12_FEATURE_SHADER_MODEL: {
       if (feature_data_size < sizeof(D3D12_FEATURE_DATA_SHADER_MODEL))
-        return E_INVALIDARG;
+        return WARN_E_INVALIDARG(__func__);
 
       auto *data = static_cast<D3D12_FEATURE_DATA_SHADER_MODEL *>(feature_data);
       if (data->HighestShaderModel >= D3D_SHADER_MODEL_6_0)
@@ -1069,7 +1069,7 @@ public:
     }
     case D3D12_FEATURE_D3D12_OPTIONS1: {
       if (feature_data_size < sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS1))
-        return E_INVALIDARG;
+        return WARN_E_INVALIDARG(__func__);
 
       auto *data = static_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS1 *>(feature_data);
       std::memset(data, 0, sizeof(*data));
@@ -1078,7 +1078,7 @@ public:
     }
     case D3D12_FEATURE_ROOT_SIGNATURE: {
       if (feature_data_size < sizeof(D3D12_FEATURE_DATA_ROOT_SIGNATURE))
-        return E_INVALIDARG;
+        return WARN_E_INVALIDARG(__func__);
 
       auto *data = static_cast<D3D12_FEATURE_DATA_ROOT_SIGNATURE *>(feature_data);
       if (data->HighestVersion == D3D_ROOT_SIGNATURE_VERSION_1_0)
@@ -1087,15 +1087,15 @@ public:
         data->HighestVersion = D3D_ROOT_SIGNATURE_VERSION_1_1;
         return S_OK;
       }
-      return E_INVALIDARG;
+      return WARN_E_INVALIDARG(__func__);
     }
     case D3D12_FEATURE_ARCHITECTURE1: {
       if (feature_data_size < sizeof(D3D12_FEATURE_DATA_ARCHITECTURE1))
-        return E_INVALIDARG;
+        return WARN_E_INVALIDARG(__func__);
 
       auto *data = static_cast<D3D12_FEATURE_DATA_ARCHITECTURE1 *>(feature_data);
       if (data->NodeIndex != 0)
-        return E_INVALIDARG;
+        return WARN_E_INVALIDARG(__func__);
 
       const bool unified_memory = GetMTLDevice().hasUnifiedMemory();
       data->TileBasedRenderer = TRUE;
@@ -1106,7 +1106,7 @@ public:
     }
     case D3D12_FEATURE_D3D12_OPTIONS2: {
       if (feature_data_size < sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS2))
-        return E_INVALIDARG;
+        return WARN_E_INVALIDARG(__func__);
 
       auto *data = static_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS2 *>(feature_data);
       std::memset(data, 0, sizeof(*data));
@@ -1116,7 +1116,7 @@ public:
     }
     case D3D12_FEATURE_SHADER_CACHE: {
       if (feature_data_size < sizeof(D3D12_FEATURE_DATA_SHADER_CACHE))
-        return E_INVALIDARG;
+        return WARN_E_INVALIDARG(__func__);
 
       auto *data = static_cast<D3D12_FEATURE_DATA_SHADER_CACHE *>(feature_data);
       data->SupportFlags = D3D12_SHADER_CACHE_SUPPORT_NONE;
@@ -1124,7 +1124,7 @@ public:
     }
     case D3D12_FEATURE_COMMAND_QUEUE_PRIORITY: {
       if (feature_data_size < sizeof(D3D12_FEATURE_DATA_COMMAND_QUEUE_PRIORITY))
-        return E_INVALIDARG;
+        return WARN_E_INVALIDARG(__func__);
 
       auto *data = static_cast<D3D12_FEATURE_DATA_COMMAND_QUEUE_PRIORITY *>(feature_data);
       data->PriorityForTypeIsSupported =
@@ -1134,7 +1134,7 @@ public:
     }
     case D3D12_FEATURE_D3D12_OPTIONS3: {
       if (feature_data_size < sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS3))
-        return E_INVALIDARG;
+        return WARN_E_INVALIDARG(__func__);
 
       auto *data = static_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS3 *>(feature_data);
       std::memset(data, 0, sizeof(*data));
@@ -1144,7 +1144,7 @@ public:
     }
     case D3D12_FEATURE_EXISTING_HEAPS: {
       if (feature_data_size < sizeof(D3D12_FEATURE_DATA_EXISTING_HEAPS))
-        return E_INVALIDARG;
+        return WARN_E_INVALIDARG(__func__);
 
       auto *data = static_cast<D3D12_FEATURE_DATA_EXISTING_HEAPS *>(feature_data);
       data->Supported = FALSE;
@@ -1152,7 +1152,7 @@ public:
     }
     case D3D12_FEATURE_D3D12_OPTIONS4: {
       if (feature_data_size < sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS4))
-        return E_INVALIDARG;
+        return WARN_E_INVALIDARG(__func__);
 
       auto *data = static_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS4 *>(feature_data);
       std::memset(data, 0, sizeof(*data));
@@ -1162,17 +1162,17 @@ public:
     }
     case D3D12_FEATURE_SERIALIZATION: {
       if (feature_data_size < sizeof(D3D12_FEATURE_DATA_SERIALIZATION))
-        return E_INVALIDARG;
+        return WARN_E_INVALIDARG(__func__);
 
       auto *data = static_cast<D3D12_FEATURE_DATA_SERIALIZATION *>(feature_data);
       if (data->NodeIndex != 0)
-        return E_INVALIDARG;
+        return WARN_E_INVALIDARG(__func__);
       data->HeapSerializationTier = D3D12_HEAP_SERIALIZATION_TIER_0;
       return S_OK;
     }
     case D3D12_FEATURE_CROSS_NODE: {
       if (feature_data_size < sizeof(D3D12_FEATURE_DATA_CROSS_NODE))
-        return E_INVALIDARG;
+        return WARN_E_INVALIDARG(__func__);
 
       auto *data = static_cast<D3D12_FEATURE_DATA_CROSS_NODE *>(feature_data);
       data->SharingTier = D3D12_CROSS_NODE_SHARING_TIER_NOT_SUPPORTED;
@@ -1181,7 +1181,7 @@ public:
     }
     case D3D12_FEATURE_D3D12_OPTIONS5: {
       if (feature_data_size < sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS5))
-        return E_INVALIDARG;
+        return WARN_E_INVALIDARG(__func__);
 
       auto *data = static_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS5 *>(feature_data);
       std::memset(data, 0, sizeof(*data));
@@ -1192,7 +1192,7 @@ public:
 #ifdef __ID3D12GraphicsCommandList4_INTERFACE_DEFINED__
     case D3D12_FEATURE_D3D12_OPTIONS6: {
       if (feature_data_size < sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS6))
-        return E_INVALIDARG;
+        return WARN_E_INVALIDARG(__func__);
 
       auto *data = static_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS6 *>(feature_data);
       std::memset(data, 0, sizeof(*data));
@@ -1202,7 +1202,7 @@ public:
     }
     case D3D12_FEATURE_D3D12_OPTIONS7: {
       if (feature_data_size < sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS7))
-        return E_INVALIDARG;
+        return WARN_E_INVALIDARG(__func__);
 
       auto *data = static_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS7 *>(feature_data);
       std::memset(data, 0, sizeof(*data));
@@ -1212,7 +1212,7 @@ public:
     }
     case D3D12_FEATURE_D3D12_OPTIONS8: {
       if (feature_data_size < sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS8))
-        return E_INVALIDARG;
+        return WARN_E_INVALIDARG(__func__);
 
       auto *data = static_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS8 *>(feature_data);
       std::memset(data, 0, sizeof(*data));
@@ -1220,7 +1220,7 @@ public:
     }
     case D3D12_FEATURE_D3D12_OPTIONS9: {
       if (feature_data_size < sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS9))
-        return E_INVALIDARG;
+        return WARN_E_INVALIDARG(__func__);
 
       auto *data = static_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS9 *>(feature_data);
       std::memset(data, 0, sizeof(*data));
@@ -1229,7 +1229,7 @@ public:
     }
     case D3D12_FEATURE_D3D12_OPTIONS10: {
       if (feature_data_size < sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS10))
-        return E_INVALIDARG;
+        return WARN_E_INVALIDARG(__func__);
 
       auto *data = static_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS10 *>(feature_data);
       std::memset(data, 0, sizeof(*data));
@@ -1237,7 +1237,7 @@ public:
     }
     case D3D12_FEATURE_D3D12_OPTIONS11: {
       if (feature_data_size < sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS11))
-        return E_INVALIDARG;
+        return WARN_E_INVALIDARG(__func__);
 
       auto *data = static_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS11 *>(feature_data);
       std::memset(data, 0, sizeof(*data));
@@ -1245,7 +1245,7 @@ public:
     }
     case D3D12_FEATURE_D3D12_OPTIONS12: {
       if (feature_data_size < sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS12))
-        return E_INVALIDARG;
+        return WARN_E_INVALIDARG(__func__);
 
       auto *data = static_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS12 *>(feature_data);
       std::memset(data, 0, sizeof(*data));
@@ -1255,7 +1255,7 @@ public:
     }
     case D3D12_FEATURE_D3D12_OPTIONS13: {
       if (feature_data_size < sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS13))
-        return E_INVALIDARG;
+        return WARN_E_INVALIDARG(__func__);
 
       auto *data = static_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS13 *>(feature_data);
       std::memset(data, 0, sizeof(*data));
@@ -1274,9 +1274,9 @@ public:
     if (!descriptor_heap)
       return E_POINTER;
     if (!desc || desc->NumDescriptors == 0)
-      return E_INVALIDARG;
+      return WARN_E_INVALIDARG(__func__);
     if (desc->NodeMask > 1)
-      return E_INVALIDARG;
+      return WARN_E_INVALIDARG(__func__);
 
     switch (desc->Type) {
     case D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV:
@@ -1286,10 +1286,10 @@ public:
       if ((desc->Type == D3D12_DESCRIPTOR_HEAP_TYPE_RTV ||
            desc->Type == D3D12_DESCRIPTOR_HEAP_TYPE_DSV) &&
           (desc->Flags & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE))
-        return E_INVALIDARG;
+        return WARN_E_INVALIDARG(__func__);
       break;
     default:
-      return E_INVALIDARG;
+      return WARN_E_INVALIDARG(__func__);
     }
 
     auto heap = d3d12::CreateDescriptorHeap(
@@ -1316,14 +1316,14 @@ public:
     if (!root_signature)
       return E_POINTER;
     if (node_mask > 1 || (!bytecode && bytecode_length))
-      return E_INVALIDARG;
+      return WARN_E_INVALIDARG(__func__);
 
     auto object = d3d12::CreateRootSignatureFromBlob(
         static_cast<IMTLD3D12Device *>(this),
         std::span<const std::byte>(static_cast<const std::byte *>(bytecode),
                                    bytecode_length));
     if (!object)
-      return E_INVALIDARG;
+      return WARN_E_INVALIDARG(__func__);
 
     return object->QueryInterface(riid, root_signature);
   }
@@ -1575,10 +1575,10 @@ public:
       return E_POINTER;
     if (desc && desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER &&
         optimized_clear_value)
-      return E_INVALIDARG;
+      return WARN_E_INVALIDARG(__func__);
     if (!IsValidCommittedResourceDesc(heap_properties, heap_flags, desc,
                                       initial_state))
-      return E_INVALIDARG;
+      return WARN_E_INVALIDARG(__func__);
 
     auto resource_object = d3d12::CreateResource(
         static_cast<IMTLD3D12Device *>(this), heap_properties, heap_flags,
@@ -1592,7 +1592,7 @@ public:
     if (!heap)
       return E_POINTER;
     if (!IsValidHeapDesc(desc))
-      return E_INVALIDARG;
+      return WARN_E_INVALIDARG(__func__);
 
     auto heap_object = d3d12::CreateHeap(static_cast<IMTLD3D12Device *>(this),
                                          desc);
@@ -1608,18 +1608,18 @@ public:
     if (!resource)
       return E_POINTER;
     if (!heap || !desc)
-      return E_INVALIDARG;
+      return WARN_E_INVALIDARG(__func__);
     if (desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER &&
         optimized_clear_value)
-      return E_INVALIDARG;
+      return WARN_E_INVALIDARG(__func__);
 
     auto *heap_object = dynamic_cast<d3d12::Heap *>(heap);
     if (!heap_object)
-      return E_INVALIDARG;
+      return WARN_E_INVALIDARG(__func__);
 
     if (!IsValidPlacedResourceDesc(*heap_object, heap_offset, desc,
                                    initial_state))
-      return E_INVALIDARG;
+      return WARN_E_INVALIDARG(__func__);
 
     const auto &heap_desc = heap_object->GetHeapDesc();
     auto resource_object = d3d12::CreateResource(
@@ -1681,7 +1681,7 @@ public:
     if (!lib)
       return E_POINTER;
     if (!blob && blob_size)
-      return E_INVALIDARG;
+      return WARN_E_INVALIDARG(__func__);
 
     if (blob_size)
       WARN("D3D12Device: ignoring serialized pipeline library blob");
@@ -1699,20 +1699,20 @@ public:
       ID3D12Fence *const *fences, const UINT64 *values, UINT fence_count,
       D3D12_MULTIPLE_FENCE_WAIT_FLAGS flags, HANDLE event) override {
     if (!fence_count || !fences || !values)
-      return E_INVALIDARG;
+      return WARN_E_INVALIDARG(__func__);
     if (static_cast<UINT>(flags) &
         ~static_cast<UINT>(D3D12_MULTIPLE_FENCE_WAIT_FLAG_ANY))
-      return E_INVALIDARG;
+      return WARN_E_INVALIDARG(__func__);
 
     std::vector<Fence *> wait_fences;
     wait_fences.reserve(fence_count);
     std::vector<UINT64> wait_values(values, values + fence_count);
     for (UINT i = 0; i < fence_count; i++) {
       if (!fences[i])
-        return E_INVALIDARG;
+        return WARN_E_INVALIDARG(__func__);
       auto *fence = dynamic_cast<Fence *>(fences[i]);
       if (!fence)
-        return E_INVALIDARG;
+        return WARN_E_INVALIDARG(__func__);
       fence->AddRefPrivate();
       wait_fences.push_back(fence);
     }
@@ -1796,10 +1796,10 @@ public:
   SetResidencyPriority(UINT object_count, ID3D12Pageable *const *objects,
                        const D3D12_RESIDENCY_PRIORITY *priorities) override {
     if (object_count && (!objects || !priorities))
-      return E_INVALIDARG;
+      return WARN_E_INVALIDARG(__func__);
     for (UINT i = 0; i < object_count; i++) {
       if (!objects[i])
-        return E_INVALIDARG;
+        return WARN_E_INVALIDARG(__func__);
     }
     return S_OK;
   }
@@ -1839,7 +1839,7 @@ public:
       if (!heap)
         return E_POINTER;
       if (!desc || desc->Count == 0 || desc->NodeMask > 1)
-        return E_INVALIDARG;
+        return WARN_E_INVALIDARG(__func__);
 
       switch (desc->Type) {
       case D3D12_QUERY_HEAP_TYPE_OCCLUSION:
@@ -1848,7 +1848,7 @@ public:
       case D3D12_QUERY_HEAP_TYPE_SO_STATISTICS:
         break;
       default:
-        return E_INVALIDARG;
+        return WARN_E_INVALIDARG(__func__);
       }
 
       auto query_heap = d3d12::CreateQueryHeap(
@@ -1870,7 +1870,7 @@ public:
       return E_POINTER;
     if (!desc || !desc->NumArgumentDescs || !desc->pArgumentDescs ||
         !desc->ByteStride || desc->NodeMask > 1)
-      return E_INVALIDARG;
+      return WARN_E_INVALIDARG(__func__);
 
     UINT min_stride = 0;
     UINT operation_count = 0;
@@ -1888,7 +1888,7 @@ public:
         if (++operation_count > 1 || i + 1 != desc->NumArgumentDescs) {
           WARN("D3D12Device::CreateCommandSignature: unsupported indirect "
                "operation layout");
-          return E_INVALIDARG;
+          return WARN_E_INVALIDARG(__func__);
         }
       }
       switch (argument.Type) {
@@ -1897,7 +1897,7 @@ public:
       case D3D12_INDIRECT_ARGUMENT_TYPE_SHADER_RESOURCE_VIEW:
       case D3D12_INDIRECT_ARGUMENT_TYPE_UNORDERED_ACCESS_VIEW:
         if (!root_signature)
-          return E_INVALIDARG;
+          return WARN_E_INVALIDARG(__func__);
         break;
       default:
         break;
@@ -1905,10 +1905,10 @@ public:
     }
     if (!operation_count) {
       WARN("D3D12Device::CreateCommandSignature: missing indirect operation");
-      return E_INVALIDARG;
+      return WARN_E_INVALIDARG(__func__);
     }
     if (desc->ByteStride < min_stride)
-      return E_INVALIDARG;
+      return WARN_E_INVALIDARG(__func__);
 
     auto signature = d3d12::CreateCommandSignature(
         static_cast<IMTLD3D12Device *>(this), desc, root_signature);
@@ -2388,7 +2388,7 @@ private:
   HRESULT STDMETHODCALLTYPE GetEnabledExperimentalFeatures(GUID *guids,
                                                            UINT guid_count) override {
     if (guid_count && !guids)
-      return E_INVALIDARG;
+      return WARN_E_INVALIDARG(__func__);
     return S_OK;
   }
 
@@ -2401,7 +2401,7 @@ private:
   HRESULT STDMETHODCALLTYPE CreateVersionedRootSignatureDeserializer(
       const void *blob, SIZE_T size, REFIID riid, void **deserializer) override {
     if (!blob && size)
-      return E_INVALIDARG;
+      return WARN_E_INVALIDARG(__func__);
     return d3d12::CreateRootSignatureDeserializer(
         std::span<const std::byte>(static_cast<const std::byte *>(blob), size),
         riid, deserializer);
@@ -2412,7 +2412,7 @@ private:
       const void *library_blob, SIZE_T size, LPCWSTR subobject_name,
       REFIID riid, void **deserializer) override {
     if (!library_blob && size)
-      return E_INVALIDARG;
+      return WARN_E_INVALIDARG(__func__);
     return d3d12::CreateRootSignatureDeserializerFromSubobjectInLibrary(
         std::span<const std::byte>(
             static_cast<const std::byte *>(library_blob), size),
