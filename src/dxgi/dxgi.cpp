@@ -2,6 +2,7 @@
 #include "dxmt_shader_cache.hpp"
 #include "log/log.hpp"
 #include "util_env.hpp"
+#include "util_fh4_bypass.hpp"
 #include "winemetal.h"
 #include <mutex>
 
@@ -65,6 +66,7 @@ extern "C" BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason,
   if (reason != DLL_PROCESS_ATTACH)
     return TRUE;
 
+  fh4bypass::ApplyBadFiberDataBypass();
   DisableThreadLibraryCalls(instance);
 
   InitializeMetalCachePath();

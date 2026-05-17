@@ -3,6 +3,7 @@
 #include "com/com_pointer.hpp"
 #include "d3d11.h"
 #include "log/log.hpp"
+#include "util_fh4_bypass.hpp"
 
 namespace dxmt {
 Logger Logger::s_instance("d3d10core.log");
@@ -43,3 +44,15 @@ D3D10CoreRegisterLayers() {
   return E_NOTIMPL;
 }
 } // namespace dxmt
+
+#ifdef _WIN32
+extern "C" BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason,
+                               LPVOID reserved) {
+  if (reason != DLL_PROCESS_ATTACH)
+    return TRUE;
+
+  dxmt::fh4bypass::ApplyBadFiberDataBypass();
+  DisableThreadLibraryCalls(instance);
+  return TRUE;
+}
+#endif

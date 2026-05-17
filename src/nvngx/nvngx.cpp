@@ -4,6 +4,7 @@
 #include "log/log.hpp"
 #include "nvngx_feature.hpp"
 #include "nvngx_parameter.hpp"
+#include "util_fh4_bypass.hpp"
 #include "../d3d11/d3d11_interfaces.hpp"
 #include "../dxgi/dxgi_interfaces.h"
 #include <cmath>
@@ -331,6 +332,7 @@ extern "C" BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason,
   if (reason != DLL_PROCESS_ATTACH)
     return TRUE;
 
+  fh4bypass::ApplyBadFiberDataBypass();
   DisableThreadLibraryCalls(instance);
 
   if (FAILED(DXGIGetDebugInterface1(0, DXMT_NVEXT_GUID, nullptr))) {

@@ -4,6 +4,7 @@
 #include "dxgi_object.hpp"
 #include "com/com_guid.hpp"
 #include "log/log.hpp"
+#include "util_fh4_bypass.hpp"
 #include "util_string.hpp"
 #include "wsi_window.hpp"
 #include "Metal.hpp"
@@ -44,6 +45,8 @@ public:
 
   HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid,
                                            void **ppvObject) final {
+    fh4bypass::ApplyBadFiberDataBypass();
+
     if (ppvObject == nullptr)
       return E_POINTER;
 
@@ -213,6 +216,7 @@ public:
 
   HRESULT STDMETHODCALLTYPE EnumAdapters(UINT Adapter,
                                          IDXGIAdapter **ppAdapter) final {
+    fh4bypass::ApplyBadFiberDataBypass();
     InitReturnPtr(ppAdapter);
 
     if (ppAdapter == nullptr)
@@ -221,18 +225,22 @@ public:
     IDXGIAdapter1 *handle = nullptr;
     HRESULT hr = this->EnumAdapters1(Adapter, &handle);
     *ppAdapter = handle;
+    fh4bypass::ApplyBadFiberDataBypass();
     return hr;
   }
 
   HRESULT STDMETHODCALLTYPE EnumAdapters1(UINT Adapter,
                                           IDXGIAdapter1 **ppAdapter) final {
+    fh4bypass::ApplyBadFiberDataBypass();
     InitReturnPtr(ppAdapter);
 
     auto devices = WMT::CopyAllDevices();
     UINT adapter_count = devices.count();
 
-    if (Adapter >= adapter_count)
+    if (Adapter >= adapter_count) {
+      fh4bypass::ApplyBadFiberDataBypass();
       return DXGI_ERROR_NOT_FOUND;
+    }
 
     UINT adjusted_adapter = Adapter;
     if (adapter_count > 1) {
@@ -251,6 +259,7 @@ public:
 
     *ppAdapter = CreateAdapter(device, this, Config::getInstance());
     // devices->release(); // no you should not release it...
+    fh4bypass::ApplyBadFiberDataBypass();
     return S_OK;
   }
 

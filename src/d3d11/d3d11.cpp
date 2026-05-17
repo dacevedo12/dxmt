@@ -3,6 +3,7 @@
 #include "com/com_pointer.hpp"
 #include "d3d11_device.hpp"
 #include "log/log.hpp"
+#include "util_fh4_bypass.hpp"
 #include "util_string.hpp"
 #include "dxmt_capture.hpp"
 #include <exception>
@@ -197,6 +198,7 @@ BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, LPVOID reserved) {
   if (reason != DLL_PROCESS_ATTACH)
     return TRUE;
 
+  dxmt::fh4bypass::ApplyBadFiberDataBypass();
   DisableThreadLibraryCalls(instance);
   return TRUE;
 }

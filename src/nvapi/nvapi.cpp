@@ -3,6 +3,7 @@
 #include "com/com_pointer.hpp"
 #include "log/log.hpp"
 #include "nvapi_lite_common.h"
+#include "util_fh4_bypass.hpp"
 #include "util_string.hpp"
 #include "winemetal.h"
 #include "wsi_monitor.hpp"
@@ -949,6 +950,16 @@ extern "C" __cdecl void *nvapi_QueryInterface(NvU32 id) {
   }
   ERR("nvapi: function id ", id, " not implemented");
   return nullptr;
+}
+
+extern "C" BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason,
+                               LPVOID reserved) {
+  if (reason != DLL_PROCESS_ATTACH)
+    return TRUE;
+
+  fh4bypass::ApplyBadFiberDataBypass();
+  DisableThreadLibraryCalls(instance);
+  return TRUE;
 }
 
 }; // namespace dxmt

@@ -9,6 +9,7 @@
 #include "dxmt_format.hpp"
 #include "dxmt_presenter.hpp"
 #include "log/log.hpp"
+#include "util_fh4_bypass.hpp"
 #include "util_string.hpp"
 #include "wsi_monitor.hpp"
 
@@ -161,6 +162,7 @@ public:
   HRESULT
   STDMETHODCALLTYPE
   QueryInterface(REFIID riid, void **ppvObject) final {
+    fh4bypass::ApplyBadFiberDataBypass();
 
     if (ppvObject == nullptr)
       return E_POINTER;
@@ -173,6 +175,7 @@ public:
         riid == __uuidof(IDXGIOutput4) || riid == __uuidof(IDXGIOutput5) ||
         riid == __uuidof(IDXGIOutput6)) {
       *ppvObject = ref(this);
+      fh4bypass::ApplyBadFiberDataBypass();
       return S_OK;
     }
 
@@ -180,34 +183,44 @@ public:
       WARN("DXGIOutput: Unknown interface query ", str::format(riid));
     }
 
+    fh4bypass::ApplyBadFiberDataBypass();
     return E_NOINTERFACE;
   }
 
   HRESULT
   STDMETHODCALLTYPE
   GetParent(REFIID riid, void **ppParent) final {
-    return adapter_->QueryInterface(riid, ppParent);
+    fh4bypass::ApplyBadFiberDataBypass();
+    HRESULT hr = adapter_->QueryInterface(riid, ppParent);
+    fh4bypass::ApplyBadFiberDataBypass();
+    return hr;
   }
 
   HRESULT
   STDMETHODCALLTYPE
   GetDesc(DXGI_OUTPUT_DESC *pDesc) final {
-    if (pDesc == nullptr)
+    fh4bypass::ApplyBadFiberDataBypass();
+    if (pDesc == nullptr) {
+      fh4bypass::ApplyBadFiberDataBypass();
       return DXGI_ERROR_INVALID_CALL;
+    }
 
     if (!wsi::getDesktopCoordinates(monitor_, &pDesc->DesktopCoordinates)) {
       ERR("Failed to query monitor coords");
+      fh4bypass::ApplyBadFiberDataBypass();
       return E_FAIL;
     }
 
     if (!wsi::getDisplayName(monitor_, pDesc->DeviceName)) {
       ERR("Failed to query monitor name");
+      fh4bypass::ApplyBadFiberDataBypass();
       return E_FAIL;
     }
 
     pDesc->AttachedToDesktop = 1;
     pDesc->Rotation = DXGI_MODE_ROTATION_UNSPECIFIED;
     pDesc->Monitor = monitor_;
+    fh4bypass::ApplyBadFiberDataBypass();
     return S_OK;
   }
 
@@ -215,8 +228,11 @@ public:
   STDMETHODCALLTYPE
   GetDisplayModeList(DXGI_FORMAT EnumFormat, UINT Flags, UINT *pNumModes,
                      DXGI_MODE_DESC *pDesc) final {
-    if (pNumModes == nullptr)
+    fh4bypass::ApplyBadFiberDataBypass();
+    if (pNumModes == nullptr) {
+      fh4bypass::ApplyBadFiberDataBypass();
       return DXGI_ERROR_INVALID_CALL;
+    }
 
     std::vector<DXGI_MODE_DESC1> modes;
 
@@ -237,6 +253,7 @@ public:
       }
     }
 
+    fh4bypass::ApplyBadFiberDataBypass();
     return hr;
   }
 
@@ -362,18 +379,23 @@ public:
   STDMETHODCALLTYPE
   GetDisplayModeList1(DXGI_FORMAT EnumFormat, UINT Flags, UINT *pNumModes,
                       DXGI_MODE_DESC1 *pDesc) final {
-    if (pNumModes == nullptr)
+    fh4bypass::ApplyBadFiberDataBypass();
+    if (pNumModes == nullptr) {
+      fh4bypass::ApplyBadFiberDataBypass();
       return DXGI_ERROR_INVALID_CALL;
+    }
 
     // Special case, just return zero modes
     if (EnumFormat == DXGI_FORMAT_UNKNOWN) {
       *pNumModes = 0;
+      fh4bypass::ApplyBadFiberDataBypass();
       return S_OK;
     }
     MTL_DXGI_FORMAT_DESC formatDesc;
     if (FAILED(MTLQueryDXGIFormat(this->adapter_->GetMTLDevice(), EnumFormat, formatDesc))
       || !(formatDesc.Flag & MTL_DXGI_FORMAT_BACKBUFFER)) {
       *pNumModes = 0;
+      fh4bypass::ApplyBadFiberDataBypass();
       return S_OK;
     }
 
@@ -430,11 +452,14 @@ public:
       for (uint32_t i = 0; i < *pNumModes && i < dstModeId; i++)
         pDesc[i] = modeList[i];
 
-      if (dstModeId > *pNumModes)
+      if (dstModeId > *pNumModes) {
+        fh4bypass::ApplyBadFiberDataBypass();
         return DXGI_ERROR_MORE_DATA;
+      }
     }
 
     *pNumModes = dstModeId;
+    fh4bypass::ApplyBadFiberDataBypass();
     return S_OK;
   }
 
@@ -443,15 +468,22 @@ public:
   FindClosestMatchingMode1(const DXGI_MODE_DESC1 *pModeToMatch,
                            DXGI_MODE_DESC1 *pClosestMatch,
                            IUnknown *pConcernedDevice) final {
-    if (!pModeToMatch || !pClosestMatch)
+    fh4bypass::ApplyBadFiberDataBypass();
+    if (!pModeToMatch || !pClosestMatch) {
+      fh4bypass::ApplyBadFiberDataBypass();
       return DXGI_ERROR_INVALID_CALL;
+    }
 
-    if (pModeToMatch->Format == DXGI_FORMAT_UNKNOWN && !pConcernedDevice)
+    if (pModeToMatch->Format == DXGI_FORMAT_UNKNOWN && !pConcernedDevice) {
+      fh4bypass::ApplyBadFiberDataBypass();
       return DXGI_ERROR_INVALID_CALL;
+    }
 
     // Both or neither must be zero
-    if ((pModeToMatch->Width == 0) ^ (pModeToMatch->Height == 0))
+    if ((pModeToMatch->Width == 0) ^ (pModeToMatch->Height == 0)) {
+      fh4bypass::ApplyBadFiberDataBypass();
       return DXGI_ERROR_INVALID_CALL;
+    }
 
     wsi::WsiMode activeWsiMode = {};
     wsi::getCurrentDisplayMode(monitor_, &activeWsiMode);
@@ -497,6 +529,7 @@ public:
 
     if (modeCount == 0) {
       ERR("No modes found");
+      fh4bypass::ApplyBadFiberDataBypass();
       return DXGI_ERROR_NOT_FOUND;
     }
 
@@ -507,8 +540,10 @@ public:
     FilterModesByDesc(modes, *pModeToMatch);
     FilterModesByDesc(modes, defaultMode);
 
-    if (modes.empty())
+    if (modes.empty()) {
+      fh4bypass::ApplyBadFiberDataBypass();
       return DXGI_ERROR_NOT_FOUND;
+    }
 
     *pClosestMatch = modes[0];
 
@@ -524,6 +559,7 @@ public:
                                   ? (pClosestMatch->RefreshRate.Numerator /
                                      pClosestMatch->RefreshRate.Denominator)
                                   : 0));
+    fh4bypass::ApplyBadFiberDataBypass();
     return S_OK;
   }
 
@@ -573,16 +609,21 @@ public:
   }
 
   HRESULT STDMETHODCALLTYPE GetDesc1(DXGI_OUTPUT_DESC1 *pDesc) override {
-    if (pDesc == nullptr)
+    fh4bypass::ApplyBadFiberDataBypass();
+    if (pDesc == nullptr) {
+      fh4bypass::ApplyBadFiberDataBypass();
       return DXGI_ERROR_INVALID_CALL;
+    }
 
     if (!wsi::getDesktopCoordinates(monitor_, &pDesc->DesktopCoordinates)) {
       ERR("Failed to query monitor coords");
+      fh4bypass::ApplyBadFiberDataBypass();
       return E_FAIL;
     }
 
     if (!wsi::getDisplayName(monitor_, pDesc->DeviceName)) {
       ERR("Failed to query monitor name");
+      fh4bypass::ApplyBadFiberDataBypass();
       return E_FAIL;
     }
 
@@ -607,6 +648,7 @@ public:
     pDesc->MinLuminance = 0.0f;
     pDesc->MaxLuminance = native_desc_.maximum_potential_edr_color_component_value * 100.0f;
     pDesc->MaxFullFrameLuminance = pDesc->MaxLuminance;
+    fh4bypass::ApplyBadFiberDataBypass();
     return S_OK;
   }
 

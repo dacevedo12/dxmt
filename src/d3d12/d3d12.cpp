@@ -10,6 +10,7 @@
 #include "log/log.hpp"
 #include "util_env.hpp"
 #include "util_error.hpp"
+#include "util_fh4_bypass.hpp"
 #include "util_string.hpp"
 #include <windows.h>
 #include <d3d12.h>
@@ -19,6 +20,18 @@
 namespace dxmt {
 Logger Logger::s_instance("d3d12.log");
 }
+
+#ifdef _WIN32
+extern "C" BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason,
+                               LPVOID reserved) {
+  if (reason != DLL_PROCESS_ATTACH)
+    return TRUE;
+
+  dxmt::fh4bypass::ApplyBadFiberDataBypass();
+  DisableThreadLibraryCalls(instance);
+  return TRUE;
+}
+#endif
 
 namespace dxmt::d3d12 {
 

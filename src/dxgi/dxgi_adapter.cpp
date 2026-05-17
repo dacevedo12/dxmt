@@ -8,6 +8,7 @@
 #include "dxgi_object.hpp"
 #include "d3d10_1.h"
 #include "Metal.hpp"
+#include "util_fh4_bypass.hpp"
 
 namespace dxmt {
 
@@ -41,6 +42,8 @@ public:
 
   HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid,
                                            void **ppvObject) final {
+    fh4bypass::ApplyBadFiberDataBypass();
+
     if (ppvObject == nullptr)
       return E_POINTER;
 
@@ -181,16 +184,22 @@ public:
 
   HRESULT STDMETHODCALLTYPE EnumOutputs(UINT Output,
                                         IDXGIOutput **ppOutput) final {
+    fh4bypass::ApplyBadFiberDataBypass();
     InitReturnPtr(ppOutput);
 
-    if (ppOutput == nullptr)
+    if (ppOutput == nullptr) {
+      fh4bypass::ApplyBadFiberDataBypass();
       return E_INVALIDARG;
+    }
 
     HMONITOR monitor = wsi::enumMonitors(Output);
-    if (monitor == nullptr)
+    if (monitor == nullptr) {
+      fh4bypass::ApplyBadFiberDataBypass();
       return DXGI_ERROR_NOT_FOUND;
+    }
 
     *ppOutput = CreateOutput(this, monitor, options_);
+    fh4bypass::ApplyBadFiberDataBypass();
     return S_OK;
   }
   HRESULT STDMETHODCALLTYPE
