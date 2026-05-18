@@ -233,6 +233,7 @@ struct ClearEncoderData : EncoderData {
   unsigned array_length;
   unsigned width;
   unsigned height;
+  unsigned sample_count;
   uint16_t level = 0;
   uint16_t slice = 0;
   uint32_t depth_plane = 0;
@@ -387,7 +388,17 @@ public:
       if (likely(allocation->flags().test(TextureAllocationFlag::ShaderReadonly))) {
         track<stage>(allocation->fenceTrackers[0], flags);
       } else {
-        auto &tracker = allocation->fenceTrackers[slice * allocation->descriptor->miplevelCount() + level];
+        const auto mip_count = allocation->descriptor->miplevelCount();
+        const auto tracker_index = slice * mip_count + level;
+        if (unlikely(level >= mip_count ||
+                     tracker_index >= allocation->fenceTrackers.size())) {
+          WARN("DXMT: texture access subresource out of range level=", level,
+               " slice=", slice, " mip_count=", mip_count,
+               " tracker_count=", allocation->fenceTrackers.size());
+          track<stage>(allocation->fenceTrackers[0], flags);
+          return allocation->texture();
+        }
+        auto &tracker = allocation->fenceTrackers[tracker_index];
         track<stage>(tracker, flags);
       }
     }
@@ -405,10 +416,21 @@ public:
       if (likely(allocation->flags().test(TextureAllocationFlag::ShaderReadonly))) {
         track<stage>(allocation->fenceTrackers[0], flags);
       } else {
-        TextureViewKey view = viewId;
-        for (unsigned slice = view.array_start; slice < view.array_end; slice++) {
-          for (unsigned level = view.mip_start; level < view.mip_end; level++) {
-            auto &tracker = allocation->fenceTrackers[slice * view.mip_count + level];
+        TextureViewKey key = viewId;
+        const auto mip_count = allocation->descriptor->miplevelCount();
+        for (unsigned slice = key.array_start; slice < key.array_end; slice++) {
+          for (unsigned level = key.mip_start; level < key.mip_end; level++) {
+            const auto tracker_index = slice * mip_count + level;
+            if (unlikely(level >= mip_count ||
+                         tracker_index >= allocation->fenceTrackers.size())) {
+              WARN("DXMT: texture view access subresource out of range view=",
+                   viewId, " level=", level, " slice=", slice,
+                   " mip_count=", mip_count, " tracker_count=",
+                   allocation->fenceTrackers.size());
+              track<stage>(allocation->fenceTrackers[0], flags);
+              return view;
+            }
+            auto &tracker = allocation->fenceTrackers[tracker_index];
             track<stage>(tracker, flags);
           }
         }

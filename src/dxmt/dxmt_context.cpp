@@ -473,6 +473,16 @@ NormalizeRenderPassInfo(WMTRenderPassInfo &info) {
     info.default_raster_sample_count = 1;
   if (!info.render_target_array_length)
     info.render_target_array_length = 1;
+  if (info.depth.texture && info.depth.depth_plane >= WMT::Texture{info.depth.texture}.depth()) {
+    WARN("RenderPass guard: clamping invalid depth attachment depthPlane=",
+         info.depth.depth_plane);
+    info.depth.depth_plane = 0;
+  }
+  if (info.stencil.texture && info.stencil.depth_plane >= WMT::Texture{info.stencil.texture}.depth()) {
+    WARN("RenderPass guard: clamping invalid stencil attachment depthPlane=",
+         info.stencil.depth_plane);
+    info.stencil.depth_plane = 0;
+  }
 }
 
 static double
@@ -1652,6 +1662,7 @@ ArgumentEncodingContext::clearColor(Rc<Texture> &&texture, uint64_t viewId, unsi
   encoder_info->array_length = arrayLength;
   encoder_info->width = texture->width();
   encoder_info->height = texture->height();
+  encoder_info->sample_count = texture->sampleCount();
   encoder_current = encoder_info;
 
   encoder_info->attachment = access(texture, viewId, ResourceAccess::Write);
@@ -1678,6 +1689,7 @@ ArgumentEncodingContext::clearColor(Rc<Buffer> &&buffer, uint64_t viewId, unsign
   encoder_info->array_length = 0;
   encoder_info->width = width;
   encoder_info->height = 1;
+  encoder_info->sample_count = 1;
   encoder_current = encoder_info;
 
   auto [view, suballocation_offset] = access<PipelineStage::Pixel>(buffer, viewId, ResourceAccess::Write);
@@ -1707,6 +1719,7 @@ ArgumentEncodingContext::clearDepthStencil(
   encoder_info->array_length = arrayLength;
   encoder_info->width = texture->width();
   encoder_info->height = texture->height();
+  encoder_info->sample_count = texture->sampleCount();
   encoder_current = encoder_info;
 
   encoder_info->attachment = access(texture, viewId, ResourceAccess::Write);
@@ -2494,6 +2507,7 @@ ArgumentEncodingContext::flushCommands(WMT::CommandBuffer cmdbuf, uint64_t seqId
           info.colors[0].store_action = WMTStoreActionStore;
         }
         info.render_target_array_length = data->array_length;
+        info.default_raster_sample_count = data->sample_count;
         NormalizeRenderPassInfo(info);
         auto encoder = cmdbuf.renderCommandEncoder(info);
         encoder.setLabel(WMT::String::string("ClearPass", WMTUTF8StringEncoding));
