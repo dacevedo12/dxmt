@@ -73,31 +73,61 @@ private:
 } // namespace dxmt
 
 
-#define TRACE(...) Logger::trace(str::format(__VA_ARGS__))
+#define DXMT_LOG_ENABLED(level)                                                \
+  (static_cast<uint32_t>(level) >=                                             \
+   static_cast<uint32_t>(dxmt::Logger::logLevel()))
 
-#define DEBUG(...) Logger::debug(str::format(__VA_ARGS__))
+#define TRACE(...)                                                             \
+  do {                                                                         \
+    if (DXMT_LOG_ENABLED(dxmt::LogLevel::Trace))                               \
+      dxmt::Logger::trace(dxmt::str::format(__VA_ARGS__));                     \
+  } while (0)
 
-#define INFO(...) Logger::info(str::format(__VA_ARGS__))
+#define DEBUG(...)                                                             \
+  do {                                                                         \
+    if (DXMT_LOG_ENABLED(dxmt::LogLevel::Debug))                               \
+      dxmt::Logger::debug(dxmt::str::format(__VA_ARGS__));                     \
+  } while (0)
 
-#define WARN(...) Logger::warn(str::format(__VA_ARGS__))
+#define INFO(...)                                                              \
+  do {                                                                         \
+    if (DXMT_LOG_ENABLED(dxmt::LogLevel::Info))                                \
+      dxmt::Logger::info(dxmt::str::format(__VA_ARGS__));                      \
+  } while (0)
+
+#define WARN(...)                                                              \
+  do {                                                                         \
+    if (DXMT_LOG_ENABLED(dxmt::LogLevel::Warn))                                \
+      dxmt::Logger::warn(dxmt::str::format(__VA_ARGS__));                      \
+  } while (0)
 
 #define WARN_FILE_ONLY(...)                                                    \
-  Logger::logFileOnly(LogLevel::Warn, str::format(__VA_ARGS__))
+  do {                                                                         \
+    if (DXMT_LOG_ENABLED(dxmt::LogLevel::Warn))                                \
+      dxmt::Logger::logFileOnly(dxmt::LogLevel::Warn,                          \
+                                dxmt::str::format(__VA_ARGS__));               \
+  } while (0)
 
 #define ERR_E_INVALIDARG(method)                                               \
   ([&]() -> HRESULT {                                                          \
-    dxmt::Logger::err(                                                         \
-        dxmt::str::format(method, " returning E_INVALIDARG at ", __FILE__,     \
-                          ":", __LINE__));                                     \
+    if (DXMT_LOG_ENABLED(dxmt::LogLevel::Error))                               \
+      dxmt::Logger::err(                                                       \
+          dxmt::str::format(method, " returning E_INVALIDARG at ", __FILE__,   \
+                            ":", __LINE__));                                   \
     return E_INVALIDARG;                                                       \
   }())
 
 #define WARN_E_INVALIDARG(method) ERR_E_INVALIDARG(method)
 
-#define ERR(...) Logger::err(str::format(__VA_ARGS__))
+#define ERR(...)                                                               \
+  do {                                                                         \
+    if (DXMT_LOG_ENABLED(dxmt::LogLevel::Error))                               \
+      dxmt::Logger::err(dxmt::str::format(__VA_ARGS__));                       \
+  } while (0)
 
 #define ERR_ONCE(...)                                                          \
   static bool s_errorShown = false;                                            \
-  if (!std::exchange(s_errorShown, true)) {                                    \
-    Logger::err(str::format(__VA_ARGS__));                                     \
+  if (DXMT_LOG_ENABLED(dxmt::LogLevel::Error) &&                               \
+      !std::exchange(s_errorShown, true)) {                                    \
+    dxmt::Logger::err(dxmt::str::format(__VA_ARGS__));                         \
   }
