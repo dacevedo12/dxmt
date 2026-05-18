@@ -7177,7 +7177,7 @@ private:
       return;
     }
 
-    WARN("D3D12CommandQueue: DiscardResource treated as conservative no-op");
+    WARN_FILE_ONLY("D3D12CommandQueue: DiscardResource treated as conservative no-op");
     EmitResourceAccessBarrier(chunk, *resource, 0, GetSubresourceCount(*resource),
                               ResourceAccess::All);
   }

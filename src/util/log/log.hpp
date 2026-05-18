@@ -47,6 +47,7 @@ public:
   static void warn(const std::string &message);
   static void err(const std::string &message);
   static void log(LogLevel level, const std::string &message);
+  static void logFileOnly(LogLevel level, const std::string &message);
 
   static LogLevel logLevel() { return s_instance.m_minLevel; }
 
@@ -62,7 +63,7 @@ private:
   bool m_initialized = false;
   PFN_wineLogOutput m_wineLogOutput = nullptr;
 
-  void emitMsg(LogLevel level, const std::string &message);
+  void emitMsg(LogLevel level, const std::string &message, bool wineOutput);
 
   std::string getFileName(const std::string &base);
 
@@ -79,6 +80,9 @@ private:
 #define INFO(...) Logger::info(str::format(__VA_ARGS__))
 
 #define WARN(...) Logger::warn(str::format(__VA_ARGS__))
+
+#define WARN_FILE_ONLY(...)                                                    \
+  Logger::logFileOnly(LogLevel::Warn, str::format(__VA_ARGS__))
 
 #define ERR_E_INVALIDARG(method)                                               \
   ([&]() -> HRESULT {                                                          \
