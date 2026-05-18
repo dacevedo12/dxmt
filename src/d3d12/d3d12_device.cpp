@@ -2082,13 +2082,12 @@ private:
 
   bool IsValidInitialState(const D3D12_HEAP_PROPERTIES &properties,
                            D3D12_RESOURCE_STATES initial_state) const {
-    const auto heap_type = d3d12::GetHeapType(properties);
-    if (heap_type == D3D12_HEAP_TYPE_UPLOAD) {
+    if (properties.Type == D3D12_HEAP_TYPE_UPLOAD) {
       return initial_state == D3D12_RESOURCE_STATE_GENERIC_READ ||
              initial_state == D3D12_RESOURCE_STATE_COMMON ||
              initial_state == D3D12_RESOURCE_STATE_COPY_SOURCE;
     }
-    if (heap_type == D3D12_HEAP_TYPE_READBACK) {
+    if (properties.Type == D3D12_HEAP_TYPE_READBACK) {
       return initial_state == D3D12_RESOURCE_STATE_COPY_DEST ||
              initial_state == D3D12_RESOURCE_STATE_COMMON;
     }
