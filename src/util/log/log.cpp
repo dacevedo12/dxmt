@@ -24,30 +24,35 @@ Logger::Logger(const std::string &fileName)
 Logger::~Logger() {}
 
 void Logger::trace(const std::string &message) {
-  s_instance.emitMsg(LogLevel::Trace, message);
+  s_instance.emitMsg(LogLevel::Trace, message, true);
 }
 
 void Logger::debug(const std::string &message) {
-  s_instance.emitMsg(LogLevel::Debug, message);
+  s_instance.emitMsg(LogLevel::Debug, message, true);
 }
 
 void Logger::info(const std::string &message) {
-  s_instance.emitMsg(LogLevel::Info, message);
+  s_instance.emitMsg(LogLevel::Info, message, true);
 }
 
 void Logger::warn(const std::string &message) {
-  s_instance.emitMsg(LogLevel::Warn, message);
+  s_instance.emitMsg(LogLevel::Warn, message, true);
 }
 
 void Logger::err(const std::string &message) {
-  s_instance.emitMsg(LogLevel::Error, message);
+  s_instance.emitMsg(LogLevel::Error, message, true);
 }
 
 void Logger::log(LogLevel level, const std::string &message) {
-  s_instance.emitMsg(level, message);
+  s_instance.emitMsg(level, message, true);
 }
 
-void Logger::emitMsg(LogLevel level, const std::string &message) {
+void Logger::logFileOnly(LogLevel level, const std::string &message) {
+  s_instance.emitMsg(level, message, false);
+}
+
+void Logger::emitMsg(LogLevel level, const std::string &message,
+                     bool wineOutput) {
   if (level >= m_minLevel) {
     std::lock_guard<dxmt::mutex> lock(m_mutex);
 
@@ -79,7 +84,7 @@ void Logger::emitMsg(LogLevel level, const std::string &message) {
 
       std::string adjusted = outstream.str();
 
-      if (!adjusted.empty()) {
+      if (!adjusted.empty() && wineOutput) {
         if (m_wineLogOutput)
           m_wineLogOutput(adjusted.c_str());
         else
