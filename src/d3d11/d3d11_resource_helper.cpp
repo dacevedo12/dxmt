@@ -365,13 +365,6 @@ CreateMTLTextureDescriptorInternal(
       metal_usage |= WMTTextureUsageRenderTarget;
     if (BindFlags & D3D11_BIND_UNORDERED_ACCESS) {
       metal_usage |= WMTTextureUsageShaderRead | WMTTextureUsageShaderWrite;
-      // NOTE: R32/RG32_TYPELESS format should be mapped to uint pixel format
-      if (metal_format.PixelFormat == WMTPixelFormatR32Uint ||
-          metal_format.PixelFormat == WMTPixelFormatR32Sint ||
-          (metal_format.PixelFormat == WMTPixelFormatRG32Uint &&
-           pDevice->GetMTLDevice().supportsFamily(WMTGPUFamilyApple8))) {
-        metal_usage |= WMTTextureUsageShaderAtomic;
-      }
     }
     // decoder not supported: D3D11_BIND_DECODER, D3D11_BIND_VIDEO_ENCODER
   }
