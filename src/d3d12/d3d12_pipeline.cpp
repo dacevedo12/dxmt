@@ -2706,12 +2706,6 @@ StoreStatus(HRESULT *status, HRESULT value) {
 }
 
 void
-LogPipelineCreateFailure(const char *where, HRESULT value) {
-  WARN("D3D12 diagnostic: pipeline create failed",
-       " where=", where, " hr=0x", std::hex, uint32_t(value), std::dec);
-}
-
-void
 LogGraphicsPipelineDesc(const char *where,
                         const D3D12_GRAPHICS_PIPELINE_STATE_DESC &desc) {
   INFO("D3D12 diagnostic: graphics pipeline create",
@@ -2745,7 +2739,6 @@ CreateGraphicsPipelineState(IMTLD3D12Device *device,
   PipelineGraphicsState graphics_state = {};
   HRESULT hr = CloneGraphicsState(*desc, graphics_state);
   if (FAILED(hr)) {
-    LogPipelineCreateFailure("CloneGraphicsState", hr);
     StoreStatus(status, hr);
     return nullptr;
   }
@@ -2756,21 +2749,18 @@ CreateGraphicsPipelineState(IMTLD3D12Device *device,
   hr = AppendPipelineShader(PipelineShaderStage::Vertex, device, desc->VS, shaders);
   if (FAILED(hr)) {
     DestroyPipelineShaders(shaders);
-    LogPipelineCreateFailure("AppendVertexShader", hr);
     StoreStatus(status, hr);
     return nullptr;
   }
   hr = AppendPipelineShader(PipelineShaderStage::Pixel, device, desc->PS, shaders);
   if (FAILED(hr)) {
     DestroyPipelineShaders(shaders);
-    LogPipelineCreateFailure("AppendPixelShader", hr);
     StoreStatus(status, hr);
     return nullptr;
   }
   hr = AppendPipelineShader(PipelineShaderStage::Geometry, device, desc->GS, shaders);
   if (FAILED(hr)) {
     DestroyPipelineShaders(shaders);
-    LogPipelineCreateFailure("AppendGeometryShader", hr);
     StoreStatus(status, hr);
     return nullptr;
   }
@@ -2813,7 +2803,6 @@ CreateComputePipelineState(IMTLD3D12Device *device,
   PipelineComputeState compute_state = {};
   HRESULT hr = CloneComputeState(*desc, compute_state);
   if (FAILED(hr)) {
-    LogPipelineCreateFailure("CloneComputeState", hr);
     StoreStatus(status, hr);
     return nullptr;
   }
@@ -2823,7 +2812,6 @@ CreateComputePipelineState(IMTLD3D12Device *device,
   hr = AppendPipelineShader(PipelineShaderStage::Compute, device, desc->CS, shaders);
   if (FAILED(hr)) {
     DestroyPipelineShaders(shaders);
-    LogPipelineCreateFailure("AppendComputeShader", hr);
     StoreStatus(status, hr);
     return nullptr;
   }
@@ -2858,7 +2846,6 @@ CreatePipelineStateFromStream(IMTLD3D12Device *device,
   HRESULT hr = ParsePipelineStateStream(*desc, graphics, compute,
                                         has_compute_shader);
   if (FAILED(hr)) {
-    LogPipelineCreateFailure("ParsePipelineStateStream", hr);
     StoreStatus(status, hr);
     return nullptr;
   }

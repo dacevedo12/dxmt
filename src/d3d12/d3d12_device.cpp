@@ -1604,10 +1604,8 @@ public:
     InitReturnPtr(heap);
     if (!heap)
       return E_POINTER;
-    if (!IsValidHeapDesc(desc)) {
-      LogInvalidHeapDesc("CreateHeap", desc, GetInvalidHeapDescReason(desc));
+    if (!IsValidHeapDesc(desc))
       return WARN_E_INVALIDARG(__func__);
-    }
 
     auto heap_object = d3d12::CreateHeap(static_cast<IMTLD3D12Device *>(this),
                                          desc);
@@ -1632,12 +1630,9 @@ public:
     if (!heap_object)
       return WARN_E_INVALIDARG(__func__);
 
-    if (const char *reason = GetInvalidPlacedResourceDescReason(
-            *heap_object, heap_offset, desc, initial_state)) {
-      LogInvalidPlacedResourceDesc(*heap_object, heap_offset, desc,
-                                   initial_state, reason);
+    if (GetInvalidPlacedResourceDescReason(*heap_object, heap_offset, desc,
+                                           initial_state))
       return WARN_E_INVALIDARG(__func__);
-    }
 
     const auto &heap_desc = heap_object->GetHeapDesc();
     auto resource_object = d3d12::CreateResource(
@@ -2082,27 +2077,6 @@ private:
     }
   }
 
-  void LogInvalidHeapDesc(const char *where, const D3D12_HEAP_DESC *desc,
-                          const char *reason) const {
-    if (!desc) {
-      WARN("D3D12 diagnostic: invalid heap desc",
-           " where=", where, " reason=", reason ? reason : "unknown");
-      return;
-    }
-
-    WARN("D3D12 diagnostic: invalid heap desc",
-         " where=", where,
-         " reason=", reason ? reason : "unknown",
-         " size=", uint64_t(desc->SizeInBytes),
-         " alignment=", uint64_t(desc->Alignment),
-         " type=", uint32_t(desc->Properties.Type),
-         " cpuPage=", uint32_t(desc->Properties.CPUPageProperty),
-         " memoryPool=", uint32_t(desc->Properties.MemoryPoolPreference),
-         " creationNode=", uint32_t(desc->Properties.CreationNodeMask),
-         " visibleNode=", uint32_t(desc->Properties.VisibleNodeMask),
-         " flags=", uint32_t(desc->Flags));
-  }
-
   bool IsValidHeapDesc(const D3D12_HEAP_DESC *desc) const {
     if (GetInvalidHeapDescReason(desc))
       return false;
@@ -2275,41 +2249,6 @@ private:
       return "heap-deny-non-rt-ds";
 
     return nullptr;
-  }
-
-  void LogInvalidPlacedResourceDesc(const d3d12::Heap &heap,
-                                    UINT64 heap_offset,
-                                    const D3D12_RESOURCE_DESC *desc,
-                                    D3D12_RESOURCE_STATES initial_state,
-                                    const char *reason) const {
-    const auto &heap_desc = heap.GetHeapDesc();
-    D3D12_RESOURCE_ALLOCATION_INFO allocation_info = {};
-    if (desc)
-      allocation_info = GetResourceAllocationInfoImpl(1, 1, desc);
-
-    ERR("D3D12 diagnostic: invalid placed resource desc",
-        " reason=", reason ? reason : "unknown",
-        " heapOffset=", uint64_t(heap_offset),
-        " allocationSize=", uint64_t(allocation_info.SizeInBytes),
-        " allocationAlignment=", uint64_t(allocation_info.Alignment),
-        " heapSize=", uint64_t(heap_desc.SizeInBytes),
-        " heapAlignment=", uint64_t(heap_desc.Alignment),
-        " heapType=", uint32_t(heap_desc.Properties.Type),
-        " heapCpuPage=", uint32_t(heap_desc.Properties.CPUPageProperty),
-        " heapMemoryPool=", uint32_t(heap_desc.Properties.MemoryPoolPreference),
-        " heapFlags=", uint32_t(heap_desc.Flags),
-        " descDimension=", desc ? uint32_t(desc->Dimension) : 0,
-        " descAlignment=", desc ? uint64_t(desc->Alignment) : 0,
-        " descWidth=", desc ? uint64_t(desc->Width) : 0,
-        " descHeight=", desc ? uint32_t(desc->Height) : 0,
-        " descDepthOrArraySize=", desc ? uint32_t(desc->DepthOrArraySize) : 0,
-        " descMipLevels=", desc ? uint32_t(desc->MipLevels) : 0,
-        " descFormat=", desc ? uint32_t(desc->Format) : 0,
-        " descSampleCount=", desc ? uint32_t(desc->SampleDesc.Count) : 0,
-        " descSampleQuality=", desc ? uint32_t(desc->SampleDesc.Quality) : 0,
-        " descLayout=", desc ? uint32_t(desc->Layout) : 0,
-        " descFlags=", desc ? uint32_t(desc->Flags) : 0,
-        " initialState=", uint32_t(initial_state));
   }
 
   void GetCopyableFootprintsImpl(
