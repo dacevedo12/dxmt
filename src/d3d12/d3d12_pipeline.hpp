@@ -65,10 +65,16 @@ struct PipelineMetalShader {
 
 struct PipelineMetalGraphicsState {
   PipelineMetalShader vertex;
+  PipelineMetalShader geometry_vertex;
+  PipelineMetalShader geometry;
+  PipelineMetalShader geometry_strip_vertex;
+  PipelineMetalShader geometry_strip;
   PipelineMetalShader pixel;
   WMT::Reference<WMT::RenderPipelineState> pso;
+  WMT::Reference<WMT::RenderPipelineState> strip_pso;
   WMT::Reference<WMT::DepthStencilState> depth_stencil;
   wmtcmd_render_setrasterizerstate rasterizer = {};
+  bool use_geometry = false;
 };
 
 struct PipelineMetalComputeState {

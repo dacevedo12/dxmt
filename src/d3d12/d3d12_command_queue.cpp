@@ -483,6 +483,72 @@ GetPrimitiveType(D3D12_PRIMITIVE_TOPOLOGY topology) {
   }
 }
 
+struct DXMT_DRAW_ARGUMENTS {
+  uint32_t VertexCount;
+  uint32_t InstanceCount;
+  uint32_t StartVertex;
+  uint32_t StartInstance;
+};
+
+struct DXMT_DRAW_INDEXED_ARGUMENTS {
+  uint32_t IndexCount;
+  uint32_t InstanceCount;
+  uint32_t StartIndex;
+  int32_t BaseVertex;
+  uint32_t StartInstance;
+};
+
+struct DXMT_DISPATCH_ARGUMENTS {
+  uint32_t X;
+  uint32_t Y;
+  uint32_t Z;
+};
+
+static bool
+IsGeometryStripTopology(D3D12_PRIMITIVE_TOPOLOGY topology) {
+  switch (topology) {
+  case D3D_PRIMITIVE_TOPOLOGY_LINESTRIP:
+  case D3D_PRIMITIVE_TOPOLOGY_LINESTRIP_ADJ:
+  case D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP:
+  case D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP_ADJ:
+    return true;
+  default:
+    return false;
+  }
+}
+
+static std::optional<std::pair<uint32_t, uint32_t>>
+GetGeometryVertexCount(D3D12_PRIMITIVE_TOPOLOGY topology) {
+  switch (topology) {
+  case D3D_PRIMITIVE_TOPOLOGY_POINTLIST:
+  case D3D_PRIMITIVE_TOPOLOGY_LINELIST:
+  case D3D_PRIMITIVE_TOPOLOGY_LINELIST_ADJ:
+    return std::make_pair(32u, 32u);
+  case D3D_PRIMITIVE_TOPOLOGY_LINESTRIP:
+    return std::make_pair(32u, 31u);
+  case D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST:
+  case D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST_ADJ:
+    return std::make_pair(30u, 30u);
+  case D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP:
+    return std::make_pair(32u, 30u);
+  case D3D_PRIMITIVE_TOPOLOGY_LINESTRIP_ADJ:
+    return std::make_pair(32u, 29u);
+  case D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP_ADJ:
+    return std::make_pair(32u, 28u);
+  default:
+    return std::nullopt;
+  }
+}
+
+static WMT::Reference<WMT::RenderPipelineState>
+SelectGraphicsPipelineState(const PipelineMetalGraphicsState &metal,
+                            D3D12_PRIMITIVE_TOPOLOGY topology) {
+  if (metal.use_geometry && IsGeometryStripTopology(topology) &&
+      metal.strip_pso)
+    return metal.strip_pso;
+  return metal.pso;
+}
+
 static WMTPixelFormat
 GetSwapChainPixelFormat(DXGI_FORMAT format) {
   switch (format) {
@@ -692,6 +758,40 @@ GetSubresourceSize(const Resource &resource, UINT subresource,
           desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D
               ? std::max<UINT64>(1, desc.DepthOrArraySize >> mip)
               : 1};
+}
+
+static bool
+ValidateTextureSubresourceAccess(const char *op, const Resource &resource,
+                                 dxmt::Texture *texture, UINT subresource,
+                                 UINT plane, UINT level, UINT slice) {
+  if (!texture) {
+    WARN("D3D12CommandQueue: ", op, " missing texture plane=", plane);
+    return false;
+  }
+  if (subresource >= GetSubresourceCount(resource)) {
+    WARN("D3D12CommandQueue: ", op, " subresource out of range subresource=",
+         subresource, " count=", GetSubresourceCount(resource));
+    return false;
+  }
+  if (plane >= GetPlaneCount(resource)) {
+    WARN("D3D12CommandQueue: ", op, " plane out of range plane=", plane,
+         " count=", GetPlaneCount(resource));
+    return false;
+  }
+  if (level >= texture->miplevelCount()) {
+    WARN("D3D12CommandQueue: ", op, " mip level out of range level=", level,
+         " count=", texture->miplevelCount(), " subresource=", subresource,
+         " plane=", plane);
+    return false;
+  }
+  if (texture->textureType() != WMTTextureType3D &&
+      slice >= texture->arrayLength()) {
+    WARN("D3D12CommandQueue: ", op, " array slice out of range slice=", slice,
+         " count=", texture->arrayLength(), " subresource=", subresource,
+         " plane=", plane);
+    return false;
+  }
+  return true;
 }
 
 static bool
@@ -1009,6 +1109,14 @@ StructuredBufferSlice(Resource &resource, UINT64 offset,
   return slice;
 }
 
+static BufferSlice
+TextureBufferSlice(Resource &resource, UINT64 offset, UINT64 byte_size,
+                   UINT stride) {
+  auto slice = StructuredBufferSlice(resource, offset, byte_size, stride);
+  slice.firstElement = 0;
+  return slice;
+}
+
 static UINT64
 ResolveBufferGpuAddress(D3D12_GPU_VIRTUAL_ADDRESS address,
                         Resource *&resource) {
@@ -1017,16 +1125,16 @@ ResolveBufferGpuAddress(D3D12_GPU_VIRTUAL_ADDRESS address,
   return offset;
 }
 
-static uint64_t
+static std::optional<BufferViewKey>
 CreateBufferView(WMT::Device device, Resource &resource, DXGI_FORMAT format,
                  UINT64 offset, UINT64 byte_size, WMTTextureUsage usage) {
   if (!resource.GetBuffer())
-    return 0;
+    return std::nullopt;
 
   MTL_DXGI_FORMAT_DESC format_desc = {};
   if (FAILED(MTLQueryDXGIFormat(device, format, format_desc)) ||
       format_desc.PixelFormat == WMTPixelFormatInvalid)
-    return 0;
+    return std::nullopt;
 
   BufferViewDescriptor view = {};
   view.format = format_desc.PixelFormat;
@@ -2394,12 +2502,14 @@ private:
   struct ReplayGraphicsPassCommand {
     std::function<void(ArgumentEncodingContext &, uint64_t &)> encode;
     uint64_t argument_buffer_size = 0;
+    bool use_geometry = false;
   };
 
   struct ReplayGraphicsPassBatch {
     ReplayRenderPassAttachments attachments;
     std::vector<ReplayGraphicsPassCommand> commands;
     uint64_t argument_buffer_size = 0;
+    bool use_geometry = false;
     bool active = false;
   };
 
@@ -2514,7 +2624,11 @@ private:
                    commands = std::move(batch.commands),
                    argument_buffer_size = batch.argument_buffer_size](
                       ArgumentEncodingContext &enc) mutable {
-      if (!BeginRenderPass(enc, attachments, argument_buffer_size))
+      bool use_geometry = false;
+      for (const auto &command : commands)
+        use_geometry = use_geometry || command.use_geometry;
+      if (!BeginRenderPass(enc, attachments, argument_buffer_size,
+                           use_geometry))
         return;
       uint64_t argbuf_offset = 0;
       for (auto &command : commands)
@@ -2528,7 +2642,8 @@ private:
   template <typename Fn>
   void QueueGraphicsPassCommand(CommandChunk *chunk, ReplayState &state,
                                 ReplayRenderPassAttachments attachments,
-                                uint64_t argument_buffer_size, Fn &&fn) {
+                                uint64_t argument_buffer_size, Fn &&fn,
+                                bool use_geometry = false) {
     auto &batch = state.graphics_pass_batch;
     if (batch.active && !ReplayRenderPassAttachmentsMatch(batch.attachments, attachments))
       FlushGraphicsPassBatch(chunk, state);
@@ -2541,8 +2656,10 @@ private:
     }
 
     active_batch.argument_buffer_size += argument_buffer_size;
+    active_batch.use_geometry = active_batch.use_geometry || use_geometry;
     active_batch.commands.push_back(
-        ReplayGraphicsPassCommand{std::forward<Fn>(fn), argument_buffer_size});
+        ReplayGraphicsPassCommand{std::forward<Fn>(fn), argument_buffer_size,
+                                  use_geometry});
   }
 
   bool D3D12ReplayGraphicsBatchingEnabled() {
@@ -2553,11 +2670,14 @@ private:
   template <typename Fn>
   void EmitSingleGraphicsPass(CommandChunk *chunk,
                               ReplayRenderPassAttachments attachments,
-                              uint64_t argument_buffer_size, Fn &&fn) {
+                              uint64_t argument_buffer_size, Fn &&fn,
+                              bool use_geometry = false) {
     chunk->emitcc([attachments = std::move(attachments), argument_buffer_size,
+                   use_geometry,
                    encode = std::function<void(ArgumentEncodingContext &, uint64_t &)>(
                        std::forward<Fn>(fn))](ArgumentEncodingContext &enc) mutable {
-      if (!BeginRenderPass(enc, attachments, argument_buffer_size))
+      if (!BeginRenderPass(enc, attachments, argument_buffer_size,
+                           use_geometry))
         return;
       uint64_t argbuf_offset = 0;
       encode(enc, argbuf_offset);
@@ -2869,26 +2989,25 @@ private:
     }
 
     if (resource.GetTexture()) {
-      std::vector<std::tuple<Rc<Texture>, UINT, UINT>> subresources;
-      subresources.reserve(subresource_count);
+      bool emitted = false;
       for (UINT i = 0; i < subresource_count; i++) {
         const UINT subresource = first_subresource + i;
         const UINT plane = GetSubresourcePlane(resource, subresource);
         Rc<Texture> texture = Rc<Texture>(resource.GetTexture(plane));
         if (!texture)
           continue;
-        subresources.push_back({std::move(texture),
-                                GetMipLevel(resource, subresource),
-                                GetArraySlice(resource, subresource)});
-      }
-      chunk->emitcc([subresources = std::move(subresources),
-                     access](ArgumentEncodingContext &enc) mutable {
-        enc.startBlitPass();
-        for (const auto &[texture, level, slice] : subresources) {
+        const UINT level = GetMipLevel(resource, subresource);
+        const UINT slice = GetArraySlice(resource, subresource);
+        emitted = true;
+        chunk->emitcc([texture = std::move(texture), level, slice,
+                       access](ArgumentEncodingContext &enc) {
+          enc.startBlitPass();
           enc.access(texture, level, slice, access);
-        }
-        enc.endPass();
-      });
+          enc.endPass();
+        });
+      }
+      if (!emitted)
+        EmitPassSeparator(chunk);
       return;
     }
 
@@ -3361,26 +3480,46 @@ private:
       return;
     }
 
-    const auto primitive = GetPrimitiveType(state.topology);
-    if (!primitive) {
-      WARN("D3D12CommandQueue: indirect draw skipped because primitive topology is unsupported topology=",
-           uint32_t(state.topology));
+    const auto metal_pso = SelectGraphicsPipelineState(*metal, state.topology);
+    if (!metal_pso) {
+      WARN("D3D12CommandQueue: indirect draw skipped because selected Metal graphics PSO is unavailable");
       return;
+    }
+    std::optional<WMTPrimitiveType> primitive;
+    std::optional<std::pair<uint32_t, uint32_t>> geometry_counts;
+    if (metal->use_geometry) {
+      geometry_counts = GetGeometryVertexCount(state.topology);
+      if (!geometry_counts) {
+        WARN("D3D12CommandQueue: geometry indirect draw skipped because primitive topology is unsupported topology=",
+             uint32_t(state.topology));
+        return;
+      }
+    } else {
+      primitive = GetPrimitiveType(state.topology);
+      if (!primitive) {
+        WARN("D3D12CommandQueue: indirect draw skipped because primitive topology is unsupported topology=",
+             uint32_t(state.topology));
+        return;
+      }
     }
     auto viewports = state.viewports;
     auto scissors = state.scissors;
     auto attachments = BuildRenderPassAttachments(state);
     if (!ResolveDynamicRasterRects(viewports, scissors, "indirect draw"))
       return;
-    const auto argument_buffer_size = EstimateGraphicsArgumentBufferSize(*pipeline);
+    const auto argument_buffer_size =
+        EstimateGraphicsArgumentBufferSize(*pipeline, metal->use_geometry);
 
     auto encode_draw =
-        [this, metal_pso = metal->pso, depth_stencil = metal->depth_stencil,
-         rasterizer = metal->rasterizer, pipeline,
+        [this, metal_pso, use_geometry = metal->use_geometry,
+         depth_stencil = metal->depth_stencil, rasterizer = metal->rasterizer,
+         pipeline,
          replay_state = CloneReplayStateWithoutBatch(state), primitive,
+         geometry_counts,
          blend_factor = state.blend_factor, stencil_ref = state.stencil_ref,
          arg_buffer, arg_offset, count_buffer, count_offset, counted_args,
          counted_offset, argument_size, command_index,
+         max_object_threadgroups = device_->GetDXMTDevice().maxObjectThreadgroups(),
          viewports = std::move(viewports), scissors = std::move(scissors)](
             ArgumentEncodingContext &enc, uint64_t &argbuf_offset) mutable {
       auto &set_pso = enc.encodeRenderCommand<wmtcmd_render_setpso>();
@@ -3395,32 +3534,66 @@ private:
       auto &rs = enc.encodeRenderCommand<wmtcmd_render_setrasterizerstate>();
       rs = rasterizer;
 
-      EncodeGraphicsBindings(enc, replay_state, *pipeline, argbuf_offset);
+      EncodeGraphicsBindings(enc, replay_state, *pipeline, use_geometry,
+                             argbuf_offset);
       EncodeDynamicRenderState(enc, viewports, scissors, blend_factor,
                                stencil_ref);
 
-      WMT::Buffer indirect_buffer = counted_args;
-      UINT64 indirect_offset = counted_offset;
-      if (!count_buffer.ptr()) {
+      if (use_geometry) {
+        if (count_buffer.ptr()) {
+          WARN("D3D12CommandQueue: counted geometry indirect draw is unsupported");
+          return;
+        }
+        auto *render_encoder = enc.currentRenderEncoder();
+        render_encoder->use_geometry = 1;
         auto [arg_allocation, arg_sub_offset] =
             enc.access<PipelineStage::Vertex>(arg_buffer, arg_offset,
-                                              argument_size,
+                                              sizeof(DXMT_DRAW_ARGUMENTS),
                                               ResourceAccess::Read);
-        indirect_buffer = arg_allocation->buffer();
-        indirect_offset = arg_sub_offset + arg_offset;
-      }
+        auto dispatch_arg =
+            enc.allocateTempBuffer1(sizeof(DXMT_DISPATCH_ARGUMENTS), 4);
+        auto [vertex_per_warp, vertex_increment_per_warp] = *geometry_counts;
+        enc.encodeGSDispatchArgumentsMarshal(
+            arg_allocation->buffer(),
+            arg_allocation->gpuAddress() + arg_sub_offset + arg_offset, 0,
+            vertex_increment_per_warp, dispatch_arg.gpu_buffer,
+            dispatch_arg.gpu_address, dispatch_arg.offset,
+            max_object_threadgroups);
+        enc.resolveRenderPassBarrier();
+        auto &draw =
+            enc.encodeRenderCommand<wmtcmd_render_dxmt_geometry_draw_indirect>();
+        draw.type = WMTRenderCommandDXMTGeometryDrawIndirect;
+        draw.dispatch_args_buffer = dispatch_arg.gpu_buffer;
+        draw.dispatch_args_offset = dispatch_arg.offset;
+        draw.vertex_per_warp = vertex_per_warp;
+        draw.indirect_args_buffer = arg_allocation->buffer();
+        draw.indirect_args_offset = arg_sub_offset + arg_offset;
+        draw.imm_draw_arguments = enc.getFinalArgumentBuffer();
+      } else {
+        WMT::Buffer indirect_buffer = counted_args;
+        UINT64 indirect_offset = counted_offset;
+        if (!count_buffer.ptr()) {
+          auto [arg_allocation, arg_sub_offset] =
+              enc.access<PipelineStage::Vertex>(arg_buffer, arg_offset,
+                                                argument_size,
+                                                ResourceAccess::Read);
+          indirect_buffer = arg_allocation->buffer();
+          indirect_offset = arg_sub_offset + arg_offset;
+        }
 
-      auto &draw = enc.encodeRenderCommand<wmtcmd_render_draw_indirect>();
-      draw.type = WMTRenderCommandDrawIndirect;
-      draw.primitive_type = *primitive;
-      draw.indirect_args_buffer = indirect_buffer;
-      draw.indirect_args_offset = indirect_offset;
+        auto &draw = enc.encodeRenderCommand<wmtcmd_render_draw_indirect>();
+        draw.type = WMTRenderCommandDrawIndirect;
+        draw.primitive_type = *primitive;
+        draw.indirect_args_buffer = indirect_buffer;
+        draw.indirect_args_offset = indirect_offset;
+      }
     };
 
     const bool has_count = count_buffer.ptr();
     if (D3D12ReplayGraphicsBatchingEnabled() && !has_count) {
       QueueGraphicsPassCommand(chunk, state, std::move(attachments),
-                               argument_buffer_size, std::move(encode_draw));
+                               argument_buffer_size, std::move(encode_draw),
+                               metal->use_geometry);
       return;
     }
 
@@ -3428,7 +3601,8 @@ private:
     chunk->emitcc([this, attachments = std::move(attachments),
                    argument_buffer_size, arg_buffer, arg_offset, count_buffer,
                    count_offset, counted_args, counted_offset, argument_size,
-                   command_index, encode = std::move(encode_draw)](
+                   command_index, use_geometry = metal->use_geometry,
+                   encode = std::move(encode_draw)](
                       ArgumentEncodingContext &enc) mutable {
       if (count_buffer) {
         PrepareCountedIndirectArguments(
@@ -3436,7 +3610,8 @@ private:
             counted_args, counted_offset, argument_size, command_index);
       }
 
-      if (!BeginRenderPass(enc, attachments, argument_buffer_size))
+      if (!BeginRenderPass(enc, attachments, argument_buffer_size,
+                           use_geometry))
         return;
       uint64_t argbuf_offset = 0;
       encode(enc, argbuf_offset);
@@ -3478,11 +3653,27 @@ private:
     }
 
     Rc<BufferAllocation> index_allocation = index_resource->GetBufferAllocation();
-    const auto primitive = GetPrimitiveType(state.topology);
-    if (!primitive) {
-      WARN("D3D12CommandQueue: indirect indexed draw skipped because primitive topology is unsupported topology=",
-           uint32_t(state.topology));
+    const auto metal_pso = SelectGraphicsPipelineState(*metal, state.topology);
+    if (!metal_pso) {
+      WARN("D3D12CommandQueue: indirect indexed draw skipped because selected Metal graphics PSO is unavailable");
       return;
+    }
+    std::optional<WMTPrimitiveType> primitive;
+    std::optional<std::pair<uint32_t, uint32_t>> geometry_counts;
+    if (metal->use_geometry) {
+      geometry_counts = GetGeometryVertexCount(state.topology);
+      if (!geometry_counts) {
+        WARN("D3D12CommandQueue: geometry indirect indexed draw skipped because primitive topology is unsupported topology=",
+             uint32_t(state.topology));
+        return;
+      }
+    } else {
+      primitive = GetPrimitiveType(state.topology);
+      if (!primitive) {
+        WARN("D3D12CommandQueue: indirect indexed draw skipped because primitive topology is unsupported topology=",
+             uint32_t(state.topology));
+        return;
+      }
     }
     const auto index_type = GetIndexType(state.index_buffer->Format);
     const UINT64 index_offset =
@@ -3492,15 +3683,19 @@ private:
     auto scissors = state.scissors;
     if (!ResolveDynamicRasterRects(viewports, scissors, "indirect indexed draw"))
       return;
-    const auto argument_buffer_size = EstimateGraphicsArgumentBufferSize(*pipeline);
+    const auto argument_buffer_size =
+        EstimateGraphicsArgumentBufferSize(*pipeline, metal->use_geometry);
 
     auto encode_draw =
-        [this, metal_pso = metal->pso, depth_stencil = metal->depth_stencil,
-         rasterizer = metal->rasterizer, pipeline,
+        [this, metal_pso, use_geometry = metal->use_geometry,
+         depth_stencil = metal->depth_stencil, rasterizer = metal->rasterizer,
+         pipeline,
          replay_state = CloneReplayStateWithoutBatch(state), index_allocation,
-         primitive, index_type, index_offset, blend_factor = state.blend_factor,
+         primitive, geometry_counts, index_type, index_offset,
+         blend_factor = state.blend_factor,
          stencil_ref = state.stencil_ref, arg_buffer, arg_offset, count_buffer,
          count_offset, counted_args, counted_offset, argument_size,
+         max_object_threadgroups = device_->GetDXMTDevice().maxObjectThreadgroups(),
          command_index, viewports = std::move(viewports),
          scissors = std::move(scissors)](ArgumentEncodingContext &enc,
                                          uint64_t &argbuf_offset) mutable {
@@ -3517,36 +3712,72 @@ private:
       auto &rs = enc.encodeRenderCommand<wmtcmd_render_setrasterizerstate>();
       rs = rasterizer;
 
-      EncodeGraphicsBindings(enc, replay_state, *pipeline, argbuf_offset);
+      EncodeGraphicsBindings(enc, replay_state, *pipeline, use_geometry,
+                             argbuf_offset);
       EncodeDynamicRenderState(enc, viewports, scissors, blend_factor,
                                stencil_ref);
 
-      WMT::Buffer indirect_buffer = counted_args;
-      UINT64 indirect_offset = counted_offset;
-      if (!count_buffer.ptr()) {
+      if (use_geometry) {
+        if (count_buffer.ptr()) {
+          WARN("D3D12CommandQueue: counted geometry indirect indexed draw is unsupported");
+          return;
+        }
+        auto *render_encoder = enc.currentRenderEncoder();
+        render_encoder->use_geometry = 1;
         auto [arg_allocation, arg_sub_offset] =
-            enc.access<PipelineStage::Vertex>(arg_buffer, arg_offset,
-                                              argument_size,
-                                              ResourceAccess::Read);
-        indirect_buffer = arg_allocation->buffer();
-        indirect_offset = arg_sub_offset + arg_offset;
-      }
+            enc.access<PipelineStage::Vertex>(
+                arg_buffer, arg_offset, sizeof(DXMT_DRAW_INDEXED_ARGUMENTS),
+                ResourceAccess::Read);
+        auto dispatch_arg =
+            enc.allocateTempBuffer1(sizeof(DXMT_DISPATCH_ARGUMENTS), 4);
+        auto [vertex_per_warp, vertex_increment_per_warp] = *geometry_counts;
+        enc.encodeGSDispatchArgumentsMarshal(
+            arg_allocation->buffer(),
+            arg_allocation->gpuAddress() + arg_sub_offset + arg_offset, 0,
+            vertex_increment_per_warp, dispatch_arg.gpu_buffer,
+            dispatch_arg.gpu_address, dispatch_arg.offset,
+            max_object_threadgroups);
+        enc.resolveRenderPassBarrier();
+        auto &draw = enc.encodeRenderCommand<
+            wmtcmd_render_dxmt_geometry_draw_indexed_indirect>();
+        draw.type = WMTRenderCommandDXMTGeometryDrawIndexedIndirect;
+        draw.dispatch_args_buffer = dispatch_arg.gpu_buffer;
+        draw.dispatch_args_offset = dispatch_arg.offset;
+        draw.vertex_per_warp = vertex_per_warp;
+        draw.indirect_args_buffer = arg_allocation->buffer();
+        draw.indirect_args_offset = arg_sub_offset + arg_offset;
+        draw.index_buffer = index_allocation->buffer();
+        draw.index_buffer_offset = index_offset;
+        draw.imm_draw_arguments = enc.getFinalArgumentBuffer();
+      } else {
+        WMT::Buffer indirect_buffer = counted_args;
+        UINT64 indirect_offset = counted_offset;
+        if (!count_buffer.ptr()) {
+          auto [arg_allocation, arg_sub_offset] =
+              enc.access<PipelineStage::Vertex>(arg_buffer, arg_offset,
+                                                argument_size,
+                                                ResourceAccess::Read);
+          indirect_buffer = arg_allocation->buffer();
+          indirect_offset = arg_sub_offset + arg_offset;
+        }
 
-      auto &draw =
-          enc.encodeRenderCommand<wmtcmd_render_draw_indexed_indirect>();
-      draw.type = WMTRenderCommandDrawIndexedIndirect;
-      draw.primitive_type = *primitive;
-      draw.index_type = index_type;
-      draw.index_buffer = index_allocation->buffer();
-      draw.index_buffer_offset = index_offset;
-      draw.indirect_args_buffer = indirect_buffer;
-      draw.indirect_args_offset = indirect_offset;
+        auto &draw =
+            enc.encodeRenderCommand<wmtcmd_render_draw_indexed_indirect>();
+        draw.type = WMTRenderCommandDrawIndexedIndirect;
+        draw.primitive_type = *primitive;
+        draw.index_type = index_type;
+        draw.index_buffer = index_allocation->buffer();
+        draw.index_buffer_offset = index_offset;
+        draw.indirect_args_buffer = indirect_buffer;
+        draw.indirect_args_offset = indirect_offset;
+      }
     };
 
     const bool has_count = count_buffer.ptr();
     if (D3D12ReplayGraphicsBatchingEnabled() && !has_count) {
       QueueGraphicsPassCommand(chunk, state, std::move(attachments),
-                               argument_buffer_size, std::move(encode_draw));
+                               argument_buffer_size, std::move(encode_draw),
+                               metal->use_geometry);
       return;
     }
 
@@ -3554,7 +3785,8 @@ private:
     chunk->emitcc([this, attachments = std::move(attachments),
                    argument_buffer_size, arg_buffer, arg_offset, count_buffer,
                    count_offset, counted_args, counted_offset, argument_size,
-                   command_index, encode = std::move(encode_draw)](
+                   command_index, use_geometry = metal->use_geometry,
+                   encode = std::move(encode_draw)](
                       ArgumentEncodingContext &enc) mutable {
       if (count_buffer) {
         PrepareCountedIndirectArguments(
@@ -3562,7 +3794,8 @@ private:
             counted_args, counted_offset, argument_size, command_index);
       }
 
-      if (!BeginRenderPass(enc, attachments, argument_buffer_size))
+      if (!BeginRenderPass(enc, attachments, argument_buffer_size,
+                           use_geometry))
         return;
       uint64_t argbuf_offset = 0;
       encode(enc, argbuf_offset);
@@ -4079,6 +4312,18 @@ private:
       enc.bindConstantBuffer<PipelineStage::Pixel>(slot, buffer_offset,
                                                    std::move(buffer));
       break;
+    case PipelineStage::Geometry:
+      enc.bindConstantBuffer<PipelineStage::Geometry>(slot, buffer_offset,
+                                                      std::move(buffer));
+      break;
+    case PipelineStage::Hull:
+      enc.bindConstantBuffer<PipelineStage::Hull>(slot, buffer_offset,
+                                                  std::move(buffer));
+      break;
+    case PipelineStage::Domain:
+      enc.bindConstantBuffer<PipelineStage::Domain>(slot, buffer_offset,
+                                                    std::move(buffer));
+      break;
     default:
       enc.bindConstantBuffer<PipelineStage::Vertex>(slot, buffer_offset,
                                                     std::move(buffer));
@@ -4108,6 +4353,7 @@ private:
         offset = 0;
       UINT64 byte_size = resource->GetResourceDesc().Width;
       uint64_t view_id = 0;
+      bool has_buffer_view = false;
       BufferSlice slice = DefaultBufferSlice(*resource);
       if (descriptor.has_desc) {
         const auto &srv = descriptor.desc.srv;
@@ -4119,12 +4365,20 @@ private:
             offset += first_element * sizeof(uint32_t);
             byte_size = UINT64(srv.Buffer.NumElements) * sizeof(uint32_t);
             if (needs_texture_buffer_view) {
-              view_id = CreateBufferView(device_->GetMTLDevice(), *resource,
-                                         DXGI_FORMAT_R32_UINT, offset,
-                                         byte_size, WMTTextureUsageShaderRead);
+              auto view = CreateBufferView(device_->GetMTLDevice(), *resource,
+                                           DXGI_FORMAT_R32_UINT, offset,
+                                           byte_size,
+                                           WMTTextureUsageShaderRead);
+              if (view) {
+                view_id = *view;
+                has_buffer_view = true;
+                slice = TextureBufferSlice(*resource, offset, byte_size,
+                                           sizeof(uint32_t));
+              }
             }
-            slice = StructuredBufferSlice(*resource, offset, byte_size,
-                                          sizeof(uint32_t));
+            if (!has_buffer_view)
+              slice = StructuredBufferSlice(*resource, offset, byte_size,
+                                            sizeof(uint32_t));
           } else if (srv.Format != DXGI_FORMAT_UNKNOWN) {
             MTL_DXGI_FORMAT_DESC format = {};
             if (SUCCEEDED(MTLQueryDXGIFormat(device_->GetMTLDevice(),
@@ -4133,10 +4387,15 @@ private:
               byte_size = UINT64(srv.Buffer.NumElements) *
                           format.BytesPerTexel;
               if (needs_texture_buffer_view) {
-                view_id = CreateBufferView(device_->GetMTLDevice(), *resource,
-                                           srv.Format, offset, byte_size,
-                                           WMTTextureUsageShaderRead);
-                if (!view_id) {
+                auto view = CreateBufferView(device_->GetMTLDevice(), *resource,
+                                             srv.Format, offset, byte_size,
+                                             WMTTextureUsageShaderRead);
+                if (view) {
+                  view_id = *view;
+                  has_buffer_view = true;
+                  slice = TextureBufferSlice(*resource, offset, byte_size,
+                                             format.BytesPerTexel);
+                } else {
                   // TODO(d3d12): typed buffer SRV shaders that reflect as
                   // texture arguments need a real typed Metal texture-buffer
                   // view. The raw-buffer fallback cannot preserve typed load
@@ -4146,8 +4405,9 @@ private:
                        "; falling back to raw buffer binding");
                 }
               }
-              slice = StructuredBufferSlice(*resource, offset, byte_size,
-                                            format.BytesPerTexel);
+              if (!has_buffer_view)
+                slice = StructuredBufferSlice(*resource, offset, byte_size,
+                                              format.BytesPerTexel);
             } else {
               WARN("D3D12CommandQueue: typed buffer SRV uses unsupported format ",
                    uint32_t(srv.Format));
@@ -4161,13 +4421,21 @@ private:
               if (const auto view_format = UintBufferViewFormatForStride(
                       srv.Buffer.StructureByteStride);
                   view_format != DXGI_FORMAT_UNKNOWN) {
-                view_id = CreateBufferView(device_->GetMTLDevice(), *resource,
-                                           view_format, offset, byte_size,
-                                           WMTTextureUsageShaderRead);
+                auto view = CreateBufferView(device_->GetMTLDevice(), *resource,
+                                             view_format, offset, byte_size,
+                                             WMTTextureUsageShaderRead);
+                if (view) {
+                  view_id = *view;
+                  has_buffer_view = true;
+                  slice = TextureBufferSlice(
+                      *resource, offset, byte_size,
+                      srv.Buffer.StructureByteStride);
+                }
               }
             }
-            slice = StructuredBufferSlice(*resource, offset, byte_size,
-                                          srv.Buffer.StructureByteStride);
+            if (!has_buffer_view)
+              slice = StructuredBufferSlice(*resource, offset, byte_size,
+                                            srv.Buffer.StructureByteStride);
           } else {
             offset += first_element;
             byte_size = srv.Buffer.NumElements;
@@ -4186,6 +4454,15 @@ private:
       else if (stage == PipelineStage::Pixel)
         enc.bindBuffer<PipelineStage::Pixel>(slot, std::move(buffer),
                                              view_id, slice);
+      else if (stage == PipelineStage::Geometry)
+        enc.bindBuffer<PipelineStage::Geometry>(slot, std::move(buffer),
+                                                view_id, slice);
+      else if (stage == PipelineStage::Hull)
+        enc.bindBuffer<PipelineStage::Hull>(slot, std::move(buffer),
+                                            view_id, slice);
+      else if (stage == PipelineStage::Domain)
+        enc.bindBuffer<PipelineStage::Domain>(slot, std::move(buffer),
+                                              view_id, slice);
       else
         enc.bindBuffer<PipelineStage::Vertex>(slot, std::move(buffer),
                                               view_id, slice);
@@ -4210,6 +4487,15 @@ private:
       else if (stage == PipelineStage::Pixel)
         enc.bindTexture<PipelineStage::Pixel>(slot, std::move(texture),
                                               view.view);
+      else if (stage == PipelineStage::Geometry)
+        enc.bindTexture<PipelineStage::Geometry>(slot, std::move(texture),
+                                                 view.view);
+      else if (stage == PipelineStage::Hull)
+        enc.bindTexture<PipelineStage::Hull>(slot, std::move(texture),
+                                             view.view);
+      else if (stage == PipelineStage::Domain)
+        enc.bindTexture<PipelineStage::Domain>(slot, std::move(texture),
+                                               view.view);
       else
         enc.bindTexture<PipelineStage::Vertex>(slot, std::move(texture),
                                                 view.view);
@@ -4246,6 +4532,7 @@ private:
         offset = 0;
       UINT64 byte_size = resource->GetResourceDesc().Width;
       uint64_t view_id = 0;
+      bool has_buffer_view = false;
       BufferSlice slice = DefaultBufferSlice(*resource);
       if (descriptor.has_desc) {
         const auto &uav = descriptor.desc.uav;
@@ -4257,14 +4544,21 @@ private:
             offset += first_element * sizeof(uint32_t);
             byte_size = UINT64(uav.Buffer.NumElements) * sizeof(uint32_t);
             if (needs_texture_buffer_view) {
-              view_id = CreateBufferView(device_->GetMTLDevice(), *resource,
-                                         DXGI_FORMAT_R32_UINT, offset,
-                                         byte_size,
-                                         WMTTextureUsageShaderRead |
-                                             WMTTextureUsageShaderWrite);
+              auto view = CreateBufferView(device_->GetMTLDevice(), *resource,
+                                           DXGI_FORMAT_R32_UINT, offset,
+                                           byte_size,
+                                           WMTTextureUsageShaderRead |
+                                               WMTTextureUsageShaderWrite);
+              if (view) {
+                view_id = *view;
+                has_buffer_view = true;
+                slice = TextureBufferSlice(*resource, offset, byte_size,
+                                           sizeof(uint32_t));
+              }
             }
-            slice = StructuredBufferSlice(*resource, offset, byte_size,
-                                          sizeof(uint32_t));
+            if (!has_buffer_view)
+              slice = StructuredBufferSlice(*resource, offset, byte_size,
+                                            sizeof(uint32_t));
           } else if (uav.Format != DXGI_FORMAT_UNKNOWN) {
             MTL_DXGI_FORMAT_DESC format = {};
             if (SUCCEEDED(MTLQueryDXGIFormat(device_->GetMTLDevice(),
@@ -4273,11 +4567,16 @@ private:
               byte_size = UINT64(uav.Buffer.NumElements) *
                           format.BytesPerTexel;
               if (needs_texture_buffer_view) {
-                view_id = CreateBufferView(device_->GetMTLDevice(), *resource,
-                                           uav.Format, offset, byte_size,
-                                           WMTTextureUsageShaderRead |
-                                               WMTTextureUsageShaderWrite);
-                if (!view_id) {
+                auto view = CreateBufferView(device_->GetMTLDevice(), *resource,
+                                             uav.Format, offset, byte_size,
+                                             WMTTextureUsageShaderRead |
+                                                 WMTTextureUsageShaderWrite);
+                if (view) {
+                  view_id = *view;
+                  has_buffer_view = true;
+                  slice = TextureBufferSlice(*resource, offset, byte_size,
+                                             format.BytesPerTexel);
+                } else {
                   // TODO(d3d12): typed buffer UAV shaders that reflect as
                   // texture arguments need a real typed Metal texture-buffer
                   // view. The raw-buffer fallback loses typed UAV semantics.
@@ -4286,8 +4585,9 @@ private:
                        "; falling back to raw buffer binding");
                 }
               }
-              slice = StructuredBufferSlice(*resource, offset, byte_size,
-                                            format.BytesPerTexel);
+              if (!has_buffer_view)
+                slice = StructuredBufferSlice(*resource, offset, byte_size,
+                                              format.BytesPerTexel);
             } else {
               WARN("D3D12CommandQueue: typed buffer UAV uses unsupported format ",
                    uint32_t(uav.Format));
@@ -4301,14 +4601,22 @@ private:
               if (const auto view_format = UintBufferViewFormatForStride(
                       uav.Buffer.StructureByteStride);
                   view_format != DXGI_FORMAT_UNKNOWN) {
-                view_id = CreateBufferView(device_->GetMTLDevice(), *resource,
-                                           view_format, offset, byte_size,
-                                           WMTTextureUsageShaderRead |
-                                               WMTTextureUsageShaderWrite);
+                auto view = CreateBufferView(device_->GetMTLDevice(), *resource,
+                                             view_format, offset, byte_size,
+                                             WMTTextureUsageShaderRead |
+                                                 WMTTextureUsageShaderWrite);
+                if (view) {
+                  view_id = *view;
+                  has_buffer_view = true;
+                  slice = TextureBufferSlice(
+                      *resource, offset, byte_size,
+                      uav.Buffer.StructureByteStride);
+                }
               }
             }
-            slice = StructuredBufferSlice(*resource, offset, byte_size,
-                                          uav.Buffer.StructureByteStride);
+            if (!has_buffer_view)
+              slice = StructuredBufferSlice(*resource, offset, byte_size,
+                                            uav.Buffer.StructureByteStride);
           } else {
             offset += first_element;
             byte_size = uav.Buffer.NumElements;
@@ -4324,9 +4632,12 @@ private:
       if (stage == PipelineStage::Compute)
         enc.bindOutputBuffer<PipelineStage::Compute>(
             slot, std::move(buffer), view_id, std::move(counter), slice);
-      else
+      else if (stage == PipelineStage::Pixel)
         enc.bindOutputBuffer<PipelineStage::Pixel>(
             slot, std::move(buffer), view_id, std::move(counter), slice);
+      else
+        WARN("D3D12CommandQueue: UAV binding for ", PipelineStageName(stage),
+             " stage is unsupported");
       return;
     }
 
@@ -4347,9 +4658,12 @@ private:
         enc.bindOutputTexture<PipelineStage::Compute>(slot,
                                                       std::move(texture),
                                                       view.view);
-      else
+      else if (stage == PipelineStage::Pixel)
         enc.bindOutputTexture<PipelineStage::Pixel>(slot, std::move(texture),
                                                    view.view);
+      else
+        WARN("D3D12CommandQueue: UAV binding for ", PipelineStageName(stage),
+             " stage is unsupported");
     }
   }
 
@@ -4385,6 +4699,12 @@ private:
       enc.bindSampler<PipelineStage::Compute>(slot, std::move(sampler));
     else if (stage == PipelineStage::Pixel)
       enc.bindSampler<PipelineStage::Pixel>(slot, std::move(sampler));
+    else if (stage == PipelineStage::Geometry)
+      enc.bindSampler<PipelineStage::Geometry>(slot, std::move(sampler));
+    else if (stage == PipelineStage::Hull)
+      enc.bindSampler<PipelineStage::Hull>(slot, std::move(sampler));
+    else if (stage == PipelineStage::Domain)
+      enc.bindSampler<PipelineStage::Domain>(slot, std::move(sampler));
     else
       enc.bindSampler<PipelineStage::Vertex>(slot, std::move(sampler));
   }
@@ -4561,6 +4881,15 @@ private:
                                                        std::move(sampler));
             else if (stage == PipelineStage::Pixel)
               enc.bindSampler<PipelineStage::Pixel>(*slot,
+                                                     std::move(sampler));
+            else if (stage == PipelineStage::Geometry)
+              enc.bindSampler<PipelineStage::Geometry>(*slot,
+                                                       std::move(sampler));
+            else if (stage == PipelineStage::Hull)
+              enc.bindSampler<PipelineStage::Hull>(*slot,
+                                                   std::move(sampler));
+            else if (stage == PipelineStage::Domain)
+              enc.bindSampler<PipelineStage::Domain>(*slot,
                                                      std::move(sampler));
             else
               enc.bindSampler<PipelineStage::Vertex>(*slot,
@@ -4764,7 +5093,15 @@ private:
     });
   }
 
-  template <PipelineStage Stage>
+  static bool PipelineUsesGeometry(const PipelineState &pipeline) {
+    for (const auto &shader : pipeline.GetDxilShaders()) {
+      if (shader.stage == PipelineShaderStage::Geometry)
+        return true;
+    }
+    return false;
+  }
+
+  template <PipelineStage Stage, PipelineKind Kind>
   void EncodeShaderBindingsForStage(ArgumentEncodingContext &enc,
                                     const PipelineDxilShader &shader,
                                     const std::string &shader_key,
@@ -4774,14 +5111,14 @@ private:
       const auto offset =
           AllocateArgumentBuffer(argbuf_offset,
                                  reflection.NumConstantBuffers << 3);
-      enc.encodeConstantBuffers<Stage, PipelineKind::Ordinary>(
+      enc.encodeConstantBuffers<Stage, Kind>(
           &reflection, shader.constantBufferInfo(), offset);
     }
     if (reflection.NumArguments && shader.resourceArgumentInfo()) {
       const auto offset =
           AllocateArgumentBuffer(argbuf_offset,
                                  reflection.ArgumentTableQwords << 3);
-      enc.encodeShaderResources<Stage, PipelineKind::Ordinary>(
+      enc.encodeShaderResources<Stage, Kind>(
           &reflection, shader.resourceArgumentInfo(), offset, shader_key,
           nullptr);
     }
@@ -4797,7 +5134,8 @@ private:
   void EncodeVertexBuffers(ArgumentEncodingContext &enc,
                            const ReplayState &state,
                            const PipelineGraphicsState *graphics_state,
-                           uint64_t &argbuf_offset) {
+                           uint64_t &argbuf_offset,
+                           PipelineKind pipeline_kind) {
     if (!graphics_state)
       return;
 
@@ -4827,25 +5165,48 @@ private:
 
     const auto table_size = uint64_t(__builtin_popcount(slot_mask)) * 16u;
     const auto offset = AllocateArgumentBuffer(argbuf_offset, table_size);
-    enc.encodeVertexBuffers<PipelineKind::Ordinary>(slot_mask, offset);
+    if (pipeline_kind == PipelineKind::Geometry)
+      enc.encodeVertexBuffers<PipelineKind::Geometry>(slot_mask, offset);
+    else
+      enc.encodeVertexBuffers<PipelineKind::Ordinary>(slot_mask, offset);
   }
 
   void EncodeGraphicsBindings(ArgumentEncodingContext &enc,
                               const ReplayState &state,
                               PipelineState &pipeline,
+                              bool use_geometry,
                               uint64_t &argbuf_offset) {
     ApplyRootDescriptorTables(enc, state, pipeline, false);
+    const auto pipeline_kind = use_geometry ? PipelineKind::Geometry
+                                            : PipelineKind::Ordinary;
     EncodeVertexBuffers(enc, state, pipeline.GetGraphicsState(),
-                        argbuf_offset);
+                        argbuf_offset, pipeline_kind);
     const auto &shaders = pipeline.GetDxilShaders();
     const auto &key = pipeline.GetShaderCacheKey();
     for (const auto &shader : shaders) {
-      if (shader.stage == PipelineShaderStage::Vertex)
-        EncodeShaderBindingsForStage<PipelineStage::Vertex>(
-            enc, shader, key, argbuf_offset);
-      else if (shader.stage == PipelineShaderStage::Pixel)
-        EncodeShaderBindingsForStage<PipelineStage::Pixel>(
-            enc, shader, key, argbuf_offset);
+      if (use_geometry) {
+        if (shader.stage == PipelineShaderStage::Vertex)
+          EncodeShaderBindingsForStage<PipelineStage::Vertex,
+                                       PipelineKind::Geometry>(
+              enc, shader, key, argbuf_offset);
+        else if (shader.stage == PipelineShaderStage::Geometry)
+          EncodeShaderBindingsForStage<PipelineStage::Geometry,
+                                       PipelineKind::Geometry>(
+              enc, shader, key, argbuf_offset);
+        else if (shader.stage == PipelineShaderStage::Pixel)
+          EncodeShaderBindingsForStage<PipelineStage::Pixel,
+                                       PipelineKind::Geometry>(
+              enc, shader, key, argbuf_offset);
+      } else {
+        if (shader.stage == PipelineShaderStage::Vertex)
+          EncodeShaderBindingsForStage<PipelineStage::Vertex,
+                                       PipelineKind::Ordinary>(
+              enc, shader, key, argbuf_offset);
+        else if (shader.stage == PipelineShaderStage::Pixel)
+          EncodeShaderBindingsForStage<PipelineStage::Pixel,
+                                       PipelineKind::Ordinary>(
+              enc, shader, key, argbuf_offset);
+      }
     }
   }
 
@@ -4858,8 +5219,9 @@ private:
     const auto &key = pipeline.GetShaderCacheKey();
     for (const auto &shader : shaders) {
       if (shader.stage == PipelineShaderStage::Compute)
-        EncodeShaderBindingsForStage<PipelineStage::Compute>(
-            enc, shader, key, argbuf_offset);
+        EncodeShaderBindingsForStage<PipelineStage::Compute,
+                                     PipelineKind::Ordinary>(
+          enc, shader, key, argbuf_offset);
     }
   }
 
@@ -4879,7 +5241,8 @@ private:
     return AlignArgumentBufferSize(size);
   }
 
-  static uint64_t EstimateGraphicsArgumentBufferSize(PipelineState &pipeline) {
+  static uint64_t EstimateGraphicsArgumentBufferSize(PipelineState &pipeline,
+                                                     bool use_geometry) {
     uint64_t size = 0;
     if (const auto *graphics = pipeline.GetGraphicsState()) {
       uint32_t slot_mask = 0;
@@ -4893,11 +5256,18 @@ private:
     }
     for (const auto &shader : pipeline.GetDxilShaders()) {
       if (shader.stage == PipelineShaderStage::Vertex ||
-          shader.stage == PipelineShaderStage::Pixel)
+          shader.stage == PipelineShaderStage::Pixel ||
+          (use_geometry && shader.stage == PipelineShaderStage::Geometry))
         size = AlignArgumentBufferSize(size) +
                EstimateShaderArgumentBufferSize(shader);
     }
     return AlignArgumentBufferSize(size);
+  }
+
+  static uint64_t EstimateDrawArgumentBufferSize(bool indexed) {
+    return indexed
+               ? AlignArgumentBufferSize(sizeof(DXMT_DRAW_INDEXED_ARGUMENTS))
+               : AlignArgumentBufferSize(sizeof(DXMT_DRAW_ARGUMENTS));
   }
 
   static uint64_t EstimateComputeArgumentBufferSize(PipelineState &pipeline) {
@@ -4983,7 +5353,8 @@ private:
 
   static bool BeginRenderPass(ArgumentEncodingContext &enc,
                               ReplayRenderPassAttachments &attachments,
-                              uint64_t argument_buffer_size) {
+                              uint64_t argument_buffer_size,
+                              bool use_geometry = false) {
     if (attachments.colors.empty() && !attachments.depth_stencil)
       return false;
 
@@ -5059,6 +5430,7 @@ private:
     info.render_target_array_length = array_length;
     info.default_raster_sample_count = sample_count;
     info.tile_barrier_pso_key.raster_sample_count = sample_count;
+    info.use_geometry = info.use_geometry || use_geometry;
     return true;
   }
 
@@ -5660,11 +6032,27 @@ private:
       return;
     }
 
-    const auto primitive = GetPrimitiveType(state.topology);
-    if (!primitive) {
-      WARN("D3D12CommandQueue: draw skipped because primitive topology is unsupported topology=",
-           uint32_t(state.topology));
+    const auto metal_pso = SelectGraphicsPipelineState(*metal, state.topology);
+    if (!metal_pso) {
+      WARN("D3D12CommandQueue: draw skipped because selected Metal graphics PSO is unavailable");
       return;
+    }
+    std::optional<WMTPrimitiveType> primitive;
+    std::optional<std::pair<uint32_t, uint32_t>> geometry_counts;
+    if (metal->use_geometry) {
+      geometry_counts = GetGeometryVertexCount(state.topology);
+      if (!geometry_counts) {
+        WARN("D3D12CommandQueue: geometry draw skipped because primitive topology is unsupported topology=",
+             uint32_t(state.topology));
+        return;
+      }
+    } else {
+      primitive = GetPrimitiveType(state.topology);
+      if (!primitive) {
+        WARN("D3D12CommandQueue: draw skipped because primitive topology is unsupported topology=",
+             uint32_t(state.topology));
+        return;
+      }
     }
     auto viewports = state.viewports;
     auto scissors = state.scissors;
@@ -5679,17 +6067,22 @@ private:
     auto visibility_query = D3D12DiagCreateDrawVisibilityQuery(
         chunk, "draw", pipeline->GetShaderCacheKey(),
         record.vertex_count_per_instance, 0, record.instance_count);
-    const auto argument_buffer_size = EstimateGraphicsArgumentBufferSize(*pipeline);
+    const auto argument_buffer_size =
+        EstimateGraphicsArgumentBufferSize(*pipeline, metal->use_geometry) +
+        (metal->use_geometry ? EstimateDrawArgumentBufferSize(false) : 0);
     auto encode_draw =
-        [this, metal_pso = metal->pso, depth_stencil = metal->depth_stencil,
-         rasterizer = metal->rasterizer, pipeline,
+        [this, metal_pso, use_geometry = metal->use_geometry,
+         depth_stencil = metal->depth_stencil, rasterizer = metal->rasterizer,
+         pipeline,
          replay_state = CloneReplayStateWithoutBatch(state), primitive,
+         geometry_counts,
          blend_factor = state.blend_factor, stencil_ref = state.stencil_ref,
          vertex_start = record.start_vertex_location,
          vertex_count = record.vertex_count_per_instance,
          instance_count = record.instance_count,
          base_instance = record.start_instance_location,
          visibility_query = std::move(visibility_query),
+         max_object_threadgroups = device_->GetDXMTDevice().maxObjectThreadgroups(),
          viewports = std::move(viewports), scissors = std::move(scissors)](
             ArgumentEncodingContext &enc, uint64_t &argbuf_offset) mutable {
       auto &set_pso = enc.encodeRenderCommand<wmtcmd_render_setpso>();
@@ -5704,7 +6097,8 @@ private:
       auto &rs = enc.encodeRenderCommand<wmtcmd_render_setrasterizerstate>();
       rs = rasterizer;
 
-      EncodeGraphicsBindings(enc, replay_state, *pipeline, argbuf_offset);
+      EncodeGraphicsBindings(enc, replay_state, *pipeline, use_geometry,
+                             argbuf_offset);
       EncodeDynamicRenderState(enc, viewports, scissors, blend_factor,
                                stencil_ref);
 
@@ -5715,13 +6109,47 @@ private:
         enc.bumpVisibilityResultOffset();
       }
 
-      auto &draw = enc.encodeRenderCommand<wmtcmd_render_draw>();
-      draw.type = WMTRenderCommandDraw;
-      draw.primitive_type = *primitive;
-      draw.vertex_start = vertex_start;
-      draw.vertex_count = vertex_count;
-      draw.instance_count = instance_count;
-      draw.base_instance = base_instance;
+      if (use_geometry) {
+        auto *render_encoder = enc.currentRenderEncoder();
+        render_encoder->use_geometry = 1;
+        const auto draw_arguments_offset =
+            AllocateArgumentBuffer(argbuf_offset, sizeof(DXMT_DRAW_ARGUMENTS));
+        auto *draw_argument =
+            enc.getMappedArgumentBuffer<DXMT_DRAW_ARGUMENTS>(
+                draw_arguments_offset);
+        draw_argument->StartVertex = vertex_start;
+        draw_argument->VertexCount = vertex_count;
+        draw_argument->InstanceCount = instance_count;
+        draw_argument->StartInstance = base_instance;
+
+        auto [vertex_per_warp, vertex_increment_per_warp] = *geometry_counts;
+        const auto warp_count =
+            (vertex_count - 1) / vertex_increment_per_warp + 1;
+        if (uint64_t(warp_count) * instance_count >
+            max_object_threadgroups) {
+          WARN("D3D12CommandQueue: omitted geometry draw because of too many object threadgroups warp_count=",
+               warp_count, " instance_count=", instance_count);
+        } else {
+          enc.resolveRenderPassBarrier();
+          auto &draw =
+              enc.encodeRenderCommand<wmtcmd_render_dxmt_geometry_draw>();
+          draw.type = WMTRenderCommandDXMTGeometryDraw;
+          draw.draw_arguments_offset =
+              enc.getFinalArgumentBufferOffset(draw_arguments_offset);
+          draw.instance_count = instance_count;
+          draw.warp_count = warp_count;
+          draw.vertex_per_warp = vertex_per_warp;
+        }
+        } else {
+          enc.resolveRenderPassBarrier();
+          auto &draw = enc.encodeRenderCommand<wmtcmd_render_draw>();
+          draw.type = WMTRenderCommandDraw;
+          draw.primitive_type = *primitive;
+        draw.vertex_start = vertex_start;
+        draw.vertex_count = vertex_count;
+        draw.instance_count = instance_count;
+        draw.base_instance = base_instance;
+      }
       if (active_visibility_query) {
         enc.endVisibilityResultQuery(std::move(active_visibility_query));
         enc.bumpVisibilityResultOffset();
@@ -5730,13 +6158,14 @@ private:
 
     if (D3D12ReplayGraphicsBatchingEnabled()) {
       QueueGraphicsPassCommand(chunk, state, std::move(attachments),
-                               argument_buffer_size, std::move(encode_draw));
+                               argument_buffer_size, std::move(encode_draw),
+                               metal->use_geometry);
       return;
     }
 
     FlushGraphicsPassBatch(chunk, state);
     EmitSingleGraphicsPass(chunk, std::move(attachments), argument_buffer_size,
-                           std::move(encode_draw));
+                           std::move(encode_draw), metal->use_geometry);
   }
 
   void ReplayDrawIndexedInstanced(CommandChunk *chunk, ReplayState &state,
@@ -5773,17 +6202,34 @@ private:
     }
 
     Rc<BufferAllocation> index_allocation = index_resource->GetBufferAllocation();
-    const auto primitive = GetPrimitiveType(state.topology);
-    if (!primitive) {
-      WARN("D3D12CommandQueue: indexed draw skipped because primitive topology is unsupported topology=",
-           uint32_t(state.topology));
+    const auto metal_pso = SelectGraphicsPipelineState(*metal, state.topology);
+    if (!metal_pso) {
+      WARN("D3D12CommandQueue: indexed draw skipped because selected Metal graphics PSO is unavailable");
       return;
     }
+    std::optional<WMTPrimitiveType> primitive;
+    std::optional<std::pair<uint32_t, uint32_t>> geometry_counts;
+    if (metal->use_geometry) {
+      geometry_counts = GetGeometryVertexCount(state.topology);
+      if (!geometry_counts) {
+        WARN("D3D12CommandQueue: geometry indexed draw skipped because primitive topology is unsupported topology=",
+             uint32_t(state.topology));
+        return;
+      }
+    } else {
+      primitive = GetPrimitiveType(state.topology);
+      if (!primitive) {
+        WARN("D3D12CommandQueue: indexed draw skipped because primitive topology is unsupported topology=",
+             uint32_t(state.topology));
+        return;
+      }
+    }
     const auto index_type = GetIndexType(state.index_buffer->Format);
-    const UINT64 index_offset = index_resource->GetHeapOffset() +
-                                index_resource_offset +
-                                record.start_index_location *
-                                    GetIndexSize(state.index_buffer->Format);
+    const UINT64 index_binding_offset =
+        index_resource->GetHeapOffset() + index_resource_offset;
+    const UINT64 index_offset =
+        index_binding_offset +
+        record.start_index_location * GetIndexSize(state.index_buffer->Format);
     auto attachments = BuildRenderPassAttachments(state);
     auto viewports = state.viewports;
     auto scissors = state.scissors;
@@ -5798,18 +6244,25 @@ private:
     auto visibility_query = D3D12DiagCreateDrawVisibilityQuery(
         chunk, "indexed", pipeline->GetShaderCacheKey(), 0,
         record.index_count_per_instance, record.instance_count);
-    const auto argument_buffer_size = EstimateGraphicsArgumentBufferSize(*pipeline);
+    const auto argument_buffer_size =
+        EstimateGraphicsArgumentBufferSize(*pipeline, metal->use_geometry) +
+        (metal->use_geometry ? EstimateDrawArgumentBufferSize(true) : 0);
     auto encode_draw =
-        [this, metal_pso = metal->pso, depth_stencil = metal->depth_stencil,
-         rasterizer = metal->rasterizer, pipeline,
+        [this, metal_pso, use_geometry = metal->use_geometry,
+         depth_stencil = metal->depth_stencil, rasterizer = metal->rasterizer,
+         pipeline,
          replay_state = CloneReplayStateWithoutBatch(state), index_allocation,
-         primitive, index_type, index_offset, blend_factor = state.blend_factor,
+         primitive, geometry_counts, index_type, index_binding_offset,
+         index_offset,
+         blend_factor = state.blend_factor,
          stencil_ref = state.stencil_ref, viewports = std::move(viewports),
          scissors = std::move(scissors),
          index_count = record.index_count_per_instance,
+         start_index = record.start_index_location,
          instance_count = record.instance_count,
          base_vertex = record.base_vertex_location,
          base_instance = record.start_instance_location,
+         max_object_threadgroups = device_->GetDXMTDevice().maxObjectThreadgroups(),
          visibility_query = std::move(visibility_query)](
             ArgumentEncodingContext &enc, uint64_t &argbuf_offset) mutable {
       enc.retainAllocation(index_allocation.ptr());
@@ -5825,7 +6278,8 @@ private:
       auto &rs = enc.encodeRenderCommand<wmtcmd_render_setrasterizerstate>();
       rs = rasterizer;
 
-      EncodeGraphicsBindings(enc, replay_state, *pipeline, argbuf_offset);
+      EncodeGraphicsBindings(enc, replay_state, *pipeline, use_geometry,
+                             argbuf_offset);
       EncodeDynamicRenderState(enc, viewports, scissors, blend_factor,
                                stencil_ref);
 
@@ -5836,16 +6290,53 @@ private:
         enc.bumpVisibilityResultOffset();
       }
 
-      auto &draw = enc.encodeRenderCommand<wmtcmd_render_draw_indexed>();
-      draw.type = WMTRenderCommandDrawIndexed;
-      draw.primitive_type = *primitive;
-      draw.index_type = index_type;
-      draw.index_count = index_count;
-      draw.index_buffer = index_allocation->buffer();
-      draw.index_buffer_offset = index_offset;
-      draw.instance_count = instance_count;
-      draw.base_vertex = base_vertex;
-      draw.base_instance = base_instance;
+      if (use_geometry) {
+        auto *render_encoder = enc.currentRenderEncoder();
+        render_encoder->use_geometry = 1;
+        const auto draw_arguments_offset = AllocateArgumentBuffer(
+            argbuf_offset, sizeof(DXMT_DRAW_INDEXED_ARGUMENTS));
+        auto *draw_argument =
+            enc.getMappedArgumentBuffer<DXMT_DRAW_INDEXED_ARGUMENTS>(
+                draw_arguments_offset);
+        draw_argument->BaseVertex = base_vertex;
+        draw_argument->IndexCount = index_count;
+        draw_argument->StartIndex = start_index;
+        draw_argument->InstanceCount = instance_count;
+        draw_argument->StartInstance = base_instance;
+
+        auto [vertex_per_warp, vertex_increment_per_warp] = *geometry_counts;
+        const auto warp_count =
+            (index_count - 1) / vertex_increment_per_warp + 1;
+        if (uint64_t(warp_count) * instance_count >
+            max_object_threadgroups) {
+          WARN("D3D12CommandQueue: omitted geometry indexed draw because of too many object threadgroups warp_count=",
+               warp_count, " instance_count=", instance_count);
+        } else {
+          enc.resolveRenderPassBarrier();
+          auto &draw = enc.encodeRenderCommand<
+              wmtcmd_render_dxmt_geometry_draw_indexed>();
+          draw.type = WMTRenderCommandDXMTGeometryDrawIndexed;
+          draw.draw_arguments_offset =
+              enc.getFinalArgumentBufferOffset(draw_arguments_offset);
+          draw.instance_count = instance_count;
+          draw.warp_count = warp_count;
+          draw.vertex_per_warp = vertex_per_warp;
+          draw.index_buffer = index_allocation->buffer();
+          draw.index_buffer_offset = index_binding_offset;
+        }
+      } else {
+        enc.resolveRenderPassBarrier();
+        auto &draw = enc.encodeRenderCommand<wmtcmd_render_draw_indexed>();
+        draw.type = WMTRenderCommandDrawIndexed;
+        draw.primitive_type = *primitive;
+        draw.index_type = index_type;
+        draw.index_count = index_count;
+        draw.index_buffer = index_allocation->buffer();
+        draw.index_buffer_offset = index_offset;
+        draw.instance_count = instance_count;
+        draw.base_vertex = base_vertex;
+        draw.base_instance = base_instance;
+      }
       if (active_visibility_query) {
         enc.endVisibilityResultQuery(std::move(active_visibility_query));
         enc.bumpVisibilityResultOffset();
@@ -5854,13 +6345,14 @@ private:
 
     if (D3D12ReplayGraphicsBatchingEnabled()) {
       QueueGraphicsPassCommand(chunk, state, std::move(attachments),
-                               argument_buffer_size, std::move(encode_draw));
+                               argument_buffer_size, std::move(encode_draw),
+                               metal->use_geometry);
       return;
     }
 
     FlushGraphicsPassBatch(chunk, state);
     EmitSingleGraphicsPass(chunk, std::move(attachments), argument_buffer_size,
-                           std::move(encode_draw));
+                           std::move(encode_draw), metal->use_geometry);
   }
 
   void ReplayDispatch(CommandChunk *chunk, ReplayState &state,
@@ -6165,6 +6657,13 @@ private:
       Rc<Texture> src_texture = Rc<Texture>(src->GetTexture(src_plane));
       if (!dst_texture || !src_texture)
         return;
+      if (!ValidateTextureSubresourceAccess("texture copy dst", *dst,
+                                            dst_texture.ptr(), dst_subresource,
+                                            dst_plane, dst_level, dst_slice) ||
+          !ValidateTextureSubresourceAccess("texture copy src", *src,
+                                            src_texture.ptr(), src_subresource,
+                                            src_plane, src_level, src_slice))
+        return;
       if (src_texture->pixelFormat() != dst_texture->pixelFormat()) {
         WARN("D3D12CommandQueue: plane texture copy format mismatch src_format=",
              uint32_t(src_texture->pixelFormat()),
@@ -6281,6 +6780,10 @@ private:
     const UINT plane = GetSubresourcePlane(texture_resource, subresource);
     Rc<Texture> texture = Rc<Texture>(texture_resource.GetTexture(plane));
     if (!texture)
+      return;
+    if (!ValidateTextureSubresourceAccess("buffer texture copy",
+                                          texture_resource, texture.ptr(),
+                                          subresource, plane, level, slice))
       return;
     const auto size =
         GetSubresourceSize(texture_resource, subresource,
@@ -6529,6 +7032,7 @@ private:
       UINT64 offset = 0;
       UINT64 byte_size = resource->GetResourceDesc().Width;
       uint64_t view_id = 0;
+      bool has_buffer_view = false;
       bool raw_buffer = false;
 
       if (record.descriptor.has_desc &&
@@ -6547,10 +7051,14 @@ private:
             offset += first_element * format.BytesPerTexel;
             byte_size = UINT64(uav.Buffer.NumElements) *
                         format.BytesPerTexel;
-            view_id = CreateBufferView(device_->GetMTLDevice(), *resource,
-                                       uav.Format, offset, byte_size,
-                                       WMTTextureUsageShaderRead |
-                                           WMTTextureUsageShaderWrite);
+            auto view = CreateBufferView(device_->GetMTLDevice(), *resource,
+                                         uav.Format, offset, byte_size,
+                                         WMTTextureUsageShaderRead |
+                                             WMTTextureUsageShaderWrite);
+            if (view) {
+              view_id = *view;
+              has_buffer_view = true;
+            }
           }
         } else if (uav.Buffer.StructureByteStride) {
           offset += first_element * uav.Buffer.StructureByteStride;
@@ -6559,17 +7067,21 @@ private:
           if (const auto view_format =
                   UintBufferViewFormatForStride(uav.Buffer.StructureByteStride);
               view_format != DXGI_FORMAT_UNKNOWN) {
-            view_id = CreateBufferView(device_->GetMTLDevice(), *resource,
-                                       view_format, offset, byte_size,
-                                       WMTTextureUsageShaderRead |
-                                           WMTTextureUsageShaderWrite);
+            auto view = CreateBufferView(device_->GetMTLDevice(), *resource,
+                                         view_format, offset, byte_size,
+                                         WMTTextureUsageShaderRead |
+                                             WMTTextureUsageShaderWrite);
+            if (view) {
+              view_id = *view;
+              has_buffer_view = true;
+            }
           }
         }
       } else {
         raw_buffer = true;
       }
 
-      if (!view_id && !raw_buffer) {
+      if (!has_buffer_view && !raw_buffer) {
         // TODO(d3d12): support formatted/structured UAV buffer clears when a
         // Metal texture-buffer view cannot be created for the requested UAV.
         WARN("D3D12CommandQueue: ClearUnorderedAccessView buffer view is unsupported");

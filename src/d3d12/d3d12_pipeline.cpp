@@ -1220,6 +1220,89 @@ CompileMetalFunction(IMTLD3D12Device *device, PipelineDxilShader &shader,
   return true;
 }
 
+bool
+CreateMetalFunctionFromBitcode(IMTLD3D12Device *device,
+                               PipelineShaderStage stage,
+                               const char *function_name,
+                               sm50_bitcode_t bitcode_handle,
+                               PipelineMetalShader &out) {
+  SM50_COMPILED_BITCODE bitcode = {};
+  SM50GetCompiledBitcode(bitcode_handle, &bitcode);
+
+  WMT::Reference<WMT::Error> metal_error;
+  auto lib_data = WMT::MakeDispatchData(bitcode.Data, bitcode.Size);
+  out.library = device->GetMTLDevice().newLibrary(lib_data, metal_error);
+  SM50DestroyBitcode(bitcode_handle);
+  if (metal_error || !out.library) {
+    WARN("D3D12PipelineState: failed to create Metal library for ",
+         ShaderStageName(stage), ": ",
+         metal_error ? metal_error.description().getUTF8String()
+                     : "unknown error");
+    return false;
+  }
+
+  out.function = out.library.newFunction(function_name);
+  if (!out.function) {
+    WARN("D3D12PipelineState: Metal function not found: ", function_name);
+    return false;
+  }
+
+  return true;
+}
+
+bool
+CompileGeometryPipelineVertexFunction(
+    IMTLD3D12Device *device, PipelineDxilShader &vs, PipelineDxilShader &gs,
+    const char *function_name, SM50_SHADER_COMPILATION_ARGUMENT_DATA *args,
+    PipelineMetalShader &out) {
+  if (vs.kind != PipelineShaderBytecodeKind::Dxbc ||
+      gs.kind != PipelineShaderBytecodeKind::Dxbc) {
+    WARN("D3D12PipelineState: DXIL geometry shader mesh lowering is unsupported");
+    return false;
+  }
+
+  sm50_bitcode_t bitcode_handle = nullptr;
+  sm50_error_t error = nullptr;
+  if (SM50CompileGeometryPipelineVertex(vs.shader, gs.shader, args,
+                                        function_name, &bitcode_handle,
+                                        &error)) {
+    WARN("D3D12PipelineState: failed to compile DXBC geometry vertex shader: ",
+         SM50GetErrorMessageString(error));
+    SM50FreeError(error);
+    return false;
+  }
+
+  return CreateMetalFunctionFromBitcode(
+      device, PipelineShaderStage::Vertex, function_name, bitcode_handle, out);
+}
+
+bool
+CompileGeometryPipelineGeometryFunction(
+    IMTLD3D12Device *device, PipelineDxilShader &vs, PipelineDxilShader &gs,
+    const char *function_name, SM50_SHADER_COMPILATION_ARGUMENT_DATA *args,
+    PipelineMetalShader &out) {
+  if (vs.kind != PipelineShaderBytecodeKind::Dxbc ||
+      gs.kind != PipelineShaderBytecodeKind::Dxbc) {
+    WARN("D3D12PipelineState: DXIL geometry shader mesh lowering is unsupported");
+    return false;
+  }
+
+  sm50_bitcode_t bitcode_handle = nullptr;
+  sm50_error_t error = nullptr;
+  if (SM50CompileGeometryPipelineGeometry(vs.shader, gs.shader, args,
+                                          function_name, &bitcode_handle,
+                                          &error)) {
+    WARN("D3D12PipelineState: failed to compile DXBC geometry shader: ",
+         SM50GetErrorMessageString(error));
+    SM50FreeError(error);
+    return false;
+  }
+
+  return CreateMetalFunctionFromBitcode(
+      device, PipelineShaderStage::Geometry, function_name, bitcode_handle,
+      out);
+}
+
 WMTPrimitiveTopologyClass
 GetTopologyClass(D3D12_PRIMITIVE_TOPOLOGY_TYPE type) {
   switch (type) {
@@ -1427,8 +1510,9 @@ ValidateGraphicsRenderFormats(IMTLD3D12Device *device,
   return true;
 }
 
+template <typename PipelineInfo>
 void
-ApplyBlendState(WMTRenderPipelineInfo &info,
+ApplyBlendState(PipelineInfo &info,
                 const D3D12_BLEND_DESC &blend_desc,
                 uint32_t render_target_count) {
   for (UINT rt = 0; rt < render_target_count && rt < 8; rt++) {
@@ -1554,6 +1638,8 @@ CreateMetalGraphicsPipeline(IMTLD3D12Device *device,
       FindShader(shaders, PipelineShaderStage::Vertex));
   auto *ps = const_cast<PipelineDxilShader *>(
       FindShader(shaders, PipelineShaderStage::Pixel));
+  auto *gs = const_cast<PipelineDxilShader *>(
+      FindShader(shaders, PipelineShaderStage::Geometry));
   if (!vs)
     return false;
 
@@ -1588,18 +1674,13 @@ CreateMetalGraphicsPipeline(IMTLD3D12Device *device,
     DebugLogDxilShaderInfo(shader_cache_key, shader);
   D3D12DumpPipelineShaders("graphics", shader_cache_key, shaders, &state,
                            nullptr);
-  if (!CompileMetalFunction(device, *vs, vs_name.c_str(),
-                            reinterpret_cast<SM50_SHADER_COMPILATION_ARGUMENT_DATA *>(&ia_layout),
-                            out.vertex))
-    return false;
 
+  uint32_t unorm_output_reg_mask = 0;
+  for (UINT i = 0; i < state.desc.NumRenderTargets; i++) {
+    if (IsUnorm8RenderTargetFormat(rtv_formats[i]))
+      unorm_output_reg_mask |= 1u << i;
+  }
   if (ps) {
-    uint32_t unorm_output_reg_mask = 0;
-    for (UINT i = 0; i < state.desc.NumRenderTargets; i++) {
-      if (IsUnorm8RenderTargetFormat(rtv_formats[i]))
-        unorm_output_reg_mask |= 1u << i;
-    }
-
     SM50_SHADER_PSO_PIXEL_SHADER_DATA ps_args = {};
     ps_args.type = SM50_SHADER_PSO_PIXEL_SHADER;
     ps_args.next = &common;
@@ -1615,6 +1696,87 @@ CreateMetalGraphicsPipeline(IMTLD3D12Device *device,
                               out.pixel))
       return false;
   }
+
+  if (gs) {
+    auto create_geometry_variant =
+        [&](bool strip_topology, PipelineMetalShader &object_shader,
+            PipelineMetalShader &mesh_shader,
+            WMT::Reference<WMT::RenderPipelineState> &pso) {
+      SM50_SHADER_PSO_GEOMETRY_SHADER_DATA geometry_args = {};
+      geometry_args.type = SM50_SHADER_PSO_GEOMETRY_SHADER;
+      geometry_args.next = &ia_layout;
+      geometry_args.strip_topology = strip_topology;
+
+      const auto vsgs_name = BuildFunctionName(
+          strip_topology ? "vsgs_strip" : "vsgs", shader_cache_key);
+      if (!CompileGeometryPipelineVertexFunction(
+              device, *vs, *gs, vsgs_name.c_str(),
+              reinterpret_cast<SM50_SHADER_COMPILATION_ARGUMENT_DATA *>(
+                  &geometry_args),
+              object_shader))
+        return false;
+
+      geometry_args.next = &common;
+      const auto gs_name = BuildFunctionName(
+          strip_topology ? "gs_strip" : "gs", shader_cache_key);
+      if (!CompileGeometryPipelineGeometryFunction(
+              device, *vs, *gs, gs_name.c_str(),
+              reinterpret_cast<SM50_SHADER_COMPILATION_ARGUMENT_DATA *>(
+                  &geometry_args),
+              mesh_shader))
+        return false;
+
+      WMTMeshRenderPipelineInfo info = {};
+      WMT::InitializeMeshRenderPipelineInfo(info);
+      info.object_function = object_shader.function;
+      info.mesh_function = mesh_shader.function;
+      info.fragment_function = out.pixel.function;
+      info.payload_memory_length = 16256;
+      info.rasterization_enabled = true;
+      info.raster_sample_count = state.desc.SampleDesc.Count;
+      info.immutable_object_buffers =
+          (1 << 16) | (1 << 21) | (1 << 29) | (1 << 30);
+      info.immutable_mesh_buffers = (1 << 29) | (1 << 30);
+      info.immutable_fragment_buffers = (1 << 29) | (1 << 30);
+
+      for (UINT i = 0; i < state.desc.NumRenderTargets; i++) {
+        if (state.desc.RTVFormats[i] != DXGI_FORMAT_UNKNOWN)
+          info.colors[i].pixel_format = rtv_formats[i];
+      }
+      ApplyBlendState(info, state.desc.BlendState, state.desc.NumRenderTargets);
+
+      if (state.desc.DSVFormat != DXGI_FORMAT_UNKNOWN) {
+        info.depth_pixel_format = depth_format;
+        info.stencil_pixel_format = stencil_format;
+      }
+
+      WMT::Reference<WMT::Error> error;
+      pso = device->GetMTLDevice().newRenderPipelineState(info, error);
+      if (error || !pso) {
+        WARN("D3D12PipelineState: failed to create Metal geometry PSO: ",
+             error ? error.description().getUTF8String() : "unknown error");
+        return false;
+      }
+      return true;
+    };
+
+    if (!create_geometry_variant(false, out.geometry_vertex, out.geometry,
+                                 out.pso) ||
+        !create_geometry_variant(true, out.geometry_strip_vertex,
+                                 out.geometry_strip, out.strip_pso))
+      return false;
+
+    out.use_geometry = true;
+    BuildRasterizerCommand(state.desc.RasterizerState, out.rasterizer);
+    out.depth_stencil =
+        CreateDepthStencilState(device, state.desc.DepthStencilState);
+    return true;
+  }
+
+  if (!CompileMetalFunction(device, *vs, vs_name.c_str(),
+                            reinterpret_cast<SM50_SHADER_COMPILATION_ARGUMENT_DATA *>(&ia_layout),
+                            out.vertex))
+    return false;
 
   WMTRenderPipelineInfo info = {};
   WMT::InitializeRenderPipelineInfo(info);
@@ -1794,10 +1956,6 @@ CloneGraphicsState(const D3D12_GRAPHICS_PIPELINE_STATE_DESC &desc,
     return WARN_E_INVALIDARG(__func__);
   if (HasBytecode(desc.HS) || HasBytecode(desc.DS)) {
     WARN("D3D12PipelineState: tessellation shaders are unsupported");
-    return WARN_E_INVALIDARG(__func__);
-  }
-  if (HasBytecode(desc.GS)) {
-    WARN("D3D12PipelineState: geometry shaders are unsupported");
     return WARN_E_INVALIDARG(__func__);
   }
   if (!HasBytecode(desc.VS))
@@ -2549,9 +2707,27 @@ StoreStatus(HRESULT *status, HRESULT value) {
 
 void
 LogPipelineCreateFailure(const char *where, HRESULT value) {
-  if (D3D12PipelineDiagShouldLog())
-    INFO("D3D12 diagnostic: pipeline create failed",
-         " where=", where, " hr=0x", std::hex, uint32_t(value), std::dec);
+  WARN("D3D12 diagnostic: pipeline create failed",
+       " where=", where, " hr=0x", std::hex, uint32_t(value), std::dec);
+}
+
+void
+LogGraphicsPipelineDesc(const char *where,
+                        const D3D12_GRAPHICS_PIPELINE_STATE_DESC &desc) {
+  INFO("D3D12 diagnostic: graphics pipeline create",
+       " where=", where,
+       " hasVS=", HasBytecode(desc.VS),
+       " hasPS=", HasBytecode(desc.PS),
+       " hasGS=", HasBytecode(desc.GS),
+       " hasHS=", HasBytecode(desc.HS),
+       " hasDS=", HasBytecode(desc.DS),
+       " topologyType=", uint32_t(desc.PrimitiveTopologyType),
+       " numRT=", uint32_t(desc.NumRenderTargets),
+       " sampleCount=", uint32_t(desc.SampleDesc.Count),
+       " sampleQuality=", uint32_t(desc.SampleDesc.Quality),
+       " streamOutputEntries=", uint32_t(desc.StreamOutput.NumEntries),
+       " streamOutputStrides=", uint32_t(desc.StreamOutput.NumStrides),
+       " cachedPsoBytes=", uint64_t(desc.CachedPSO.CachedBlobSizeInBytes));
 }
 
 } // namespace
@@ -2564,6 +2740,7 @@ CreateGraphicsPipelineState(IMTLD3D12Device *device,
     StoreStatus(status, E_INVALIDARG);
     return nullptr;
   }
+  LogGraphicsPipelineDesc("CreateGraphicsPipelineState", *desc);
 
   PipelineGraphicsState graphics_state = {};
   HRESULT hr = CloneGraphicsState(*desc, graphics_state);
@@ -2593,6 +2770,7 @@ CreateGraphicsPipelineState(IMTLD3D12Device *device,
   hr = AppendPipelineShader(PipelineShaderStage::Geometry, device, desc->GS, shaders);
   if (FAILED(hr)) {
     DestroyPipelineShaders(shaders);
+    LogPipelineCreateFailure("AppendGeometryShader", hr);
     StoreStatus(status, hr);
     return nullptr;
   }
@@ -2680,9 +2858,13 @@ CreatePipelineStateFromStream(IMTLD3D12Device *device,
   HRESULT hr = ParsePipelineStateStream(*desc, graphics, compute,
                                         has_compute_shader);
   if (FAILED(hr)) {
+    LogPipelineCreateFailure("ParsePipelineStateStream", hr);
     StoreStatus(status, hr);
     return nullptr;
   }
+
+  if (!has_compute_shader)
+    LogGraphicsPipelineDesc("CreatePipelineStateFromStream", graphics);
 
   if (has_compute_shader)
     return CreateComputePipelineState(device, &compute, status);
