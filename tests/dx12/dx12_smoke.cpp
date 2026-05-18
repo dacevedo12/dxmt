@@ -243,6 +243,79 @@ static void test_create_device_arguments(void)
                                 __uuidof(ID3D12Device), (void **)&device), E_INVALIDARG);
 }
 
+#ifdef __ID3D12Device6_INTERFACE_DEFINED__
+static void test_device_interface_versions(void)
+{
+  ID3D12Device *device = nullptr;
+  ID3D12Device3 *device3 = nullptr;
+  ID3D12Device4 *device4 = nullptr;
+  ID3D12Device5 *device5 = nullptr;
+  ID3D12Device6 *device6 = nullptr;
+  ID3D12Fence *fence = nullptr;
+  ID3D12GraphicsCommandList *list = nullptr;
+  HRESULT hr = create_device(&device);
+  check_hr(hr);
+  if (FAILED(hr))
+    goto done;
+
+  check_hr(device->QueryInterface(__uuidof(ID3D12Device3), (void **)&device3));
+  check_hr(device->QueryInterface(__uuidof(ID3D12Device4), (void **)&device4));
+  check_hr(device->QueryInterface(__uuidof(ID3D12Device5), (void **)&device5));
+  check_hr(device->QueryInterface(__uuidof(ID3D12Device6), (void **)&device6));
+
+#ifdef __ID3D12Device7_INTERFACE_DEFINED__
+  {
+    ID3D12Device7 *device7 = nullptr;
+    check_hr_eq(device->QueryInterface(__uuidof(ID3D12Device7), (void **)&device7),
+                E_NOINTERFACE);
+    release_object(&device7);
+  }
+#endif
+
+  if (device3) {
+    check_hr(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, __uuidof(ID3D12Fence),
+                                 (void **)&fence));
+    if (fence) {
+      check_hr(device3->EnqueueMakeResident(static_cast<D3D12_RESIDENCY_FLAGS>(0),
+                                            0, nullptr, fence, 7));
+      check_true(fence->GetCompletedValue() == 7);
+    }
+  }
+
+  if (device4) {
+    check_hr(device4->CreateCommandList1(0, D3D12_COMMAND_LIST_TYPE_DIRECT,
+                                         D3D12_COMMAND_LIST_FLAG_NONE,
+                                         __uuidof(ID3D12GraphicsCommandList),
+                                         (void **)&list));
+    if (list)
+      check_hr_eq(list->Close(), E_FAIL);
+  }
+
+  if (device5) {
+    UINT meta_count = 1;
+    check_hr(device5->EnumerateMetaCommands(&meta_count, nullptr));
+    check_true(meta_count == 0);
+  }
+
+  if (device6) {
+    WINBOOL desired = TRUE;
+    check_hr(device6->SetBackgroundProcessingMode(
+        D3D12_BACKGROUND_PROCESSING_MODE_ALLOWED,
+        D3D12_MEASUREMENTS_ACTION_KEEP_ALL, nullptr, &desired));
+    check_true(desired == FALSE);
+  }
+
+done:
+  release_object(&list);
+  release_object(&fence);
+  release_object(&device6);
+  release_object(&device5);
+  release_object(&device4);
+  release_object(&device3);
+  release_object(&device);
+}
+#endif
+
 static void test_device_properties(void)
 {
   ID3D12Device *device = nullptr;
@@ -1855,6 +1928,7 @@ int main(int argc, char **argv)
 {
   bool run_create_device = true;
   bool run_create_device_arguments = true;
+  bool run_device_interface_versions = true;
   bool run_device_properties = true;
   bool run_descriptor_heap = true;
   bool run_query_heap = true;
@@ -1878,6 +1952,7 @@ int main(int argc, char **argv)
     if (!strcmp(argv[i], "--list")) {
       puts("create-device");
       puts("create-device-arguments");
+      puts("device-interface-versions");
       puts("device-properties");
       puts("create-descriptor-heap");
       puts("create-query-heap");
@@ -1902,6 +1977,7 @@ int main(int argc, char **argv)
       const char *filter = argv[++i];
       run_create_device = strstr("create-device", filter) != nullptr;
       run_create_device_arguments = strstr("create-device-arguments", filter) != nullptr;
+      run_device_interface_versions = strstr("device-interface-versions", filter) != nullptr;
       run_device_properties = strstr("device-properties", filter) != nullptr;
       run_descriptor_heap = strstr("create-descriptor-heap", filter) != nullptr;
       run_query_heap = strstr("create-query-heap", filter) != nullptr;
@@ -1928,6 +2004,10 @@ int main(int argc, char **argv)
     test_create_device();
   if (run_create_device_arguments)
     test_create_device_arguments();
+#ifdef __ID3D12Device6_INTERFACE_DEFINED__
+  if (run_device_interface_versions)
+    test_device_interface_versions();
+#endif
   if (run_device_properties)
     test_device_properties();
   if (run_descriptor_heap)

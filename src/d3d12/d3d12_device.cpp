@@ -610,7 +610,9 @@ CopyDescriptorRecord(DescriptorRecord &dst, const DescriptorRecord &src) {
   dst.heap_count = heap_count;
 }
 
-#ifdef __ID3D12Device2_INTERFACE_DEFINED__
+#ifdef __ID3D12Device6_INTERFACE_DEFINED__
+using DeviceComBase = ID3D12Device6;
+#elif defined(__ID3D12Device2_INTERFACE_DEFINED__)
 using DeviceComBase = ID3D12Device2;
 #else
 using DeviceComBase = ID3D12Device1;
@@ -667,6 +669,34 @@ public:
 #ifdef __ID3D12Device2_INTERFACE_DEFINED__
     if (riid == __uuidof(ID3D12Device2)) {
       *ppvObject = ref(static_cast<ID3D12Device2 *>(this));
+      return S_OK;
+    }
+#endif
+
+#ifdef __ID3D12Device3_INTERFACE_DEFINED__
+    if (riid == __uuidof(ID3D12Device3)) {
+      *ppvObject = ref(static_cast<ID3D12Device3 *>(this));
+      return S_OK;
+    }
+#endif
+
+#ifdef __ID3D12Device4_INTERFACE_DEFINED__
+    if (riid == __uuidof(ID3D12Device4)) {
+      *ppvObject = ref(static_cast<ID3D12Device4 *>(this));
+      return S_OK;
+    }
+#endif
+
+#ifdef __ID3D12Device5_INTERFACE_DEFINED__
+    if (riid == __uuidof(ID3D12Device5)) {
+      *ppvObject = ref(static_cast<ID3D12Device5 *>(this));
+      return S_OK;
+    }
+#endif
+
+#ifdef __ID3D12Device6_INTERFACE_DEFINED__
+    if (riid == __uuidof(ID3D12Device6)) {
+      *ppvObject = ref(static_cast<ID3D12Device6 *>(this));
       return S_OK;
     }
 #endif
@@ -1686,6 +1716,47 @@ public:
     return S_OK;
   }
 
+#ifdef __ID3D12Device3_INTERFACE_DEFINED__
+  HRESULT STDMETHODCALLTYPE OpenExistingHeapFromAddress(const void *address,
+                                                        REFIID riid,
+                                                        void **heap) override {
+    InitReturnPtr(heap);
+    if (!heap)
+      return E_POINTER;
+    if (!address)
+      return WARN_E_INVALIDARG(__func__);
+    WARN("D3D12Device: existing heaps from CPU addresses are unsupported");
+    return E_NOTIMPL;
+  }
+
+  HRESULT STDMETHODCALLTYPE OpenExistingHeapFromFileMapping(HANDLE file_mapping,
+                                                            REFIID riid,
+                                                            void **heap) override {
+    InitReturnPtr(heap);
+    if (!heap)
+      return E_POINTER;
+    if (!file_mapping)
+      return WARN_E_INVALIDARG(__func__);
+    WARN("D3D12Device: existing heaps from file mappings are unsupported");
+    return E_NOTIMPL;
+  }
+
+  HRESULT STDMETHODCALLTYPE EnqueueMakeResident(D3D12_RESIDENCY_FLAGS flags,
+                                                UINT object_count,
+                                                ID3D12Pageable *const *objects,
+                                                ID3D12Fence *fence,
+                                                UINT64 fence_value) override {
+    if (flags)
+      return WARN_E_INVALIDARG(__func__);
+    if (!fence)
+      return WARN_E_INVALIDARG(__func__);
+    HRESULT hr = MakeResident(object_count, objects);
+    if (FAILED(hr))
+      return hr;
+    return fence->Signal(fence_value);
+  }
+#endif
+
   HRESULT STDMETHODCALLTYPE CreatePipelineLibrary(const void *blob,
                                                   SIZE_T blob_size,
                                                   REFIID iid,
@@ -1944,6 +2015,207 @@ public:
       *sub_resource_tiling_count = 0;
   }
 
+#ifdef __ID3D12Device4_INTERFACE_DEFINED__
+  HRESULT STDMETHODCALLTYPE CreateCommandList1(UINT node_mask,
+                                               D3D12_COMMAND_LIST_TYPE type,
+                                               D3D12_COMMAND_LIST_FLAGS flags,
+                                               REFIID riid,
+                                               void **command_list) override {
+    InitReturnPtr(command_list);
+    if (!command_list)
+      return E_POINTER;
+    if (flags)
+      return WARN_E_INVALIDARG(__func__);
+    if (node_mask > 1)
+      return WARN_E_INVALIDARG(__func__);
+    if (!IsSupportedCommandListType(type)) {
+      WARN("D3D12Device: unsupported command list type ", type);
+      return WARN_E_INVALIDARG(__func__);
+    }
+
+    HRESULT status = S_OK;
+    auto list = d3d12::CreateGraphicsCommandList(
+        static_cast<IMTLD3D12Device *>(this), node_mask, type, nullptr,
+        nullptr, &status);
+    if (!list)
+      return status;
+    status = list->Close();
+    if (FAILED(status))
+      return status;
+    return list->QueryInterface(riid, command_list);
+  }
+
+  HRESULT STDMETHODCALLTYPE
+  CreateProtectedResourceSession(const D3D12_PROTECTED_RESOURCE_SESSION_DESC *desc,
+                                 REFIID riid, void **session) override {
+    InitReturnPtr(session);
+    if (!session)
+      return E_POINTER;
+    if (!desc)
+      return WARN_E_INVALIDARG(__func__);
+    WARN("D3D12Device: protected resource sessions are unsupported");
+    return E_NOTIMPL;
+  }
+
+  HRESULT STDMETHODCALLTYPE
+  CreateCommittedResource1(const D3D12_HEAP_PROPERTIES *heap_properties,
+                           D3D12_HEAP_FLAGS heap_flags,
+                           const D3D12_RESOURCE_DESC *desc,
+                           D3D12_RESOURCE_STATES initial_state,
+                           const D3D12_CLEAR_VALUE *optimized_clear_value,
+                           ID3D12ProtectedResourceSession *protected_session,
+                           REFIID riid, void **resource) override {
+    if (protected_session) {
+      InitReturnPtr(resource);
+      WARN("D3D12Device: protected committed resources are unsupported");
+      return E_NOTIMPL;
+    }
+    return CreateCommittedResource(heap_properties, heap_flags, desc,
+                                   initial_state, optimized_clear_value, riid,
+                                   resource);
+  }
+
+  HRESULT STDMETHODCALLTYPE CreateHeap1(const D3D12_HEAP_DESC *desc,
+                                        ID3D12ProtectedResourceSession *protected_session,
+                                        REFIID riid, void **heap) override {
+    if (protected_session) {
+      InitReturnPtr(heap);
+      WARN("D3D12Device: protected heaps are unsupported");
+      return E_NOTIMPL;
+    }
+    return CreateHeap(desc, riid, heap);
+  }
+
+  HRESULT STDMETHODCALLTYPE
+  CreateReservedResource1(const D3D12_RESOURCE_DESC *desc,
+                          D3D12_RESOURCE_STATES initial_state,
+                          const D3D12_CLEAR_VALUE *optimized_clear_value,
+                          ID3D12ProtectedResourceSession *protected_session,
+                          REFIID riid, void **resource) override {
+    if (protected_session) {
+      InitReturnPtr(resource);
+      WARN("D3D12Device: protected reserved resources are unsupported");
+      return E_NOTIMPL;
+    }
+    return CreateReservedResource(desc, initial_state, optimized_clear_value,
+                                  riid, resource);
+  }
+
+#ifdef WIDL_EXPLICIT_AGGREGATE_RETURNS
+  D3D12_RESOURCE_ALLOCATION_INFO *STDMETHODCALLTYPE
+  GetResourceAllocationInfo1(D3D12_RESOURCE_ALLOCATION_INFO *__ret,
+                             UINT visible_mask, UINT resource_desc_count,
+                             const D3D12_RESOURCE_DESC *resource_descs,
+                             D3D12_RESOURCE_ALLOCATION_INFO1 *resource_info) override {
+    *__ret = GetResourceAllocationInfo1Impl(visible_mask, resource_desc_count,
+                                            resource_descs, resource_info);
+    return __ret;
+  }
+#else
+  D3D12_RESOURCE_ALLOCATION_INFO STDMETHODCALLTYPE
+  GetResourceAllocationInfo1(UINT visible_mask, UINT resource_desc_count,
+                             const D3D12_RESOURCE_DESC *resource_descs,
+                             D3D12_RESOURCE_ALLOCATION_INFO1 *resource_info) override {
+    return GetResourceAllocationInfo1Impl(visible_mask, resource_desc_count,
+                                          resource_descs, resource_info);
+  }
+#endif
+#endif
+
+#ifdef __ID3D12Device5_INTERFACE_DEFINED__
+  HRESULT STDMETHODCALLTYPE CreateLifetimeTracker(ID3D12LifetimeOwner *owner,
+                                                  REFIID riid,
+                                                  void **tracker) override {
+    InitReturnPtr(tracker);
+    if (!tracker)
+      return E_POINTER;
+    if (!owner)
+      return WARN_E_INVALIDARG(__func__);
+    WARN("D3D12Device: lifetime trackers are unsupported");
+    return E_NOTIMPL;
+  }
+
+  void STDMETHODCALLTYPE RemoveDevice() override {
+    WARN("D3D12Device: RemoveDevice is unsupported");
+  }
+
+  HRESULT STDMETHODCALLTYPE EnumerateMetaCommands(UINT *meta_command_count,
+                                                  D3D12_META_COMMAND_DESC *descs) override {
+    if (!meta_command_count)
+      return WARN_E_INVALIDARG(__func__);
+    *meta_command_count = 0;
+    return S_OK;
+  }
+
+  HRESULT STDMETHODCALLTYPE
+  EnumerateMetaCommandParameters(REFGUID command_id,
+                                 D3D12_META_COMMAND_PARAMETER_STAGE stage,
+                                 UINT *total_structure_size,
+                                 UINT *parameter_count,
+                                 D3D12_META_COMMAND_PARAMETER_DESC *parameter_descs) override {
+    if (!total_structure_size || !parameter_count)
+      return WARN_E_INVALIDARG(__func__);
+    if (*parameter_count && !parameter_descs)
+      return WARN_E_INVALIDARG(__func__);
+    *total_structure_size = 0;
+    *parameter_count = 0;
+    return DXGI_ERROR_NOT_FOUND;
+  }
+
+  HRESULT STDMETHODCALLTYPE CreateMetaCommand(REFGUID command_id, UINT node_mask,
+                                              const void *creation_parameters,
+                                              SIZE_T creation_parameters_size,
+                                              REFIID riid, void **meta_command) override {
+    InitReturnPtr(meta_command);
+    if (!meta_command)
+      return E_POINTER;
+    if (node_mask > 1)
+      return WARN_E_INVALIDARG(__func__);
+    WARN("D3D12Device: meta commands are unsupported");
+    return DXGI_ERROR_NOT_FOUND;
+  }
+
+  HRESULT STDMETHODCALLTYPE CreateStateObject(const D3D12_STATE_OBJECT_DESC *desc,
+                                              REFIID riid,
+                                              void **state_object) override {
+    InitReturnPtr(state_object);
+    if (!state_object)
+      return E_POINTER;
+    if (!desc)
+      return WARN_E_INVALIDARG(__func__);
+    WARN("D3D12Device: state objects are unsupported");
+    return E_NOTIMPL;
+  }
+
+  void STDMETHODCALLTYPE GetRaytracingAccelerationStructurePrebuildInfo(
+      const D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS *desc,
+      D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO *info) override {
+    if (info)
+      std::memset(info, 0, sizeof(*info));
+    WARN("D3D12Device: raytracing acceleration structures are unsupported");
+  }
+
+  D3D12_DRIVER_MATCHING_IDENTIFIER_STATUS STDMETHODCALLTYPE
+  CheckDriverMatchingIdentifier(
+      D3D12_SERIALIZED_DATA_TYPE serialized_data_type,
+      const D3D12_SERIALIZED_DATA_DRIVER_MATCHING_IDENTIFIER *identifier) override {
+    return D3D12_DRIVER_MATCHING_IDENTIFIER_UNSUPPORTED_TYPE;
+  }
+#endif
+
+#ifdef __ID3D12Device6_INTERFACE_DEFINED__
+  HRESULT STDMETHODCALLTYPE
+  SetBackgroundProcessingMode(D3D12_BACKGROUND_PROCESSING_MODE mode,
+                              D3D12_MEASUREMENTS_ACTION action, HANDLE event,
+                              WINBOOL *further_measurements_desired) override {
+    if (further_measurements_desired)
+      *further_measurements_desired = FALSE;
+    if (event)
+      SetEvent(event);
+    return S_OK;
+  }
+#endif
+
 #ifdef WIDL_EXPLICIT_AGGREGATE_RETURNS
   LUID *STDMETHODCALLTYPE GetAdapterLuid(LUID *__ret) override {
     *__ret = adapter_luid_;
@@ -2002,6 +2274,60 @@ private:
 
     return info;
   }
+
+#ifdef __ID3D12Device4_INTERFACE_DEFINED__
+  D3D12_RESOURCE_ALLOCATION_INFO
+  GetResourceAllocationInfo1Impl(UINT visible_mask, UINT resource_desc_count,
+                                 const D3D12_RESOURCE_DESC *resource_descs,
+                                 D3D12_RESOURCE_ALLOCATION_INFO1 *resource_info) const {
+    D3D12_RESOURCE_ALLOCATION_INFO info = {};
+    info.Alignment = 1;
+
+    if (!resource_desc_count || !resource_descs)
+      return info;
+
+    UINT64 offset = 0;
+    for (UINT i = 0; i < resource_desc_count; i++) {
+      const auto &desc = resource_descs[i];
+      UINT64 alignment = desc.Alignment;
+      if (!alignment)
+        alignment = desc.SampleDesc.Count > 1
+                        ? D3D12_DEFAULT_MSAA_RESOURCE_PLACEMENT_ALIGNMENT
+                        : D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;
+
+      UINT64 size = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;
+      if (desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
+        size = desc.Width;
+      } else {
+        const UINT mip_levels = desc.MipLevels ? desc.MipLevels : 1;
+        const UINT plane_count = GetD3D12FormatPlaneCount(desc.Format);
+        const UINT subresources = mip_levels *
+                                  (desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D
+                                       ? 1
+                                       : desc.DepthOrArraySize) *
+                                  plane_count;
+        UINT64 total_bytes = 0;
+        GetCopyableFootprintsImpl(&desc, 0, subresources, 0, nullptr, nullptr,
+                                  nullptr, &total_bytes, false);
+        size = total_bytes;
+      }
+
+      offset = Align(offset, alignment);
+      const UINT64 aligned_size = Align(size, alignment);
+      if (resource_info) {
+        resource_info[i].Offset = offset;
+        resource_info[i].Alignment = alignment;
+        resource_info[i].SizeInBytes = aligned_size;
+      }
+
+      info.Alignment = std::max(info.Alignment, alignment);
+      offset += aligned_size;
+    }
+
+    info.SizeInBytes = offset;
+    return info;
+  }
+#endif
 
   D3D12_HEAP_PROPERTIES
   GetCustomHeapPropertiesImpl(UINT node_mask, D3D12_HEAP_TYPE heap_type) const {
