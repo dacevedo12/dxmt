@@ -3,8 +3,13 @@
 #include "wineunixlib.h"
 #include <stdint.h>
 
+#if (defined(__x86_64__) || defined(_M_X64)) && !defined(__aarch64__) &&       \
+    !defined(__arm64ec__) && !defined(_M_ARM64) && !defined(_M_ARM64EC)
+#define DXMT_FH4_BYPASS_HAS_X64_GS 1
+#endif
+
 static uintptr_t read_gs_qword(unsigned int offset) {
-#if defined(__x86_64__) || defined(_M_X64)
+#if DXMT_FH4_BYPASS_HAS_X64_GS
   uintptr_t value = 0;
 #if defined(__GNUC__) || defined(__clang__)
   if (offset == 0x20)
@@ -18,7 +23,7 @@ static uintptr_t read_gs_qword(unsigned int offset) {
 }
 
 static void write_gs_qword(unsigned int offset, uintptr_t value) {
-#if defined(__x86_64__) || defined(_M_X64)
+#if DXMT_FH4_BYPASS_HAS_X64_GS
 #if defined(__GNUC__) || defined(__clang__)
   if (offset == 0x20)
     __asm__ volatile("movq %0,%%gs:0x20" : : "r"(value) : "memory");

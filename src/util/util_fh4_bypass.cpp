@@ -9,8 +9,14 @@
 namespace dxmt::fh4bypass {
 namespace {
 
+#if defined(_WIN32) && (defined(__x86_64__) || defined(_M_X64)) &&             \
+    !defined(__aarch64__) && !defined(__arm64ec__) &&                          \
+    !defined(_M_ARM64) && !defined(_M_ARM64EC)
+#define DXMT_FH4_BYPASS_HAS_X64_GS 1
+#endif
+
 uintptr_t ReadGsQword(uint32_t offset) {
-#if defined(_WIN32) && (defined(__x86_64__) || defined(_M_X64))
+#if DXMT_FH4_BYPASS_HAS_X64_GS
   uintptr_t value = 0;
 #if defined(__GNUC__) || defined(__clang__)
   if (offset == 0x20)
@@ -28,7 +34,7 @@ uintptr_t ReadGsQword(uint32_t offset) {
 }
 
 void WriteGsQword(uint32_t offset, uintptr_t value) {
-#if defined(_WIN32) && (defined(__x86_64__) || defined(_M_X64))
+#if DXMT_FH4_BYPASS_HAS_X64_GS
 #if defined(__GNUC__) || defined(__clang__)
   if (offset == 0x20)
     __asm__ volatile("movq %0,%%gs:0x20" : : "r"(value) : "memory");
