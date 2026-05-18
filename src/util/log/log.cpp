@@ -132,7 +132,7 @@ LogLevel Logger::getMinLogLevel() {
       return pair.second;
   }
 
-  return LogLevel::Info;
+  return LogLevel::None;
 }
 
 } // namespace dxmt
