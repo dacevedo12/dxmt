@@ -1604,8 +1604,10 @@ public:
     InitReturnPtr(heap);
     if (!heap)
       return E_POINTER;
-    if (!IsValidHeapDesc(desc))
+    if (!IsValidHeapDesc(desc)) {
+      LogInvalidHeapDesc("CreateHeap", desc, GetInvalidHeapDescReason(desc));
       return WARN_E_INVALIDARG(__func__);
+    }
 
     auto heap_object = d3d12::CreateHeap(static_cast<IMTLD3D12Device *>(this),
                                          desc);
@@ -1630,9 +1632,12 @@ public:
     if (!heap_object)
       return WARN_E_INVALIDARG(__func__);
 
-    if (!IsValidPlacedResourceDesc(*heap_object, heap_offset, desc,
-                                   initial_state))
+    if (const char *reason = GetInvalidPlacedResourceDescReason(
+            *heap_object, heap_offset, desc, initial_state)) {
+      LogInvalidPlacedResourceDesc(*heap_object, heap_offset, desc,
+                                   initial_state, reason);
       return WARN_E_INVALIDARG(__func__);
+    }
 
     const auto &heap_desc = heap_object->GetHeapDesc();
     auto resource_object = d3d12::CreateResource(
@@ -2016,18 +2021,24 @@ private:
     return properties;
   }
 
-  bool IsValidHeapDesc(const D3D12_HEAP_DESC *desc) const {
-    if (!desc || desc->SizeInBytes == 0 ||
-        desc->Alignment > D3D12_DEFAULT_MSAA_RESOURCE_PLACEMENT_ALIGNMENT)
-      return false;
-    if (desc->Alignment && desc->Alignment != D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT &&
+  const char *GetInvalidHeapDescReason(const D3D12_HEAP_DESC *desc) const {
+    if (!desc)
+      return "null-desc";
+    if (desc->SizeInBytes == 0)
+      return "zero-size";
+    if (desc->Alignment > D3D12_DEFAULT_MSAA_RESOURCE_PLACEMENT_ALIGNMENT)
+      return "alignment-too-large";
+    if (desc->Alignment &&
+        desc->Alignment != D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT &&
         desc->Alignment != D3D12_DEFAULT_MSAA_RESOURCE_PLACEMENT_ALIGNMENT)
-      return false;
-    if (desc->Properties.CreationNodeMask > 1 || desc->Properties.VisibleNodeMask > 1)
-      return false;
+      return "unsupported-alignment";
+    if (desc->Properties.CreationNodeMask > 1)
+      return "creation-node-mask";
+    if (desc->Properties.VisibleNodeMask > 1)
+      return "visible-node-mask";
     if (desc->Properties.CreationNodeMask && desc->Properties.VisibleNodeMask &&
         (desc->Properties.CreationNodeMask & desc->Properties.VisibleNodeMask) == 0)
-      return false;
+      return "disjoint-node-masks";
     if (desc->Properties.Type == D3D12_HEAP_TYPE_CUSTOM) {
       switch (desc->Properties.CPUPageProperty) {
       case D3D12_CPU_PAGE_PROPERTY_NOT_AVAILABLE:
@@ -2035,7 +2046,7 @@ private:
       case D3D12_CPU_PAGE_PROPERTY_WRITE_BACK:
         break;
       default:
-        return false;
+        return "custom-cpu-page-property";
       }
       switch (desc->Properties.MemoryPoolPreference) {
       case D3D12_MEMORY_POOL_UNKNOWN:
@@ -2043,31 +2054,59 @@ private:
       case D3D12_MEMORY_POOL_L1:
         break;
       default:
-        return false;
+        return "custom-memory-pool";
       }
       if (desc->Flags & D3D12_HEAP_FLAG_ALLOW_DISPLAY)
-        return false;
+        return "custom-allow-display";
       if ((desc->Flags & D3D12_HEAP_FLAG_SHARED_CROSS_ADAPTER) &&
           desc->Properties.CPUPageProperty !=
               D3D12_CPU_PAGE_PROPERTY_NOT_AVAILABLE)
-        return false;
-      return true;
+        return "custom-cross-adapter-cpu-visible";
+      return nullptr;
     }
-    if (desc->Properties.CPUPageProperty != D3D12_CPU_PAGE_PROPERTY_UNKNOWN ||
-        desc->Properties.MemoryPoolPreference != D3D12_MEMORY_POOL_UNKNOWN)
-      return false;
+    if (desc->Properties.CPUPageProperty != D3D12_CPU_PAGE_PROPERTY_UNKNOWN)
+      return "typed-cpu-page-property";
+    if (desc->Properties.MemoryPoolPreference != D3D12_MEMORY_POOL_UNKNOWN)
+      return "typed-memory-pool";
     if (desc->Flags & D3D12_HEAP_FLAG_ALLOW_DISPLAY)
-      return false;
+      return "allow-display";
     if (desc->Flags & D3D12_HEAP_FLAG_SHARED_CROSS_ADAPTER)
-      return false;
+      return "shared-cross-adapter";
     switch (desc->Properties.Type) {
     case D3D12_HEAP_TYPE_DEFAULT:
     case D3D12_HEAP_TYPE_UPLOAD:
     case D3D12_HEAP_TYPE_READBACK:
-      return true;
+      return nullptr;
     default:
-      return false;
+      return "heap-type";
     }
+  }
+
+  void LogInvalidHeapDesc(const char *where, const D3D12_HEAP_DESC *desc,
+                          const char *reason) const {
+    if (!desc) {
+      WARN("D3D12 diagnostic: invalid heap desc",
+           " where=", where, " reason=", reason ? reason : "unknown");
+      return;
+    }
+
+    WARN("D3D12 diagnostic: invalid heap desc",
+         " where=", where,
+         " reason=", reason ? reason : "unknown",
+         " size=", uint64_t(desc->SizeInBytes),
+         " alignment=", uint64_t(desc->Alignment),
+         " type=", uint32_t(desc->Properties.Type),
+         " cpuPage=", uint32_t(desc->Properties.CPUPageProperty),
+         " memoryPool=", uint32_t(desc->Properties.MemoryPoolPreference),
+         " creationNode=", uint32_t(desc->Properties.CreationNodeMask),
+         " visibleNode=", uint32_t(desc->Properties.VisibleNodeMask),
+         " flags=", uint32_t(desc->Flags));
+  }
+
+  bool IsValidHeapDesc(const D3D12_HEAP_DESC *desc) const {
+    if (GetInvalidHeapDescReason(desc))
+      return false;
+    return true;
   }
 
   bool IsValidHeapProperties(const D3D12_HEAP_PROPERTIES *properties) const {
@@ -2175,57 +2214,102 @@ private:
   bool IsValidPlacedResourceDesc(const d3d12::Heap &heap, UINT64 heap_offset,
                                  const D3D12_RESOURCE_DESC *desc,
                                  D3D12_RESOURCE_STATES initial_state) const {
-    if (!desc || !d3d12::IsSupportedResourceDesc(*desc))
-      return false;
+    return !GetInvalidPlacedResourceDescReason(heap, heap_offset, desc,
+                                               initial_state);
+  }
+
+  const char *GetInvalidPlacedResourceDescReason(
+      const d3d12::Heap &heap, UINT64 heap_offset,
+      const D3D12_RESOURCE_DESC *desc,
+      D3D12_RESOURCE_STATES initial_state) const {
+    if (!desc)
+      return "null-desc";
+    if (!d3d12::IsSupportedResourceDesc(*desc))
+      return "unsupported-desc";
     if (desc->Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D &&
         IsBcFormat(device_->device(), desc->Format))
-      return false;
+      return "bc-texture1d";
     if (!IsValidInitialState(heap.GetHeapDesc().Properties, initial_state))
-      return false;
+      return "initial-state";
     if (!IsValidResourceStateForDesc(*desc, initial_state))
-      return false;
+      return "state-for-desc";
     if (!IsValidResourceAlignment(*desc))
-      return false;
+      return "resource-alignment";
     if (desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER &&
         (desc->Flags & D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS))
-      return false;
+      return "buffer-simultaneous-access";
 
     const auto allocation_info = GetResourceAllocationInfoImpl(1, 1, desc);
     if (allocation_info.SizeInBytes == 0)
-      return false;
+      return "zero-allocation-size";
     if (heap_offset % allocation_info.Alignment)
-      return false;
+      return "heap-offset-alignment";
     if (heap_offset > heap.GetHeapDesc().SizeInBytes ||
         allocation_info.SizeInBytes > heap.GetHeapDesc().SizeInBytes - heap_offset)
-      return false;
+      return "heap-range";
 
     const auto heap_type = heap.GetHeapType();
     if (!IsValidCrossAdapterTextureDesc(heap.GetHeapDesc().Properties,
                                         heap.GetHeapDesc().Flags, *desc))
-      return false;
+      return "cross-adapter-texture";
     if (HasInvalidCpuVisibleBufferFlags(*desc, heap_type))
-      return false;
+      return "cpu-visible-buffer-flags";
     if ((heap_type == D3D12_HEAP_TYPE_UPLOAD ||
          heap_type == D3D12_HEAP_TYPE_READBACK) &&
         desc->Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
         desc->Layout != D3D12_TEXTURE_LAYOUT_ROW_MAJOR)
-      return false;
+      return "cpu-visible-texture-layout";
 
     const auto heap_flags = heap.GetHeapDesc().Flags;
     if ((heap_flags & D3D12_HEAP_FLAG_DENY_BUFFERS) &&
         desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER)
-      return false;
+      return "heap-deny-buffer";
     if ((heap_flags & D3D12_HEAP_FLAG_DENY_RT_DS_TEXTURES) &&
         (desc->Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET |
                         D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL)))
-      return false;
+      return "heap-deny-rt-ds";
     if ((heap_flags & D3D12_HEAP_FLAG_DENY_NON_RT_DS_TEXTURES) &&
         desc->Dimension != D3D12_RESOURCE_DIMENSION_BUFFER &&
         !(desc->Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET |
                          D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL)))
-      return false;
+      return "heap-deny-non-rt-ds";
 
-    return true;
+    return nullptr;
+  }
+
+  void LogInvalidPlacedResourceDesc(const d3d12::Heap &heap,
+                                    UINT64 heap_offset,
+                                    const D3D12_RESOURCE_DESC *desc,
+                                    D3D12_RESOURCE_STATES initial_state,
+                                    const char *reason) const {
+    const auto &heap_desc = heap.GetHeapDesc();
+    D3D12_RESOURCE_ALLOCATION_INFO allocation_info = {};
+    if (desc)
+      allocation_info = GetResourceAllocationInfoImpl(1, 1, desc);
+
+    ERR("D3D12 diagnostic: invalid placed resource desc",
+        " reason=", reason ? reason : "unknown",
+        " heapOffset=", uint64_t(heap_offset),
+        " allocationSize=", uint64_t(allocation_info.SizeInBytes),
+        " allocationAlignment=", uint64_t(allocation_info.Alignment),
+        " heapSize=", uint64_t(heap_desc.SizeInBytes),
+        " heapAlignment=", uint64_t(heap_desc.Alignment),
+        " heapType=", uint32_t(heap_desc.Properties.Type),
+        " heapCpuPage=", uint32_t(heap_desc.Properties.CPUPageProperty),
+        " heapMemoryPool=", uint32_t(heap_desc.Properties.MemoryPoolPreference),
+        " heapFlags=", uint32_t(heap_desc.Flags),
+        " descDimension=", desc ? uint32_t(desc->Dimension) : 0,
+        " descAlignment=", desc ? uint64_t(desc->Alignment) : 0,
+        " descWidth=", desc ? uint64_t(desc->Width) : 0,
+        " descHeight=", desc ? uint32_t(desc->Height) : 0,
+        " descDepthOrArraySize=", desc ? uint32_t(desc->DepthOrArraySize) : 0,
+        " descMipLevels=", desc ? uint32_t(desc->MipLevels) : 0,
+        " descFormat=", desc ? uint32_t(desc->Format) : 0,
+        " descSampleCount=", desc ? uint32_t(desc->SampleDesc.Count) : 0,
+        " descSampleQuality=", desc ? uint32_t(desc->SampleDesc.Quality) : 0,
+        " descLayout=", desc ? uint32_t(desc->Layout) : 0,
+        " descFlags=", desc ? uint32_t(desc->Flags) : 0,
+        " initialState=", uint32_t(initial_state));
   }
 
   void GetCopyableFootprintsImpl(
