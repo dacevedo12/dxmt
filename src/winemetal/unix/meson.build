@@ -4,8 +4,8 @@ winemetal_unix_src = [
 ]
 
 if wine_build_path != ''
-  winemac_so = join_paths(wine_build_path, 'dlls/winemac.drv/winemac.so')
-  ntdll_so = join_paths(wine_build_path, 'dlls/ntdll/ntdll.so')
+  winemac_so = wine_build_target[4]
+  ntdll_so = wine_build_target[5]
 elif wine_install_path != ''
   winemac_so = join_paths(wine_install_path, 'lib/wine', unix_install_dir, 'winemac.so')
   ntdll_so = join_paths(wine_install_path, 'lib/wine', unix_install_dir, 'ntdll.so')
@@ -15,7 +15,8 @@ endif
 
 winemetal_unix_ld_args = [
   '-Wl,-install_name,@rpath/winemetal.so',
-  winemac_so, ntdll_so,
+  wine_build_path != '' ? winemac_so.full_path() : winemac_so,
+  wine_build_path != '' ? ntdll_so.full_path() : ntdll_so,
   '-weak_framework', 'CoreFoundation', '-weak_framework', 'Metal',
   '-framework', 'MetalFX', '-weak_framework', 'Foundation',
   '-weak_framework', 'CoreGraphics', '-weak_framework', 'QuartzCore',
@@ -23,6 +24,9 @@ winemetal_unix_ld_args = [
   '-lsqlite3',
 ]
 winemetal_unix_link_depends = []
+if wine_build_path != ''
+  winemetal_unix_link_depends += [winemac_so, ntdll_so]
+endif
 
 shared_library('winemetal', winemetal_unix_src,
   name_prefix         : '',
@@ -30,6 +34,7 @@ shared_library('winemetal', winemetal_unix_src,
   include_directories : dxmt_include_path,
   c_args              : ['-ObjC'],
   link_args           : winemetal_unix_ld_args,
+  link_depends        : winemetal_unix_link_depends,
   native              : true,
   name_suffix         : 'so',
   install_rpath       : '',

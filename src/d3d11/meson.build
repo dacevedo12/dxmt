@@ -67,7 +67,7 @@ if wine_builtin_dll
 custom_target('postprocess_libd3d11',
   input : d3d11_dll,
   output: 'd3d11.dll.postproc',
-  command : [ winebuild, '--builtin', '@INPUT@' ],
+  command : [ wine_build_path != '' ? winebuild.full_path() : winebuild, '--builtin', '@INPUT@' ],
   depends : d3d11_dll,
   build_by_default : true
 )

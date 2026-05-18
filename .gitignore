@@ -4,6 +4,7 @@ build
 wineprefix
 .cache
 wine
+!external/wine
 .local
 .config
 toolchains

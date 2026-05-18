@@ -148,6 +148,21 @@ dxmt_version = vcs_tag(
 if dxmt_crossbuild
   wine_builtin_dll = get_option('wine_builtin_dll')
 
+  wine_source_path = get_option('wine_source_path')
+  if wine_source_path != '' and not wine_source_path.startswith('/')
+    wine_source_path = join_paths(meson.project_source_root(), wine_source_path)
+  endif
+
+  wine_build_path = get_option('wine_build_path')
+  if wine_build_path != '' and not wine_build_path.startswith('/')
+    wine_build_path = join_paths(meson.project_source_root(), wine_build_path)
+  endif
+
+  wine_install_path = get_option('wine_install_path')
+  if wine_install_path != '' and not wine_install_path.startswith('/')
+    wine_install_path = join_paths(meson.project_source_root(), wine_install_path)
+  endif
+
   if cpu_family == 'x86'
     # Enable stdcall fixup on 32-bit
     link_args += [
@@ -183,9 +198,58 @@ if dxmt_crossbuild
   endif
 
   unix_install_dir = cpu_family + '-unix'
+
+  wine_build_target = []
+  wine_build_artifacts = {}
+  if wine_build_path != ''
+    if wine_source_path == ''
+      error('wine_source_path is required when wine_build_path is used')
+    endif
+
+    wine_build_artifacts = {
+      'libwinecrt0': 'wine-libwinecrt0.a',
+      'libntdll': 'wine-libntdll.a',
+      'dbghelp': 'wine-dbghelp.dll',
+      'winebuild': 'wine-winebuild',
+      'winemac': 'wine-winemac.so',
+      'ntdll_so': 'wine-ntdll.so',
+    }
+
+    wine_build_target = custom_target(
+      'wine_build',
+      output: [
+        wine_build_artifacts['libwinecrt0'],
+        wine_build_artifacts['libntdll'],
+        wine_build_artifacts['dbghelp'],
+        wine_build_artifacts['winebuild'],
+        wine_build_artifacts['winemac'],
+        wine_build_artifacts['ntdll_so'],
+      ],
+      command: [
+        find_program('scripts/build-wine.sh'),
+        wine_source_path,
+        wine_build_path,
+        windows_builtin_install_dir,
+        unix_install_dir,
+        '@OUTPUT0@',
+        '@OUTPUT1@',
+        '@OUTPUT2@',
+        '@OUTPUT3@',
+        '@OUTPUT4@',
+        '@OUTPUT5@',
+        get_option('wine_configure_args'),
+      ],
+      build_by_default: true,
+    )
+  endif
 else
   wine_builtin_dll = false
   windows_native_install_dir = ''
+  wine_source_path = ''
+  wine_build_path = ''
+  wine_install_path = ''
+  wine_build_target = []
+  wine_build_artifacts = {}
 endif
 
 native_compiler_arch = cpu_family == 'aarch64' ? 'arm64' : 'x86_64'

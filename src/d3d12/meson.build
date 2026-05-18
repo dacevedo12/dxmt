@@ -62,7 +62,7 @@ if wine_builtin_dll
 custom_target('postprocess_libd3d12',
   input : d3d12_dll,
   output: 'd3d12.dll.postproc',
-  command : [ winebuild, '--builtin', '@INPUT@' ],
+  command : [ wine_build_path != '' ? winebuild.full_path() : winebuild, '--builtin', '@INPUT@' ],
   depends : d3d12_dll,
   build_by_default : true
 )
@@ -72,7 +72,7 @@ if wine_builtin_dll
 custom_target('postprocess_libd3d12core',
   input : d3d12core_dll,
   output: 'd3d12core.dll.postproc',
-  command : [ winebuild, '--builtin', '@INPUT@' ],
+  command : [ wine_build_path != '' ? winebuild.full_path() : winebuild, '--builtin', '@INPUT@' ],
   depends : d3d12core_dll,
   build_by_default : true
 )

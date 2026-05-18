@@ -57,7 +57,10 @@ See [winehq.org - MacOS Building](https://gitlab.winehq.org/wine/wine/-/wikis/Ma
 
 You should also check the target architecture of Wine build, `--enable-archs=i386,x86_64` is a popular option when you also want x86 (32-bit programs) support in addition to x86_64.
 
-If you build Wine from source, you don't have to install it, just pass the build directory later.
+DXMT uses the `external/wine` submodule as the default Wine source tree for
+cross builds. Meson builds Wine automatically into `external/wine/build` before
+linking the Wine-facing DXMT binaries. The default Wine configure arguments are
+defined by `wine_configure_args` in [meson.options](/meson.options).
 
 ## Build DXMT
 
@@ -66,14 +69,14 @@ If you build Wine from source, you don't have to install it, just pass the build
 Build (64-bit) Windows PE+ dlls **and** 64-bit unixlib (a Mach-O library with `.so` extension by convention).
 
 ```sh
-meson setup --cross-file build-win64.txt -Dnative_llvm_path=</path/to/llvm> -Dwine_build_path=</path/to/wine/build> build --buildtype release
-meson compile -C build
+meson setup --cross-file build-win64.txt -Dnative_llvm_path=</path/to/llvm> build-builtin --buildtype release
+meson compile -C build-builtin
 ```
 
 (Optional) Build (32-bit) Windows PE dlls
 
 ```sh
-meson setup --cross-file build-win32.txt -Dwine_build_path=</path/to/wine/build> build32 --buildtype release
+meson setup --cross-file build-win32.txt build32 --buildtype release
 meson compile -C build32
 ```
 
@@ -90,8 +93,8 @@ Since this project contains code runs on macOS/Windows(Wine)/both, `clangd` may 
 Build all components as Mach-O .dylib
 
 ```sh
-meson setup -Dnative_llvm_path=</path/to/llvm> --buildtype release
-meson compile -C build
+meson setup -Dnative_llvm_path=</path/to/llvm> build-native --buildtype release
+meson compile -C build-native
 ```
 
 #### Side notes on building x86_64 target from arm64 device/environment
