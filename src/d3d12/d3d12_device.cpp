@@ -64,6 +64,19 @@ GetD3D12FormatPlaneElementSize(DXGI_FORMAT format, UINT plane,
              : format_desc.BytesPerTexel;
 }
 
+static bool
+HasD3D12TraitFootprintLayout(const DXGIFormatTraits &traits) {
+  if (!traits.planeCount || traits.classification == DXGIFormatClass::Unsupported ||
+      traits.classification == DXGIFormatClass::Mask)
+    return false;
+
+  for (UINT plane = 0; plane < traits.planeCount; ++plane) {
+    if (!traits.planes[plane].elementSize)
+      return false;
+  }
+  return true;
+}
+
 static UINT
 GetD3D12FormatBlockWidth(const MTL_DXGI_FORMAT_DESC &format_desc) {
   return (format_desc.Flag & MTL_DXGI_FORMAT_BC) ? 4 : 1;
@@ -2259,9 +2272,7 @@ private:
     const auto &traits = GetDXGIFormatTraits(desc->Format);
     const bool trait_layout_format =
         desc->Dimension != D3D12_RESOURCE_DIMENSION_BUFFER &&
-        traits.classification != DXGIFormatClass::Unsupported &&
-        traits.classification != DXGIFormatClass::Mask &&
-        traits.planeCount;
+        HasD3D12TraitFootprintLayout(traits);
 
     MTL_DXGI_FORMAT_DESC format = {};
     if (desc->Dimension != D3D12_RESOURCE_DIMENSION_BUFFER &&
