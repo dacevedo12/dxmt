@@ -610,7 +610,13 @@ CopyDescriptorRecord(DescriptorRecord &dst, const DescriptorRecord &src) {
   dst.heap_count = heap_count;
 }
 
-#ifdef __ID3D12Device6_INTERFACE_DEFINED__
+#ifdef __ID3D12Device9_INTERFACE_DEFINED__
+using DeviceComBase = ID3D12Device9;
+#elif defined(__ID3D12Device8_INTERFACE_DEFINED__)
+using DeviceComBase = ID3D12Device8;
+#elif defined(__ID3D12Device7_INTERFACE_DEFINED__)
+using DeviceComBase = ID3D12Device7;
+#elif defined(__ID3D12Device6_INTERFACE_DEFINED__)
 using DeviceComBase = ID3D12Device6;
 #elif defined(__ID3D12Device2_INTERFACE_DEFINED__)
 using DeviceComBase = ID3D12Device2;
@@ -697,6 +703,27 @@ public:
 #ifdef __ID3D12Device6_INTERFACE_DEFINED__
     if (riid == __uuidof(ID3D12Device6)) {
       *ppvObject = ref(static_cast<ID3D12Device6 *>(this));
+      return S_OK;
+    }
+#endif
+
+#ifdef __ID3D12Device7_INTERFACE_DEFINED__
+    if (riid == __uuidof(ID3D12Device7)) {
+      *ppvObject = ref(static_cast<ID3D12Device7 *>(this));
+      return S_OK;
+    }
+#endif
+
+#ifdef __ID3D12Device8_INTERFACE_DEFINED__
+    if (riid == __uuidof(ID3D12Device8)) {
+      *ppvObject = ref(static_cast<ID3D12Device8 *>(this));
+      return S_OK;
+    }
+#endif
+
+#ifdef __ID3D12Device9_INTERFACE_DEFINED__
+    if (riid == __uuidof(ID3D12Device9)) {
+      *ppvObject = ref(static_cast<ID3D12Device9 *>(this));
       return S_OK;
     }
 #endif
@@ -1181,6 +1208,7 @@ public:
 
       auto *data = static_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS3 *>(feature_data);
       std::memset(data, 0, sizeof(*data));
+      data->CastingFullyTypedFormatSupported = TRUE;
       data->CopyQueueTimestampQueriesSupported = TRUE;
       data->ViewInstancingTier = D3D12_VIEW_INSTANCING_TIER_NOT_SUPPORTED;
       return S_OK;
@@ -2216,6 +2244,135 @@ public:
   }
 #endif
 
+#ifdef __ID3D12Device7_INTERFACE_DEFINED__
+  HRESULT STDMETHODCALLTYPE AddToStateObject(
+      const D3D12_STATE_OBJECT_DESC *addition,
+      ID3D12StateObject *state_object_to_grow_from, REFIID riid,
+      void **new_state_object) override {
+    InitReturnPtr(new_state_object);
+    if (!new_state_object)
+      return E_POINTER;
+    if (!addition || !state_object_to_grow_from)
+      return WARN_E_INVALIDARG(__func__);
+    WARN("D3D12Device: state objects are unsupported");
+    return E_NOTIMPL;
+  }
+
+  HRESULT STDMETHODCALLTYPE
+  CreateProtectedResourceSession1(
+      const D3D12_PROTECTED_RESOURCE_SESSION_DESC1 *desc, REFIID riid,
+      void **session) override {
+    InitReturnPtr(session);
+    if (!session)
+      return E_POINTER;
+    if (!desc || desc->NodeMask > 1)
+      return WARN_E_INVALIDARG(__func__);
+    WARN("D3D12Device: protected resource sessions are unsupported");
+    return E_NOTIMPL;
+  }
+#endif
+
+#ifdef __ID3D12Device8_INTERFACE_DEFINED__
+#ifdef WIDL_EXPLICIT_AGGREGATE_RETURNS
+  D3D12_RESOURCE_ALLOCATION_INFO *STDMETHODCALLTYPE
+  GetResourceAllocationInfo2(
+      D3D12_RESOURCE_ALLOCATION_INFO *__ret, UINT visible_mask,
+      UINT resource_descs_count, const D3D12_RESOURCE_DESC1 *resource_descs,
+      D3D12_RESOURCE_ALLOCATION_INFO1 *resource_allocation_info1) override {
+    *__ret = GetResourceAllocationInfo2Impl(visible_mask, resource_descs_count,
+                                            resource_descs,
+                                            resource_allocation_info1);
+    return __ret;
+  }
+#else
+  D3D12_RESOURCE_ALLOCATION_INFO STDMETHODCALLTYPE
+  GetResourceAllocationInfo2(
+      UINT visible_mask, UINT resource_descs_count,
+      const D3D12_RESOURCE_DESC1 *resource_descs,
+      D3D12_RESOURCE_ALLOCATION_INFO1 *resource_allocation_info1) override {
+    return GetResourceAllocationInfo2Impl(visible_mask, resource_descs_count,
+                                          resource_descs,
+                                          resource_allocation_info1);
+  }
+#endif
+
+  HRESULT STDMETHODCALLTYPE CreateCommittedResource2(
+      const D3D12_HEAP_PROPERTIES *heap_properties,
+      D3D12_HEAP_FLAGS heap_flags, const D3D12_RESOURCE_DESC1 *desc,
+      D3D12_RESOURCE_STATES initial_resource_state,
+      const D3D12_CLEAR_VALUE *optimized_clear_value,
+      ID3D12ProtectedResourceSession *protected_session,
+      REFIID riid_resource, void **resource) override {
+    const auto downgraded_desc = ToResourceDesc(desc);
+    return CreateCommittedResource1(heap_properties, heap_flags,
+                                    desc ? &downgraded_desc : nullptr,
+                                    initial_resource_state,
+                                    optimized_clear_value,
+                                    protected_session, riid_resource,
+                                    resource);
+  }
+
+  HRESULT STDMETHODCALLTYPE CreatePlacedResource1(
+      ID3D12Heap *heap, UINT64 heap_offset, const D3D12_RESOURCE_DESC1 *desc,
+      D3D12_RESOURCE_STATES initial_state,
+      const D3D12_CLEAR_VALUE *optimized_clear_value, REFIID riid,
+      void **resource) override {
+    const auto downgraded_desc = ToResourceDesc(desc);
+    return CreatePlacedResource(heap, heap_offset,
+                                desc ? &downgraded_desc : nullptr,
+                                initial_state, optimized_clear_value, riid,
+                                resource);
+  }
+
+  void STDMETHODCALLTYPE CreateSamplerFeedbackUnorderedAccessView(
+      ID3D12Resource *targeted_resource, ID3D12Resource *feedback_resource,
+      D3D12_CPU_DESCRIPTOR_HANDLE dst_descriptor) override {
+    WARN("D3D12Device: sampler feedback UAVs are unsupported");
+    if (auto *record = GetDescriptorRecordForWrite(
+            dst_descriptor, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+            "sampler feedback UAV"))
+      ResetDescriptorRecord(*record);
+  }
+
+  void STDMETHODCALLTYPE GetCopyableFootprints1(
+      const D3D12_RESOURCE_DESC1 *resource_desc, UINT first_subresource,
+      UINT subresources_count, UINT64 base_offset,
+      D3D12_PLACED_SUBRESOURCE_FOOTPRINT *layouts, UINT *rows_count,
+      UINT64 *row_size_in_bytes, UINT64 *total_bytes) override {
+    const auto downgraded_desc = ToResourceDesc(resource_desc);
+    GetCopyableFootprintsImpl(resource_desc ? &downgraded_desc : nullptr,
+                              first_subresource,
+                              subresources_count, base_offset, layouts,
+                              rows_count, row_size_in_bytes, total_bytes);
+  }
+#endif
+
+#ifdef __ID3D12Device9_INTERFACE_DEFINED__
+  HRESULT STDMETHODCALLTYPE CreateShaderCacheSession(
+      const D3D12_SHADER_CACHE_SESSION_DESC *desc, REFIID riid,
+      void **session) override {
+    InitReturnPtr(session);
+    if (!session)
+      return E_POINTER;
+    if (!desc)
+      return WARN_E_INVALIDARG(__func__);
+    WARN("D3D12Device: shader cache sessions are unsupported");
+    return E_NOTIMPL;
+  }
+
+  HRESULT STDMETHODCALLTYPE
+  ShaderCacheControl(D3D12_SHADER_CACHE_KIND_FLAGS kinds,
+                     D3D12_SHADER_CACHE_CONTROL_FLAGS control) override {
+    return S_OK;
+  }
+
+  HRESULT STDMETHODCALLTYPE CreateCommandQueue1(
+      const D3D12_COMMAND_QUEUE_DESC *desc, REFIID creator_id, REFIID riid,
+      void **command_queue) override {
+    return CreateCommandQueue(desc, riid, command_queue);
+  }
+#endif
+
 #ifdef WIDL_EXPLICIT_AGGREGATE_RETURNS
   LUID *STDMETHODCALLTYPE GetAdapterLuid(LUID *__ret) override {
     *__ret = adapter_luid_;
@@ -2274,6 +2431,46 @@ private:
 
     return info;
   }
+
+#ifdef __ID3D12Device8_INTERFACE_DEFINED__
+  static D3D12_RESOURCE_DESC
+  ToResourceDesc(const D3D12_RESOURCE_DESC1 *desc) {
+    D3D12_RESOURCE_DESC downgraded = {};
+    if (!desc)
+      return downgraded;
+    downgraded.Dimension = desc->Dimension;
+    downgraded.Alignment = desc->Alignment;
+    downgraded.Width = desc->Width;
+    downgraded.Height = desc->Height;
+    downgraded.DepthOrArraySize = desc->DepthOrArraySize;
+    downgraded.MipLevels = desc->MipLevels;
+    downgraded.Format = desc->Format;
+    downgraded.SampleDesc = desc->SampleDesc;
+    downgraded.Layout = desc->Layout;
+    downgraded.Flags = desc->Flags;
+    return downgraded;
+  }
+
+  D3D12_RESOURCE_ALLOCATION_INFO
+  GetResourceAllocationInfo2Impl(
+      UINT visible_mask, UINT resource_desc_count,
+      const D3D12_RESOURCE_DESC1 *resource_descs,
+      D3D12_RESOURCE_ALLOCATION_INFO1 *resource_info) const {
+    if (!resource_desc_count || !resource_descs)
+      return GetResourceAllocationInfo1Impl(visible_mask, resource_desc_count,
+                                            nullptr, resource_info);
+
+    std::vector<D3D12_RESOURCE_DESC> downgraded_descs;
+    downgraded_descs.reserve(resource_desc_count);
+    for (UINT i = 0; i < resource_desc_count; ++i)
+      downgraded_descs.push_back(ToResourceDesc(&resource_descs[i]));
+
+    return GetResourceAllocationInfo1Impl(
+        visible_mask, resource_desc_count,
+        downgraded_descs.empty() ? nullptr : downgraded_descs.data(),
+        resource_info);
+  }
+#endif
 
 #ifdef __ID3D12Device4_INTERFACE_DEFINED__
   D3D12_RESOURCE_ALLOCATION_INFO

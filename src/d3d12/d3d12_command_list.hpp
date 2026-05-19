@@ -2,6 +2,7 @@
 
 #include "d3d12_command_allocator.hpp"
 #include "d3d12_descriptor_heap.hpp"
+#include "d3d12_interfaces.hpp"
 #include "d3d12_pipeline.hpp"
 #include "com/com_pointer.hpp"
 #include <d3d12.h>
@@ -233,6 +234,27 @@ struct ExecuteIndirectRecord {
   UINT64 count_buffer_offset = 0;
 };
 
+struct TemporalUpscaleRecord {
+  UINT input_content_width = 0;
+  UINT input_content_height = 0;
+  UINT motion_vector_width = 0;
+  UINT motion_vector_height = 0;
+  BOOL auto_exposure = FALSE;
+  BOOL in_reset = FALSE;
+  BOOL depth_reversed = FALSE;
+  BOOL motion_vector_in_display_res = FALSE;
+  Com<ID3D12Resource> color;
+  Com<ID3D12Resource> depth;
+  Com<ID3D12Resource> motion_vector;
+  Com<ID3D12Resource> output;
+  FLOAT motion_vector_scale_x = 1.0f;
+  FLOAT motion_vector_scale_y = 1.0f;
+  FLOAT pre_exposure = 0.0f;
+  Com<ID3D12Resource> exposure_texture;
+  FLOAT jitter_offset_x = 0.0f;
+  FLOAT jitter_offset_y = 0.0f;
+};
+
 using CommandRecordPayload = std::variant<
     DrawInstancedRecord, DrawIndexedInstancedRecord, DispatchRecord,
     PipelineStateRecord, CopyBufferRegionRecord, CopyTextureRegionRecord,
@@ -245,7 +267,7 @@ using CommandRecordPayload = std::variant<
     RootConstantsRecord, RootDescriptorRecord, BeginQueryRecord,
     EndQueryRecord, ResolveQueryDataRecord, PredicationRecord,
     WriteBufferImmediateRecord,
-    ExecuteIndirectRecord>;
+    ExecuteIndirectRecord, TemporalUpscaleRecord>;
 
 struct CommandRecord {
   CommandRecordPayload payload;

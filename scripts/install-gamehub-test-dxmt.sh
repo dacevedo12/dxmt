@@ -21,6 +21,8 @@ runtime_files=(
   "x86_64-windows/d3d12core.dll"
   "x86_64-windows/d3d11.dll"
   "x86_64-windows/d3d10core.dll"
+  "x86_64-windows/nvapi64.dll"
+  "x86_64-windows/nvngx.dll"
   "x86_64-unix/winemetal.so"
 )
 
@@ -72,7 +74,7 @@ install_to_stage() {
   meson compile -C "${BUILD_DIR}"
 
   log "installing runtime to staging root: ${STAGE_DIR}"
-  DESTDIR="${STAGE_DIR}" meson install -C "${BUILD_DIR}" --tags runtime
+  DESTDIR="${STAGE_DIR}" meson install -C "${BUILD_DIR}" --tags runtime,nvext
 }
 
 resolve_stage_prefix() {
@@ -139,7 +141,7 @@ manifest = {
         "${COMPONENT_PATH}/wine/x86_64-windows",
     ],
     "environment_template": {
-        "WINEDLLOVERRIDES": "d3d10core,d3d11,d3d12,dxgi,winemetal=n,b",
+        "WINEDLLOVERRIDES": "d3d10core,d3d11,d3d12,dxgi,winemetal,nvapi64,nvngx=n,b",
         "WINEDLLPATH": "${COMPONENT_PATH}/wine",
         "DYLD_FALLBACK_LIBRARY_PATH": "${COMPONENT_PATH}/wine/x86_64-unix:${WINE_INSTALL_PATH}/lib:${WINE_INSTALL_PATH}/lib/wine/x86_64-unix",
     },

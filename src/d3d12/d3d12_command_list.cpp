@@ -136,9 +136,19 @@ using GraphicsCommandListComBase = ID3D12GraphicsCommandList1;
 using GraphicsCommandListComBase = ID3D12GraphicsCommandList;
 #endif
 
-class GraphicsCommandListImpl final : public ComObjectWithInitialRef<GraphicsCommandListComBase>,
-                                      public GraphicsCommandList {
+class GraphicsCommandListImpl final
+    : public ComObjectWithInitialRef<GraphicsCommandListComBase>,
+      public GraphicsCommandList,
+      public IMTLD3D12GraphicsCommandListExt {
 public:
+  ULONG STDMETHODCALLTYPE AddRef() override {
+    return ComObjectWithInitialRef<GraphicsCommandListComBase>::AddRef();
+  }
+
+  ULONG STDMETHODCALLTYPE Release() override {
+    return ComObjectWithInitialRef<GraphicsCommandListComBase>::Release();
+  }
+
   ~GraphicsCommandListImpl() override {
     if (allocator_ && !closed_)
       allocator_->EndCommandListRecording(this);
@@ -210,6 +220,11 @@ public:
       return S_OK;
     }
 #endif
+
+    if (riid == __uuidof(IMTLD3D12GraphicsCommandListExt)) {
+      *ppvObject = ref(static_cast<IMTLD3D12GraphicsCommandListExt *>(this));
+      return S_OK;
+    }
 
     if (logQueryInterfaceError(__uuidof(ID3D12GraphicsCommandList), riid))
       WARN("D3D12GraphicsCommandList: unknown interface query ", str::format(riid));
@@ -306,6 +321,53 @@ public:
           SubmittedCommandAllocatorUse{allocator_, allocator_->MarkCommandListSubmitted()});
     }
     return S_OK;
+  }
+
+  void STDMETHODCALLTYPE
+  TemporalUpscale(const MTL_TEMPORAL_UPSCALE_D3D12_DESC *desc) override {
+    if (!desc || !desc->Color || !desc->Depth || !desc->MotionVector ||
+        !desc->Output)
+      return;
+
+    TemporalUpscaleRecord record = {};
+    record.input_content_width = desc->InputContentWidth;
+    record.input_content_height = desc->InputContentHeight;
+    const D3D12_RESOURCE_DESC motion_desc = desc->MotionVector->GetDesc();
+    record.motion_vector_width = static_cast<UINT>(motion_desc.Width);
+    record.motion_vector_height = motion_desc.Height;
+    record.auto_exposure = desc->AutoExposure;
+    record.in_reset = desc->InReset;
+    record.depth_reversed = desc->DepthReversed;
+    record.motion_vector_in_display_res = desc->MotionVectorInDisplayRes;
+    record.color = desc->Color;
+    record.depth = desc->Depth;
+    record.motion_vector = desc->MotionVector;
+    record.output = desc->Output;
+    record.motion_vector_scale_x = desc->MotionVectorScaleX;
+    record.motion_vector_scale_y = desc->MotionVectorScaleY;
+    record.pre_exposure = desc->PreExposure;
+    record.exposure_texture = desc->ExposureTexture;
+    record.jitter_offset_x = desc->JitterOffsetX;
+    record.jitter_offset_y = desc->JitterOffsetY;
+    AddRecord(std::move(record));
+  }
+
+  HRESULT STDMETHODCALLTYPE CheckFeatureSupport(MTL_D3D12_FEATURE feature,
+                                                void *feature_support_data,
+                                                UINT feature_support_data_size) override {
+    if (!feature_support_data)
+      return E_INVALIDARG;
+
+    switch (feature) {
+    case MTL_D3D12_FEATURE_METALFX_TEMPORAL_SCALER:
+      if (feature_support_data_size != sizeof(BOOL))
+        return E_INVALIDARG;
+      *reinterpret_cast<BOOL *>(feature_support_data) =
+          device_->GetMTLDevice().supportsFXTemporalScaler();
+      return S_OK;
+    }
+
+    return E_INVALIDARG;
   }
 
   void STDMETHODCALLTYPE ClearState(ID3D12PipelineState *pipeline_state) override {
