@@ -2390,6 +2390,20 @@ Converter::LoadAtomicOpAddress(const AtomicBufferResourceHandle &Handle, const S
   return ir.CreateLShr(Address1D, 2);
 }
 
+static bool
+IsTextureBufferUavAtomicTarget(const io_binding_map &resources,
+                               const std::variant<AtomicDstOperandUAV,
+                                                  AtomicOperandTGSM> &dst) {
+  auto *uav = std::get_if<AtomicDstOperandUAV>(&dst);
+  if (!uav)
+    return false;
+
+  auto texture = resources.uav_range_map.find(uav->range_id);
+  return texture != resources.uav_range_map.end() &&
+         texture->second.texture_info.resource_kind_logical ==
+             llvm::air::Texture::texture_buffer;
+}
+
 void
 Converter::operator()(const InstAtomicBinOp &atomic) {
   using namespace llvm;
@@ -2427,19 +2441,11 @@ Converter::operator()(const InstAtomicBinOp &atomic) {
     break;
   }
 
-  auto Buf = LoadBuffer(atomic.dst);
+  if (IsTextureBufferUavAtomicTarget(ctx.resource, atomic.dst)) {
+    auto Tex = LoadTexture(atomic.dst);
+    if (!Tex)
+      return;
 
-  if (Buf) {
-    auto IntPtrOffset = LoadAtomicOpAddress(Buf.getValue(), atomic.dst_address);
-    auto Ptr = ir.CreateGEP(ir.getInt32Ty(), Buf->Pointer, {IntPtrOffset});
-    auto Value = air.CreateAtomicRMW(Op, Ptr, LoadOperand(atomic.src, kMaskComponentX));
-    StoreOperand(atomic.dst_original, Value);
-    return;
-  }
-
-  auto Tex = LoadTexture(atomic.dst);
-
-  if (Tex) {
     llvm::Value *Address = nullptr;
     llvm::Value *ArrayIndex = nullptr;
 
@@ -2475,6 +2481,16 @@ Converter::operator()(const InstAtomicBinOp &atomic) {
     StoreOperand(atomic.dst_original, Value);
     return;
   }
+
+  auto Buf = LoadBuffer(atomic.dst);
+
+  if (Buf) {
+    auto IntPtrOffset = LoadAtomicOpAddress(Buf.getValue(), atomic.dst_address);
+    auto Ptr = ir.CreateGEP(ir.getInt32Ty(), Buf->Pointer, {IntPtrOffset});
+    auto Value = air.CreateAtomicRMW(Op, Ptr, LoadOperand(atomic.src, kMaskComponentX));
+    StoreOperand(atomic.dst_original, Value);
+    return;
+  }
 }
 
 void
@@ -2482,22 +2498,11 @@ Converter::operator()(const InstAtomicImmCmpExchange &atomic) {
   using namespace llvm;
   using namespace llvm::air;
 
-  auto Buf = LoadBuffer(atomic.dst_resource);
+  if (IsTextureBufferUavAtomicTarget(ctx.resource, atomic.dst_resource)) {
+    auto Tex = LoadTexture(atomic.dst_resource);
+    if (!Tex)
+      return;
 
-  if (Buf) {
-    auto IntPtrOffset = LoadAtomicOpAddress(Buf.getValue(), atomic.dst_address);
-    auto Ptr = ir.CreateGEP(ir.getInt32Ty(), Buf->Pointer, {IntPtrOffset});
-    auto Value = ir.CreateAtomicCmpXchg(
-        Ptr, LoadOperand(atomic.src0, kMaskComponentX), LoadOperand(atomic.src1, kMaskComponentX), {},
-        AtomicOrdering::Monotonic, AtomicOrdering::Monotonic
-    );
-    StoreOperand(atomic.dst, ir.CreateExtractValue(Value, 0));
-    return;
-  }
-
-  auto Tex = LoadTexture(atomic.dst_resource);
-
-  if (Tex) {
     llvm::Value *Address = nullptr;
     llvm::Value *ArrayIndex = nullptr;
 
@@ -2533,6 +2538,19 @@ Converter::operator()(const InstAtomicImmCmpExchange &atomic) {
         ArrayIndex
     );
     StoreOperand(atomic.dst, Value);
+    return;
+  }
+
+  auto Buf = LoadBuffer(atomic.dst_resource);
+
+  if (Buf) {
+    auto IntPtrOffset = LoadAtomicOpAddress(Buf.getValue(), atomic.dst_address);
+    auto Ptr = ir.CreateGEP(ir.getInt32Ty(), Buf->Pointer, {IntPtrOffset});
+    auto Value = ir.CreateAtomicCmpXchg(
+        Ptr, LoadOperand(atomic.src0, kMaskComponentX), LoadOperand(atomic.src1, kMaskComponentX), {},
+        AtomicOrdering::Monotonic, AtomicOrdering::Monotonic
+    );
+    StoreOperand(atomic.dst, ir.CreateExtractValue(Value, 0));
     return;
   }
 }
