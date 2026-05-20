@@ -17,6 +17,17 @@
 namespace dxmt::d3d12 {
 namespace {
 
+static void
+RunCompletionCallbacksAsync(std::vector<std::function<void()>> callbacks) {
+  if (callbacks.empty())
+    return;
+
+  dxmt::thread([callbacks = std::move(callbacks)]() mutable {
+    for (auto &callback : callbacks)
+      callback();
+  }).detach();
+}
+
 class FenceImpl final : public ComObjectWithInitialRef<ID3D12Fence>, public Fence {
 public:
   FenceImpl(IMTLD3D12Device *device, UINT64 initial_value, D3D12_FENCE_FLAGS flags)
@@ -162,8 +173,7 @@ public:
     }
     for (HANDLE event : events_to_signal)
       SetEvent(event);
-    for (auto &callback : callbacks_to_run)
-      callback();
+    RunCompletionCallbacksAsync(std::move(callbacks_to_run));
   }
 
   void SignalFromQueue(UINT64 value) override {
