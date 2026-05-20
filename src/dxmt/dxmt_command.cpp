@@ -468,7 +468,7 @@ DepthStencilBlitContext::copyFromBuffer(
 
   auto &stencil = pass_info.stencil;
   stencil.attachment = ctx_.access<PipelineStage::Pixel>(depth_stencil, view, ResourceAccess::Write);
-  stencil.depth_plane = 1;
+  stencil.depth_plane = 0;
   stencil.level = level;
   stencil.slice = slice;
   stencil.load_action = WMTLoadActionLoad;
@@ -676,7 +676,7 @@ DepthStencilBlitContext::copyPlaneFromBuffer(
     auto &stencil = pass_info.stencil;
     stencil.attachment =
         ctx_.access<PipelineStage::Pixel>(dst, view, ResourceAccess::Write);
-    stencil.depth_plane = 1;
+    stencil.depth_plane = 0;
     stencil.level = level;
     stencil.slice = slice;
     stencil.load_action = WMTLoadActionLoad;

@@ -133,7 +133,7 @@ ResourceInitializer::initDepthStencilWithZero(
       info->stencil.store_action = WMTStoreActionStore;
       info->stencil.slice = slice;
       info->stencil.level = level;
-      info->stencil.depth_plane = 1;
+      info->stencil.depth_plane = 0;
     }
 
   } while (0);

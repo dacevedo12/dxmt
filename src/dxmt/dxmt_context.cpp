@@ -1669,7 +1669,7 @@ ArgumentEncodingContext::clearColor(Rc<Texture> &&texture, uint64_t viewId, unsi
   encoder_info->level = 0;
   encoder_info->slice = 0;
   encoder_info->depth_plane = 0;
-  encoder_info->stencil_depth_plane = 1;
+  encoder_info->stencil_depth_plane = 0;
 
   currentFrameStatistics().clear_pass_count++;
 
@@ -1726,6 +1726,7 @@ ArgumentEncodingContext::clearDepthStencil(
   encoder_info->level = 0;
   encoder_info->slice = 0;
   encoder_info->depth_plane = 0;
+  encoder_info->stencil_depth_plane = 0;
 
   currentFrameStatistics().clear_pass_count++;
   

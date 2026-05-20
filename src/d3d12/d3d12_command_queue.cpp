@@ -5668,7 +5668,7 @@ private:
         TextureViewKey view = attachments.depth_stencil->view;
         stencil.level = view.mip_start;
         stencil.slice = view.array_start;
-        stencil.depth_plane = 1;
+        stencil.depth_plane = 0;
         stencil.load_action = WMTLoadActionLoad;
         stencil.store_action = WMTStoreActionStore;
       }
