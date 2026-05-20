@@ -57,8 +57,11 @@ public:
 
   HRESULT STDMETHODCALLTYPE Reset() override {
     std::lock_guard lock(mutex_);
-    if (recording_list_ || pending_submission_count_)
+    if (recording_list_)
       return E_FAIL;
+    // GPU-side allocator lifetime is the application's fence responsibility.
+    // DXMT copies command records on ExecuteCommandLists, so a reset does not
+    // invalidate queued submissions that still reference this allocator.
     return S_OK;
   }
 
