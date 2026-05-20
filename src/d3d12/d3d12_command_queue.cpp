@@ -3774,6 +3774,7 @@ private:
       auto &set_pso = enc.encodeRenderCommand<wmtcmd_render_setpso>();
       set_pso.type = WMTRenderCommandSetPSO;
       set_pso.pso = metal_pso;
+      enc.currentRenderEncoder()->last_pso = metal_pso;
       if (depth_stencil) {
         auto &cmd = enc.encodeRenderCommand<wmtcmd_render_setdsso>();
         cmd.type = WMTRenderCommandSetDSSO;
@@ -3952,6 +3953,7 @@ private:
       auto &set_pso = enc.encodeRenderCommand<wmtcmd_render_setpso>();
       set_pso.type = WMTRenderCommandSetPSO;
       set_pso.pso = metal_pso;
+      enc.currentRenderEncoder()->last_pso = metal_pso;
       if (depth_stencil) {
         auto &cmd = enc.encodeRenderCommand<wmtcmd_render_setdsso>();
         cmd.type = WMTRenderCommandSetDSSO;
@@ -6337,6 +6339,7 @@ private:
       auto &set_pso = enc.encodeRenderCommand<wmtcmd_render_setpso>();
       set_pso.type = WMTRenderCommandSetPSO;
       set_pso.pso = metal_pso;
+      enc.currentRenderEncoder()->last_pso = metal_pso;
       if (depth_stencil) {
         auto &cmd = enc.encodeRenderCommand<wmtcmd_render_setdsso>();
         cmd.type = WMTRenderCommandSetDSSO;
@@ -6518,6 +6521,7 @@ private:
       auto &set_pso = enc.encodeRenderCommand<wmtcmd_render_setpso>();
       set_pso.type = WMTRenderCommandSetPSO;
       set_pso.pso = metal_pso;
+      enc.currentRenderEncoder()->last_pso = metal_pso;
       if (depth_stencil) {
         auto &cmd = enc.encodeRenderCommand<wmtcmd_render_setdsso>();
         cmd.type = WMTRenderCommandSetDSSO;
