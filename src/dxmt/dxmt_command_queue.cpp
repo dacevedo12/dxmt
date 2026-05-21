@@ -92,23 +92,34 @@ CommandQueue::~CommandQueue() {
 
 void
 CommandQueue::CommitCurrentChunk() {
+  auto& statistics = CurrentFrameStatistics();
+#if ASYNC_ENCODING
+  auto t0 = clock::now();
+  for (;;) {
+    auto ongoing = chunk_ongoing.load(std::memory_order_acquire);
+    while (ongoing >= kCommandChunkCount - 1) {
+      chunk_ongoing.wait(ongoing, std::memory_order_acquire);
+      ongoing = chunk_ongoing.load(std::memory_order_acquire);
+    }
+    if (chunk_ongoing.compare_exchange_weak(
+            ongoing, ongoing + 1, std::memory_order_acq_rel,
+            std::memory_order_acquire))
+      break;
+  }
+  auto t1 = clock::now();
+  statistics.commit_interval += (t1 - t0);
+#endif
+
   auto chunk_id = ready_for_encode.load(std::memory_order_relaxed);
   auto &chunk = chunks[chunk_id % kCommandChunkCount];
   chunk.chunk_id = chunk_id;
   chunk.chunk_event_id = GetNextEventSeqId();
   chunk.frame_ = frame_count;
   chunk.resource_initializer_event_id = initializer.flushToWait();
-  auto& statistics = CurrentFrameStatistics();
   statistics.command_buffer_count++;
 #if ASYNC_ENCODING
   ready_for_encode.fetch_add(1, std::memory_order_release);
   ready_for_encode.notify_one();
-
-  auto t0 = clock::now();
-  chunk_ongoing.wait(kCommandChunkCount - 1, std::memory_order_acquire);
-  chunk_ongoing.fetch_add(1, std::memory_order_relaxed);
-  auto t1 = clock::now();
-  statistics.commit_interval += (t1 - t0);
 
 #else
   ready_for_encode.fetch_add(1, std::memory_order_relaxed);
