@@ -3159,17 +3159,21 @@ private:
 
     const UINT first = all_subresources ? 0 : transition.Subresource;
     const UINT count = all_subresources ? subresource_count : 1;
+    const bool begin_only =
+        barrier.barrier.Flags & D3D12_RESOURCE_BARRIER_FLAG_BEGIN_ONLY;
     for (UINT i = 0; i < count; i++) {
       const UINT subresource = first + i;
       const auto current_state = states[subresource];
-      if (current_state != transition.StateBefore &&
-          !IsImplicitPromotionCompatible(current_state,
-                                         transition.StateBefore)) {
-        WARN("D3D12CommandQueue: transition barrier state mismatch subresource=",
-             subresource, " expected=", uint32_t(current_state),
-             " before=", uint32_t(transition.StateBefore));
+      if (!begin_only) {
+        if (current_state != transition.StateBefore &&
+            !IsImplicitPromotionCompatible(current_state,
+                                           transition.StateBefore)) {
+          WARN("D3D12CommandQueue: transition barrier state mismatch subresource=",
+               subresource, " expected=", uint32_t(current_state),
+               " before=", uint32_t(transition.StateBefore));
+        }
+        states[subresource] = transition.StateAfter;
       }
-      states[subresource] = transition.StateAfter;
     }
 
     const int before_access = ResourceAccessForState(transition.StateBefore);
@@ -6700,7 +6704,8 @@ private:
   }
 
   TextureViewKey CreateResolveView(Resource &resource, UINT subresource,
-                                   WMTPixelFormat format) {
+                                   WMTPixelFormat format,
+                                   WMTTextureUsage intended_usage) {
     auto *texture = resource.GetTexture(GetSubresourcePlane(resource, subresource));
     if (!texture)
       return {};
@@ -6712,7 +6717,7 @@ private:
     view.miplevelCount = 1;
     view.firstArraySlice = GetArraySlice(resource, subresource);
     view.arraySize = 1;
-    view.intendedUsage = WMTTextureUsageRenderTarget;
+    view.intendedUsage = intended_usage;
     return texture->createView(view);
   }
 
@@ -6844,8 +6849,10 @@ private:
                                 resolve_size))
       return;
 
-    auto src_view = CreateResolveView(*src, record.src_subresource, format);
-    auto dst_view = CreateResolveView(*dst, record.dst_subresource, format);
+    auto src_view = CreateResolveView(*src, record.src_subresource, format,
+                                      WMTTextureUsageRenderTarget);
+    auto dst_view = CreateResolveView(*dst, record.dst_subresource, format,
+                                      WMTTextureUsageShaderWrite);
     Rc<Texture> src_texture = src->GetTexture();
     Rc<Texture> dst_texture = dst->GetTexture();
     const bool fast_path =
