@@ -2526,6 +2526,9 @@ ArgumentEncodingContext::flushCommands(WMT::CommandBuffer cmdbuf, uint64_t seqId
         info.render_target_array_length = data->array_length;
         info.default_raster_sample_count = data->sample_count;
         NormalizeRenderPassInfo(info);
+        if (queue_.apitraceEnabled()) {
+          dxmt::apitrace::set_current_d3d_sequence(seqId);
+        }
         auto encoder = cmdbuf.renderCommandEncoder(info);
         encoder.setLabel(WMT::String::string("ClearPass", WMTUTF8StringEncoding));
         data->fence_wait.forEach([&](auto id) { encoder.waitForFence(fence_pool_[id], WMTRenderStageFragment); });
@@ -2573,6 +2576,9 @@ ArgumentEncodingContext::flushCommands(WMT::CommandBuffer cmdbuf, uint64_t seqId
         }
 
         NormalizeRenderPassInfo(info);
+        if (queue_.apitraceEnabled()) {
+          dxmt::apitrace::set_current_d3d_sequence(seqId);
+        }
         auto encoder = cmdbuf.renderCommandEncoder(info);
         encoder.setLabel(WMT::String::string("ResolvePass", WMTUTF8StringEncoding));
         data->fence_wait.forEach([&](auto id) { encoder.waitForFence(fence_pool_[id], WMTRenderStageFragment); });
