@@ -14,10 +14,12 @@ llvm_ld_flags_darwin = [
   '-lm', '-lz', '-lcurses', '-lxml2'
 ]
 
-if native_llvm_path.startswith('/usr/local/opt')
+if native_llvm_path.startswith('/usr/local/opt') or native_llvm_path.startswith('/opt/homebrew/opt')
+  llvm_homebrew_prefix = native_llvm_path.startswith('/opt/homebrew/opt') ? '/opt/homebrew/opt' : '/usr/local/opt'
   llvm_ld_flags_darwin = [
     llvm_ld_flags_darwin,
-    '/usr/local/opt/zstd/lib/libzstd.a', '/usr/local/opt/llvm@15/lib/libunwind.a'
+    join_paths(llvm_homebrew_prefix, 'zstd/lib/libzstd.a'),
+    join_paths(native_llvm_path, 'lib/libunwind.a')
   ]
 endif
 

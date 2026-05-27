@@ -139,7 +139,8 @@ private:
   std::atomic_uint64_t chunk_ongoing = 0;
   CpuFence cpu_coherent;
   CpuFence frame_latency_fence_;
-  std::atomic_bool stopped;
+  std::atomic_bool stopped = false;
+  const bool apitrace_enabled_;
 
   std::array<CommandChunk, kCommandChunkCount> chunks;
   uint64_t encoder_seq = 1;
@@ -214,6 +215,11 @@ public:
 
   obj_handle_t GetSharedEventListener() {
     return shared_event_listener;
+  }
+
+  bool
+  apitraceEnabled() const {
+    return apitrace_enabled_;
   }
 
   /**

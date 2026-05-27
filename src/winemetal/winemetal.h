@@ -87,6 +87,16 @@ WINEMETAL_API obj_handle_t NSAutoreleasePool_alloc_init();
 
 WINEMETAL_API obj_handle_t MTLCommandQueue_commandBuffer(obj_handle_t queue);
 
+WINEMETAL_API void WMTApitraceSessionEnsureOpen(void);
+
+WINEMETAL_API void WMTApitraceSessionClose(void);
+
+WINEMETAL_API void WMTApitraceSetCurrentD3DSequence(uint64_t d3d_sequence);
+
+WINEMETAL_API void WMTApitraceCommandBufferBegin(obj_handle_t command_buffer, uint64_t frame_id);
+
+WINEMETAL_API void WMTApitraceCommandBufferCommit(obj_handle_t command_buffer);
+
 WINEMETAL_API void MTLCommandBuffer_commit(obj_handle_t cmdbuf);
 
 WINEMETAL_API void MTLCommandBuffer_waitUntilCompleted(obj_handle_t cmdbuf);
@@ -1525,6 +1535,13 @@ WINEMETAL_API void MTLCommandBuffer_presentDrawable(obj_handle_t cmdbuf, obj_han
 
 WINEMETAL_API void
 MTLCommandBuffer_presentDrawableAfterMinimumDuration(obj_handle_t cmdbuf, obj_handle_t drawable, double after);
+
+WINEMETAL_API void WMTApitracePresentDrawable(
+    obj_handle_t command_buffer,
+    obj_handle_t drawable,
+    uint64_t frame_index,
+    uint32_t sync_interval,
+    uint32_t flags);
 
 enum WMTGPUFamily {
   WMTGPUFamilyApple1 = 1001,

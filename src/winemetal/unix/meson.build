@@ -28,11 +28,18 @@ if wine_build_path != ''
   winemetal_unix_link_depends += [winemac_so, ntdll_so]
 endif
 
+winemetal_unix_deps = [ airconv_dep_darwin ] + apitrace_metal_native_deps
+winemetal_unix_include_dirs = [ dxmt_include_path ] + apitrace_metal_include_path
+winemetal_unix_c_args = ['-ObjC']
+if dxmt_apitrace_metal_enabled
+  winemetal_unix_c_args += ['-DDXMT_APITRACE_METAL=1']
+endif
+
 shared_library('winemetal', winemetal_unix_src,
   name_prefix         : '',
-  dependencies        : [ airconv_dep_darwin ],
-  include_directories : dxmt_include_path,
-  c_args              : ['-ObjC'],
+  dependencies        : winemetal_unix_deps,
+  include_directories : winemetal_unix_include_dirs,
+  c_args              : winemetal_unix_c_args,
   link_args           : winemetal_unix_ld_args,
   link_depends        : winemetal_unix_link_depends,
   native              : true,

@@ -19,13 +19,8 @@ namespace {
 
 static void
 RunCompletionCallbacksAsync(std::vector<std::function<void()>> callbacks) {
-  if (callbacks.empty())
-    return;
-
-  dxmt::thread([callbacks = std::move(callbacks)]() mutable {
-    for (auto &callback : callbacks)
-      callback();
-  }).detach();
+  for (auto &callback : callbacks)
+    callback();
 }
 
 class FenceImpl final : public ComObjectWithInitialRef<ID3D12Fence>, public Fence {
@@ -46,11 +41,11 @@ public:
       for (const auto &pending : pending_events_)
         events_to_signal.push_back(pending.event);
       pending_events_.clear();
-      for (auto &pending : pending_callbacks_)
+      for (auto &pending : pending_callbacks_) {
         callbacks_to_run.push_back(std::move(pending.callback));
+      }
       pending_callbacks_.clear();
     }
-    event_.signalValue(UINT64_MAX);
     for (HANDLE event : events_to_signal)
       SetEvent(event);
     for (auto &callback : callbacks_to_run)
@@ -115,7 +110,7 @@ public:
           if (GetCompletedValueLocked() >= value)
             return S_OK;
         }
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        dxmt::this_thread::yield();
       }
     }
 
@@ -171,6 +166,7 @@ public:
       has_manual_completed_value_ = true;
       collectCompletedEventsLocked(events_to_signal, callbacks_to_run);
     }
+    event_.signalValue(value);
     for (HANDLE event : events_to_signal)
       SetEvent(event);
     RunCompletionCallbacksAsync(std::move(callbacks_to_run));
@@ -181,42 +177,20 @@ public:
   }
 
   void AddCompletionCallback(UINT64 value, std::function<void()> callback) override {
-    auto fired = std::make_shared<std::atomic_bool>(false);
-    auto run_once = [fired, callback = std::move(callback)]() mutable {
-      bool expected = false;
-      if (fired->compare_exchange_strong(expected, true))
-        callback();
-    };
-
     bool run_now = false;
     {
       std::lock_guard lock(mutex_);
       if (GetCompletedValueLocked() >= value) {
         run_now = true;
       } else {
-        pending_callbacks_.push_back({value, run_once});
+        pending_callbacks_.push_back({value, std::move(callback)});
       }
     }
 
     if (run_now) {
-      run_once();
+      callback();
       return;
     }
-
-    HANDLE event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-    if (!event) {
-      run_once();
-      return;
-    }
-
-    MTLSharedEvent_setWin32EventAtValue(
-        event_.handle, device_->GetDXMTDevice().queue().GetSharedEventListener(),
-        event, value);
-    dxmt::thread([event, run_once]() mutable {
-      WaitForSingleObject(event, INFINITE);
-      CloseHandle(event);
-      run_once();
-    }).detach();
   }
 
   bool HasReached(UINT64 value) const override {

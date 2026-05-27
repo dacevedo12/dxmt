@@ -4,6 +4,7 @@ dxmt_src = [
   'dxmt_command_queue.cpp',
   'dxmt_command.cpp',
   'dxmt_capture.cpp',
+  'dxmt_apitrace.cpp',
   'dxmt_info.cpp',
   'dxmt_device.cpp',
   'dxmt_buffer.cpp',

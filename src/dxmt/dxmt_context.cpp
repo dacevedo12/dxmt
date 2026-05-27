@@ -1,5 +1,6 @@
 #include "dxmt_context.hpp"
 #include "Metal.hpp"
+#include "dxmt_apitrace.hpp"
 #include "dxmt_command_queue.hpp"
 #include "dxmt_deptrack.hpp"
 #include "dxmt_format.hpp"
@@ -2274,6 +2275,9 @@ ArgumentEncodingContext::flushCommands(WMT::CommandBuffer cmdbuf, uint64_t seqId
       DebugEncodeRenderAttachmentReadbacks(readbacks, cmdbuf, device_, frame_id_,
                                            seqId, data, sample_render_readback,
                                            "render-color-before-pass");
+      if (queue_.apitraceEnabled()) {
+        dxmt::apitrace::set_current_d3d_sequence(seqId);
+      }
       auto encoder = cmdbuf.renderCommandEncoder(render_pass_info);
       data->fence_wait.forEach(
           data->fence_wait_vertex, // if a fence is waited pre-raster, no need to wait again at fragment
@@ -2383,6 +2387,9 @@ ArgumentEncodingContext::flushCommands(WMT::CommandBuffer cmdbuf, uint64_t seqId
         data->allocated_argbuf.updateContents(data->allocated_argbuf_offset, data->allocated_argbuf_mapping,
                                               data->allocated_argbuf_size);
       }
+      if (queue_.apitraceEnabled()) {
+        dxmt::apitrace::set_current_d3d_sequence(seqId);
+      }
       auto encoder = cmdbuf.computeCommandEncoder(true);
       data->fence_wait.forEach([&](auto id) { encoder.waitForFence(fence_pool_[id]); });
       if (data->allocated_argbuf_size) {
@@ -2404,6 +2411,9 @@ ArgumentEncodingContext::flushCommands(WMT::CommandBuffer cmdbuf, uint64_t seqId
     }
     case EncoderType::Blit: {
       auto data = static_cast<BlitEncoderData *>(current);
+      if (queue_.apitraceEnabled()) {
+        dxmt::apitrace::set_current_d3d_sequence(seqId);
+      }
       auto encoder = cmdbuf.blitCommandEncoder();
       data->fence_wait.forEach([&](auto id) { encoder.waitForFence(fence_pool_[id]); });
       encoder.encodeCommands(&data->cmd_head);
@@ -2422,6 +2432,9 @@ ArgumentEncodingContext::flushCommands(WMT::CommandBuffer cmdbuf, uint64_t seqId
         DebugEncodePresentReadbacks(
             readbacks, cmdbuf, device_, data->backbuffer, "backbuffer-before-present",
             currentFrameId(), seqId, present_index);
+      }
+      if (queue_.apitraceEnabled()) {
+        dxmt::apitrace::set_current_d3d_sequence(seqId);
       }
       auto drawable = data->presenter->encodeCommands(
           cmdbuf, data->backbuffer, data->metadata,
@@ -2448,6 +2461,9 @@ ArgumentEncodingContext::flushCommands(WMT::CommandBuffer cmdbuf, uint64_t seqId
                data->backbuffer.height(), " elapsedMs=", DebugMillis(present_encode_interval),
                " presentAfter=", data->after);
         }
+      }
+      if (queue_.apitraceEnabled()) {
+        dxmt::apitrace::on_present_drawable(cmdbuf.handle, drawable.handle, currentFrameId(), 0, 0);
       }
       if (data->after > 0)
         cmdbuf.presentDrawableAfterMinimumDuration(drawable, data->after);

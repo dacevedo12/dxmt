@@ -13,11 +13,18 @@ winemetal_ld_args = [
   '-lsqlite3',
 ]
 
+winemetal_native_deps = [ airconv_dep_darwin ] + apitrace_metal_native_deps
+winemetal_native_include_dirs = [ dxmt_include_path, include_directories('.') ] + apitrace_metal_include_path
+winemetal_native_c_args = ['-ObjC', '-DDXMT_NATIVE=1']
+if dxmt_apitrace_metal_enabled
+  winemetal_native_c_args += ['-DDXMT_APITRACE_METAL=1']
+endif
+
 winemetal_dll = shared_library('winemetal', winemetal_src,
   name_prefix         : '',
-  dependencies        : [ airconv_dep_darwin ],
-  include_directories : [ dxmt_include_path, include_directories('.') ],
-  c_args              : ['-ObjC', '-DDXMT_NATIVE=1'],
+  dependencies        : winemetal_native_deps,
+  include_directories : winemetal_native_include_dirs,
+  c_args              : winemetal_native_c_args,
   link_args           : winemetal_ld_args,
   build_rpath         : '@loader_path/:@loader_path/../../',
 )

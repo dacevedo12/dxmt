@@ -18,9 +18,12 @@
 #include "log/log.hpp"
 #include "thread.hpp"
 #include "util_string.hpp"
+#include "util_win32_compat.h"
+#include <atomic>
 #include <algorithm>
 #include <chrono>
 #include <cstring>
+#include <memory>
 #include <vector>
 
 namespace dxmt::d3d12 {
@@ -1954,42 +1957,82 @@ public:
 
     if (!event) {
       while (!completed())
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        dxmt::this_thread::yield();
       release_wait_fences();
       return S_OK;
     }
 
-    auto signal = multiple_fence_wait_signal_;
-    auto signal_value = ++multiple_fence_wait_value_;
-    MTLSharedEvent_setWin32EventAtValue(
-        signal.handle, device_->queue().GetSharedEventListener(), event,
-        signal_value);
+    struct MultipleFenceWaitState {
+      HANDLE event;
+      std::vector<Fence *> fences;
+      std::atomic_bool signaled = false;
+      std::atomic_uint32_t remaining = 0;
 
-    dxmt::thread([wait_fences = std::move(wait_fences),
-                  wait_values = std::move(wait_values), flags,
-                  signal = std::move(signal), signal_value]() mutable {
-      auto completed = [&]() {
-        if (flags & D3D12_MULTIPLE_FENCE_WAIT_FLAG_ANY) {
-          for (size_t i = 0; i < wait_fences.size(); i++) {
-            if (wait_fences[i]->GetCompletedValue() >= wait_values[i])
-              return true;
-          }
-          return false;
+      void signal_once() {
+        bool expected = false;
+        if (!signaled.compare_exchange_strong(expected, true))
+          return;
+
+        SetEvent(event);
+        for (auto *fence : fences)
+          fence->ReleasePrivate();
+        fences.clear();
+      }
+    };
+
+    auto state = std::make_shared<MultipleFenceWaitState>();
+    state->event = event;
+    state->fences = std::move(wait_fences);
+
+    const bool wait_any = flags & D3D12_MULTIPLE_FENCE_WAIT_FLAG_ANY;
+    std::vector<size_t> pending_indices;
+    pending_indices.reserve(state->fences.size());
+    for (size_t i = 0; i < state->fences.size(); i++) {
+      if (state->fences[i]->GetCompletedValue() >= wait_values[i]) {
+        if (wait_any) {
+          state->signal_once();
+          return S_OK;
         }
+        continue;
+      }
+      pending_indices.push_back(i);
+    }
 
-        for (size_t i = 0; i < wait_fences.size(); i++) {
-          if (wait_fences[i]->GetCompletedValue() < wait_values[i])
-            return false;
+    if (pending_indices.empty()) {
+      state->signal_once();
+      return S_OK;
+    }
+
+    if (!wait_any)
+      state->remaining.store(static_cast<uint32_t>(pending_indices.size()),
+                             std::memory_order_release);
+
+    for (size_t index : pending_indices) {
+      auto *fence = state->fences[index];
+      const auto value = wait_values[index];
+      if (fence->GetCompletedValue() >= value) {
+        if (wait_any) {
+          state->signal_once();
+          return S_OK;
         }
-        return true;
-      };
+        if (state->remaining.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+          state->signal_once();
+          return S_OK;
+        }
+        continue;
+      }
 
-      while (!completed())
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
-      signal.signalValue(signal_value);
-      for (auto *fence : wait_fences)
-        fence->ReleasePrivate();
-    }).detach();
+      if (wait_any) {
+        fence->AddCompletionCallback(value, [state]() {
+          state->signal_once();
+        });
+      } else {
+        fence->AddCompletionCallback(value, [state]() {
+          if (state->remaining.fetch_sub(1, std::memory_order_acq_rel) == 1)
+            state->signal_once();
+        });
+      }
+    }
 
     return S_OK;
   }

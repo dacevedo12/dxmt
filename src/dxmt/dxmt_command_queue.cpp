@@ -1,5 +1,6 @@
 #include "dxmt_command_queue.hpp"
 #include "Metal.hpp"
+#include "dxmt_apitrace.hpp"
 #include "dxmt_statistics.hpp"
 #include "util_env.hpp"
 #include "util_win32_compat.h"
@@ -33,6 +34,7 @@ CommandChunk::encode(WMT::CommandBuffer cmdbuf, ArgumentEncodingContext &enc) {
 };
 
 CommandQueue::CommandQueue(WMT::Device device) :
+    apitrace_enabled_(dxmt::apitrace::enabled()),
     encodeThread([this]() { this->EncodingThread(); }),
     finishThread([this]() { this->WaitForFinishThread(); }),
     device(device),
@@ -87,6 +89,8 @@ CommandQueue::~CommandQueue() {
     chunk.reset();
   };
   event_listener_thread.join();
+  if (apitrace_enabled_)
+    dxmt::apitrace::shutdown();
   TRACE("Destructed command queue");
 }
 
@@ -98,7 +102,7 @@ CommandQueue::CommitCurrentChunk() {
   for (;;) {
     auto ongoing = chunk_ongoing.load(std::memory_order_acquire);
     while (ongoing >= kCommandChunkCount - 1) {
-      chunk_ongoing.wait(ongoing, std::memory_order_acquire);
+      dxmt::this_thread::yield();
       ongoing = chunk_ongoing.load(std::memory_order_acquire);
     }
     if (chunk_ongoing.compare_exchange_weak(
@@ -180,10 +184,17 @@ CommandQueue::CommitChunkInternal(CommandChunk &chunk) {
 
   auto cmdbuf = commandQueue.commandBuffer();
   chunk.attached_cmdbuf = cmdbuf;
+  if (apitrace_enabled_) {
+    dxmt::apitrace::on_command_buffer_begin(cmdbuf.handle, chunk.frame_);
+  }
   if (chunk.resource_initializer_event_id) {
     cmdbuf.encodeWaitForEvent(initializer.event(), chunk.resource_initializer_event_id);
   }
   chunk.encode(chunk.attached_cmdbuf, this->argument_encoding_ctx);
+  if (apitrace_enabled_) {
+    dxmt::apitrace::set_current_d3d_sequence(chunk.chunk_id);
+    dxmt::apitrace::on_command_buffer_commit(cmdbuf.handle);
+  }
   cmdbuf.commit();
 
   ready_for_commit.fetch_add(1, std::memory_order_release);
@@ -197,7 +208,10 @@ CommandQueue::EncodingThread() {
   SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
   uint64_t internal_seq = 1;
   while (!stopped.load()) {
-    ready_for_encode.wait(internal_seq, std::memory_order_acquire);
+    while (!stopped.load() &&
+           ready_for_encode.load(std::memory_order_acquire) == internal_seq) {
+      dxmt::this_thread::yield();
+    }
     if (stopped.load())
       break;
     // perform...
@@ -216,7 +230,10 @@ CommandQueue::WaitForFinishThread() {
   SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
   uint64_t internal_seq = 1;
   while (!stopped.load()) {
-    ready_for_commit.wait(internal_seq, std::memory_order_acquire);
+    while (!stopped.load() &&
+           ready_for_commit.load(std::memory_order_acquire) == internal_seq) {
+      dxmt::this_thread::yield();
+    }
     if (stopped.load())
       break;
     auto &chunk = chunks[internal_seq % kCommandChunkCount];

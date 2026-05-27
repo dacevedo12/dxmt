@@ -124,6 +124,43 @@ MTLCommandQueue_commandBuffer(obj_handle_t queue) {
 }
 
 WINEMETAL_API void
+WMTApitraceSessionEnsureOpen(void) {
+  struct unixcall_generic_obj_noret params;
+  params.handle = 0;
+  UNIX_CALL(136, &params);
+}
+
+WINEMETAL_API void
+WMTApitraceSessionClose(void) {
+  struct unixcall_generic_obj_noret params;
+  params.handle = 0;
+  UNIX_CALL(137, &params);
+}
+
+WINEMETAL_API void
+WMTApitraceSetCurrentD3DSequence(uint64_t d3d_sequence) {
+  struct unixcall_generic_obj_uint64_noret params;
+  params.handle = 0;
+  params.arg = d3d_sequence;
+  UNIX_CALL(138, &params);
+}
+
+WINEMETAL_API void
+WMTApitraceCommandBufferBegin(obj_handle_t command_buffer, uint64_t frame_id) {
+  struct unixcall_apitrace_command_buffer_begin params;
+  params.command_buffer = command_buffer;
+  params.frame_id = frame_id;
+  UNIX_CALL(139, &params);
+}
+
+WINEMETAL_API void
+WMTApitraceCommandBufferCommit(obj_handle_t command_buffer) {
+  struct unixcall_generic_obj_noret params;
+  params.handle = command_buffer;
+  UNIX_CALL(140, &params);
+}
+
+WINEMETAL_API void
 MTLCommandBuffer_commit(obj_handle_t cmdbuf) {
   struct unixcall_generic_obj_noret params;
   params.handle = cmdbuf;
@@ -500,6 +537,22 @@ MTLCommandBuffer_presentDrawableAfterMinimumDuration(obj_handle_t cmdbuf, obj_ha
   params.arg1 = after;
   UNIX_CALL(48, &params);
 };
+
+WINEMETAL_API void
+WMTApitracePresentDrawable(
+    obj_handle_t command_buffer,
+    obj_handle_t drawable,
+    uint64_t frame_index,
+    uint32_t sync_interval,
+    uint32_t flags) {
+  struct unixcall_apitrace_present params;
+  params.command_buffer = command_buffer;
+  params.drawable = drawable;
+  params.frame_index = frame_index;
+  params.sync_interval = sync_interval;
+  params.flags = flags;
+  UNIX_CALL(141, &params);
+}
 
 WINEMETAL_API bool
 MTLDevice_supportsFamily(obj_handle_t device, enum WMTGPUFamily gpu_family) {

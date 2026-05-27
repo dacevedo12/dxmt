@@ -35,6 +35,19 @@ struct unixcall_generic_obj_uint64_noret {
   uint64_t arg;
 };
 
+struct unixcall_apitrace_command_buffer_begin {
+  obj_handle_t command_buffer;
+  uint64_t frame_id;
+};
+
+struct unixcall_apitrace_present {
+  obj_handle_t command_buffer;
+  obj_handle_t drawable;
+  uint64_t frame_index;
+  uint32_t sync_interval;
+  uint32_t flags;
+};
+
 struct unixcall_generic_obj_ptr_noret {
   obj_handle_t handle;
   struct WMTMemoryPointer arg;
