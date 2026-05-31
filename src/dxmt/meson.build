@@ -4,7 +4,6 @@ dxmt_src = [
   'dxmt_command_queue.cpp',
   'dxmt_command.cpp',
   'dxmt_capture.cpp',
-  'dxmt_apitrace.cpp',
   'dxmt_info.cpp',
   'dxmt_device.cpp',
   'dxmt_buffer.cpp',
@@ -23,6 +22,14 @@ dxmt_src = [
   'dxmt_deptrack.cpp',
 ]
 
+if dxmt_apitrace_metal_enabled
+  dxmt_src += ['dxmt_apitrace.cpp']
+endif
+
+if apitrace_d3d_pe_deps.length() > 0
+  dxmt_src += ['dxmt_apitrace_d3d.cpp']
+endif
+
 dxmt_shaders = [
   'dxmt_command.metal'
 ]
@@ -34,11 +41,12 @@ dxmt_shaders_lib = metallib_generator.process(dxmt_shaders_ir)
 dxmt_shaders_header = hexdump_generator.process(dxmt_shaders_lib)
 
 dxmt_lib = static_library('dxmt', dxmt_src, dxmt_shaders_header, dxmt_version,
-  dependencies        : [ util_dep, airconv_forward_dep, winemetal_dep ],
+  dependencies        : [ util_dep, airconv_forward_dep, winemetal_dep ] + apitrace_d3d_pe_deps,
   include_directories : [ dxmt_include_path ],
 )
 
 dxmt_dep = declare_dependency(
   link_with           : [ dxmt_lib ],
   include_directories : [ dxmt_include_path, include_directories('.') ],
+  dependencies        : apitrace_d3d_pe_deps,
 )
