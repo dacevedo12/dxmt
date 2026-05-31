@@ -14,9 +14,11 @@
 #include "d3d12_query.hpp"
 #include "d3d12_resource.hpp"
 #include "d3d12_root_signature.hpp"
+#include "dxmt_apitrace_d3d.hpp"
 #include "dxmt_format.hpp"
 #include "log/log.hpp"
 #include "thread.hpp"
+#include "util_env.hpp"
 #include "util_string.hpp"
 #include "util_win32_compat.h"
 #include <atomic>
@@ -31,6 +33,29 @@ namespace dxmt::d3d12 {
 namespace {
 
 constexpr D3D_FEATURE_LEVEL kSupportedFeatureLevel = D3D_FEATURE_LEVEL_12_0;
+constexpr uint32_t kRepeatedDescriptorWarningLimit = 8;
+
+static bool
+ShouldLogRepeatedDescriptorWarning(std::atomic<uint32_t> &counter) {
+  auto previous = counter.fetch_add(1, std::memory_order_relaxed);
+  return previous < kRepeatedDescriptorWarningLimit;
+}
+
+static void
+BeginDeviceCall(const char *method) {
+  std::string opname = "ID3D12Device::";
+  opname += method;
+  dxmt::apitrace::record_call(opname.c_str());
+}
+
+static bool
+D3D12DeviceDiagEnabled() {
+  auto enabled = env::getEnvVar("DXMT_DIAG_D3D12_DEVICE");
+  if (enabled.empty())
+    enabled = env::getEnvVar("DXMT_DIAG_COMMAND_QUEUE");
+  return enabled == "1" || enabled == "true" || enabled == "yes" ||
+         enabled == "trace";
+}
 
 static UINT64
 Align(UINT64 value, UINT64 alignment) {
@@ -980,11 +1005,24 @@ public:
 
   HRESULT STDMETHODCALLTYPE CreateCommandQueue(const D3D12_COMMAND_QUEUE_DESC *desc,
                                                REFIID riid, void **command_queue) override {
-    return d3d12::CreateCommandQueue(static_cast<IMTLD3D12Device *>(this), desc, riid, command_queue);
+    InitReturnPtr(command_queue);
+    auto hr = d3d12::CreateCommandQueue(
+        static_cast<IMTLD3D12Device *>(this), desc, riid, command_queue);
+    if (dxmt::apitrace::d3d_enabled()) {
+      dxmt::apitrace::record_create_command_queue(
+          this, desc, command_queue ? *command_queue : nullptr,
+          static_cast<int32_t>(hr));
+    }
+    return hr;
   }
 
   HRESULT STDMETHODCALLTYPE CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE type,
                                                    REFIID riid, void **command_allocator) override {
+    if (D3D12DeviceDiagEnabled()) {
+      WARN("D3D12 diagnostic: CreateCommandAllocator enter"
+           " type=", type,
+           " riid=", str::format(riid));
+    }
     InitReturnPtr(command_allocator);
     if (!command_allocator)
       return E_POINTER;
@@ -994,7 +1032,20 @@ public:
     }
 
     auto allocator = d3d12::CreateCommandAllocator(static_cast<IMTLD3D12Device *>(this), type);
-    return allocator->QueryInterface(riid, command_allocator);
+    HRESULT hr = allocator->QueryInterface(riid, command_allocator);
+    if (dxmt::apitrace::d3d_enabled()) {
+      dxmt::apitrace::record_create_command_allocator(
+          this, type, command_allocator ? *command_allocator : nullptr,
+          static_cast<int32_t>(hr));
+    }
+    if (D3D12DeviceDiagEnabled()) {
+      WARN("D3D12 diagnostic: CreateCommandAllocator result"
+           " hr=", hr,
+           " allocator=", command_allocator && *command_allocator
+                             ? reinterpret_cast<uintptr_t>(*command_allocator)
+                             : 0);
+    }
+    return hr;
   }
 
   HRESULT STDMETHODCALLTYPE
@@ -1006,7 +1057,13 @@ public:
         static_cast<IMTLD3D12Device *>(this), desc, &status);
     if (!state)
       return status;
-    return state->QueryInterface(riid, pipeline_state);
+    auto hr = state->QueryInterface(riid, pipeline_state);
+    if (dxmt::apitrace::d3d_enabled()) {
+      dxmt::apitrace::record_create_graphics_pipeline_state(
+          this, desc, pipeline_state ? *pipeline_state : nullptr,
+          static_cast<int32_t>(hr));
+    }
+    return hr;
   }
 
   HRESULT STDMETHODCALLTYPE
@@ -1018,13 +1075,20 @@ public:
         static_cast<IMTLD3D12Device *>(this), desc, &status);
     if (!state)
       return status;
-    return state->QueryInterface(riid, pipeline_state);
+    auto hr = state->QueryInterface(riid, pipeline_state);
+    if (dxmt::apitrace::d3d_enabled()) {
+      dxmt::apitrace::record_create_compute_pipeline_state(
+          this, desc, pipeline_state ? *pipeline_state : nullptr,
+          static_cast<int32_t>(hr));
+    }
+    return hr;
   }
 
 #ifdef __ID3D12Device2_INTERFACE_DEFINED__
   HRESULT STDMETHODCALLTYPE
   CreatePipelineState(const D3D12_PIPELINE_STATE_STREAM_DESC *desc,
                       REFIID riid, void **pipeline_state) override {
+    BeginDeviceCall("CreatePipelineState");
     InitReturnPtr(pipeline_state);
     if (!pipeline_state)
       return E_POINTER;
@@ -1034,7 +1098,16 @@ public:
         static_cast<IMTLD3D12Device *>(this), desc, &status);
     if (!state)
       return status;
-    return state->QueryInterface(riid, pipeline_state);
+    auto hr = state->QueryInterface(riid, pipeline_state);
+    if (dxmt::apitrace::d3d_enabled()) {
+      dxmt::apitrace::record_create_pipeline_state(
+          this,
+          desc ? desc->pPipelineStateSubobjectStream : nullptr,
+          desc ? desc->SizeInBytes : 0,
+          pipeline_state ? *pipeline_state : nullptr,
+          static_cast<int32_t>(hr));
+    }
+    return hr;
   }
 #endif
 
@@ -1042,6 +1115,14 @@ public:
                                               ID3D12CommandAllocator *command_allocator,
                                               ID3D12PipelineState *initial_pipeline_state,
                                               REFIID riid, void **command_list) override {
+    if (D3D12DeviceDiagEnabled()) {
+      WARN("D3D12 diagnostic: CreateCommandList enter"
+           " nodeMask=", node_mask,
+           " type=", type,
+           " allocator=", reinterpret_cast<uintptr_t>(command_allocator),
+           " initialPSO=", reinterpret_cast<uintptr_t>(initial_pipeline_state),
+           " riid=", str::format(riid));
+    }
     InitReturnPtr(command_list);
 
     if (node_mask > 1 || !command_allocator)
@@ -1061,7 +1142,21 @@ public:
         command_allocator, initial_pipeline_state, &status);
     if (!list)
       return status;
-    return list->QueryInterface(riid, command_list);
+    HRESULT hr = list->QueryInterface(riid, command_list);
+    if (dxmt::apitrace::d3d_enabled()) {
+      dxmt::apitrace::record_create_command_list(
+          this, node_mask, type, command_allocator, initial_pipeline_state,
+          command_list ? *command_list : nullptr, static_cast<int32_t>(hr));
+    }
+    if (D3D12DeviceDiagEnabled()) {
+      WARN("D3D12 diagnostic: CreateCommandList result"
+           " createStatus=", status,
+           " hr=", hr,
+           " list=", command_list && *command_list
+                      ? reinterpret_cast<uintptr_t>(*command_list)
+                      : 0);
+    }
+    return hr;
   }
 
   HRESULT STDMETHODCALLTYPE CheckFeatureSupport(D3D12_FEATURE feature, void *feature_data,
@@ -1458,7 +1553,24 @@ public:
 
     auto heap = d3d12::CreateDescriptorHeap(
         static_cast<IMTLD3D12Device *>(this), desc);
-    return heap->QueryInterface(riid, descriptor_heap);
+    auto hr = heap->QueryInterface(riid, descriptor_heap);
+    if (dxmt::apitrace::d3d_enabled()) {
+      uint64_t cpu_start = 0;
+      uint64_t gpu_start = 0;
+      if (SUCCEEDED(hr) && descriptor_heap && *descriptor_heap) {
+        auto *heap_object = static_cast<ID3D12DescriptorHeap *>(*descriptor_heap);
+        cpu_start = heap_object->GetCPUDescriptorHandleForHeapStart().ptr;
+        if (desc->Flags & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE) {
+          gpu_start = heap_object->GetGPUDescriptorHandleForHeapStart().ptr;
+        }
+      }
+      dxmt::apitrace::record_create_descriptor_heap(
+          this, desc, descriptor_heap ? *descriptor_heap : nullptr,
+          desc ? GetDescriptorHandleIncrementSize(desc->Type) : 0,
+          cpu_start, gpu_start,
+          static_cast<int32_t>(hr));
+    }
+    return hr;
   }
 
   UINT STDMETHODCALLTYPE GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE descriptor_heap_type) override {
@@ -1489,7 +1601,13 @@ public:
     if (!object)
       return WARN_E_INVALIDARG(__func__);
 
-    return object->QueryInterface(riid, root_signature);
+    auto hr = object->QueryInterface(riid, root_signature);
+    if (dxmt::apitrace::d3d_enabled()) {
+      dxmt::apitrace::record_create_root_signature(
+          this, node_mask, bytecode, bytecode_length,
+          root_signature ? *root_signature : nullptr, static_cast<int32_t>(hr));
+    }
+    return hr;
   }
 
   void STDMETHODCALLTYPE CreateConstantBufferView(const D3D12_CONSTANT_BUFFER_VIEW_DESC *desc,
@@ -1502,21 +1620,33 @@ public:
     ResetDescriptorRecord(*record);
     record->type = DescriptorRecordType::ConstantBufferView;
     if (desc) {
-      if (desc->BufferLocation & (D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT - 1))
+      const bool null_cbv = !desc->BufferLocation && !desc->SizeInBytes;
+      if (!null_cbv &&
+          (desc->BufferLocation &
+           (D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT - 1)))
         WARN("D3D12Device: CBV BufferLocation is not 256-byte aligned");
-      if (desc->SizeInBytes & (D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT - 1))
+      if (!null_cbv &&
+          (desc->SizeInBytes &
+           (D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT - 1)))
         WARN("D3D12Device: CBV SizeInBytes is not 256-byte aligned");
       UINT64 offset = 0;
       auto *resource =
           LookupBufferResourceByGpuVirtualAddress(desc->BufferLocation, &offset);
-      if (!resource || !resource->GetBuffer()) {
-        WARN("D3D12Device: CBV BufferLocation does not resolve to a buffer resource");
-      } else if (desc->SizeInBytes >
+      if (!null_cbv && (!resource || !resource->GetBuffer())) {
+        static std::atomic<uint32_t> unresolved_cbv_warnings = 0;
+        if (ShouldLogRepeatedDescriptorWarning(unresolved_cbv_warnings))
+          WARN("D3D12Device: CBV BufferLocation does not resolve to a buffer resource");
+      } else if (!null_cbv && desc->SizeInBytes >
                  resource->GetResourceDesc().Width - offset) {
         WARN("D3D12Device: CBV range exceeds buffer resource size");
       }
       record->desc.cbv = *desc;
       record->has_desc = true;
+    }
+    if (dxmt::apitrace::d3d_enabled()) {
+      dxmt::apitrace::record_create_constant_buffer_view(
+          this, desc, descriptor,
+          desc ? LookupBufferResourceByGpuVirtualAddress(desc->BufferLocation) : nullptr);
     }
   }
 
@@ -1536,6 +1666,10 @@ public:
         return;
       record->desc.srv = *desc;
       record->has_desc = true;
+    }
+    if (dxmt::apitrace::d3d_enabled()) {
+      dxmt::apitrace::record_create_shader_resource_view(
+          this, resource, desc, descriptor);
     }
   }
 
@@ -1558,6 +1692,9 @@ public:
       record->desc.uav = *desc;
       record->has_desc = true;
     }
+    if (dxmt::apitrace::d3d_enabled())
+      dxmt::apitrace::record_create_unordered_access_view(
+          this, resource, counter_resource, desc, descriptor);
   }
 
   void STDMETHODCALLTYPE CreateRenderTargetView(ID3D12Resource *resource,
@@ -1577,6 +1714,9 @@ public:
       record->desc.rtv = *desc;
       record->has_desc = true;
     }
+    if (dxmt::apitrace::d3d_enabled())
+      dxmt::apitrace::record_create_render_target_view(
+          this, resource, desc, descriptor);
   }
 
   void STDMETHODCALLTYPE CreateDepthStencilView(ID3D12Resource *resource,
@@ -1596,6 +1736,9 @@ public:
       record->desc.dsv = *desc;
       record->has_desc = true;
     }
+    if (dxmt::apitrace::d3d_enabled())
+      dxmt::apitrace::record_create_depth_stencil_view(
+          this, resource, desc, descriptor);
   }
 
   void STDMETHODCALLTYPE CreateSampler(const D3D12_SAMPLER_DESC *desc,
@@ -1610,6 +1753,8 @@ public:
       record->desc.sampler = *desc;
       record->has_desc = true;
     }
+    if (dxmt::apitrace::d3d_enabled())
+      dxmt::apitrace::record_create_sampler(this, desc, descriptor);
   }
 
   void STDMETHODCALLTYPE CopyDescriptors(UINT dst_descriptor_range_count,
@@ -1678,6 +1823,18 @@ public:
 
     for (size_t i = 0; i < copied.size(); i++)
       CopyDescriptorRecord(*destinations[i], copied[i]);
+
+    if (dxmt::apitrace::d3d_enabled())
+      dxmt::apitrace::record_copy_descriptors(
+          this,
+          dst_descriptor_range_count,
+          dst_descriptor_range_offsets,
+          dst_descriptor_range_sizes,
+          src_descriptor_range_count,
+          src_descriptor_range_offsets,
+          src_descriptor_range_sizes,
+          descriptor_heap_type,
+          GetDescriptorHandleIncrementSize(descriptor_heap_type));
   }
 
   void STDMETHODCALLTYPE CopyDescriptorsSimple(UINT descriptor_count,
@@ -1697,6 +1854,15 @@ public:
     std::vector<DescriptorRecord> copied(src, src + descriptor_count);
     for (UINT i = 0; i < copied.size(); i++)
       CopyDescriptorRecord(dst[i], copied[i]);
+
+    if (dxmt::apitrace::d3d_enabled())
+      dxmt::apitrace::record_copy_descriptors_simple(
+          this,
+          descriptor_count,
+          dst_descriptor_range_offset,
+          src_descriptor_range_offset,
+          descriptor_heap_type,
+          GetDescriptorHandleIncrementSize(descriptor_heap_type));
   }
 
 #ifdef WIDL_EXPLICIT_AGGREGATE_RETURNS
@@ -1734,6 +1900,7 @@ public:
                           D3D12_RESOURCE_STATES initial_state,
                           const D3D12_CLEAR_VALUE *optimized_clear_value,
                           REFIID riid, void **resource) override {
+    BeginDeviceCall("CreateCommittedResource");
     InitReturnPtr(resource);
     if (!resource)
       return E_POINTER;
@@ -1747,11 +1914,22 @@ public:
     auto resource_object = d3d12::CreateResource(
         static_cast<IMTLD3D12Device *>(this), heap_properties, heap_flags,
         desc, initial_state, 0, optimized_clear_value);
-    return resource_object->QueryInterface(riid, resource);
+    auto hr = resource_object->QueryInterface(riid, resource);
+    if (dxmt::apitrace::d3d_enabled()) {
+      auto *created = resource && *resource ? dynamic_cast<d3d12::Resource *>(
+                                               static_cast<ID3D12Resource *>(*resource))
+                                             : nullptr;
+      dxmt::apitrace::record_create_committed_resource(
+          this, heap_properties, heap_flags, desc, initial_state,
+          optimized_clear_value, resource ? *resource : nullptr,
+          created ? created->GetGpuVirtualAddress() : 0, static_cast<int32_t>(hr));
+    }
+    return hr;
   }
 
   HRESULT STDMETHODCALLTYPE CreateHeap(const D3D12_HEAP_DESC *desc, REFIID riid,
                                        void **heap) override {
+    BeginDeviceCall("CreateHeap");
     InitReturnPtr(heap);
     if (!heap)
       return E_POINTER;
@@ -1760,7 +1938,12 @@ public:
 
     auto heap_object = d3d12::CreateHeap(static_cast<IMTLD3D12Device *>(this),
                                          desc);
-    return heap_object->QueryInterface(riid, heap);
+    auto hr = heap_object->QueryInterface(riid, heap);
+    if (dxmt::apitrace::d3d_enabled()) {
+      dxmt::apitrace::record_create_heap(
+          this, desc, heap ? *heap : nullptr, static_cast<int32_t>(hr));
+    }
+    return hr;
   }
 
   HRESULT STDMETHODCALLTYPE CreatePlacedResource(ID3D12Heap *heap, UINT64 heap_offset,
@@ -1768,6 +1951,7 @@ public:
                                                  D3D12_RESOURCE_STATES initial_state,
                                                  const D3D12_CLEAR_VALUE *optimized_clear_value,
                                                  REFIID riid, void **resource) override {
+    BeginDeviceCall("CreatePlacedResource");
     InitReturnPtr(resource);
     if (!resource)
       return E_POINTER;
@@ -1790,13 +1974,24 @@ public:
         static_cast<IMTLD3D12Device *>(this), &heap_desc.Properties,
         heap_desc.Flags, desc, initial_state, heap_offset,
         optimized_clear_value);
-    return resource_object->QueryInterface(riid, resource);
+    auto hr = resource_object->QueryInterface(riid, resource);
+    if (dxmt::apitrace::d3d_enabled()) {
+      auto *created = resource && *resource ? dynamic_cast<d3d12::Resource *>(
+                                               static_cast<ID3D12Resource *>(*resource))
+                                             : nullptr;
+      dxmt::apitrace::record_create_placed_resource(
+          this, heap, heap_offset, desc, initial_state, optimized_clear_value,
+          resource ? *resource : nullptr,
+          created ? created->GetGpuVirtualAddress() : 0, static_cast<int32_t>(hr));
+    }
+    return hr;
   }
 
   HRESULT STDMETHODCALLTYPE CreateReservedResource(const D3D12_RESOURCE_DESC *desc,
                                                    D3D12_RESOURCE_STATES initial_state,
                                                    const D3D12_CLEAR_VALUE *optimized_clear_value,
                                                    REFIID riid, void **resource) override {
+    BeginDeviceCall("CreateReservedResource");
     InitReturnPtr(resource);
     // TODO(d3d12): implement reserved resources together with tile mappings.
     WARN("D3D12Device: reserved resources are unsupported");
@@ -2060,7 +2255,13 @@ public:
     }
 
     auto fence_object = d3d12::CreateFence(static_cast<IMTLD3D12Device *>(this), initial_value, flags);
-    return fence_object->QueryInterface(riid, fence);
+    auto hr = fence_object->QueryInterface(riid, fence);
+    if (dxmt::apitrace::d3d_enabled()) {
+      dxmt::apitrace::record_create_fence(
+          this, initial_value, flags, fence ? *fence : nullptr,
+          static_cast<int32_t>(hr));
+    }
+    return hr;
   }
 
   HRESULT STDMETHODCALLTYPE GetDeviceRemovedReason() override {
@@ -2098,7 +2299,10 @@ public:
 
       auto query_heap = d3d12::CreateQueryHeap(
           static_cast<IMTLD3D12Device *>(this), desc);
-      return query_heap->QueryInterface(riid, heap);
+      auto hr = query_heap->QueryInterface(riid, heap);
+      dxmt::apitrace::record_create_query_heap(
+          this, desc, heap ? *heap : nullptr, static_cast<int32_t>(hr));
+      return hr;
     }
 
   HRESULT STDMETHODCALLTYPE SetStablePowerState(WINBOOL enable) override {
@@ -2157,7 +2361,14 @@ public:
 
     auto signature = d3d12::CreateCommandSignature(
         static_cast<IMTLD3D12Device *>(this), desc, root_signature);
-    return signature->QueryInterface(riid, command_signature);
+    HRESULT hr = signature->QueryInterface(riid, command_signature);
+    if (dxmt::apitrace::d3d_enabled()) {
+      dxmt::apitrace::record_create_command_signature(
+          this, desc, root_signature,
+          SUCCEEDED(hr) && command_signature ? *command_signature : nullptr,
+          hr);
+    }
+    return hr;
   }
 
   void STDMETHODCALLTYPE GetResourceTiling(ID3D12Resource *resource, UINT *total_tile_count,
@@ -2182,6 +2393,13 @@ public:
                                                D3D12_COMMAND_LIST_FLAGS flags,
                                                REFIID riid,
                                                void **command_list) override {
+    if (D3D12DeviceDiagEnabled()) {
+      WARN("D3D12 diagnostic: CreateCommandList1 enter"
+           " nodeMask=", node_mask,
+           " type=", type,
+           " flags=", flags,
+           " riid=", str::format(riid));
+    }
     InitReturnPtr(command_list);
     if (!command_list)
       return E_POINTER;
@@ -2200,10 +2418,28 @@ public:
         nullptr, &status);
     if (!list)
       return status;
+    if (auto *graphics_list = dynamic_cast<d3d12::GraphicsCommandList *>(list.ptr()))
+      graphics_list->SetApitraceLifecycleRecordingEnabled(false);
     status = list->Close();
+    if (auto *graphics_list = dynamic_cast<d3d12::GraphicsCommandList *>(list.ptr()))
+      graphics_list->SetApitraceLifecycleRecordingEnabled(true);
     if (FAILED(status))
       return status;
-    return list->QueryInterface(riid, command_list);
+    HRESULT hr = list->QueryInterface(riid, command_list);
+    if (dxmt::apitrace::d3d_enabled()) {
+      dxmt::apitrace::record_create_command_list1(
+          this, node_mask, type, flags, command_list ? *command_list : nullptr,
+          static_cast<int32_t>(hr));
+    }
+    if (D3D12DeviceDiagEnabled()) {
+      WARN("D3D12 diagnostic: CreateCommandList1 result"
+           " closeStatus=", status,
+           " hr=", hr,
+           " list=", command_list && *command_list
+                      ? reinterpret_cast<uintptr_t>(*command_list)
+                      : 0);
+    }
+    return hr;
   }
 
   HRESULT STDMETHODCALLTYPE
@@ -2818,9 +3054,12 @@ private:
     const UINT64 height_tiles =
         (UINT64(desc.Height) + tile_shape.HeightInTexels - 1) /
         tile_shape.HeightInTexels;
+    const UINT64 depth =
+        desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D
+            ? desc.DepthOrArraySize
+            : 1;
     const UINT64 depth_tiles =
-        (UINT64(desc.DepthOrArraySize) + tile_shape.DepthInTexels - 1) /
-        tile_shape.DepthInTexels;
+        (depth + tile_shape.DepthInTexels - 1) / tile_shape.DepthInTexels;
 
     if (!width_tiles || !height_tiles || !depth_tiles)
       return false;

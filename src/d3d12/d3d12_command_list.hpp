@@ -270,6 +270,7 @@ using CommandRecordPayload = std::variant<
     ExecuteIndirectRecord, TemporalUpscaleRecord>;
 
 struct CommandRecord {
+  std::uint64_t d3d_sequence = 0;
   CommandRecordPayload payload;
 };
 
@@ -285,6 +286,7 @@ public:
   virtual bool IsClosed() const = 0;
   virtual D3D12_COMMAND_LIST_TYPE GetCommandListType() const = 0;
   virtual const std::vector<CommandRecord> &GetCommandRecords() const = 0;
+  virtual void SetApitraceLifecycleRecordingEnabled(bool enabled) = 0;
   virtual HRESULT MarkSubmittedToQueue(
       D3D12_COMMAND_LIST_TYPE queue_type,
       std::vector<SubmittedCommandAllocatorUse> &allocator_uses) = 0;

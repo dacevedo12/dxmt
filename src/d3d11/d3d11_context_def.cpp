@@ -153,6 +153,7 @@ public:
   STDMETHODCALLTYPE
   Map(ID3D11Resource *pResource, UINT Subresource, D3D11_MAP MapType, UINT MapFlags,
       D3D11_MAPPED_SUBRESOURCE *pMappedResource) override {
+    dxmt::apitrace::begin_d3d_call("ID3D11DeviceContext::Map");
     UINT buffer_length = 0, &row_pitch = buffer_length;
     UINT bind_flag = 0, &depth_pitch = bind_flag;
     if (auto dynamic = GetDynamicBuffer(pResource, &buffer_length, &bind_flag)) {
@@ -274,6 +275,7 @@ public:
   void
   STDMETHODCALLTYPE
   Unmap(ID3D11Resource *pResource, UINT Subresource) override {
+    dxmt::apitrace::begin_d3d_call("ID3D11DeviceContext::Unmap");
     UINT buffer_length = 0, &row_pitch = buffer_length;
     UINT bind_flag = 0, &depth_pitch = bind_flag;
     if (auto dynamic = GetDynamicBuffer(pResource, &buffer_length, &bind_flag)) {

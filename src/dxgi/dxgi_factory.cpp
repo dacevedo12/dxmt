@@ -3,6 +3,7 @@
 #include "dxgi_interfaces.h"
 #include "dxgi_object.hpp"
 #include "com/com_guid.hpp"
+#include "dxmt_apitrace_d3d.hpp"
 #include "log/log.hpp"
 #include "util_fh4_bypass.hpp"
 #include "util_string.hpp"
@@ -192,8 +193,12 @@ public:
       fsDesc.Windowed = TRUE;
     }
 
-    return metal_dxgi_device->CreateSwapChain(this, hWnd, &desc, &fsDesc,
-                                              ppSwapChain);
+    HRESULT hr = metal_dxgi_device->CreateSwapChain(this, hWnd, &desc, &fsDesc,
+                                                    ppSwapChain);
+    if (SUCCEEDED(hr) && ppSwapChain && *ppSwapChain) {
+      dxmt::apitrace::on_dxgi_create_swapchain(this, pDevice, *ppSwapChain);
+    }
+    return hr;
   }
 
   HRESULT STDMETHODCALLTYPE CreateSwapChainForCoreWindow(

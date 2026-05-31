@@ -8,6 +8,7 @@
 #include "d3d12_query.hpp"
 #include "d3d12_resource.hpp"
 #include "d3d12_root_signature.hpp"
+#include "dxmt_apitrace_d3d.hpp"
 #include "dxmt_context.hpp"
 #include "dxmt_format.hpp"
 #include "dxmt_hud_state.hpp"
@@ -28,6 +29,7 @@
 #include <cfloat>
 #include <functional>
 #include <iomanip>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <deque>
@@ -39,6 +41,13 @@
 
 namespace dxmt::d3d12 {
 namespace {
+
+struct CommandQueueResourceStates;
+
+std::unordered_map<IMTLD3D12Device *,
+                   std::weak_ptr<CommandQueueResourceStates>>
+    g_resource_states_by_device;
+std::mutex g_resource_states_mutex;
 
 static UINT GetPlaneCount(const Resource &resource);
 static UINT GetSubresourceIndex(const Resource &resource, UINT subresource);
@@ -839,10 +848,37 @@ IsReadOnlyResourceState(D3D12_RESOURCE_STATES state) {
 }
 
 static bool
-IsImplicitPromotionCompatible(D3D12_RESOURCE_STATES current,
-                              D3D12_RESOURCE_STATES before) {
-  return current == D3D12_RESOURCE_STATE_COMMON &&
-         IsReadOnlyResourceState(before);
+IsSingleWriteResourceState(D3D12_RESOURCE_STATES state) {
+  const auto bits = uint32_t(state);
+  return StateHasWriteAccess(state) && !(bits & (bits - 1));
+}
+
+static bool
+IsDecayEligibleResource(const Resource &resource,
+                        D3D12_COMMAND_LIST_TYPE queue_type) {
+  const auto &desc = resource.GetResourceDesc();
+  return queue_type == D3D12_COMMAND_LIST_TYPE_COPY ||
+         desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER ||
+         (desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS);
+}
+
+static bool
+IsImplicitPromotionCompatibleResource(const Resource &resource,
+                                      D3D12_RESOURCE_STATES current,
+                                      D3D12_RESOURCE_STATES before) {
+  if (current != D3D12_RESOURCE_STATE_COMMON)
+    return false;
+
+  if (IsReadOnlyResourceState(before))
+    return true;
+
+  if (IsSingleWriteResourceState(before) &&
+      (resource.GetResourceDesc().Dimension == D3D12_RESOURCE_DIMENSION_BUFFER ||
+       (resource.GetResourceDesc().Flags &
+        D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS)))
+    return true;
+
+  return false;
 }
 
 static bool
@@ -1649,10 +1685,30 @@ struct CachedTemporalScaler {
   Rc<Texture> mv_downscaled;
 };
 
+struct CommandQueueResourceStates {
+  std::unordered_map<ID3D12Resource *, std::vector<D3D12_RESOURCE_STATES>>
+      resources;
+  std::mutex mutex;
+};
+
+std::shared_ptr<CommandQueueResourceStates>
+GetDeviceResourceStates(IMTLD3D12Device *device) {
+  std::lock_guard lock(g_resource_states_mutex);
+  auto &weak = g_resource_states_by_device[device];
+  auto states = weak.lock();
+  if (!states) {
+    states = std::make_shared<CommandQueueResourceStates>();
+    weak = states;
+  }
+  return states;
+}
+
 class CommandQueueImpl final : public ComObjectWithInitialRef<ID3D12CommandQueue, IMTLDXGIDevice> {
 public:
-  CommandQueueImpl(IMTLD3D12Device *device, const D3D12_COMMAND_QUEUE_DESC &desc)
-      : device_(device), desc_(desc) {}
+  CommandQueueImpl(IMTLD3D12Device *device, const D3D12_COMMAND_QUEUE_DESC &desc,
+                   std::shared_ptr<CommandQueueResourceStates> resource_states)
+      : device_(device), desc_(desc),
+        resource_states_(std::move(resource_states)) {}
 
   HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void **ppvObject) override {
     if (!ppvObject)
@@ -1743,12 +1799,27 @@ public:
 
   void STDMETHODCALLTYPE ExecuteCommandLists(UINT command_list_count,
                                              ID3D12CommandList *const *command_lists) override {
+    static std::atomic<uint32_t> diag_execute_log_count = 0;
     if (!command_list_count)
       return;
 
     if (!command_lists) {
       Logger::err("D3D12CommandQueue: ExecuteCommandLists called with null command list array");
       return;
+    }
+
+    if (D3D12DiagShouldLog(diag_execute_log_count,
+                           D3D12DiagEnabledEnv("DXMT_DIAG_D3D12_DEVICE") ||
+                               D3D12DiagEnabledEnv("DXMT_DIAG_COMMAND_QUEUE"))) {
+      WARN("D3D12 diagnostic: ExecuteCommandLists"
+           " queueType=", desc_.Type,
+           " listCount=", command_list_count,
+           " queue=", reinterpret_cast<uintptr_t>(this));
+    }
+
+    for (UINT i = 0; i < command_list_count; i++) {
+      if (command_lists[i])
+        dxmt::apitrace::on_d3d12_execute_command_lists(this, command_lists[i]);
     }
 
     PendingOperation op;
@@ -2241,6 +2312,7 @@ private:
     HRESULT STDMETHODCALLTYPE Present1(
         UINT sync_interval, UINT flags,
         const DXGI_PRESENT_PARAMETERS *present_parameters) override {
+      dxmt::apitrace::on_d3d12_present(this, sync_interval, flags);
       if (sync_interval > 4)
         return DXGI_ERROR_INVALID_CALL;
       if (flags & ~D3D12SupportedPresentFlags) {
@@ -2448,19 +2520,42 @@ private:
         UINT buffer_count, UINT width, UINT height, DXGI_FORMAT format,
         UINT flags, const UINT *creation_node_mask,
         IUnknown *const *present_queue) override {
+      const UINT queue_count =
+          buffer_count ? buffer_count : (desc_.BufferCount ? desc_.BufferCount : 2);
+      if (!creation_node_mask || !present_queue)
+        return DXGI_ERROR_INVALID_CALL;
       if (creation_node_mask) {
-        for (UINT i = 0; i < buffer_count; i++) {
+        for (UINT i = 0; i < queue_count; i++) {
           if (creation_node_mask[i] > 1) {
             WARN("D3D12SwapChain::ResizeBuffers1: unsupported creation node mask ",
                  creation_node_mask[i]);
-            return DXGI_ERROR_UNSUPPORTED;
+            return DXGI_ERROR_INVALID_CALL;
           }
         }
       }
-      if (present_queue) {
-        WARN("D3D12SwapChain::ResizeBuffers1: present queues are not supported");
-        return DXGI_ERROR_UNSUPPORTED;
+
+      for (UINT i = 0; i < queue_count; i++) {
+        if (!present_queue[i])
+          return DXGI_ERROR_INVALID_CALL;
+
+        auto queue = Com<ID3D12CommandQueue>::queryFrom(present_queue[i]);
+        if (!queue) {
+          WARN("D3D12SwapChain::ResizeBuffers1: present queue is not a D3D12 command queue");
+          return DXGI_ERROR_INVALID_CALL;
+        }
+
+        if (queue.ptr() != static_cast<ID3D12CommandQueue *>(queue_.ptr())) {
+          WARN_FILE_ONLY(
+              "D3D12SwapChain::ResizeBuffers1: ignoring non-swapchain present queue");
+        }
       }
+
+      if (D3D12DiagSwapChainEnabled()) {
+        INFO("D3D12 diagnostic: ResizeBuffers1 bufferCount=", buffer_count,
+             " effectiveQueueCount=", queue_count, " size=", width, "x",
+             height, " format=", format, " flags=", flags);
+      }
+
       return ResizeBuffers(buffer_count, width, height, format, flags);
     }
 
@@ -2550,6 +2645,7 @@ private:
 
   struct ReplayGraphicsPassCommand {
     std::function<void(ArgumentEncodingContext &, uint64_t &)> encode;
+    uint64_t d3d_sequence = 0;
     uint64_t argument_buffer_size = 0;
     bool use_geometry = false;
   };
@@ -2566,6 +2662,8 @@ private:
     std::unordered_map<ID3D12Resource *,
                        std::vector<D3D12_RESOURCE_STATES>> *resource_states =
         nullptr;
+    D3D12_COMMAND_LIST_TYPE queue_type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+    std::vector<Com<ID3D12Resource>> *touched_resources = nullptr;
     Com<ID3D12PipelineState> pipeline_state;
     Com<ID3D12RootSignature> graphics_root_signature;
     Com<ID3D12RootSignature> compute_root_signature;
@@ -2601,6 +2699,8 @@ private:
   CloneReplayStateWithoutBatch(const ReplayState &state) {
     ReplayState copy = {};
     copy.resource_states = state.resource_states;
+    copy.queue_type = state.queue_type;
+    copy.touched_resources = state.touched_resources;
     copy.pipeline_state = state.pipeline_state;
     copy.graphics_root_signature = state.graphics_root_signature;
     copy.compute_root_signature = state.compute_root_signature;
@@ -2680,8 +2780,12 @@ private:
                            use_geometry))
         return;
       uint64_t argbuf_offset = 0;
-      for (auto &command : commands)
+      for (auto &command : commands) {
+        if (command.d3d_sequence != 0) {
+          dxmt::apitrace::set_current_d3d_sequence(command.d3d_sequence);
+        }
         command.encode(enc, argbuf_offset);
+      }
       enc.endPass();
     });
 
@@ -2707,8 +2811,8 @@ private:
     active_batch.argument_buffer_size += argument_buffer_size;
     active_batch.use_geometry = active_batch.use_geometry || use_geometry;
     active_batch.commands.push_back(
-        ReplayGraphicsPassCommand{std::forward<Fn>(fn), argument_buffer_size,
-                                  use_geometry});
+        ReplayGraphicsPassCommand{std::forward<Fn>(fn), dxmt::apitrace::current_d3d_sequence(),
+                                  argument_buffer_size, use_geometry});
   }
 
   bool D3D12ReplayGraphicsBatchingEnabled() {
@@ -2719,26 +2823,35 @@ private:
   template <typename Fn>
   void EmitSingleGraphicsPass(CommandChunk *chunk,
                               ReplayRenderPassAttachments attachments,
-                              uint64_t argument_buffer_size, Fn &&fn,
+                              uint64_t argument_buffer_size, uint64_t d3d_sequence, Fn &&fn,
                               bool use_geometry = false) {
     chunk->emitcc([attachments = std::move(attachments), argument_buffer_size,
-                   use_geometry,
+                   use_geometry, d3d_sequence,
                    encode = std::function<void(ArgumentEncodingContext &, uint64_t &)>(
                        std::forward<Fn>(fn))](ArgumentEncodingContext &enc) mutable {
       if (!BeginRenderPass(enc, attachments, argument_buffer_size,
                            use_geometry))
         return;
       uint64_t argbuf_offset = 0;
+      if (d3d_sequence != 0) {
+        dxmt::apitrace::set_current_d3d_sequence(d3d_sequence);
+      }
       encode(enc, argbuf_offset);
       enc.endPass();
     });
   }
 
-  void ReplayCommandRecords(const std::vector<CommandRecord> &records) {
+  void ReplayCommandRecords(const std::vector<CommandRecord> &records,
+                            std::vector<Com<ID3D12Resource>> &touched_resources) {
     auto *chunk = device_->GetDXMTDevice().queue().CurrentChunk();
     ReplayState state = {};
-    state.resource_states = &resource_states_;
+    state.resource_states = &resource_states_->resources;
+    state.queue_type = desc_.Type;
+    state.touched_resources = &touched_resources;
     for (const auto &record : records) {
+      if (record.d3d_sequence != 0) {
+        dxmt::apitrace::set_current_d3d_sequence(record.d3d_sequence);
+      }
       std::visit([&](const auto &payload) { ReplayRecord(chunk, state, payload); },
                  record.payload);
     }
@@ -2749,27 +2862,39 @@ private:
   void ReplayRecord(CommandChunk *chunk, ReplayState &state, const T &record) {
     if constexpr (std::is_same_v<T, CopyBufferRegionRecord>) {
       FlushGraphicsPassBatch(chunk, state);
+      TouchReplayResource(state, record.dst.ptr());
+      TouchReplayResource(state, record.src.ptr());
       ReplayCopyBufferRegion(chunk, record);
     } else if constexpr (std::is_same_v<T, CopyTextureRegionRecord>) {
       FlushGraphicsPassBatch(chunk, state);
+      TouchReplayResource(state, record.dst.resource.ptr());
+      TouchReplayResource(state, record.src.resource.ptr());
       ReplayCopyTextureRegion(chunk, record);
     } else if constexpr (std::is_same_v<T, CopyResourceRecord>) {
       FlushGraphicsPassBatch(chunk, state);
+      TouchReplayResource(state, record.dst.ptr());
+      TouchReplayResource(state, record.src.ptr());
       ReplayCopyResource(chunk, record);
     } else if constexpr (std::is_same_v<T, ResolveSubresourceRecord>) {
       FlushGraphicsPassBatch(chunk, state);
+      TouchReplayResource(state, record.dst.ptr());
+      TouchReplayResource(state, record.src.ptr());
       ReplayResolveSubresource(chunk, record);
     } else if constexpr (std::is_same_v<T, ClearRenderTargetRecord>) {
       FlushGraphicsPassBatch(chunk, state);
+      TouchReplayResource(state, record.descriptor.resource.ptr());
       ReplayClearRenderTarget(chunk, record);
     } else if constexpr (std::is_same_v<T, ClearDepthStencilRecord>) {
       FlushGraphicsPassBatch(chunk, state);
+      TouchReplayResource(state, record.descriptor.resource.ptr());
       ReplayClearDepthStencil(chunk, record);
     } else if constexpr (std::is_same_v<T, ClearUnorderedAccessRecord>) {
       FlushGraphicsPassBatch(chunk, state);
+      TouchReplayResource(state, record.resource.ptr());
       ReplayClearUnorderedAccess(chunk, record);
     } else if constexpr (std::is_same_v<T, DiscardResourceRecord>) {
       FlushGraphicsPassBatch(chunk, state);
+      TouchReplayResource(state, record.resource.ptr());
       ReplayDiscardResource(chunk, record);
     } else if constexpr (std::is_same_v<T, PipelineStateRecord>) {
       state.pipeline_state = record.pipeline_state;
@@ -3133,6 +3258,34 @@ private:
     return states;
   }
 
+  void TouchReplayResource(ReplayState &state, ID3D12Resource *resource) {
+    if (!state.touched_resources || !resource)
+      return;
+    if (std::find_if(state.touched_resources->begin(),
+                     state.touched_resources->end(),
+                     [resource](const Com<ID3D12Resource> &entry) {
+                       return entry.ptr() == resource;
+                     }) != state.touched_resources->end())
+      return;
+    state.touched_resources->push_back(resource);
+  }
+
+  void DecayTouchedResourceStates(
+      const std::vector<Com<ID3D12Resource>> &touched_resources) {
+    for (const auto &resource_com : touched_resources) {
+      auto *resource = GetResource(resource_com.ptr());
+      if (!resource || !IsDecayEligibleResource(*resource, desc_.Type))
+        continue;
+
+      auto it = resource_states_->resources.find(resource->GetD3D12Resource());
+      if (it == resource_states_->resources.end())
+        continue;
+
+      std::fill(it->second.begin(), it->second.end(),
+                D3D12_RESOURCE_STATE_COMMON);
+    }
+  }
+
   void ReplayTransitionBarrier(CommandChunk *chunk, ReplayState &state,
                                const StoredResourceBarrier &barrier) {
     auto *resource = GetResource(barrier.resource.ptr());
@@ -3147,6 +3300,7 @@ private:
     WarnUnsupportedResourceState(transition.StateAfter, "transition after");
 
     auto &states = GetReplayResourceStates(state, *resource);
+    TouchReplayResource(state, resource->GetD3D12Resource());
     const UINT subresource_count = states.size();
     const bool all_subresources =
         transition.Subresource == D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
@@ -3166,8 +3320,8 @@ private:
       const auto current_state = states[subresource];
       if (!begin_only) {
         if (current_state != transition.StateBefore &&
-            !IsImplicitPromotionCompatible(current_state,
-                                           transition.StateBefore)) {
+            !IsImplicitPromotionCompatibleResource(*resource, current_state,
+                                                   transition.StateBefore)) {
           WARN("D3D12CommandQueue: transition barrier state mismatch subresource=",
                subresource, " expected=", uint32_t(current_state),
                " before=", uint32_t(transition.StateBefore));
@@ -4553,11 +4707,13 @@ private:
     Resource *resource = nullptr;
     const auto offset =
         ResolveBufferGpuAddress(descriptor.desc.cbv.BufferLocation, resource);
-    if (!resource || !resource->GetBuffer())
+    const bool null_cbv =
+        !descriptor.desc.cbv.BufferLocation && !descriptor.desc.cbv.SizeInBytes;
+    if (!null_cbv && (!resource || !resource->GetBuffer()))
       return;
-    const auto buffer_offset = resource->GetHeapOffset() + offset;
+    const auto buffer_offset = null_cbv ? 0 : resource->GetHeapOffset() + offset;
 
-    auto buffer = Rc<Buffer>(resource->GetBuffer());
+    auto buffer = null_cbv ? Rc<Buffer>() : Rc<Buffer>(resource->GetBuffer());
     switch (stage) {
     case PipelineStage::Compute:
       enc.bindConstantBuffer<PipelineStage::Compute>(slot, buffer_offset,
@@ -6421,6 +6577,7 @@ private:
 
     FlushGraphicsPassBatch(chunk, state);
     EmitSingleGraphicsPass(chunk, std::move(attachments), argument_buffer_size,
+                           dxmt::apitrace::current_d3d_sequence(),
                            std::move(encode_draw), metal->use_geometry);
   }
 
@@ -6609,6 +6766,7 @@ private:
 
     FlushGraphicsPassBatch(chunk, state);
     EmitSingleGraphicsPass(chunk, std::move(attachments), argument_buffer_size,
+                           dxmt::apitrace::current_d3d_sequence(),
                            std::move(encode_draw), metal->use_geometry);
   }
 
@@ -7513,8 +7671,11 @@ private:
       auto &operation = pending_operations_.front();
       switch (operation.type) {
       case PendingOperationType::Execute: {
+        std::lock_guard resource_state_lock(resource_states_->mutex);
+        std::vector<Com<ID3D12Resource>> touched_resources;
         for (const auto &records : operation.command_records)
-          ReplayCommandRecords(records);
+          ReplayCommandRecords(records, touched_resources);
+        DecayTouchedResourceStates(touched_resources);
         auto allocator_uses = std::make_shared<std::vector<SubmittedCommandAllocatorUse>>(
             std::move(operation.allocator_uses));
         auto *chunk = device_->GetDXMTDevice().queue().CurrentChunk();
@@ -7602,8 +7763,7 @@ private:
   UINT64 last_signal_value_ = 0;
   bool has_waited_ = false;
   std::vector<CachedTemporalScaler> temporal_scaler_cache_;
-  std::unordered_map<ID3D12Resource *,
-                     std::vector<D3D12_RESOURCE_STATES>> resource_states_;
+  std::shared_ptr<CommandQueueResourceStates> resource_states_;
   std::deque<PendingOperation> pending_operations_;
   bool draining_pending_operations_ = false;
   std::mutex mutex_;
@@ -7624,7 +7784,8 @@ CreateCommandQueue(IMTLD3D12Device *device, const D3D12_COMMAND_QUEUE_DESC *desc
   if (FAILED(hr))
     return hr;
 
-  auto queue = Com<ID3D12CommandQueue>::transfer(new CommandQueueImpl(device, normalized));
+  auto queue = Com<ID3D12CommandQueue>::transfer(
+      new CommandQueueImpl(device, normalized, GetDeviceResourceStates(device)));
   return queue->QueryInterface(riid, command_queue);
 }
 

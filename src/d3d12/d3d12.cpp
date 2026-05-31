@@ -6,6 +6,7 @@
 #include "d3d12_device.hpp"
 #include "d3d12_root_signature.hpp"
 #include "dxgi_interfaces.h"
+#include "dxmt_apitrace_d3d.hpp"
 #include "dxmt_device.hpp"
 #include "log/log.hpp"
 #include "util_env.hpp"
@@ -249,8 +250,11 @@ CreateD3D12DeviceInstance(IUnknown *adapter, D3D_FEATURE_LEVEL minimum_feature_l
 
 extern "C" HRESULT __stdcall
 D3D12CreateDevice(IUnknown *adapter, D3D_FEATURE_LEVEL minimum_feature_level, REFIID riid, void **device) {
-  return dxmt::d3d12::CreateD3D12DeviceInstance(
+  HRESULT hr = dxmt::d3d12::CreateD3D12DeviceInstance(
       adapter, minimum_feature_level, riid, device, true);
+  if (SUCCEEDED(hr) && device)
+    dxmt::apitrace::on_d3d12_create_device(*device);
+  return hr;
 }
 
 extern "C" HRESULT __stdcall

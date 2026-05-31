@@ -143,6 +143,7 @@ public:
   STDMETHODCALLTYPE
   Map(ID3D11Resource *pResource, UINT Subresource, D3D11_MAP MapType, UINT MapFlags,
       D3D11_MAPPED_SUBRESOURCE *pMappedResource) override {
+    dxmt::apitrace::begin_d3d_call("ID3D11DeviceContext::Map");
     std::lock_guard<d3d11_device_mutex> lock(mutex);
 
     if (unlikely(!pResource || !pMappedResource))
@@ -295,6 +296,7 @@ public:
   void
   STDMETHODCALLTYPE
   Unmap(ID3D11Resource *pResource, UINT Subresource) override {
+    dxmt::apitrace::begin_d3d_call("ID3D11DeviceContext::Unmap");
     std::lock_guard<d3d11_device_mutex> lock(mutex);
 
     if (unlikely(!pResource))
