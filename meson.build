@@ -96,18 +96,17 @@ endif
 dxmt_include_path = include_directories(dxmt_include_dirs)
 dxmt_native_include_path = include_directories(dxmt_native_include_dirs)
 
-apitrace_feature = get_option('apitrace')
-apitrace_buildtype = get_option('buildtype')
-dxmt_debug_build = apitrace_buildtype == 'debug' or apitrace_buildtype == 'debugoptimized'
-dxmt_apitrace_metal_enabled = apitrace_feature.enabled() or (apitrace_feature.auto() and dxmt_debug_build)
-if apitrace_feature.disabled()
-  dxmt_apitrace_metal_enabled = false
+dxmt_apitrace_metal_enabled = get_option('apitrace_builtin')
+
+if dxmt_apitrace_metal_enabled
+  add_project_arguments('-DDXMT_APITRACE_ENABLED=1', language: 'cpp')
 endif
 
 apitrace_source_path = ''
 apitrace_build_path = ''
 apitrace_metal_include_path = []
 apitrace_metal_native_deps = []
+apitrace_d3d_pe_deps = []
 if dxmt_apitrace_metal_enabled
   apitrace_source_path = get_option('apitrace_source_path')
   if apitrace_source_path == ''
@@ -137,8 +136,10 @@ if dxmt_apitrace_metal_enabled
       apitrace_source_path,
       apitrace_build_path,
       '@OUTPUT@',
+      'native',
     ],
     build_by_default: true,
+    build_always_stale: true,
   )
   apitrace_metal_archive = join_paths(apitrace_build_path, 'libapitrace_core.a')
   apitrace_platform_archive = join_paths(apitrace_build_path, 'libapitrace_platform_apple_metal.a')
@@ -150,6 +151,47 @@ if dxmt_apitrace_metal_enabled
       sources : [apitrace_build_stamp],
     ),
   ]
+
+  if dxmt_crossbuild
+    apitrace_pe_build_path = join_paths(meson.project_build_root(), 'subprojects/apitrace-pe')
+    apitrace_pe_toolchain = join_paths(meson.project_source_root(), 'scripts/apitrace-mingw-toolchain.cmake')
+    apitrace_pe_build_stamp = custom_target(
+      'apitrace_pe_build',
+      output: 'apitrace-pe.stamp',
+      command: [
+        find_program('scripts/build-apitrace.sh'),
+        apitrace_source_path,
+        apitrace_pe_build_path,
+        '@OUTPUT@',
+        'mingw',
+        apitrace_pe_toolchain,
+      ],
+      build_by_default: true,
+      build_always_stale: true,
+    )
+    apitrace_pe_core_archive = join_paths(apitrace_pe_build_path, 'libapitrace_core.a')
+    apitrace_pe_d3d11_archive = join_paths(apitrace_pe_build_path, 'libapitrace_d3d11_capture.a')
+    apitrace_pe_d3d12_archive = join_paths(apitrace_pe_build_path, 'libapitrace_d3d12_capture.a')
+    apitrace_d3d_pe_deps = [
+      declare_dependency(
+        compile_args : [
+          '-DDXMT_APITRACE_D3D=1',
+          '-I' + join_paths(apitrace_source_path, 'src/api/include'),
+          '-I' + join_paths(apitrace_source_path, 'src/trace/include'),
+          '-I' + join_paths(apitrace_source_path, 'src/capture/include'),
+          '-I' + join_paths(apitrace_source_path, 'src/retrace/include'),
+          '-I' + join_paths(apitrace_source_path, 'src/d3d11/include'),
+          '-I' + join_paths(apitrace_source_path, 'src/d3d12/include'),
+        ],
+        link_args : [
+          apitrace_pe_d3d12_archive,
+          apitrace_pe_d3d11_archive,
+          apitrace_pe_core_archive,
+        ],
+        sources : [apitrace_pe_build_stamp],
+      ),
+    ]
+  endif
 endif
 
 if not fs.is_file('include/native/directx/d3d11.h')
