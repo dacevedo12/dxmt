@@ -1344,6 +1344,38 @@ done:
   release_object(&device);
 }
 
+static void test_small_aligned_committed_texture_array(void)
+{
+  ID3D12Device *device = nullptr;
+  ID3D12Resource *resource = nullptr;
+  D3D12_HEAP_PROPERTIES heap = {};
+  D3D12_RESOURCE_DESC desc = {};
+  HRESULT hr = create_device(&device);
+  check_hr(hr);
+  if (FAILED(hr))
+    goto done;
+
+  heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+  desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+  desc.Alignment = D3D12_SMALL_RESOURCE_PLACEMENT_ALIGNMENT;
+  desc.Width = 128;
+  desc.Height = 128;
+  desc.DepthOrArraySize = 2046;
+  desc.MipLevels = 5;
+  desc.Format = DXGI_FORMAT_BC6H_UF16;
+  desc.SampleDesc.Count = 1;
+  desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+
+  check_hr(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
+                                           D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                           __uuidof(ID3D12Resource),
+                                           (void **)&resource));
+
+done:
+  release_object(&resource);
+  release_object(&device);
+}
+
 static void test_heap_placement_va_probe(void)
 {
   ID3D12Device *device = nullptr;
@@ -2129,6 +2161,8 @@ int main(int argc, char **argv)
     test_resource_allocation_info();
   if (run_allocation_info)
     test_small_aligned_placed_resource();
+  if (run_allocation_info)
+    test_small_aligned_committed_texture_array();
   if (run_allocation_info)
     test_heap_placement_va_probe();
   if (run_committed_resource)

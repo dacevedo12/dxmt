@@ -17,6 +17,7 @@ since it is for internal use only
 #include "d3d11_device.hpp"
 #include "d3d11_pipeline.hpp"
 #include "d3d11_query.hpp"
+#include "dxmt_apitrace_d3d.hpp"
 #include "dxmt_buffer.hpp"
 #include "dxmt_context.hpp"
 #include "dxmt_format.hpp"
@@ -1176,6 +1177,7 @@ public:
       ID3D11Resource *pDstResource, UINT DstSubresource, const D3D11_BOX *pDstBox, const void *pSrcData,
       UINT SrcRowPitch, UINT SrcDepthPitch, UINT CopyFlags
   ) override {
+    dxmt::apitrace::begin_d3d_call("ID3D11DeviceContext::UpdateSubresource1");
     std::lock_guard<mutex_t> lock(mutex);
 
     if (!pDstResource)
@@ -1274,6 +1276,7 @@ public:
   void
   STDMETHODCALLTYPE
   Draw(UINT VertexCount, UINT StartVertexLocation) override {
+    dxmt::apitrace::begin_d3d_call("ID3D11DeviceContext::Draw");
     std::lock_guard<mutex_t> lock(mutex);
 
     WMTPrimitiveType Primitive;
@@ -1305,6 +1308,7 @@ public:
   void
   STDMETHODCALLTYPE
   DrawIndexed(UINT IndexCount, UINT StartIndexLocation, INT BaseVertexLocation) override {
+    dxmt::apitrace::begin_d3d_call("ID3D11DeviceContext::DrawIndexed");
     std::lock_guard<mutex_t> lock(mutex);
 
     if (!IndexCount)
@@ -1348,6 +1352,7 @@ public:
   STDMETHODCALLTYPE
   DrawInstanced(UINT VertexCountPerInstance, UINT InstanceCount, UINT StartVertexLocation, UINT StartInstanceLocation)
       override {
+    dxmt::apitrace::begin_d3d_call("ID3D11DeviceContext::DrawInstanced");
     std::lock_guard<mutex_t> lock(mutex);
 
     WMTPrimitiveType Primitive;
@@ -1385,6 +1390,7 @@ public:
       UINT IndexCountPerInstance, UINT InstanceCount, UINT StartIndexLocation, INT BaseVertexLocation,
       UINT StartInstanceLocation
   ) override {
+    dxmt::apitrace::begin_d3d_call("ID3D11DeviceContext::DrawIndexedInstanced");
     std::lock_guard<mutex_t> lock(mutex);
 
     if (!IndexCountPerInstance)
@@ -1587,6 +1593,7 @@ public:
   void
   STDMETHODCALLTYPE
   DrawIndexedInstancedIndirect(ID3D11Buffer *pBufferForArgs, UINT AlignedByteOffsetForArgs) override {
+    dxmt::apitrace::begin_d3d_call("ID3D11DeviceContext::DrawIndexedInstancedIndirect");
     std::lock_guard<mutex_t> lock(mutex);
 
     WMTPrimitiveType Primitive;
@@ -1630,6 +1637,7 @@ public:
   void
   STDMETHODCALLTYPE
   DrawInstancedIndirect(ID3D11Buffer *pBufferForArgs, UINT AlignedByteOffsetForArgs) override {
+    dxmt::apitrace::begin_d3d_call("ID3D11DeviceContext::DrawInstancedIndirect");
     std::lock_guard<mutex_t> lock(mutex);
 
     WMTPrimitiveType Primitive;
@@ -1813,6 +1821,7 @@ public:
   void
   STDMETHODCALLTYPE
   DrawAuto() override {
+    dxmt::apitrace::begin_d3d_call("ID3D11DeviceContext::DrawAuto");
     std::lock_guard<mutex_t> lock(mutex);
 
     EmitST([](ArgumentEncodingContext &enc) { enc.setCompatibilityFlag(FeatureCompatibility::UnsupportedDrawAuto); });
@@ -1821,6 +1830,7 @@ public:
   void
   STDMETHODCALLTYPE
   Dispatch(UINT ThreadGroupCountX, UINT ThreadGroupCountY, UINT ThreadGroupCountZ) override {
+    dxmt::apitrace::begin_d3d_call("ID3D11DeviceContext::Dispatch");
     std::lock_guard<mutex_t> lock(mutex);
 
     if (!PreDispatch())
@@ -1836,6 +1846,7 @@ public:
   void
   STDMETHODCALLTYPE
   DispatchIndirect(ID3D11Buffer *pBufferForArgs, UINT AlignedByteOffsetForArgs) override {
+    dxmt::apitrace::begin_d3d_call("ID3D11DeviceContext::DispatchIndirect");
     std::lock_guard<mutex_t> lock(mutex);
 
     if (!PreDispatch())
@@ -2817,6 +2828,7 @@ public:
       UINT UAVStartSlot, UINT NumUAVs, ID3D11UnorderedAccessView *const *ppUnorderedAccessViews,
       const UINT *pUAVInitialCounts
   ) override {
+    dxmt::apitrace::begin_d3d_call("ID3D11DeviceContext::OMSetRenderTargetsAndUnorderedAccessViews");
     std::lock_guard<mutex_t> lock(mutex);
 
     if (!ValidateMultiOutput(NumRTVs, ppRenderTargetViews, NumUAVs, ppUnorderedAccessViews))
