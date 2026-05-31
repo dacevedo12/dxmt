@@ -1644,9 +1644,13 @@ public:
       record->has_desc = true;
     }
     if (dxmt::apitrace::d3d_enabled()) {
+      UINT64 offset = 0;
+      auto *resource = desc ? LookupBufferResourceByGpuVirtualAddress(
+                                  desc->BufferLocation, &offset)
+                            : nullptr;
       dxmt::apitrace::record_create_constant_buffer_view(
-          this, desc, descriptor,
-          desc ? LookupBufferResourceByGpuVirtualAddress(desc->BufferLocation) : nullptr);
+          this, desc, descriptor, resource, offset,
+          resource ? resource->GetResourceDesc().Width : 0);
     }
   }
 

@@ -165,7 +165,8 @@ uint64_t record_create_command_signature(
     int32_t result_code);
 uint64_t record_create_constant_buffer_view(
     ID3D12Device *device, const D3D12_CONSTANT_BUFFER_VIEW_DESC *desc,
-    D3D12_CPU_DESCRIPTOR_HANDLE descriptor, const void *resolved_resource);
+    D3D12_CPU_DESCRIPTOR_HANDLE descriptor, const void *resolved_resource,
+    uint64_t resolved_resource_offset, uint64_t resolved_resource_width);
 uint64_t record_create_shader_resource_view(
     ID3D12Device *device, const void *resource,
     const D3D12_SHADER_RESOURCE_VIEW_DESC *desc,
@@ -403,7 +404,7 @@ inline uint64_t record_create_heap(ID3D12Device *, const D3D12_HEAP_DESC *, cons
 inline uint64_t record_create_placed_resource(ID3D12Device *, const void *, uint64_t, const D3D12_RESOURCE_DESC *, uint32_t, const D3D12_CLEAR_VALUE *, const void *, uint64_t, int32_t) { return 0; }
 inline uint64_t record_create_fence(ID3D12Device *, uint64_t, uint32_t, const void *, int32_t) { return 0; }
 inline uint64_t record_create_command_signature(ID3D12Device *, const D3D12_COMMAND_SIGNATURE_DESC *, const void *, const void *, int32_t) { return 0; }
-inline uint64_t record_create_constant_buffer_view(ID3D12Device *, const D3D12_CONSTANT_BUFFER_VIEW_DESC *, D3D12_CPU_DESCRIPTOR_HANDLE, const void *) { return 0; }
+inline uint64_t record_create_constant_buffer_view(ID3D12Device *, const D3D12_CONSTANT_BUFFER_VIEW_DESC *, D3D12_CPU_DESCRIPTOR_HANDLE, const void *, uint64_t, uint64_t) { return 0; }
 inline uint64_t record_create_shader_resource_view(ID3D12Device *, const void *, const D3D12_SHADER_RESOURCE_VIEW_DESC *, D3D12_CPU_DESCRIPTOR_HANDLE) { return 0; }
 inline uint64_t record_create_unordered_access_view(ID3D12Device *, const void *, const void *, const D3D12_UNORDERED_ACCESS_VIEW_DESC *, D3D12_CPU_DESCRIPTOR_HANDLE) { return 0; }
 inline uint64_t record_create_render_target_view(ID3D12Device *, const void *, const D3D12_RENDER_TARGET_VIEW_DESC *, D3D12_CPU_DESCRIPTOR_HANDLE) { return 0; }

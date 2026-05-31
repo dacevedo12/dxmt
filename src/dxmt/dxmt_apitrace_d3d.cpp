@@ -352,12 +352,14 @@ record_create_command_signature(
 uint64_t
 record_create_constant_buffer_view(
     ID3D12Device *device, const D3D12_CONSTANT_BUFFER_VIEW_DESC *desc,
-    D3D12_CPU_DESCRIPTOR_HANDLE descriptor, const void *resolved_resource) {
+    D3D12_CPU_DESCRIPTOR_HANDLE descriptor, const void *resolved_resource,
+    uint64_t resolved_resource_offset, uint64_t resolved_resource_width) {
   if (!d3d_enabled())
     return 0;
   ensure_session_open();
   return ::apitrace::d3d12::record_create_constant_buffer_view(
-      device, desc, descriptor, resolved_resource);
+      device, desc, descriptor, resolved_resource, resolved_resource_offset,
+      resolved_resource_width);
 }
 
 uint64_t
