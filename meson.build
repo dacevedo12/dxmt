@@ -106,7 +106,9 @@ apitrace_source_path = ''
 apitrace_build_path = ''
 apitrace_metal_include_path = []
 apitrace_metal_native_deps = []
+apitrace_metal_native_link_depends = []
 apitrace_d3d_pe_deps = []
+apitrace_d3d_pe_link_depends = []
 if dxmt_apitrace_metal_enabled
   apitrace_source_path = get_option('apitrace_source_path')
   if apitrace_source_path == ''
@@ -143,6 +145,11 @@ if dxmt_apitrace_metal_enabled
   )
   apitrace_metal_archive = join_paths(apitrace_build_path, 'libapitrace_core.a')
   apitrace_platform_archive = join_paths(apitrace_build_path, 'libapitrace_platform_apple_metal.a')
+  apitrace_metal_native_link_depends = [
+    apitrace_build_stamp,
+    apitrace_platform_archive,
+    apitrace_metal_archive,
+  ]
   apitrace_metal_include_path = []
   apitrace_metal_native_deps = [
     declare_dependency(
@@ -172,6 +179,12 @@ if dxmt_apitrace_metal_enabled
     apitrace_pe_core_archive = join_paths(apitrace_pe_build_path, 'libapitrace_core.a')
     apitrace_pe_d3d11_archive = join_paths(apitrace_pe_build_path, 'libapitrace_d3d11_capture.a')
     apitrace_pe_d3d12_archive = join_paths(apitrace_pe_build_path, 'libapitrace_d3d12_capture.a')
+    apitrace_d3d_pe_link_depends = [
+      apitrace_pe_build_stamp,
+      apitrace_pe_core_archive,
+      apitrace_pe_d3d12_archive,
+      apitrace_pe_d3d11_archive,
+    ]
     apitrace_d3d_pe_deps = [
       declare_dependency(
         compile_args : [

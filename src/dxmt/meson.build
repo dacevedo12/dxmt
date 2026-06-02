@@ -29,6 +29,7 @@ endif
 if apitrace_d3d_pe_deps.length() > 0
   dxmt_src += ['dxmt_apitrace_d3d.cpp']
 endif
+dxmt_link_depends = apitrace_d3d_pe_link_depends
 
 dxmt_shaders = [
   'dxmt_command.metal'
@@ -43,6 +44,7 @@ dxmt_shaders_header = hexdump_generator.process(dxmt_shaders_lib)
 dxmt_lib = static_library('dxmt', dxmt_src, dxmt_shaders_header, dxmt_version,
   dependencies        : [ util_dep, airconv_forward_dep, winemetal_dep ] + apitrace_d3d_pe_deps,
   include_directories : [ dxmt_include_path ],
+  link_depends        : dxmt_link_depends,
 )
 
 dxmt_dep = declare_dependency(

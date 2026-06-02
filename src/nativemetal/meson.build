@@ -3,7 +3,7 @@ winemetal_src = [
   '../winemetal/unix/winemetal_unix.c',
   '../winemetal/unix/cache.c',
 ]
-winemetal_link_depends = []
+winemetal_link_depends = apitrace_metal_native_link_depends
 
 winemetal_ld_args = [
   '-weak_framework', 'CoreFoundation', '-weak_framework', 'Metal',

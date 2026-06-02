@@ -27,6 +27,7 @@ winemetal_unix_link_depends = []
 if wine_build_path != ''
   winemetal_unix_link_depends += [winemac_so, ntdll_so]
 endif
+winemetal_unix_link_depends += apitrace_metal_native_link_depends
 
 winemetal_unix_deps = [ airconv_dep_darwin ] + apitrace_metal_native_deps
 winemetal_unix_include_dirs = [ dxmt_include_path ] + apitrace_metal_include_path
