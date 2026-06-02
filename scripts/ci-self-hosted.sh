@@ -152,7 +152,11 @@ ensure_wine_rosetta_build_tools() {
   for package in "${packages[@]}"; do
     if ! "${brew_x86[@]}" list --formula "${package}" >/dev/null 2>&1; then
       log "installing x86_64 Homebrew formula for Wine: ${package}"
-      "${brew_x86[@]}" install --formula "${package}"
+      if ! "${brew_x86[@]}" install --formula "${package}"; then
+        "${brew_x86[@]}" list --formula "${package}" >/dev/null 2>&1 ||
+          die "failed to install x86_64 Homebrew formula for Wine: ${package}"
+        log "x86_64 Homebrew formula ${package} is installed despite brew returning non-zero"
+      fi
     fi
   done
 }
