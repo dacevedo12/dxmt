@@ -206,14 +206,6 @@ public:
     m_metalFormat = m_texture.pixelFormat();
   }
 
-  // Swap Metal backing between surface objects (swapchain Present rotation, FLIP/FLIPEX/DISCARD).
-  // Sibling backbuffer slots: contents shift per Present (0→N-1, 1→0, etc). Views carried by m_dxmtTexture.
-  void
-  SwapBacking(MTLD3D9Surface *other) {
-    std::swap(m_texture, other->m_texture);
-    std::swap(m_dxmtTexture, other->m_dxmtTexture);
-  }
-
 private:
   // Lifetime: device held by surface; first public AddRef→device AddRef, last Release→device Release.
   // Device-side bookkeeping (SetRenderTarget storing bound surfaces) uses private refs only, never public.

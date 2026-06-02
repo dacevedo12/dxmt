@@ -28,9 +28,10 @@ public:
   // Raw accessor used by the device ctor to auto-bind the backbuffer to
   // RT slot 0. Doesn't bump the public refcount: the caller treats the
   // surface as device-owned via the implicit-chain priv pin.
-  // With BackBufferCount > 1 the device's RT0 still tracks slot 0;
-  // Metal's CAMetalLayer handles in-flight buffering, so a single
-  // app-visible surface is sufficient for the GPU rotation. Apps that
+  // With BackBufferCount > 1 the device's RT0 still tracks slot 0; the
+  // chain never rotates backings (the CAMetalLayer drawable pool does the
+  // in-flight buffering the GL/Vulkan back ends emulate by rotating), so
+  // slot 0 alone is the persistent draw + present buffer. Apps that
   // explicitly fetch GetBackBuffer(i>0) get a distinct surface object
   // they can manage themselves.
   MTLD3D9Surface *
@@ -92,9 +93,11 @@ private:
   MTLD3D9Device *m_device;
   const bool m_isEx;
   D3DPRESENT_PARAMETERS m_params;
-  // Implicit backbuffer chain: m_backBuffers[0] = device RT0. With
-  // BackBufferCount > 1, Present rotates backing per SwapEffect=FLIP/DISCARD;
-  // COPY skips rotation. Surfaces are Com<,false> (priv ref only).
+  // Implicit backbuffer chain: m_backBuffers[0] = device RT0 = the
+  // persistent draw + present buffer. The chain does not rotate backings
+  // (the CAMetalLayer drawable pool does the in-flight buffering); slots
+  // i>0 exist only so GetBackBuffer(i) returns distinct objects and are
+  // never presented. Surfaces are Com<,false> (priv ref only).
   std::vector<Com<MTLD3D9Surface, false>> m_backBuffers;
   // CAMetalLayer the chain blits to at Present, plus the NSView wrapper
   // returned by CreateMetalViewFromHWND that owns its lifetime. Null
