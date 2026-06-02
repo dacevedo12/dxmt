@@ -1,0 +1,1833 @@
+#include "dxso_compile.hpp"
+
+#include "air_operations.hpp"
+#include "air_signature.hpp"
+#include "air_type.hpp"
+#include "airconv_context.hpp"
+#include "airconv_public.h"
+#include "metallib_writer.hpp"
+#include "nt/air_builder.hpp"
+
+#include "llvm/IR/Constants.h"
+#include "llvm/IR/IRBuilder.h"
+#include "llvm/IR/Intrinsics.h"
+#include "llvm/IR/LLVMContext.h"
+#include "llvm/IR/Metadata.h"
+#include "llvm/IR/Module.h"
+#include "llvm/Support/raw_ostream.h"
+
+#include <array>
+#include <atomic>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <memory>
+#include <new>
+#include <optional>
+#include <string>
+
+namespace dxmt {
+
+// TODO: d3d9 should route CreateVertexShader/CreatePixelShader through
+// DXSOInitialize for validation and walk instead of duplicating.
+// Emit placeholder DXSO entry into externally-owned Module,
+// mirroring dxbc::convertDXBC's role in the optimization pipeline.
+void
+compile_dxso(
+    DxsoShader *shader, const ::DXSO_SHADER_IA_INPUT_LAYOUT_DATA *ia_layout,
+    const ::DXSO_SHADER_PSO_PIXEL_SHADER_DATA *ps_args, const ::DXSO_SHADER_PS_SAMPLER_LAYOUT_DATA *ps_samp_layout,
+    bool ps_point_sprite, float vs_point_size_override, const ::DXSO_SHADER_PS_BUMP_ENV_DATA *ps_bump_env,
+    const char *name, llvm::LLVMContext &context, llvm::Module &module
+) {
+  using namespace llvm;
+  const bool is_vertex = shader->header.kind == DxsoShaderKind::Vertex;
+  // Manual fetch is VS-only; even if the host hands a layout for a PS
+  // (it shouldn't), the lowering below would have nothing to do.
+  const bool manual_fetch = is_vertex && ia_layout != nullptr;
+  // Alpha test is PS-only and only relevant when the host explicitly
+  // opts in; passing nullptr (or D3DCMP_ALWAYS) means no test snippet
+  // is emitted, so the unspecialised PS keeps its current shape.
+  const bool emit_alpha_test = !is_vertex && ps_args != nullptr && ps_args->alpha_test_func != 8 /* D3DCMP_ALWAYS */;
+
+  // air.version / air.language_version: AGX rejects PS metallibs
+  // missing these. Mirrors dxbc::setup_metal_version's
+  // SM50_SHADER_METAL_320 arm.
+  auto u32_md = [&](uint32_t v) { return ConstantAsMetadata::get(ConstantInt::get(context, APInt{32, v})); };
+  module.setTargetTriple("air64-apple-macosx15.0.0");
+  module.getOrInsertNamedMetadata("air.version")->addOperand(MDTuple::get(context, {u32_md(2), u32_md(7), u32_md(0)}));
+  module.getOrInsertNamedMetadata("air.language_version")
+      ->addOperand(MDTuple::get(context, {MDString::get(context, "Metal"), u32_md(3), u32_md(2), u32_md(0)}));
+
+  air::FunctionSignatureBuilder sig;
+
+  // VS inputs: one [[stage_in]] attribute per dcl_<usage> v#: the
+  // attribute index is the v# register number, host vertex descriptor
+  // binds against it. PS inputs: InputFragmentStageIn keyed on a
+  // user-name, and the matching VS output uses the same string. v#
+  // (Input register file) and t# (Texture register file, SM2 / SM 1.4
+  // PS) live in separate input arrays so the body's load_src can
+  // route by register file directly.
+  std::array<int, 16> input_arg_idx;
+  input_arg_idx.fill(-1);
+  // Parallel to input_arg_idx: true when v<N> was dcl'd as TEXCOORD.
+  // Drives the POINTSPRITEENABLE per-input substitution at tex_inputs
+  // load time; SM3 PS reads texcoords via v# (input_arg_idx) rather
+  // than t# (ps_tex_arg_idx), so the substitution has to look at both
+  // register files. Stays all-false for SM1.x (legacy-PS reroutes
+  // every v# to COLOR via the legacy_ps branch above) and for SM3
+  // shaders that don't bind any texcoords.
+  std::array<bool, 16> ps_v_is_texcoord{};
+  // PS Texture-register-file inputs (t0..t7). Used by SM2 PS and SM 1.4
+  // PS as the texcoord-input register file; SM3 PS reads texcoords
+  // through v# instead and leaves this array fully -1.
+  std::array<int, 8> ps_tex_arg_idx;
+  ps_tex_arg_idx.fill(-1);
+  // Per-v# index into ia_layout->elements when manual_fetch is on; -1
+  // means the v# slot zero-fills like an undeclared input does today.
+  std::array<int, 16> ia_element_idx;
+  ia_element_idx.fill(-1);
+
+  // PS signature head: InputPosition lands first so it occupies struct
+  // field 0, even when no dcl_position v# is present. AGX rejects PS
+  // metallibs that interleave [[position]] with user varyings; the
+  // mismatched field order surfaces as
+  // XPC_ERROR_CONNECTION_INTERRUPTED at PSO link time with no metallib
+  // diagnostic. The arg index is captured so a SM3 `dcl_position v#`
+  // can reuse it for v# loading instead of double-defining.
+  int ps_position_arg_idx = -1;
+  // Set of PS user-input names already claimed by an explicit dcl;
+  // used below to avoid emitting a duplicate stub for the same name.
+  std::array<bool, 8> ps_texcoord_used{};
+  std::array<bool, 2> ps_color_used{};
+  bool ps_fog_used = false;
+  if (!is_vertex) {
+    ps_position_arg_idx = (int)sig.DefineInput(
+        air::InputPosition{
+            .interpolation = air::Interpolation::center_no_perspective,
+        }
+    );
+  }
+
+  // vFace (DXSO MiscType register 1) -> [[front_facing]]. Defined right
+  // after [[position]]: both are built-in inputs that must precede the
+  // user varyings and the texture/sampler args (built-in inputs must
+  // precede user varyings on AGX, or PSO link fails): and only when the
+  // shader actually reads vFace, so a
+  // PS that doesn't use it keeps a byte-identical signature. vPos (MiscType
+  // register 0) needs no new input; it reuses ps_position_arg_idx.
+  int ps_vface_arg_idx = -1;
+  if (!is_vertex) {
+    DxsoBytecodeIter vfscan(shader->bytecode.data(), static_cast<uint32_t>(shader->bytecode.size()), shader->header);
+    DxsoInstruction vfins{};
+    bool uses_vface = false;
+    while (!uses_vface && vfscan.next(vfins)) {
+      if (vfins.opcode == DxsoOpcode::End)
+        break;
+      for (uint32_t s = 0; s < vfins.src_count; ++s)
+        if (vfins.src[s].base.type == DxsoRegisterType::MiscType && vfins.src[s].base.num == 1) {
+          uses_vface = true;
+          break;
+        }
+    }
+    if (uses_vface)
+      ps_vface_arg_idx = (int)sig.DefineInput(air::InputFrontFacing{});
+  }
+
+  // SM 1.0..1.3 PS, SM 2.0 PS and SM 1.4 PS: input semantics from
+  // register file, not dcl token. SM 3.0 PS: semantic on dcl token.
+  // (Mirrors DXVK dxso_compiler.cpp)
+  bool legacy_ps = !is_vertex && shader->header.major < 3;
+  bool ps_t_is_stage_in =
+      !is_vertex && (shader->header.major >= 2 || (shader->header.major == 1 && shader->header.minor == 4));
+  for (const auto &d : shader->metadata.dcls) {
+    if (is_vertex) {
+      if (d.bound_to.type != DxsoRegisterType::Input || d.bound_to.num >= input_arg_idx.size())
+        continue;
+      if (manual_fetch) {
+        // Look up the IA element whose `reg` matches this v#. The d3d9
+        // caller resolves (decl semantic, VS dcl) → reg before
+        // populating the layout, so a matched element is the
+        // expected case; an unmatched dcl falls through to zero-fill,
+        // which mirrors the "undcl'd input is zero" DXSO contract.
+        for (uint32_t k = 0; k < ia_layout->num_elements; ++k) {
+          if (ia_layout->elements[k].reg == d.bound_to.num) {
+            ia_element_idx[d.bound_to.num] = (int)k;
+            break;
+          }
+        }
+        continue;
+      }
+      input_arg_idx[d.bound_to.num] = (int)sig.DefineInput(
+          air::InputVertexStageIn{
+              .attribute = d.bound_to.num,
+              .type = air::InputAttributeComponentType::Float,
+              .name = "in" + std::to_string(d.bound_to.num),
+          }
+      );
+      continue;
+    }
+
+    // PS path. Two register files reach the fragment shader as
+    // interpolated inputs: Input (v#) and Texture (t#). SM3 PS only
+    // declares v# and routes everything (Color, Texcoord, Fog,
+    // Position) by dcl.usage. SM2 PS and SM 1.4 PS declare both v#
+    // and t# but leave dcl.usage unreliable; register-file is the
+    // truth. SM 1.0..1.3 PS doesn't dcl t# (and we don't bind it as
+    // a stage-in below); the t# slots come from the `tex t#` opcode.
+    bool is_v = d.bound_to.type == DxsoRegisterType::Input;
+    bool is_t = d.bound_to.type == DxsoRegisterType::Texture;
+    if (!is_v && !is_t)
+      continue;
+    if (is_v && d.bound_to.num >= input_arg_idx.size())
+      continue;
+    if (is_t && (!ps_t_is_stage_in || d.bound_to.num >= ps_tex_arg_idx.size()))
+      continue;
+
+    DxsoUsage effective_usage = d.dcl.usage;
+    uint32_t effective_index = d.dcl.usage_index;
+    if (legacy_ps) {
+      effective_usage = is_t ? DxsoUsage::Texcoord : DxsoUsage::Color;
+      effective_index = d.bound_to.num;
+    }
+
+    const char *base = nullptr;
+    switch (effective_usage) {
+    case DxsoUsage::Position:
+      // SM3 PS dcl_position v# carries SV_Position. Reuse the
+      // InputPosition emitted at the signature head: a second
+      // DefineInput would put two [[position]] fields in the function.
+      // legacy_ps never reaches this (effective_usage was rewritten
+      // to Color/Texcoord based on register file).
+      if (is_v)
+        input_arg_idx[d.bound_to.num] = ps_position_arg_idx;
+      continue;
+    case DxsoUsage::Color:
+      base = "COLOR";
+      break;
+    case DxsoUsage::Texcoord:
+      base = "TEXCOORD";
+      break;
+    case DxsoUsage::Fog:
+      base = "FOG";
+      break;
+    default:
+      break; // BlendWeight/Normal/etc; skip
+    }
+    if (!base)
+      continue;
+    int arg_idx = (int)sig.DefineInput(
+        air::InputFragmentStageIn{
+            .user = std::string(base) + std::to_string(effective_index),
+            .type = air::msl_float4,
+            .interpolation = air::Interpolation::center_perspective,
+            .pull_mode = false,
+        }
+    );
+    if (is_v) {
+      input_arg_idx[d.bound_to.num] = arg_idx;
+      if (effective_usage == DxsoUsage::Texcoord)
+        ps_v_is_texcoord[d.bound_to.num] = true;
+    } else
+      ps_tex_arg_idx[d.bound_to.num] = arg_idx;
+    if (effective_usage == DxsoUsage::Color && effective_index < ps_color_used.size())
+      ps_color_used[effective_index] = true;
+    else if (effective_usage == DxsoUsage::Texcoord && effective_index < ps_texcoord_used.size())
+      ps_texcoord_used[effective_index] = true;
+    else if (effective_usage == DxsoUsage::Fog && effective_index == 0)
+      ps_fog_used = true;
+  }
+
+  // PS signature tail: define stubs for COLOR0..1, TEXCOORD0..7, FOG0
+  // so AGX's PSO link finds matching PS inputs for all possible VS outputs,
+  // preventing XPC_ERROR_CONNECTION_INTERRUPTED at link time.
+  if (!is_vertex) {
+    auto define_stub = [&](const std::string &user) {
+      return (int)sig.DefineInput(
+          air::InputFragmentStageIn{
+              .user = user,
+              .type = air::msl_float4,
+              .interpolation = air::Interpolation::center_perspective,
+              .pull_mode = false,
+          }
+      );
+    };
+    // SM 1.0..1.3 PS has no dcl tokens; the dcls walk above never
+    // populates input_arg_idx[] or ps_tex_arg_idx[]. The body still
+    // reads v0/v1 (= COLOR0/1) and t0..t7 (= TEXCOORD0..7) by register-
+    // file convention; without binding those slots to the stage-in
+    // args defined here, every v#/t# read returns ConstantAggregateZero
+    // and any "modulate by vertex color" PS produces solid black.
+    // A ps_1_1 shader that does "mul r0, tex t0, v0" produces 0 when v0
+    // reads as zero; this binding prevents that silent collapse.
+    bool sm1_legacy_ps = shader->header.major == 1 && shader->header.minor < 4;
+    for (int i = 0; i < 2; ++i) {
+      if (!ps_color_used[i]) {
+        int arg_idx = define_stub("COLOR" + std::to_string(i));
+        if (sm1_legacy_ps && i < (int)input_arg_idx.size())
+          input_arg_idx[i] = arg_idx;
+      }
+    }
+    for (int i = 0; i < 8; ++i) {
+      if (!ps_texcoord_used[i]) {
+        int arg_idx = define_stub("TEXCOORD" + std::to_string(i));
+        if (sm1_legacy_ps && i < (int)ps_tex_arg_idx.size())
+          ps_tex_arg_idx[i] = arg_idx;
+      }
+    }
+    if (!ps_fog_used)
+      define_stub("FOG0");
+  }
+
+  // PS point-sprite [[point_coord]] input. When ps_point_sprite is on
+  // (host has bound a point-list primitive with D3DRS_POINTSPRITEENABLE),
+  // every TEXCOORD<N> stage_in read at tex_inputs init time gets
+  // substituted with float4(point_coord.xy, 0, 1). The substitution is
+  // unconditional across all 8 texcoord slots per D3D9 spec (no per-
+  // stage D3DTSS_TEXCOORDINDEX gating for POINTSPRITEENABLE).
+  int ps_point_coord_arg_idx = -1;
+  if (!is_vertex && ps_point_sprite) {
+    ps_point_coord_arg_idx = (int)sig.DefineInput(air::InputPointCoord{});
+  }
+
+  // Manual-fetch VS extras: vertex_buffers table at [[buffer(16)]]
+  // (struct-array of {device char *base, i32 stride, i32 length}, one
+  // entry per active stream slot, indexed by popcount of the slot mask
+  // below the element's slot bit), plus the [[vertex_id]] /
+  // [[base_vertex]] system inputs the prologue uses to compute the
+  // per-element byte offset. Mirrors pull_vertex_input in
+  // dxbc_converter_basicblock.cpp (which sources the same struct
+  // layout via AirType::_dxmt_vertex_buffer_entry).
+  uint32_t vbuf_table_arg_idx = 0;
+  uint32_t vid_arg_idx = 0;
+  uint32_t base_vertex_arg_idx = 0;
+  uint32_t instance_id_arg_idx = 0;
+  uint32_t base_instance_arg_idx = 0;
+  if (manual_fetch) {
+    // array_size = 1 (not 0): xcrun metal emits `air.location_index,
+    // i32 N, i32 1` for non-array bindings; AGX reads the second integer
+    // as a binding count and rejects 0 at PSO link with
+    // XPC_ERROR_CONNECTION_INTERRUPTED, even though the metallib writer
+    // accepts it without complaint. Same fix applies to every
+    // ArgumentBindingBuffer site below.
+    vbuf_table_arg_idx = sig.DefineInput(
+        air::ArgumentBindingBuffer{
+            .buffer_size = {},
+            .location_index = 16,
+            .array_size = 1,
+            .memory_access = air::MemoryAccess::read,
+            .address_space = air::AddressSpace::constant,
+            .type = air::msl_uint,
+            .arg_name = "vertex_buffers",
+            .raster_order_group = {},
+        }
+    );
+    vid_arg_idx = sig.DefineInput(air::InputVertexID{});
+    base_vertex_arg_idx = sig.DefineInput(air::InputBaseVertex{});
+    instance_id_arg_idx = sig.DefineInput(air::InputInstanceID{});
+    base_instance_arg_idx = sig.DefineInput(air::InputBaseInstance{});
+  }
+
+  // Constant register files: c#, i#, b#. Split per-file (not DXVK's
+  // single struct) to match existing dxmt convention. Host binds:
+  // buffer(0)=float4 c[], buffer(1)=int4 i[], buffer(2)=uint b[].
+  // Covers vs_2_0/3_0 and ps_2_0/3_0; SWVP and ps_1_x are not covered.
+  uint32_t cb_arg_idx = sig.DefineInput(
+      air::ArgumentBindingBuffer{
+          .buffer_size = {},
+          .location_index = 0,
+          .array_size = 1,
+          .memory_access = air::MemoryAccess::read,
+          .address_space = air::AddressSpace::constant,
+          .type = air::msl_float4,
+          .arg_name = "c",
+          .raster_order_group = {},
+      }
+  );
+  // Integer constant buffer: i0..i15. Read by Rep / Loop for the
+  // count / init / stride payload and by load_src for general
+  // ConstInt operands (rare outside loops). Sized for 16 entries
+  // unconditionally; D3D9 caps i# at 16 across all SM2/SM3
+  // profiles.
+  uint32_t ic_arg_idx = sig.DefineInput(
+      air::ArgumentBindingBuffer{
+          .buffer_size = {},
+          .location_index = 1,
+          .array_size = 1,
+          .memory_access = air::MemoryAccess::read,
+          .address_space = air::AddressSpace::constant,
+          .type = air::msl_int4,
+          .arg_name = "i",
+          .raster_order_group = {},
+      }
+  );
+  // Bool bitmask: single uint32 packing b0..b15 with bit i = b#i.
+  // Matches DXVK's bConsts[1] layout (src/d3d9/d3d9_constant_set.h)
+  // so that the SetXShaderConstantB host-side packing path is a
+  // bit-OR / bit-AND, no per-bool dispatch.
+  uint32_t bc_arg_idx = sig.DefineInput(
+      air::ArgumentBindingBuffer{
+          .buffer_size = {},
+          .location_index = 2,
+          .array_size = 1,
+          .memory_access = air::MemoryAccess::read,
+          .address_space = air::AddressSpace::constant,
+          .type = air::msl_uint,
+          .arg_name = "b",
+          .raster_order_group = {},
+      }
+  );
+
+  // VS clip planes: host packs enabled planes consecutively.
+  // Disabled planes write 0.0 (GPU clips if < 0, so 0.0 passes).
+  // PS does not use these bindings; slots 3/4 free for fragment stage.
+  uint32_t clip_planes_arg_idx = ~0u;
+  uint32_t clip_count_arg_idx = ~0u;
+  if (is_vertex) {
+    clip_planes_arg_idx = sig.DefineInput(
+        air::ArgumentBindingBuffer{
+            .buffer_size = {},
+            .location_index = 3,
+            .array_size = 1,
+            .memory_access = air::MemoryAccess::read,
+            .address_space = air::AddressSpace::constant,
+            .type = air::msl_float4,
+            .arg_name = "clip_planes",
+            .raster_order_group = {},
+        }
+    );
+    clip_count_arg_idx = sig.DefineInput(
+        air::ArgumentBindingBuffer{
+            .buffer_size = {},
+            .location_index = 4,
+            .array_size = 1,
+            .memory_access = air::MemoryAccess::read,
+            .address_space = air::AddressSpace::constant,
+            .type = air::msl_uint,
+            .arg_name = "clip_count",
+            .raster_order_group = {},
+        }
+    );
+  }
+
+  // PS texture+sampler bindings: one pair per sampled s# from pre-scan.
+  // Binding ABI only; Tex lowering in follow-up. Keep unknown samplers
+  // out of both signature and opcode lowering to avoid unused args.
+  std::array<int, 16> tex_arg_idx{};
+  tex_arg_idx.fill(-1);
+  std::array<int, 16> samp_arg_idx{};
+  samp_arg_idx.fill(-1);
+  std::array<DxsoTextureType, 16> samp_kind{};
+  samp_kind.fill(DxsoTextureType::Unknown);
+  // Per-slot hardware-PCF flag: flips SM2+ sample to sample_compare.
+  // SM1.x texm3x*/texbem sample depth2d raw (bound as env/bump maps).
+  std::array<bool, 16> samp_compare{};
+  if (!is_vertex) {
+    for (const auto &d : shader->metadata.dcls) {
+      if (d.bound_to.type == DxsoRegisterType::Sampler && d.bound_to.num < samp_kind.size())
+        samp_kind[d.bound_to.num] = d.dcl.texture_type;
+    }
+    bool used[16] = {};
+    DxsoBytecodeIter scan(shader->bytecode.data(), static_cast<uint32_t>(shader->bytecode.size()), shader->header);
+    DxsoInstruction tins{};
+    while (scan.next(tins)) {
+      if (tins.opcode == DxsoOpcode::End)
+        break;
+      // SM2+: texld / texldl / texldd dst, coord, sampler[, ddx, ddy].
+      // Sampler is in src[1] for all three. SM1.x: tex t#; sampler is
+      // implicit, slot matches dst.base.num. The SM1.x decoder leaves
+      // src_count=0 and dst.base.type=Texture.
+      bool is_sampling =
+          tins.opcode == DxsoOpcode::Tex || tins.opcode == DxsoOpcode::TexLdl || tins.opcode == DxsoOpcode::TexLdd;
+      if (!is_sampling)
+        continue;
+      uint32_t slot = UINT32_MAX;
+      if (tins.src_count >= 2 && tins.src[1].base.type == DxsoRegisterType::Sampler)
+        slot = tins.src[1].base.num;
+      else if (tins.has_dst && tins.dst.base.type == DxsoRegisterType::Texture)
+        slot = tins.dst.base.num;
+      if (slot < 16)
+        used[slot] = true;
+    }
+    // Host layout is authoritative: engine's actual bound texture type
+    // may differ from shader dcl (e.g., declare 2D but bind Cube for env-map).
+    // Fallback to shader's dcl when no host layout; preserves airconv_cli.
+    if (ps_samp_layout) {
+      for (uint32_t i = 0; i < 16; ++i) {
+        if (!used[i])
+          continue;
+        switch (ps_samp_layout->kinds[i]) {
+        case DXSO_PS_SAMPLER_KIND_TEXTURE_2D:
+          samp_kind[i] = DxsoTextureType::Texture2D;
+          break;
+        case DXSO_PS_SAMPLER_KIND_TEXTURE_CUBE:
+          samp_kind[i] = DxsoTextureType::TextureCube;
+          break;
+        case DXSO_PS_SAMPLER_KIND_TEXTURE_3D:
+          samp_kind[i] = DxsoTextureType::Texture3D;
+          break;
+        case DXSO_PS_SAMPLER_KIND_TEXTURE_2D_DEPTH:
+          samp_kind[i] = DxsoTextureType::Texture2DDepth;
+          break;
+        case DXSO_PS_SAMPLER_KIND_TEXTURE_2D_DEPTH_COMPARE:
+          // Same Metal kind (depth2d); the Tex arm emits sample_compare
+          // instead of sample, and the host pairs this with a LessEqual
+          // compareFunction sampler.
+          samp_kind[i] = DxsoTextureType::Texture2DDepth;
+          samp_compare[i] = true;
+          break;
+        default:
+          // UNKNOWN; host didn't pin (e.g. stage with no bound
+          // texture at PSO build time, or a partial-binding shape).
+          // Leave samp_kind[i] alone: the shader's own dcl is the
+          // next-best signal, and the SM 1.x default-to-2D arm below
+          // catches the remaining Unknown case.
+          break;
+        }
+      }
+    }
+    // Fallback for SM 1.0..1.3 sampler slots the host didn't pin: keep the
+    // historical Texture2D default. wined3d glsl_shader.c
+    // shader_glsl_get_sample_function and DXVK src/dxso/dxso_compiler.cpp
+    // both assume 2D when the bytecode itself can't disambiguate. Without
+    // either source, samp_kind[i] stays Unknown → the binding loop below
+    // `continue`s → tex_arg_idx[i] stays -1 → the Tex opcode short-
+    // circuits and r0 sees the raw TEXCOORD<n> stage_in instead of the
+    // sampled texel (UV-as-color gradient).
+    if (shader->header.major == 1 && shader->header.minor < 4) {
+      for (uint32_t i = 0; i < 16; ++i) {
+        if (used[i] && samp_kind[i] == DxsoTextureType::Unknown)
+          samp_kind[i] = DxsoTextureType::Texture2D;
+      }
+    }
+    for (uint32_t i = 0; i < 16; ++i) {
+      if (!used[i])
+        continue;
+      air::TextureKind kind;
+      switch (samp_kind[i]) {
+      case DxsoTextureType::Texture2D:
+        kind = air::TextureKind::texture_2d;
+        break;
+      case DxsoTextureType::TextureCube:
+        kind = air::TextureKind::texture_cube;
+        break;
+      case DxsoTextureType::Texture3D:
+        kind = air::TextureKind::texture_3d;
+        break;
+      case DxsoTextureType::Texture2DDepth:
+        kind = air::TextureKind::depth_2d;
+        break;
+      default:
+        // Unknown sampler (no dcl); leave unbound; the case arm will
+        // short-circuit on tex_arg_idx == -1.
+        continue;
+      }
+      // array_size = 1 (not 0): AGX rejects 0 with
+      // XPC_ERROR_CONNECTION_INTERRUPTED at pipeline link, even though
+      // the metallib writer accepts it without complaint. xcrun metal
+      // emits `air.location_index, i32 N, i32 1` for non-array bindings.
+      tex_arg_idx[i] = (int)sig.DefineInput(
+          air::ArgumentBindingTexture{
+              .location_index = i,
+              .array_size = 1,
+              .memory_access = air::MemoryAccess::sample,
+              .type =
+                  air::MSLTexture{
+                      .component_type = air::msl_float,
+                      .memory_access = air::MemoryAccess::sample,
+                      .resource_kind = kind,
+                      .resource_kind_logical = kind,
+                  },
+              .arg_name = "t" + std::to_string(i),
+              .raster_order_group = {},
+          }
+      );
+      samp_arg_idx[i] = (int)sig.DefineInput(
+          air::ArgumentBindingSampler{
+              .location_index = i,
+              .array_size = 1,
+              .arg_name = "s" + std::to_string(i),
+          }
+      );
+    }
+  }
+
+  // VS varying outputs: pre-scan SM≤2 for oD#/oT# writes, SM3 reads dcl.
+  // SM1/SM2 semantics positional; SM3 uses dcl. OutputPosition first.
+  std::array<int, 2> oD_arg_idx{};
+  oD_arg_idx.fill(-1);
+  std::array<int, 8> oT_arg_idx{};
+  oT_arg_idx.fill(-1);
+  int oFog_arg_idx = -1;
+  // VS oPts (point size): SM1.x via mov oPts, SM3 via dcl_psize o#.
+  // Without plumb-through, D3DPT_POINTLIST defaults to 1.0.
+  // vs_point_size_override seeds slot when not written by bytecode.
+  bool oPts_used = false;
+  if (is_vertex && vs_point_size_override > 0.0f)
+    oPts_used = true;
+  int oPts_arg_idx = -1;
+  // SM3 dcl_psize routes here via oN_is_pointsize[N] aliasing, mirroring
+  // the oN_is_position pattern below. Tracked separately from
+  // oN_arg_idx so the SM3 varying-output emit loop skips PointSize
+  // (it's a non-varying output that needs scalar emission, not float4).
+  std::array<bool, 16> oN_is_pointsize{};
+  // PS [[color(N)]] outputs: SM2+ shaders may write up to 4 RTs.
+  // SM1.x has no ColorOut register file; the output is r0 implicitly,
+  // and that path stays gated through the SM1.x lowering work.
+  std::array<int, 4> oC_arg_idx{};
+  oC_arg_idx.fill(-1);
+  int oDepth_arg_idx = -1;
+  // SM3 VS outputs: `dcl_<usage> o#` registers, dcl-driven semantics.
+  // Output # is the dcl's bound_to.num; usage gives the AIR user name.
+  // o#'s register file decodes as TexcoordOut/Output (=6); same
+  // numeric value, distinct meaning. -1 unbound, ≥ 0 is the
+  // OutputVertex arg index. oN_is_position aliases the slot to oPos
+  // for Position dcls so the existing field-0 plumbing covers them.
+  std::array<int, 16> oN_arg_idx{};
+  oN_arg_idx.fill(-1);
+  std::array<bool, 16> oN_is_position{};
+  std::array<Value *, 16> oN_slot{};
+  bool sm12_vs_varyings = is_vertex && shader->header.major <= 2;
+  bool sm3_vs_outputs = is_vertex && shader->header.major == 3;
+  uint32_t clip_dist_field_idx = ~0u;
+  if (is_vertex) {
+    sig.DefineOutput(air::OutputPosition{.type = air::msl_float4});
+    // 8-element clip-distance array: every VS unconditionally writes
+    // the array even when D3DRS_CLIPPLANEENABLE is 0, because the host
+    // packs only enabled planes consecutively and signals "no plane is
+    // enabled" by setting clip_count to 0; the per-lane select below
+    // then short-circuits to 0.0, which the GPU treats as "not
+    // clipped". This avoids per-draw VS variants keyed on
+    // CLIPPLANEENABLE; DXVK uses the same shape via a spec constant
+    // (src/dxso/dxso_compiler.cpp) for the same reason.
+    clip_dist_field_idx = sig.DefineOutput(air::OutputClipDistance{.count = 8});
+    if (sm12_vs_varyings) {
+      bool oD_used[2] = {};
+      bool oT_used[8] = {};
+      bool oFog_used = false;
+      DxsoBytecodeIter scan(shader->bytecode.data(), static_cast<uint32_t>(shader->bytecode.size()), shader->header);
+      DxsoInstruction sins{};
+      while (scan.next(sins)) {
+        if (sins.opcode == DxsoOpcode::End)
+          break;
+        if (!sins.has_dst)
+          continue;
+        if (sins.dst.base.type == DxsoRegisterType::AttributeOut && sins.dst.base.num < 2)
+          oD_used[sins.dst.base.num] = true;
+        else if (sins.dst.base.type == DxsoRegisterType::TexcoordOut && sins.dst.base.num < 8)
+          oT_used[sins.dst.base.num] = true;
+        else if (sins.dst.base.type == DxsoRegisterType::RasterizerOut && sins.dst.base.num == 1)
+          oFog_used = true;
+        else if (sins.dst.base.type == DxsoRegisterType::RasterizerOut && sins.dst.base.num == 2)
+          oPts_used = true;
+      }
+      for (int i = 0; i < 2; ++i) {
+        if (oD_used[i])
+          oD_arg_idx[i] = (int)sig.DefineOutput(
+              air::OutputVertex{
+                  .user = "COLOR" + std::to_string(i),
+                  .type = air::msl_float4,
+              }
+          );
+      }
+      for (int i = 0; i < 8; ++i) {
+        if (oT_used[i])
+          oT_arg_idx[i] = (int)sig.DefineOutput(
+              air::OutputVertex{
+                  .user = "TEXCOORD" + std::to_string(i),
+                  .type = air::msl_float4,
+              }
+          );
+      }
+      if (oFog_used)
+        oFog_arg_idx = (int)sig.DefineOutput(
+            air::OutputVertex{
+                .user = "FOG0",
+                .type = air::msl_float4,
+            }
+        );
+      if (oPts_used)
+        oPts_arg_idx = (int)sig.DefineOutput(air::OutputPointSize{});
+    } else if (sm3_vs_outputs) {
+      // SM3 VS: walk dcls, emit one OutputVertex per `dcl_<usage> o#`.
+      // Position routes to the oPos slot (already defined above);
+      // PointSize routes to the AIR [[point_size]] output via
+      // oN_is_pointsize aliasing (mirroring oN_is_position). Color /
+      // Texcoord / Fog become user-named varyings whose name matches
+      // the PS InputFragmentStageIn naming convention so linkage works.
+      for (const auto &d : shader->metadata.dcls) {
+        if (d.bound_to.type != DxsoRegisterType::Output || d.bound_to.num >= oN_arg_idx.size())
+          continue;
+        if (d.dcl.usage == DxsoUsage::Position) {
+          oN_is_position[d.bound_to.num] = true;
+          continue;
+        }
+        if (d.dcl.usage == DxsoUsage::PointSize) {
+          oN_is_pointsize[d.bound_to.num] = true;
+          oPts_used = true;
+          continue;
+        }
+        const char *base = nullptr;
+        switch (d.dcl.usage) {
+        case DxsoUsage::Color:
+          base = "COLOR";
+          break;
+        case DxsoUsage::Texcoord:
+          base = "TEXCOORD";
+          break;
+        case DxsoUsage::Fog:
+          base = "FOG";
+          break;
+        default:
+          break; // Depth / etc; TODO
+        }
+        if (!base)
+          continue;
+        oN_arg_idx[d.bound_to.num] = (int)sig.DefineOutput(
+            air::OutputVertex{
+                .user = std::string(base) + std::to_string(d.dcl.usage_index),
+                .type = air::msl_float4,
+            }
+        );
+      }
+      if (oPts_used)
+        oPts_arg_idx = (int)sig.DefineOutput(air::OutputPointSize{});
+    }
+  } else {
+    // Pre-scan PS body for ColorOut writes so we only define
+    // [[color(N)]] outputs for the slots the shader actually uses;
+    // a shader that touches only oC2 should produce a function
+    // returning just that RT, not three unused zero-filled ones.
+    // FXC always writes oC0, so the empty-shader fallback below keeps
+    // the no-write degenerate case rendering transparent black
+    // instead of skipping the function output entirely.
+    bool oC_used[4] = {};
+    bool oDepth_used = false;
+    DxsoBytecodeIter scan(shader->bytecode.data(), static_cast<uint32_t>(shader->bytecode.size()), shader->header);
+    DxsoInstruction sins{};
+    while (scan.next(sins)) {
+      if (sins.opcode == DxsoOpcode::End)
+        break;
+      if (!sins.has_dst)
+        continue;
+      if (sins.dst.base.type == DxsoRegisterType::ColorOut && sins.dst.base.num < 4)
+        oC_used[sins.dst.base.num] = true;
+      else if (sins.dst.base.type == DxsoRegisterType::DepthOut)
+        oDepth_used = true;
+      // SM 1.x TexDepth / TexM3x2Depth encode the destination as a
+      // Temp / Texture register, not DepthOut; but the opcode
+      // semantically writes [[depth]]. Treat their presence as a
+      // depth-output declaration too so the OutputDepth signature
+      // entry + slot get allocated. wined3d glsl_shader.c +
+      // :6563 emit `gl_FragDepth = …` for both.
+      else if (sins.opcode == DxsoOpcode::TexDepth || sins.opcode == DxsoOpcode::TexM3x2Depth)
+        oDepth_used = true;
+    }
+    bool any = false;
+    for (int i = 0; i < 4; ++i)
+      any = any || oC_used[i];
+    if (!any)
+      oC_used[0] = true;
+    for (int i = 0; i < 4; ++i) {
+      if (oC_used[i])
+        oC_arg_idx[i] = (int)sig.DefineOutput(
+            air::OutputRenderTarget{
+                .dual_source_blending = false,
+                .index = (uint32_t)i,
+                .type = air::msl_float4,
+            }
+        );
+    }
+    if (oDepth_used)
+      oDepth_arg_idx = (int)sig.DefineOutput(
+          air::OutputDepth{
+              .depth_argument = air::DepthArgument::any,
+          }
+      );
+  }
+  auto [fn, fn_md] = sig.CreateFunction(name, context, module, 0, false);
+
+  IRBuilder<> builder(BasicBlock::Create(context, "entry", fn));
+
+  // AIRBuilder for high-level texture / sampler ops: same wrapper
+  // dxbc_converter uses. Texture sample lowerings call
+  // through this so the air.sample.* intrinsic emission stays in one
+  // place. Debug stream is null'd; AIR diagnostics aren't surfaced
+  // through the DXSO path.
+  raw_null_ostream nulldbg{};
+  llvm::air::AIRBuilder air(builder, nulldbg);
+
+  // Temp register file r0..r31: one alloca, zero-init to avoid undef.
+  // D3D9 PS leaves unwritten lanes as default; undef causes per-frame
+  // flicker on alpha-blended output. MTL_SHADER_VALIDATION masks this
+  // by zeroing undef reads; we do it unconditionally.
+  auto *float4Ty = FixedVectorType::get(Type::getFloatTy(context), 4);
+  auto *int4Ty = FixedVectorType::get(Type::getInt32Ty(context), 4);
+  auto *tempArrTy = ArrayType::get(float4Ty, 32);
+  auto *temps = builder.CreateAlloca(tempArrTy, nullptr, "r");
+  builder.CreateStore(ConstantAggregateZero::get(tempArrTy), temps);
+
+  // VS address register a0. <4 x i32> alloca, zero-seeded; Mova
+  // writes the rounded float-to-int result here, and load_src reads
+  // it back when a Const operand carries a relative-address suffix.
+  Value *a0_slot = nullptr;
+  if (is_vertex) {
+    a0_slot = builder.CreateAlloca(int4Ty, nullptr, "a0");
+    builder.CreateStore(ConstantAggregateZero::get(int4Ty), a0_slot);
+  }
+
+  // Loop iterator aL; single i32. Loop sets it to the initial value
+  // from the integer constant; EndLoop steps it by the stride. Const
+  // reads with relative.base.type == Loop pick it up directly. SM3
+  // allows aL in both VS and PS, so allocate unconditionally
+  // (DXVK's emitGetOperandPtr for Loop doesn't gate on stage either).
+  auto *aL_slot = builder.CreateAlloca(Type::getInt32Ty(context), nullptr, "aL");
+  builder.CreateStore(builder.getInt32(0), aL_slot);
+
+  // Predicate register p0; <4 x i1>, one bool per lane. Setp writes
+  // it from a lane-wise compare; predicated instructions read it
+  // through store_dst and gate per-lane writes accordingly.
+  auto *bool4Ty = FixedVectorType::get(Type::getInt1Ty(context), 4);
+  auto *p0_slot = builder.CreateAlloca(bool4Ty, nullptr, "p0");
+  builder.CreateStore(ConstantAggregateZero::get(bool4Ty), p0_slot);
+
+  // VS oPos slot. Pre-seeded with (0,0,0,1) so a shader that never
+  // writes oPos still produces a clip-safe Position; zero-w divides
+  // to NaN at clip and the draw rasterizes nothing.
+  auto *zero = ConstantFP::get(Type::getFloatTy(context), 0.0);
+  auto *one = ConstantFP::get(Type::getFloatTy(context), 1.0);
+  Value *out_slot = nullptr;
+  if (is_vertex) {
+    out_slot = builder.CreateAlloca(float4Ty, nullptr, "oPos");
+    builder.CreateStore(ConstantVector::get({zero, zero, zero, one}), out_slot);
+  }
+  // PS oC# slots: one alloca per render target the pre-scan
+  // discovered. Each is pre-seeded with transparent black so the
+  // never-written degenerate case still produces a defined RT
+  // sample.
+  std::array<Value *, 4> oC_slot{};
+  Value *oDepth_slot = nullptr;
+  if (!is_vertex) {
+    auto *zero4 = ConstantAggregateZero::get(float4Ty);
+    for (int i = 0; i < 4; ++i) {
+      if (oC_arg_idx[i] < 0)
+        continue;
+      oC_slot[i] = builder.CreateAlloca(float4Ty, nullptr, ("oC" + std::to_string(i)).c_str());
+      builder.CreateStore(zero4, oC_slot[i]);
+    }
+    if (oDepth_arg_idx >= 0) {
+      // <4 x float> alloca so store_dst's float4 plumbing can write
+      // through it uniformly; epilogue extracts lane 0 for the actual
+      // OutputDepth scalar.
+      oDepth_slot = builder.CreateAlloca(float4Ty, nullptr, "oDepth");
+      builder.CreateStore(zero4, oDepth_slot);
+    }
+  }
+
+  // VS varying-output slots: one alloca per oD#/oT# the pre-scan
+  // discovered. Pre-seeded with zero so a partial-mask write still
+  // produces a defined varying for the lanes the shader didn't touch.
+  std::array<Value *, 2> oD_slot{};
+  std::array<Value *, 8> oT_slot{};
+  Value *oFog_slot = nullptr;
+  // oPts (point size): float4 alloca, extract lane 0 for [[point_size]].
+  // Seed 1.0 by default or D3DRS_POINTSIZE override when bytecode doesn't write.
+  Value *oPts_slot = nullptr;
+  if (is_vertex && oPts_arg_idx >= 0) {
+    float seed = vs_point_size_override > 0.0f ? vs_point_size_override : 1.0f;
+    Value *seed_const = ConstantFP::get(builder.getFloatTy(), seed);
+    Value *seed_splat = ConstantVector::getSplat(llvm::ElementCount::getFixed(4), cast<llvm::Constant>(seed_const));
+    oPts_slot = builder.CreateAlloca(float4Ty, nullptr, "oPts");
+    builder.CreateStore(seed_splat, oPts_slot);
+  }
+  if (sm12_vs_varyings) {
+    auto *zero4 = ConstantAggregateZero::get(float4Ty);
+    for (int i = 0; i < 2; ++i) {
+      if (oD_arg_idx[i] < 0)
+        continue;
+      oD_slot[i] = builder.CreateAlloca(float4Ty, nullptr, ("oD" + std::to_string(i)).c_str());
+      builder.CreateStore(zero4, oD_slot[i]);
+    }
+    for (int i = 0; i < 8; ++i) {
+      if (oT_arg_idx[i] < 0)
+        continue;
+      oT_slot[i] = builder.CreateAlloca(float4Ty, nullptr, ("oT" + std::to_string(i)).c_str());
+      builder.CreateStore(zero4, oT_slot[i]);
+    }
+    if (oFog_arg_idx >= 0) {
+      oFog_slot = builder.CreateAlloca(float4Ty, nullptr, "oFog");
+      builder.CreateStore(zero4, oFog_slot);
+    }
+  } else if (sm3_vs_outputs) {
+    auto *zero4 = ConstantAggregateZero::get(float4Ty);
+    for (int i = 0; i < 16; ++i) {
+      // Position aliases oPos (already (0,0,0,1)-seeded); PointSize
+      // aliases oPts_slot (1.0-seeded above). Other varyings get their
+      // own zero-seeded alloca. Undcl'd o# stays null and silently
+      // swallows any spurious write.
+      if (oN_is_position[i]) {
+        oN_slot[i] = out_slot;
+      } else if (oN_is_pointsize[i]) {
+        oN_slot[i] = oPts_slot;
+      } else if (oN_arg_idx[i] >= 0) {
+        oN_slot[i] = builder.CreateAlloca(float4Ty, nullptr, ("o" + std::to_string(i)).c_str());
+        builder.CreateStore(zero4, oN_slot[i]);
+      }
+    }
+  }
+
+  // Pre-compute the point-sprite substitution value once if requested.
+  // Used to override both v# (SM3 PS dcl_texcoord) and t# (SM2/SM1.4
+  // PS texture-register-file) reads. D3D9 POINTSPRITEENABLE replaces
+  // all PS texcoord inputs uniformly regardless of D3DTSS_TEXCOORDINDEX.
+  Value *point_sprite_v = nullptr;
+  if (!is_vertex && ps_point_sprite && ps_point_coord_arg_idx >= 0) {
+    auto *pc2 = fn->getArg(ps_point_coord_arg_idx);
+    Value *px = builder.CreateExtractElement(pc2, builder.getInt32(0));
+    Value *py = builder.CreateExtractElement(pc2, builder.getInt32(1));
+    Value *v4 = UndefValue::get(float4Ty);
+    v4 = builder.CreateInsertElement(v4, px, builder.getInt32(0));
+    v4 = builder.CreateInsertElement(v4, py, builder.getInt32(1));
+    v4 = builder.CreateInsertElement(v4, ConstantFP::get(Type::getFloatTy(context), 0.0f), builder.getInt32(2));
+    v4 = builder.CreateInsertElement(v4, ConstantFP::get(Type::getFloatTy(context), 1.0f), builder.getInt32(3));
+    point_sprite_v = v4;
+  }
+
+  // Input register file v0..v15. Allocas + an upfront copy from the
+  // function's stage_in args (legacy path) or buffer-pulled fetch
+  // (manual_fetch), so load_src reads through GEP+load like the temp
+  // file does. Inputs the shader didn't declare get
+  // ConstantAggregateZero (matches DXSO "undeclared inputs are zero").
+  auto *inputArrTy = ArrayType::get(float4Ty, 16);
+  auto *inputs = builder.CreateAlloca(inputArrTy, nullptr, "v");
+
+  // air::AirType is constructed lazily; only the manual-fetch path
+  // needs it (for _dxmt_vertex_buffer_entry and the AIRBuilderContext
+  // that pull_vec4_from_addr expects).
+  std::optional<air::AirType> air_types_storage;
+  auto get_air_types = [&]() -> air::AirType & {
+    if (!air_types_storage)
+      air_types_storage.emplace(context);
+    return *air_types_storage;
+  };
+
+  for (uint32_t i = 0; i < 16; ++i) {
+    Value *src = nullptr;
+    if (manual_fetch && ia_element_idx[i] >= 0) {
+      const auto &element = ia_layout->elements[ia_element_idx[i]];
+      auto &types = get_air_types();
+      auto *vbuf_table = builder.CreateBitCast(
+          fn->getArg(vbuf_table_arg_idx),
+          types._dxmt_vertex_buffer_entry->getPointerTo((uint32_t)air::AddressSpace::constant)
+      );
+      // popcount of slot bits below this element's slot; same packing
+      // dxbc_converter_basicblock.cpp uses so the host can
+      // produce one shared layout for both pipelines.
+      unsigned int shift = 32u - element.slot;
+      unsigned int vbuf_entry_index = element.slot ? __builtin_popcount((ia_layout->slot_mask << shift) >> shift) : 0u;
+      auto *vbuf_entry = builder.CreateLoad(
+          types._dxmt_vertex_buffer_entry,
+          builder.CreateConstGEP1_32(types._dxmt_vertex_buffer_entry, vbuf_table, vbuf_entry_index)
+      );
+      auto *base_addr = builder.CreateExtractValue(vbuf_entry, {0});
+      auto *stride = builder.CreateExtractValue(vbuf_entry, {1});
+      // [[vertex_id]] is post-resolution vertex number for both draw modes.
+      // [[base_vertex]] declared for dcl side-effects only; MUST NOT add—would
+      // double-add and overflow buffer (verified smoke_draw_indexed P2).
+      Value *index;
+      if (element.step_function) {
+        Value *instance_id = fn->getArg(instance_id_arg_idx);
+        Value *base_instance = fn->getArg(base_instance_arg_idx);
+        if (element.step_rate) {
+          index =
+              builder.CreateAdd(base_instance, builder.CreateUDiv(instance_id, builder.getInt32(element.step_rate)));
+        } else {
+          index = base_instance;
+        }
+      } else {
+        index = fn->getArg(vid_arg_idx);
+      }
+      // base_vertex_arg_idx names the [[base_vertex]] system input
+      // declared on the signature above. Keeping the dcl alive (even
+      // unread here) leaves room for a follow-up lowering; e.g.,
+      // recovering the raw 0-indexed vertex number for stream-output
+      // emulation; without re-shuffling input indices.
+      (void)base_vertex_arg_idx;
+      auto *byte_offset =
+          builder.CreateAdd(builder.CreateMul(stride, index), builder.getInt32(element.aligned_byte_offset));
+      air::AIRBuilderContext abctx{
+          .llvm = context,
+          .module = module,
+          .builder = builder,
+          .types = types,
+          .air = air,
+      };
+      auto result =
+          air::pull_vec4_from_addr((air::MTLAttributeFormat)element.format, base_addr, byte_offset).build(abctx);
+      if (auto err = result.takeError()) {
+        // Unsupported MTLAttributeFormat (gaps in pull_vec4_from_addr_checked).
+        // Fail open: zero-fill so the rest of the shader still
+        // compiles. A later commit either widens the format coverage
+        // or rejects the layout up front.
+        llvm::consumeError(std::move(err));
+        src = ConstantAggregateZero::get(float4Ty);
+      } else {
+        src = result.get();
+        if (src->getType() == int4Ty) {
+          // Non-normalized integer formats must be presented as floats.
+          // D3D9 spec: UBYTE4 5 → v.x = 5.0, not int bits.
+          // Bone-index path depends on this; bitcast would collapse to 0.
+          src = builder.CreateSIToFP(src, float4Ty);
+        }
+      }
+    } else if (input_arg_idx[i] >= 0) {
+      // POINTSPRITEENABLE substitution: when v<N> was dcl'd as
+      // TEXCOORD (SM3 PS path), override the stage_in read with the
+      // point-sprite UV vec4. v<N> dcl'd as COLOR is left alone.
+      if (point_sprite_v && i < ps_v_is_texcoord.size() && ps_v_is_texcoord[i])
+        src = point_sprite_v;
+      else
+        src = fn->getArg(input_arg_idx[i]);
+    } else {
+      src = ConstantAggregateZero::get(float4Ty);
+    }
+    auto *slot = builder.CreateGEP(inputArrTy, inputs, {builder.getInt32(0), builder.getInt32(i)});
+    builder.CreateStore(src, slot);
+  }
+
+  // PS t# inputs (t0..t7): allocated unconditionally. SM2/SM1.4 pre-load
+  // from stage-in; SM1.0..1.3 populated at runtime by tex opcode.
+  auto *texInputArrTy = ArrayType::get(float4Ty, 8);
+  Value *tex_inputs = nullptr;
+  if (!is_vertex) {
+    tex_inputs = builder.CreateAlloca(texInputArrTy, nullptr, "t");
+    for (uint32_t i = 0; i < 8; ++i) {
+      Value *src;
+      if (point_sprite_v) {
+        // POINTSPRITEENABLE substitution for the t# (SM2 / SM 1.4 PS)
+        // register file. Override regardless of whether the slot would
+        // otherwise have a stage_in binding; apps may declare zero
+        // texcoord inputs but still sample with the implicit point
+        // sprite UV, which D3DRS_POINTSPRITEENABLE injects.
+        src = point_sprite_v;
+      } else if (ps_tex_arg_idx[i] >= 0) {
+        src = fn->getArg(ps_tex_arg_idx[i]);
+      } else {
+        src = ConstantAggregateZero::get(float4Ty);
+      }
+      auto *slot = builder.CreateGEP(texInputArrTy, tex_inputs, {builder.getInt32(0), builder.getInt32(i)});
+      builder.CreateStore(src, slot);
+    }
+  }
+
+  // Operand helpers: closures over the entry-block builder + the
+  // register files. Each helper returns nullptr when the operand
+  // shape isn't covered yet (Input/Const/sampler/...); the per-opcode
+  // arms treat that as "skip this instruction" rather than fail.
+  auto load_src = [&](const DxsoSrcRegister &src) -> Value * {
+    Value *v = nullptr;
+    switch (src.base.type) {
+    case DxsoRegisterType::Temp: {
+      auto *gep = builder.CreateGEP(tempArrTy, temps, {builder.getInt32(0), builder.getInt32(src.base.num)});
+      v = builder.CreateLoad(float4Ty, gep);
+      break;
+    }
+    case DxsoRegisterType::Input: {
+      if (src.base.num >= 16)
+        return nullptr;
+      auto *gep = builder.CreateGEP(inputArrTy, inputs, {builder.getInt32(0), builder.getInt32(src.base.num)});
+      v = builder.CreateLoad(float4Ty, gep);
+      break;
+    }
+    case DxsoRegisterType::Texture: {
+      // PS-only: SM2 / SM 1.4 reads interpolated TEXCOORD<n> through
+      // the t# register file; SM 1.0..1.3 reads the same slot but it
+      // was populated by an earlier `tex t#` instruction. VS doesn't
+      // own a Texture-file source. tex_inputs is allocated whenever
+      // !is_vertex regardless of SM (zero-init covers both SM3-PS-
+      // never-uses and SM 1.0..1.3-not-yet-populated cases).
+      if (is_vertex || src.base.num >= 8 || !tex_inputs)
+        return nullptr;
+      auto *gep = builder.CreateGEP(texInputArrTy, tex_inputs, {builder.getInt32(0), builder.getInt32(src.base.num)});
+      v = builder.CreateLoad(float4Ty, gep);
+      break;
+    }
+    case DxsoRegisterType::Const: {
+      // def-baked Float32 literal first; codegen-time constant beats
+      // a runtime load. Int / Bool defs share the Const switch arm
+      // here as a per-DefKind dispatch only because the decoder gives
+      // each its own DxsoRegisterType (ConstInt / ConstBool); those
+      // types are handled by the dedicated arms below.
+      const DxsoBoundConst *match = nullptr;
+      for (const auto &c : shader->metadata.consts) {
+        if (c.bound_to.type == src.base.type && c.bound_to.num == src.base.num) {
+          match = &c;
+          break;
+        }
+      }
+      if (match && match->def.kind == DxsoDefKind::Float32) {
+        auto *fTy = Type::getFloatTy(context);
+        Constant *lanes[4] = {
+            ConstantFP::get(fTy, match->def.payload.f32[0]),
+            ConstantFP::get(fTy, match->def.payload.f32[1]),
+            ConstantFP::get(fTy, match->def.payload.f32[2]),
+            ConstantFP::get(fTy, match->def.payload.f32[3]),
+        };
+        v = ConstantVector::get(lanes);
+        break;
+      }
+      if (match)
+        return nullptr; // mismatched def kind on a Float register;
+                        // malformed bytecode, skip.
+      // Runtime-set: load from the Float CB at slot src.base.num,
+      // optionally plus the indexed component of a0 when the operand
+      // carries a relative-address suffix (`c[a0.x + N]`). vs_2_0/3_0
+      // caps c# at 255, ps_2_0/3_0 at 223; the host binds a CB sized to
+      // each ceiling. Out-of-range registers come from malformed
+      // bytecode; skip rather than emit an OOB read on the host CB.
+      if (src.base.num >= (is_vertex ? 256u : 224u))
+        return nullptr;
+      auto *cbPtr = fn->getArg(cb_arg_idx);
+      Value *idx = builder.getInt32(src.base.num);
+      if (src.has_relative) {
+        Value *off = nullptr;
+        if (src.relative.base.type == DxsoRegisterType::Addr && src.relative.base.num == 0 && a0_slot) {
+          auto *a0v = builder.CreateLoad(int4Ty, a0_slot);
+          off = builder.CreateExtractElement(a0v, builder.getInt32(src.relative.swizzle[0]));
+        } else if (src.relative.base.type == DxsoRegisterType::Loop) {
+          off = builder.CreateLoad(Type::getInt32Ty(context), aL_slot);
+        } else {
+          return nullptr;
+        }
+        idx = builder.CreateAdd(idx, off);
+      }
+      auto *gep = builder.CreateGEP(float4Ty, cbPtr, idx);
+      v = builder.CreateLoad(float4Ty, gep);
+      break;
+    }
+    case DxsoRegisterType::ConstInt: {
+      // i# as a generic operand. DXVK src/dxso/dxso_compiler.cpp
+      // returns the raw int4; our load_src contract is <4 x float>, so
+      // we sint-to-fp the four lanes after loading and let downstream
+      // swizzle/modifier handling treat it as any other float source.
+      // FXC almost always uses i# only for `loop`/`rep` counts (which
+      // bypass load_src entirely); a `mov r0, i0` does appear in
+      // hand-written shaders though, and is the symptom that motivated
+      // this arm.
+      if (src.base.num >= 16)
+        return nullptr;
+      const DxsoBoundConst *match = nullptr;
+      for (const auto &c : shader->metadata.consts) {
+        if (c.bound_to.type == DxsoRegisterType::ConstInt && c.bound_to.num == src.base.num &&
+            c.def.kind == DxsoDefKind::Int32) {
+          match = &c;
+          break;
+        }
+      }
+      Value *as_int = nullptr;
+      if (match) {
+        Constant *lanes[4] = {
+            builder.getInt32(match->def.payload.i32[0]),
+            builder.getInt32(match->def.payload.i32[1]),
+            builder.getInt32(match->def.payload.i32[2]),
+            builder.getInt32(match->def.payload.i32[3]),
+        };
+        as_int = ConstantVector::get(lanes);
+      } else {
+        auto *icPtr = fn->getArg(ic_arg_idx);
+        auto *gep = builder.CreateGEP(int4Ty, icPtr, builder.getInt32(src.base.num));
+        as_int = builder.CreateLoad(int4Ty, gep);
+      }
+      v = builder.CreateSIToFP(as_int, float4Ty);
+      break;
+    }
+    case DxsoRegisterType::ConstBool: {
+      // b# as a generic operand. The dedicated `If b#` handler reads
+      // the bit directly into an i1; here we lift the same bit into a
+      // {0.0, 1.0} float and splat across all four lanes so a `mul r0,
+      // r0, b0` gates the multiply on the bool. Def-baked literal
+      // first; otherwise sample the bitmask binding (one uint, bit i =
+      // b#i) shared with the If handler.
+      if (src.base.num >= 16)
+        return nullptr;
+      auto *fTy = Type::getFloatTy(context);
+      auto *one = ConstantFP::get(fTy, 1.0);
+      auto *zero = ConstantFP::get(fTy, 0.0);
+      Value *flt = nullptr;
+      const DxsoBoundConst *match = nullptr;
+      for (const auto &c : shader->metadata.consts) {
+        if (c.bound_to.type == DxsoRegisterType::ConstBool && c.bound_to.num == src.base.num &&
+            c.def.kind == DxsoDefKind::Bool) {
+          match = &c;
+          break;
+        }
+      }
+      if (match) {
+        flt = match->def.payload.u32[0] != 0 ? one : zero;
+      } else {
+        auto *u32Ty = Type::getInt32Ty(context);
+        auto *bcPtr = fn->getArg(bc_arg_idx);
+        Value *bits = builder.CreateLoad(u32Ty, bcPtr);
+        Value *mask = builder.getInt32(1u << src.base.num);
+        Value *bit = builder.CreateAnd(bits, mask);
+        Value *cond = builder.CreateICmpNE(bit, builder.getInt32(0));
+        flt = builder.CreateSelect(cond, one, zero);
+      }
+      v = builder.CreateVectorSplat(4, flt);
+      break;
+    }
+    case DxsoRegisterType::MiscType: {
+      // PS-only: vPos = [[position]].xy; vFace: true->+1, false->-1.
+      // dxmt pins winding=Clockwise (no Y-flip), so mapping is direct—
+      // don't 'correct' to Vulkan/DXVK pattern (opposite reason).
+      if (is_vertex)
+        return nullptr;
+      if (src.base.num == 0 && ps_position_arg_idx >= 0) {
+        v = fn->getArg(ps_position_arg_idx);
+        break;
+      }
+      if (src.base.num == 1 && ps_vface_arg_idx >= 0) {
+        auto *fTy = Type::getFloatTy(context);
+        Value *ff = fn->getArg(ps_vface_arg_idx); // i1 [[front_facing]]
+        Value *sel = builder.CreateSelect(ff, ConstantFP::get(fTy, 1.0), ConstantFP::get(fTy, -1.0));
+        v = builder.CreateVectorSplat(4, sel);
+        break;
+      }
+      return nullptr;
+    }
+    default:
+      return nullptr;
+    }
+    // PRE-swizzle modifiers: Dz/Dw divide RAW register z/w before swizzle.
+    // Post-swizzle divide is wrong: projected texcoords become ±inf.
+    if (src.modifier == DxsoRegModifier::Dz || src.modifier == DxsoRegModifier::Dw) {
+      uint32_t lane_idx = (src.modifier == DxsoRegModifier::Dz) ? 2u : 3u;
+      Value *lane = builder.CreateExtractElement(v, builder.getInt32(lane_idx));
+      v = builder.CreateFDiv(v, builder.CreateVectorSplat(4, lane));
+    }
+    if (src.swizzle.raw() != 0b11100100u) {
+      int mask[4] = {(int)src.swizzle[0], (int)src.swizzle[1], (int)src.swizzle[2], (int)src.swizzle[3]};
+      v = builder.CreateShuffleVector(v, v, ArrayRef<int>(mask, 4));
+    }
+    if (src.modifier == DxsoRegModifier::None)
+      return v;
+    // POST-swizzle modifiers: fetch-time arithmetic on the swizzled
+    // float4 (DXVK emitSrcOperandPostSwizzleModifiers). Dz/Dw were
+    // already applied pre-swizzle above. Not is the bool-register
+    // inversion (D3D9 spec restricts the modifier to b# / predicate
+    // registers, where the value is 0.0 or 1.0); we implement it as a
+    // logical "non-zero ⇒ 0, zero ⇒ 1" select so the IR reads cleanly
+    // for downstream passes.
+    auto kSplat = [&](double x) -> Constant * {
+      return ConstantVector::getSplat(ElementCount::getFixed(4), ConstantFP::get(Type::getFloatTy(context), x));
+    };
+    auto fabs = [&](Value *x) { return air.CreateFPUnOp(llvm::air::AIRBuilder::fabs, x); };
+    switch (src.modifier) {
+    case DxsoRegModifier::Neg:
+      v = builder.CreateFNeg(v);
+      break;
+    case DxsoRegModifier::Abs:
+      v = fabs(v);
+      break;
+    case DxsoRegModifier::AbsNeg:
+      v = builder.CreateFNeg(fabs(v));
+      break;
+    case DxsoRegModifier::Comp:
+      v = builder.CreateFSub(kSplat(1.0), v);
+      break;
+    case DxsoRegModifier::X2:
+      v = builder.CreateFMul(v, kSplat(2.0));
+      break;
+    case DxsoRegModifier::X2Neg:
+      v = builder.CreateFNeg(builder.CreateFMul(v, kSplat(2.0)));
+      break;
+    case DxsoRegModifier::Bias:
+      v = builder.CreateFSub(v, kSplat(0.5));
+      break;
+    case DxsoRegModifier::BiasNeg:
+      v = builder.CreateFNeg(builder.CreateFSub(v, kSplat(0.5)));
+      break;
+    case DxsoRegModifier::Sign:
+      v = builder.CreateFSub(builder.CreateFMul(v, kSplat(2.0)), kSplat(1.0));
+      break;
+    case DxsoRegModifier::SignNeg:
+      v = builder.CreateFNeg(builder.CreateFSub(builder.CreateFMul(v, kSplat(2.0)), kSplat(1.0)));
+      break;
+    case DxsoRegModifier::Dz:
+    case DxsoRegModifier::Dw:
+      // Already applied pre-swizzle above (DXVK splits these out of the
+      // post-swizzle modifier path).
+      break;
+    case DxsoRegModifier::Not: {
+      // bool-register inversion. v ∈ {0.0, 1.0} per D3D9 spec; pick
+      // 1.0 when v is zero and 0.0 otherwise so non-zero non-one
+      // inputs (which the spec disallows but a misencoded shader can
+      // emit) still produce a defined result.
+      Value *zero = kSplat(0.0);
+      Value *one = kSplat(1.0);
+      Value *isZero = builder.CreateFCmpOEQ(v, zero);
+      v = builder.CreateSelect(isZero, one, zero);
+      break;
+    }
+    default:
+      return nullptr; // unreachable; enum values past Not are masked
+                      // out by the decoder per dxso_decoder.hpp
+    }
+    return v;
+  };
+
+  // Declared up front so store_dst can read its predicate fields.
+  // Each iteration of the lowering loop overwrites it via it.next(ins).
+  DxsoInstruction ins{};
+  auto store_dst = [&](const DxsoDstRegister &dst, Value *value) {
+    if (!value)
+      return;
+    // DXSO destination modifiers per DXVK
+    // src/dxso/dxso_compiler.h (emitDstStore): result-shift
+    // first as a power-of-two multiply (sign-magnitude shift, range
+    // -8..+7), then saturate as a [0,1] clamp. Both apply to the
+    // full <4 x float> before mask blending.
+    if (dst.shift != 0) {
+      float scale = dst.shift < 0 ? 1.0f / static_cast<float>(1 << -dst.shift) : static_cast<float>(1 << dst.shift);
+      auto *fTy = Type::getFloatTy(context);
+      Constant *splat = ConstantVector::getSplat(ElementCount::getFixed(4), ConstantFP::get(fTy, scale));
+      value = builder.CreateFMul(value, splat);
+    }
+    // A write to oFog (RasterizerOut[1]) is force-saturated regardless of
+    // the dst saturate bit; the fog factor is defined on [0,1] and the
+    // FFP blend clamps it. DXVK emitDstStore (dxso_compiler.h)
+    // forces saturate for RasterOutFog for the same reason.
+    bool force_saturate = is_vertex && dst.base.type == DxsoRegisterType::RasterizerOut && dst.base.num == 1;
+    if (dst.saturate || force_saturate)
+      value = air.CreateFPUnOp(llvm::air::AIRBuilder::saturate, value);
+    Value *slot = nullptr;
+    switch (dst.base.type) {
+    case DxsoRegisterType::Temp:
+      slot = builder.CreateGEP(tempArrTy, temps, {builder.getInt32(0), builder.getInt32(dst.base.num)});
+      break;
+    case DxsoRegisterType::RasterizerOut:
+      if (is_vertex && dst.base.num == 0)
+        slot = out_slot;
+      else if (sm12_vs_varyings && dst.base.num == 1)
+        slot = oFog_slot;
+      else if (is_vertex && dst.base.num == 2 && oPts_slot)
+        slot = oPts_slot;
+      break;
+    case DxsoRegisterType::ColorOut:
+      if (!is_vertex && dst.base.num < 4)
+        slot = oC_slot[dst.base.num];
+      break;
+    case DxsoRegisterType::DepthOut:
+      // PS-only; D3D9 only writes the .x lane to oDepth, but the slot
+      // is float4 so the rest of store_dst's plumbing is uniform.
+      if (!is_vertex)
+        slot = oDepth_slot;
+      break;
+    case DxsoRegisterType::AttributeOut:
+      // Only SM ≤ 2 routes through the positional COLOR mapping.
+      // SM3's `o#` (Output, alias for TexcoordOut numerically) has
+      // its own dcl-driven path landing in a follow-up.
+      if (sm12_vs_varyings && dst.base.num < 2)
+        slot = oD_slot[dst.base.num];
+      break;
+    case DxsoRegisterType::TexcoordOut:
+      // SM ≤ 2: positional oT# → TEXCOORD<n>. SM3: same numeric file
+      // (Output=6) but dcl-driven, so route via oN_slot built from
+      // the dcl walk above.
+      if (sm12_vs_varyings && dst.base.num < 8)
+        slot = oT_slot[dst.base.num];
+      else if (sm3_vs_outputs && dst.base.num < 16)
+        slot = oN_slot[dst.base.num];
+      break;
+    case DxsoRegisterType::Texture:
+      // SM 1.x PS t# is both a sampler index and a register slot:
+      // tex / texcoord / texreg2* write back into the same t<n> slot
+      // that subsequent operands read through the Texture src arm
+      // above. wined3d glsl_shader.c routes these through ffp_texcoord
+      // implicitly. The Addr / Texture enum value (3) is shared with
+      // VS a#, but VS writes go through Mova rather than store_dst.
+      if (!is_vertex && tex_inputs && dst.base.num < 8)
+        slot = builder.CreateGEP(texInputArrTy, tex_inputs, {builder.getInt32(0), builder.getInt32(dst.base.num)});
+      break;
+    default:
+      break;
+    }
+    if (!slot)
+      return;
+    // Predicated execution: per-lane gate on p0. The predicate's
+    // swizzle picks which p0 lane drives each result lane; modifier
+    // Not inverts it (DXVK src/dxso/dxso_compiler.cpp
+    // emitPredicateOp + emitPredicateLoad).
+    Value *pmask = nullptr;
+    if (ins.has_predicate && ins.predicate.base.type == DxsoRegisterType::Predicate && ins.predicate.base.num == 0) {
+      pmask = builder.CreateLoad(bool4Ty, p0_slot);
+      if (ins.predicate.swizzle.raw() != 0b11100100u) {
+        int sw[4] = {
+            (int)ins.predicate.swizzle[0], (int)ins.predicate.swizzle[1], (int)ins.predicate.swizzle[2],
+            (int)ins.predicate.swizzle[3]
+        };
+        pmask = builder.CreateShuffleVector(pmask, pmask, ArrayRef<int>(sw, 4));
+      }
+      if (ins.predicate.modifier == DxsoRegModifier::Not)
+        pmask = builder.CreateNot(pmask);
+    }
+    if (dst.mask.raw() == 0xF && !pmask) {
+      builder.CreateStore(value, slot);
+      return;
+    }
+    auto *cur = builder.CreateLoad(float4Ty, slot);
+    Value *to_write = pmask ? builder.CreateSelect(pmask, value, cur) : value;
+    Value *blended = cur;
+    for (uint32_t i = 0; i < 4; ++i) {
+      if (dst.mask[i]) {
+        auto *e = builder.CreateExtractElement(to_write, builder.getInt32(i));
+        blended = builder.CreateInsertElement(blended, e, builder.getInt32(i));
+      }
+    }
+    builder.CreateStore(blended, slot);
+  };
+
+  // Two-source arithmetic helper: load both operands, run `op`, store
+  // the result. nullptr from load_src (unsupported source shape) is
+  // treated as skip; same model the per-opcode arms had inline.
+  auto fold_binary = [&](const DxsoInstruction &ins, auto op) {
+    if (!ins.has_dst || ins.src_count < 2)
+      return;
+    Value *a = load_src(ins.src[0]);
+    Value *b = load_src(ins.src[1]);
+    if (a && b)
+      store_dst(ins.dst, op(a, b));
+  };
+
+  // One-source variant for Mov / Rcp / Rsq / Frc / Abs / Exp / Log.
+  auto fold_unary = [&](const DxsoInstruction &ins, auto op) {
+    if (!ins.has_dst || ins.src_count < 1)
+      return;
+    Value *a = load_src(ins.src[0]);
+    if (a)
+      store_dst(ins.dst, op(a));
+  };
+
+  // Three-source variant for Cmp / Lrp / Mad-style ternary lowerings.
+  auto fold_ternary = [&](const DxsoInstruction &ins, auto op) {
+    if (!ins.has_dst || ins.src_count < 3)
+      return;
+    Value *a = load_src(ins.src[0]);
+    Value *b = load_src(ins.src[1]);
+    Value *c = load_src(ins.src[2]);
+    if (a && b && c)
+      store_dst(ins.dst, op(a, b, c));
+  };
+
+  // float4 splat constant: uniqued by LLVM, no IR cost per use.
+  auto v4splat = [&](double x) -> Constant * {
+    return ConstantVector::getSplat(ElementCount::getFixed(4), ConstantFP::get(Type::getFloatTy(context), x));
+  };
+
+  // Scalar dot product of the first n lanes of a and b (n=3 or 4).
+  // For n=3 the inputs get shuffled down to a 3-vec first so lane 3;
+  // which may be poison when the temp wasn't initialized; never
+  // reaches the multiply. Mirrors DXVK src/dxso/dxso_compiler.cpp
+  // emitDot. Used by Dp3 / Dp4 and by the M*x* matrix multiplies.
+  auto compute_dot = [&](Value *a, Value *b, int n) -> Value * {
+    if (n == 3) {
+      int xyz[3] = {0, 1, 2};
+      a = builder.CreateShuffleVector(a, a, ArrayRef<int>(xyz, 3));
+      b = builder.CreateShuffleVector(b, b, ArrayRef<int>(xyz, 3));
+    }
+    Value *prod = builder.CreateFMul(a, b);
+    Value *sum = builder.CreateExtractElement(prod, builder.getInt32(0));
+    for (int i = 1; i < n; ++i)
+      sum = builder.CreateFAdd(sum, builder.CreateExtractElement(prod, builder.getInt32(i)));
+    return sum;
+  };
+
+  // Walk the body. No opcodes are lowered yet; the iterator + switch
+  // are the spine real lowerings hang off. Anything we don't recognize
+  // is silently skipped so the output stays a valid zero-filled
+  // placeholder until per-opcode commits land.
+  // DWORD is `typedef uint32_t DWORD` in this codebase
+  // (windows_base.h), so DxsoBytecodeIter's `const DWORD *`
+  // accepts a `const uint32_t *` directly with no cast.
+  DxsoBytecodeIter it(shader->bytecode.data(), static_cast<uint32_t>(shader->bytecode.size()), shader->header);
+  // CFG stack for structured control flow. else_bb is allocated up
+  // front as the false-edge target; if the source has no `else`, it
+  // ends up as a single uncond br to merge_bb.
+  struct IfBlock {
+    BasicBlock *else_bb;
+    BasicBlock *merge_bb;
+    bool saw_else;
+  };
+  std::vector<IfBlock> cf_stack;
+  // Rep / Loop frames. EndRep and EndLoop share the same close shape;
+  // the only difference is that Loop also steps aL each iteration and
+  // (for SM3 nesting) saves/restores aL across the inner scope.
+  // Counts and stride are LLVM Values rather than constants so def-
+  // baked (defi i#) and runtime-set (SetXShaderConstantI) i# both
+  // flow through the same loop emitter.
+  struct LoopFrame {
+    Value *counter_slot;
+    Value *aL_backup_slot; // null for Rep; no aL save/restore
+    Value *total_count;    // i32, dynamic
+    Value *aL_stride;      // i32, dynamic; ignored for Rep
+    BasicBlock *header_bb;
+    BasicBlock *latch_bb;
+    BasicBlock *merge_bb;
+  };
+  std::vector<LoopFrame> loop_stack;
+  while (it.next(ins)) {
+    switch (ins.opcode) {
+    case DxsoOpcode::End:
+    case DxsoOpcode::Comment:
+    case DxsoOpcode::Nop:
+    case DxsoOpcode::Phase:
+    case DxsoOpcode::Dcl:
+    case DxsoOpcode::Def:
+    case DxsoOpcode::DefI:
+    case DxsoOpcode::DefB:
+      break;
+    default: {
+      // Silent fall-through is how "almost-correct shader" symptoms
+      // reach the pipeline: an unhandled op is dropped, the resulting
+      // metallib compiles fine, the draw runs, output is partially
+      // wrong. Emit a one-shot warn per opcode value (low 7 bits
+      // cover the entire SM 1.x / 2.x / 3.x table 0..96; the special
+      // Phase / Comment / End values 0xFFFD..0xFFFF are caught by
+      // their own cases above).
+      uint32_t op_val = static_cast<uint32_t>(ins.opcode);
+      if (op_val < 128) {
+        static std::atomic<uint64_t> warned_lo{0};
+        static std::atomic<uint64_t> warned_hi{0};
+        auto &slot = (op_val < 64) ? warned_lo : warned_hi;
+        uint64_t bit = 1ull << (op_val & 63);
+        uint64_t prev = slot.fetch_or(bit, std::memory_order_relaxed);
+        if (!(prev & bit)) {
+          llvm::errs() << "dxso: unhandled opcode " << op_val << " in " << (is_vertex ? "vs" : "ps") << " shader\n";
+        }
+      }
+      break;
+    }
+    }
+    if (ins.opcode == DxsoOpcode::End)
+      break;
+  }
+
+  // SM 1.x PS has no oC# register file; `r0` is the implicit pixel
+  // output (D3D9 SDK ps_1_x reference; wined3d glsl_shader.c
+  // emits the same `oC0 = R0` copy at the GLSL backend). The body
+  // writes `mul r0, ...` through store_dst's Temp arm (temps[0]); the
+  // retval assembly below loads from oC_slot[0] which is zero-init
+  // unless we copy here. Without this every ps_1_x PS returns
+  // (0,0,0,0) regardless of body; the output register must be
+  // explicitly seeded from temps[0] after input_arg_idx wiring.
+  if (!is_vertex && shader->header.major < 2 && oC_arg_idx[0] >= 0) {
+    auto *r0_gep = builder.CreateGEP(tempArrTy, temps, {builder.getInt32(0), builder.getInt32(0)});
+    Value *r0 = builder.CreateLoad(float4Ty, r0_gep);
+    builder.CreateStore(r0, oC_slot[0]);
+  }
+
+  // D3D9 alpha test, lowered to discard_fragment per wined3d's GLSL
+  // backend (dlls/wined3d/glsl_shader.c shader_glsl_generate_alpha_
+  // test): "alpha_func is the PASS condition"; we compare oC0.a
+  // against ALPHAREF/255.0 with the D3DCMP_* predicate, then discard
+  // when the test fails. Runs after the body has finished writing
+  // oC0 and before retval assembly so an alpha-failing fragment never
+  // makes it into the PSO output. NEVER ⇒ unconditional discard;
+  // ALWAYS is filtered out by emit_alpha_test above.
+  if (emit_alpha_test && oC_arg_idx[0] >= 0) {
+    auto *cont_bb = BasicBlock::Create(context, "alpha_test.cont", fn);
+    auto *kill_bb = BasicBlock::Create(context, "alpha_test.kill", fn);
+    if (ps_args->alpha_test_func == 1 /* D3DCMP_NEVER */) {
+      builder.CreateBr(kill_bb);
+    } else {
+      Value *out_color = builder.CreateLoad(float4Ty, oC_slot[0]);
+      Value *alpha = builder.CreateExtractElement(out_color, builder.getInt32(3));
+      Value *ref =
+          ConstantFP::get(Type::getFloatTy(context), static_cast<double>(ps_args->alpha_test_ref & 0xFF) / 255.0);
+      Value *pass = nullptr;
+      switch (ps_args->alpha_test_func) {
+      case 2 /* D3DCMP_LESS */:
+        pass = builder.CreateFCmpOLT(alpha, ref);
+        break;
+      case 3 /* D3DCMP_EQUAL */:
+        pass = builder.CreateFCmpOEQ(alpha, ref);
+        break;
+      case 4 /* D3DCMP_LESSEQUAL */:
+        pass = builder.CreateFCmpOLE(alpha, ref);
+        break;
+      case 5 /* D3DCMP_GREATER */:
+        pass = builder.CreateFCmpOGT(alpha, ref);
+        break;
+      case 6 /* D3DCMP_NOTEQUAL */:
+        pass = builder.CreateFCmpUNE(alpha, ref);
+        break;
+      case 7 /* D3DCMP_GREATEREQUAL */:
+        pass = builder.CreateFCmpOGE(alpha, ref);
+        break;
+      default:
+        pass = ConstantInt::getTrue(context);
+        break;
+      }
+      // pass=true → continue; pass=false → discard.
+      builder.CreateCondBr(pass, cont_bb, kill_bb);
+    }
+    builder.SetInsertPoint(kill_bb);
+    air.CreateDiscard();
+    builder.CreateBr(cont_bb);
+    builder.SetInsertPoint(cont_bb);
+  }
+
+  auto *retTy = fn->getReturnType();
+  if (retTy->isVoidTy()) {
+    builder.CreateRetVoid();
+  } else {
+    Value *retval = UndefValue::get(retTy);
+    if (is_vertex) {
+      auto *pos = builder.CreateLoad(float4Ty, out_slot);
+      retval = builder.CreateInsertValue(retval, pos, {0});
+      // User clip planes: emit clip_distance[i] = (i < clip_count)
+      //   ? dot(planes[i], pos) : 0.0
+      // for the 8 plane slots. The host packs enabled planes
+      // consecutively into the buffer; clip_count is the popcount of
+      // D3DRS_CLIPPLANEENABLE. dot is computed lane-wise rather than
+      // through an intrinsic so the IR stays at the same level the
+      // rest of compile_dxso uses (LLVM optimisation passes coalesce
+      // the four FMul + three FAdd into a single fdot).
+      auto *fTy = Type::getFloatTy(context);
+      auto *i32Ty = Type::getInt32Ty(context);
+      auto *cdArrTy = ArrayType::get(fTy, 8);
+      Value *cdArr = UndefValue::get(cdArrTy);
+      auto *cpPtr = fn->getArg(clip_planes_arg_idx);
+      auto *ccPtr = fn->getArg(clip_count_arg_idx);
+      Value *count = builder.CreateLoad(i32Ty, ccPtr);
+      Value *zero_f = ConstantFP::get(fTy, 0.0);
+      for (uint32_t i = 0; i < 8; ++i) {
+        auto *gep = builder.CreateGEP(float4Ty, cpPtr, builder.getInt32(i));
+        Value *plane = builder.CreateLoad(float4Ty, gep);
+        Value *prod = builder.CreateFMul(plane, pos);
+        Value *x = builder.CreateExtractElement(prod, builder.getInt32(0));
+        Value *y = builder.CreateExtractElement(prod, builder.getInt32(1));
+        Value *z = builder.CreateExtractElement(prod, builder.getInt32(2));
+        Value *w = builder.CreateExtractElement(prod, builder.getInt32(3));
+        Value *xy = builder.CreateFAdd(x, y);
+        Value *zw = builder.CreateFAdd(z, w);
+        Value *dot = builder.CreateFAdd(xy, zw);
+        Value *enabled = builder.CreateICmpULT(builder.getInt32(i), count);
+        Value *lane = builder.CreateSelect(enabled, dot, zero_f);
+        cdArr = builder.CreateInsertValue(cdArr, lane, {i});
+      }
+      retval = builder.CreateInsertValue(retval, cdArr, {clip_dist_field_idx});
+    } else {
+      // PS: each oC# slot lands at the field DefineOutput assigned
+      // in pre-scan order. oC_arg_idx[N] gives the struct index.
+      for (int i = 0; i < 4; ++i) {
+        if (oC_arg_idx[i] < 0)
+          continue;
+        auto *v = builder.CreateLoad(float4Ty, oC_slot[i]);
+        retval = builder.CreateInsertValue(retval, v, {(unsigned)oC_arg_idx[i]});
+      }
+      if (oDepth_arg_idx >= 0) {
+        auto *v4 = builder.CreateLoad(float4Ty, oDepth_slot);
+        Value *d = builder.CreateExtractElement(v4, builder.getInt32(0));
+        retval = builder.CreateInsertValue(retval, d, {(unsigned)oDepth_arg_idx});
+      }
+    }
+    if (sm12_vs_varyings) {
+      for (int i = 0; i < 2; ++i) {
+        if (oD_arg_idx[i] < 0)
+          continue;
+        auto *v = builder.CreateLoad(float4Ty, oD_slot[i]);
+        retval = builder.CreateInsertValue(retval, v, {(unsigned)oD_arg_idx[i]});
+      }
+      for (int i = 0; i < 8; ++i) {
+        if (oT_arg_idx[i] < 0)
+          continue;
+        auto *v = builder.CreateLoad(float4Ty, oT_slot[i]);
+        retval = builder.CreateInsertValue(retval, v, {(unsigned)oT_arg_idx[i]});
+      }
+      if (oFog_arg_idx >= 0) {
+        auto *v = builder.CreateLoad(float4Ty, oFog_slot);
+        retval = builder.CreateInsertValue(retval, v, {(unsigned)oFog_arg_idx});
+      }
+    } else if (sm3_vs_outputs) {
+      // Position aliases out_slot and is already covered at field 0;
+      // only varyings (oN_arg_idx >= 0) need a struct insert. PointSize
+      // (oN_is_pointsize) is emitted via the oPts_arg_idx block below
+      // since it's a scalar, not a float4.
+      for (int i = 0; i < 16; ++i) {
+        if (oN_arg_idx[i] < 0)
+          continue;
+        auto *v = builder.CreateLoad(float4Ty, oN_slot[i]);
+        retval = builder.CreateInsertValue(retval, v, {(unsigned)oN_arg_idx[i]});
+      }
+    }
+    if (oPts_arg_idx >= 0 && oPts_slot) {
+      // [[point_size]] is a scalar float: extract lane 0 from the
+      // float4 storage slot (store_dst's plumbing writes the same
+      // value to all four lanes for a scalar write like `mov oPts, c0.x`).
+      auto *v4 = builder.CreateLoad(float4Ty, oPts_slot);
+      Value *ps = builder.CreateExtractElement(v4, builder.getInt32(0));
+      retval = builder.CreateInsertValue(retval, ps, {(unsigned)oPts_arg_idx});
+    }
+    builder.CreateRet(retval);
+  }
+
+  module.getOrInsertNamedMetadata(is_vertex ? "air.vertex" : "air.fragment")->addOperand(fn_md);
+}
+
+DxsoShader *
+dxso_shader_initialize(const void *bytecode, size_t bytecode_size) {
+  if (!bytecode || bytecode_size < sizeof(uint32_t) || bytecode_size % sizeof(uint32_t) != 0)
+    return nullptr;
+
+  const uint32_t *words = static_cast<const uint32_t *>(bytecode);
+  uint32_t word_count = static_cast<uint32_t>(bytecode_size / sizeof(uint32_t));
+
+  auto header = parse_dxso_header(words, word_count);
+  if (!header)
+    return nullptr;
+
+  auto metadata = walk_dxso_shader(words, word_count, *header);
+  if (!metadata)
+    return nullptr;
+
+  auto *shader = new (std::nothrow) DxsoShader();
+  if (!shader)
+    return nullptr;
+  shader->bytecode.assign(words, words + word_count);
+  shader->header = *header;
+  shader->metadata = std::move(*metadata);
+  return shader;
+}
+
+void
+dxso_shader_destroy(DxsoShader *shader) {
+  delete shader;
+}
+
+} // namespace dxmt
+
+extern "C" {
+
+AIRCONV_API int
+DXSOInitialize(const void *pBytecode, size_t BytecodeSize, dxso_shader_t *ppShader) {
+  if (!ppShader)
+    return -1;
+  // sm50_ptr64_t is a 64-bit-fixed handle that's `void *` on 64-bit
+  // builds and a wrapper struct with a `void *` constructor on 32-bit.
+  // Both let us assign from a raw pointer through the constructor;
+  // clearing it on early-out uses the same path.
+  *ppShader = (void *)nullptr;
+  auto *shader = dxmt::dxso_shader_initialize(pBytecode, BytecodeSize);
+  if (!shader)
+    return -1;
+  *ppShader = (void *)shader;
+  return 0;
+}
+
+AIRCONV_API void
+DXSODestroy(dxso_shader_t pShader) {
+  // Mirrors SM50Destroy (dxbc_converter.cpp): C-style cast
+  // back to the implementation type. On 32-bit this routes through
+  // sm50_ptr64_t::operator uint64_t().
+  delete (dxmt::DxsoShader *)pShader;
+}
+
+AIRCONV_API int
+DXSOCompile(
+    dxso_shader_t pShader, struct DXSO_SHADER_COMPILATION_ARGUMENT_DATA *pArgs, const char *FunctionName,
+    dxso_bitcode_t *ppBitcode
+) {
+  using namespace llvm;
+  if (!ppBitcode)
+    return -1;
+  *ppBitcode = (void *)nullptr;
+  if (!pShader || !FunctionName)
+    return -1;
+
+  // Walk the argument chain. Recognised arg types: IA layout (VS),
+  // PSO alpha-test (PS), PS sampler-kind layout (PS), PS point-sprite
+  // (PS). Unknown types are silently skipped; same forgiveness
+  // contract SM50 uses.
+  DXSO_SHADER_IA_INPUT_LAYOUT_DATA *ia_layout = nullptr;
+  DXSO_SHADER_PSO_PIXEL_SHADER_DATA *ps_args = nullptr;
+  DXSO_SHADER_PS_SAMPLER_LAYOUT_DATA *ps_samp_layout = nullptr;
+  DXSO_SHADER_PS_BUMP_ENV_DATA *ps_bump_env = nullptr;
+  bool ps_point_sprite = false;
+  float vs_point_size_override = 0.0f;
+  for (auto *arg = pArgs; arg; arg = (DXSO_SHADER_COMPILATION_ARGUMENT_DATA *)arg->next) {
+    switch (arg->type) {
+    case DXSO_SHADER_IA_INPUT_LAYOUT:
+      ia_layout = (DXSO_SHADER_IA_INPUT_LAYOUT_DATA *)arg;
+      break;
+    case DXSO_SHADER_PSO_PIXEL_SHADER:
+      ps_args = (DXSO_SHADER_PSO_PIXEL_SHADER_DATA *)arg;
+      break;
+    case DXSO_SHADER_PS_SAMPLER_LAYOUT:
+      ps_samp_layout = (DXSO_SHADER_PS_SAMPLER_LAYOUT_DATA *)arg;
+      break;
+    case DXSO_SHADER_PS_POINT_SPRITE:
+      ps_point_sprite = true;
+      break;
+    case DXSO_SHADER_VS_POINT_SIZE:
+      vs_point_size_override = ((DXSO_SHADER_VS_POINT_SIZE_DATA *)arg)->value;
+      break;
+    case DXSO_SHADER_PS_BUMP_ENV:
+      ps_bump_env = (DXSO_SHADER_PS_BUMP_ENV_DATA *)arg;
+      break;
+    case DXSO_SHADER_ARGUMENT_TYPE_MAX:
+      break;
+    }
+  }
+
+  LLVMContext context;
+  context.setOpaquePointers(false);
+  auto module = std::make_unique<Module>("dxso.air", context);
+  dxmt::initializeModule(*module);
+  dxmt::compile_dxso(
+      (dxmt::DxsoShader *)pShader, ia_layout, ps_args, ps_samp_layout, ps_point_sprite, vs_point_size_override,
+      ps_bump_env, FunctionName, context, *module
+  );
+
+  auto *compiled = new (std::nothrow) dxmt::DxsoBitcode();
+  if (!compiled)
+    return -1;
+  llvm::raw_svector_ostream os(compiled->bytes);
+  dxmt::metallib::MetallibWriter writer;
+  writer.Write(*module, os);
+
+  // Env-gated metallib dump: point DXMT_AIRCONV_DUMP at a directory
+  // and every DXSOCompile call drops a {kind}_{hash}.metallib there.
+  // Disassemble with `xcrun air-objdump -d <file>` to inspect what
+  // AGX actually receives. Only meant for triage of XPC link
+  // failures; off by default.
+  if (const char *dump_dir = std::getenv("DXMT_AIRCONV_DUMP")) {
+    if (dump_dir[0]) {
+      static std::atomic<uint64_t> counter{0};
+      uint64_t n = counter.fetch_add(1, std::memory_order_relaxed);
+      std::string path = std::string(dump_dir) + "/" + FunctionName + "_" + std::to_string(n) + ".metallib";
+      if (FILE *fp = std::fopen(path.c_str(), "wb")) {
+        std::fwrite(compiled->bytes.data(), 1, compiled->bytes.size(), fp);
+        std::fclose(fp);
+      }
+    }
+  }
+
+  *ppBitcode = (void *)compiled;
+  return 0;
+}
+
+AIRCONV_API void
+DXSOGetCompiledBitcode(dxso_bitcode_t pBitcode, struct SM50_COMPILED_BITCODE *pData) {
+  auto *bc = (dxmt::DxsoBitcode *)pBitcode;
+  if (!bc || !pData)
+    return;
+  pData->Data = bc->bytes.data();
+  pData->Size = bc->bytes.size();
+}
+
+AIRCONV_API void
+DXSODestroyBitcode(dxso_bitcode_t pBitcode) {
+  delete (dxmt::DxsoBitcode *)pBitcode;
+}
+
+} // extern "C"
