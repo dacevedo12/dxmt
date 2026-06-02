@@ -11,7 +11,19 @@
 
 namespace dxmt {
 
+// Default staging block size. 32 MB suits x86_64 / arm64 where the
+// virtual-address space is effectively unbounded; the d3d9 build under
+// Rosetta x86_32 + WoW64 lives inside a 2-3 GB user VA ceiling that a
+// memory-heavy title can approach. Each block is host RAM + Metal
+// address-space registration + a pre-fault memset,
+// so 32 MB per block magnifies VA pressure quickly once the ring grows
+// past a couple of blocks. Drop to 8 MB on i386: rings hold more,
+// smaller blocks; pre-fault cost shrinks proportionally.
+#ifdef __i386__
+constexpr size_t kStagingBlockSize = 0x800000; // 8MB
+#else
 constexpr size_t kStagingBlockSize = 0x2000000; // 32MB
+#endif
 constexpr size_t kStagingBlockSizeForDeferredContext = 0x200000; // 2MB
 constexpr size_t kStagingBlockLifetime = 300;
 constexpr size_t kRingBumpGuardBytes = 64;
@@ -39,6 +51,31 @@ public:
   allocate(uint64_t seq_id, uint64_t coherent_id, size_t size, size_t alignment);
 
   void free_blocks(uint64_t coherent_id);
+
+  // Pre-allocate `count` blocks of the ring's natural BlockSize and push
+  // them onto the FIFO with last_used_seq_id=0 so the first call to
+  // `allocate` reuses them rather than allocating fresh on the calling
+  // thread. The Rosetta x86_32 first-touch cliff for a 32 MB Metal-
+  // registered buffer is ~1.2 s; without this, that cost lands on a
+  // d3d9 hot-path call (CreateVertexBuffer / DrawIndexedPrimitive) as
+  // a visible stutter. With 2 blocks pre-allocated and GPU completion
+  // recycling them, gameplay never allocates a fresh block.
+  // Call from device construction time, where the cost hides inside
+  // overall game startup. No locks: caller must serialize against
+  // any concurrent `allocate` (typically the device isn't published
+  // yet during ctor).
+  void
+  preallocate(unsigned count) {
+    for (unsigned i = 0; i < count; ++i) {
+      fifo.push({
+          .allocated_size  = 0,
+          .total_size      = BlockSize,
+          .last_used_seq_id = 0,
+          .inc_time_to_live = 0,
+          .block            = allocator_.allocate(BlockSize),
+      });
+    }
+  }
 
 private:
   struct Allocation {
@@ -147,6 +184,17 @@ public:
     block.gpu_address = info.gpu_address;
     if (!placed_buffer_)
       block.mapped_address = info.memory.get_accessible_or_null();
+    // Pre-fault all pages of the malloc'd backing so subsequent CPU
+    // writes from the d3d9 calling thread don't pay per-page first-
+    // touch cost. On Apple Silicon + Rosetta x86_32, first-touch faults
+    // on Metal-registered host buffers can cost 100+ ms each: a
+    // consumer (e.g. BuildDrawCapture) that walks ~10 KB per call
+    // through a fresh ring block stalls for seconds on the first
+    // page of each call. Eager memset pays the cost once at block
+    // allocation (~50 ms for a 32 MB block at native ARM speed)
+    // instead of streaming it across every consumer.
+    if (placed_buffer_ && block.mapped_address)
+      std::memset(block.mapped_address, 0, block_size);
     return block;
   };
 
@@ -277,7 +325,18 @@ RingBumpState<Allocator, BlockSize, mutex>::allocate(
         latest.total_size - guard_bytes) {
       break;
     }
-    latest.last_used_seq_id = seq_id;
+    // Only ever advance last_used_seq_id, never regress. The d3d9 chunk
+    // pipeline calls allocate() concurrently from two threads with
+    // different seq_id sources: the encode thread passes the chunk's
+    // snapshotted seq (older), the calling thread passes the live
+    // m_currentCmdSeq (newer). The prior unconditional write let the
+    // encode-thread Resolve at seq=N stomp a block whose last_used was
+    // just bumped to N+5 by a calling-thread allocate, which then made
+    // free_blocks(coherent_id in [N..N+4]) drop a block the calling
+    // thread had pinned to chunks N+1..N+5: UAF on the placed-buffer
+    // backing once those chunks reached the GPU.
+    if (seq_id > latest.last_used_seq_id)
+      latest.last_used_seq_id = seq_id;
     return suballocate(latest, size, alignment);
   }
   return suballocate(

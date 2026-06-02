@@ -1,8 +1,10 @@
 
 #include <algorithm>
+#include <chrono>
 #include "Metal.hpp"
 #include "dxmt_format.hpp"
 #include "dxmt_presenter.hpp"
+#include "log/log.hpp"
 #include "util_likely.hpp"
 
 namespace dxmt {
@@ -91,11 +93,13 @@ Presenter::changeGammaRamp(const DXMTGammaRamp *gamma_ramp) {
       gamma_lut_rgba_[i * 4 + 2] = std::clamp(gamma_ramp->blue[i], 0.f, 1.f);
       gamma_lut_rgba_[i * 4 + 3] = 1.0f;
     }
-    gamma_lut_texture_.replaceRegion(
-          {0, 0, 0}, {DXMT_GAMMA_CP_COUNT, 1, 1}, 0, 0,
-          gamma_lut_rgba_.data(),
-          DXMT_GAMMA_CP_COUNT * sizeof(float) * 4,
-          0);
+    // Defer the texture upload to synchronizeLayerProperties. Writing the
+    // shared-storage LUT here (calling thread) races the encode thread / GPU
+    // sampling it for an in-flight present; torn gamma during animated
+    // fades. pso_valid.clear() already forces synchronizeLayerProperties to
+    // rebuild after frame_presented_.wait() has drained every in-flight
+    // present, so the upload rides that existing drain for free.
+    gamma_lut_dirty_ = true;
     pso_valid.clear();
   }
 }
@@ -120,7 +124,17 @@ Presenter::synchronizeLayerProperties() {
                                                    : nullptr;
   if (unlikely(!pso_valid.test_and_set())) {
     frame_presented_.wait(frame_requested_);
-    buildRenderPipelineState(final_colorspace == WMTColorSpaceHDR_PQ, is_hdr && hdr_metadata != nullptr, sample_count_ > 1, gamma_version_ != 0);
+    // Drained: no present is in flight, so the shared-storage gamma LUT can
+    // be uploaded without racing a GPU read (see changeGammaRamp).
+    if (gamma_lut_dirty_) {
+      gamma_lut_texture_.replaceRegion(
+          {0, 0, 0}, {DXMT_GAMMA_CP_COUNT, 1, 1}, 0, 0, gamma_lut_rgba_.data(),
+          DXMT_GAMMA_CP_COUNT * sizeof(float) * 4, 0
+      );
+      gamma_lut_dirty_ = false;
+    }
+    gamma_enabled_ = gamma_version_ != 0;
+    buildRenderPipelineState(final_colorspace == WMTColorSpaceHDR_PQ, is_hdr && hdr_metadata != nullptr, sample_count_ > 1, gamma_enabled_);
     layer_.setProps(layer_props_);
     layer_.setColorSpace(final_colorspace);
   }
@@ -130,7 +144,7 @@ Presenter::synchronizeLayerProperties() {
   metadata.edr_scale = 1.0;
   metadata.max_content_luminance = 10000;
   metadata.max_display_luminance = display_edr_value_.maximum_potential_edr_color_component_value * 100;
-  metadata.alpha_mode = 0;
+  metadata.alpha_mode = present_alpha_mode_;
   metadata.background_color[0] = 0.0f;
   metadata.background_color[1] = 0.0f;
   metadata.background_color[2] = 0.0f;
@@ -158,36 +172,67 @@ WMT::MetalDrawable
 Presenter::encodeCommands(
     WMT::CommandBuffer cmdbuf, WMT::Texture backbuffer, DXMTPresentMetadata metadata,
     std::function<void(WMT::RenderCommandEncoder)> &&wait_fences,
-    std::function<void(WMT::RenderCommandEncoder)> &&update_fences
+    std::function<void(WMT::RenderCommandEncoder)> &&update_fences, uint64_t *out_next_drawable_us
 ) {
+  auto t0 = std::chrono::steady_clock::now();
   auto drawable = layer_.nextDrawable();
+  if (out_next_drawable_us) {
+    *out_next_drawable_us =
+        std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count();
+  }
+  auto drawable_tex = drawable.texture();
 
   WMTRenderPassInfo info;
   WMT::InitializeRenderPassInfo(info);
   info.colors[0].load_action = WMTLoadActionClear;
   info.colors[0].clear_color = {0.0, 0.0, 0.0, 1.0};
   info.colors[0].store_action = WMTStoreActionStore;
-  auto drawable_texture = drawable.texture();
-  info.colors[0].texture = drawable_texture;
-  info.render_target_width = drawable_texture.width();
-  info.render_target_height = drawable_texture.height();
-  info.render_target_array_length = drawable_texture.arrayLength();
+  info.colors[0].texture = drawable_tex;
+  info.render_target_width = drawable_tex.width();
+  info.render_target_height = drawable_tex.height();
+  info.render_target_array_length = drawable_tex.arrayLength();
   info.default_raster_sample_count = 1;
   auto encoder = cmdbuf.renderCommandEncoder(info);
   wait_fences(encoder);
   encoder.setFragmentTexture(backbuffer, 0);
-  encoder.setFragmentTexture(gamma_lut_texture_, 1);
+  // Only bind the gamma LUT when the live PSO variant samples it. When no
+  // gamma ramp is set, fs_present_quad is compiled without the gamma path
+  // and never reads texture index 1; binding it anyway leaves an unused
+  // binding that MTL_DEBUG_LAYER's end-encoding validation flags.
+  if (gamma_enabled_)
+    encoder.setFragmentTexture(gamma_lut_texture_, 1);
 
-  double width = layer_props_.drawable_width;
-  double height = layer_props_.drawable_height;
+  // Present target size = this frame's live drawable, not layer_props_.
+  // The swapchain mutates layer_props_.drawable_* on the calling thread
+  // (its per-Present resize poll); reading it here on the encode thread
+  // would be a cross-thread race. The drawable we just acquired is the
+  // authoritative render-target extent: and matching the viewport/blit
+  // decision to it is what we actually render into this frame.
+  double width = (double)drawable_tex.width();
+  double height = (double)drawable_tex.height();
 
   encoder.setFragmentBytes(&metadata, sizeof(metadata), 0);
-  if (backbuffer.width() == (uint64_t)width && backbuffer.height() == (uint64_t)height) {
-    encoder.setRenderPipelineState(present_blit_);
-  } else {
-    encoder.setRenderPipelineState(present_scale_);
-  }
+  bool size_matched = backbuffer.width() == drawable_tex.width() && backbuffer.height() == drawable_tex.height();
+  encoder.setRenderPipelineState(size_matched ? present_blit_ : present_scale_);
   encoder.setViewport({0, 0, width, height, 0, 1});
+
+  if (unlikely(DXMT_LOG_ENABLED(dxmt::LogLevel::Trace))) {
+    // Backbuffer vs live drawable only; the cached layer_props_ extent is
+    // logged race-free on the calling thread by d3d9_swapchain's "layer
+    // extent:" line; reading it here on the encode thread would reintroduce
+    // a cross-thread read of a calling-thread-mutated field. Deduped to one
+    // line per size transition so the per-event trace tier isn't spammed.
+    uint64_t bw = backbuffer.width(), bh = backbuffer.height();
+    uint64_t lw = drawable_tex.width(), lh = drawable_tex.height();
+    if (bw != dbg_last_bb_w_ || bh != dbg_last_bb_h_ || lw != dbg_last_live_w_ || lh != dbg_last_live_h_) {
+      dbg_last_bb_w_ = bw, dbg_last_bb_h_ = bh;
+      dbg_last_live_w_ = lw, dbg_last_live_h_ = lh;
+      TRACE(
+          "present: backbuffer ", bw, "x", bh, " live-drawable ", lw, "x", lh, " -> ",
+          size_matched ? "BLIT (1:1)" : "SCALE (bilinear)"
+      );
+    }
+  }
   encoder.drawPrimitives(WMTPrimitiveTypeTriangle, 0, 3);
   update_fences(encoder);
   encoder.endEncoding();
