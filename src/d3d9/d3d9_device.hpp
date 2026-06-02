@@ -784,6 +784,15 @@ public:
     // per-wrapper D3D9ViewCache whose views died with the wrapper on
     // Reset. 0 for dummy stages.
     uint64_t resolved_frag_view[16] = {};
+    // Vertex texture fetch (VTF, SM3.0): D3DVERTEXTEXTURESAMPLER0-3 map to
+    // texture slots 16-19 (texture_stage_to_slot) and are sampled in the VS,
+    // bound on the Metal vertex stage via setVertexTexture/Sampler. The
+    // shader's vertex sampler s<N> binds at Metal vertex index N. Resolved
+    // every draw (not cached) since VTF draws are rare; 0/null when unused.
+    obj_handle_t resolved_vert_textures[4] = {};
+    obj_handle_t resolved_vert_samplers[4] = {};
+    Rc<dxmt::Texture> resolved_vert_texture_dxmt[4];
+    uint64_t resolved_vert_view[4] = {};
     // Render-pass attachments: pre-resolved to Metal handles (with sRGB
     // RT swap if D3DRS_SRGBWRITEENABLE), levels/slices, dimensions.
     obj_handle_t resolved_rt_handles[D3D_MAX_SIMULTANEOUS_RENDERTARGETS] = {};
@@ -816,6 +825,12 @@ public:
     // chunk-emit body for the lone-Clear-then-Present path.
     bool resolved_rt_srgb_swapped[D3D_MAX_SIMULTANEOUS_RENDERTARGETS] = {};
     bool resolved_ds_has_stencil = false;
+    // The bound depth-stencil is also sampled at a fragment stage and neither
+    // depth nor stencil is written this draw, so it is bound read-only: Metal
+    // permits the in-pass sample only when there is no write to the attachment
+    // (a depth-aware post-process samples the depth it tests against). See the
+    // render-pass start. The depth-write case is a true feedback loop, left as-is.
+    bool resolved_ds_readonly = false;
     // D3DRS_DEPTHBIAS r-value scale, resolved from the bound DS's D3D9
     // format. The app-side bias is in normalized depth-buffer space;
     // Metal applies `bias * r` in hardware where r is the format's
@@ -1523,9 +1538,13 @@ private:
   // requires texture+sampler at every index the shader declares;
   // unbound slot faults encoder. Classic trigger: Reset clearing all
   // textures before app re-binds. Lazily created on encode thread.
-  obj_handle_t dummyFragmentTexture2D();
-  Rc<dxmt::Texture> m_dummyFragTexAlloc;
-  obj_handle_t m_dummyFragTexHandle = 0;
+  // Per-type, indexed 0 = 2D, 1 = 3D, 2 = Cube. The bound dummy's type
+  // must match the sampler kind the PS was compiled with, mirroring
+  // wined3d's per-type dummy textures; one 2D dummy would mis-bind a 2D
+  // texture to a 3D/cube sampler (Metal type mismatch, undefined sample).
+  obj_handle_t dummyFragmentTexture(WMTTextureType type);
+  Rc<dxmt::Texture> m_dummyFragTexAlloc[3];
+  obj_handle_t m_dummyFragTexHandle[3] = {0, 0, 0};
 
   // DSSO cache. Same shape as the sampler cache above and as d3d11's
   // StateObjectCache<D3D11_DEPTH_STENCIL_DESC, ...>
