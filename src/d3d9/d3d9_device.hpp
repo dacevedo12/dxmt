@@ -1209,9 +1209,18 @@ private:
   // the wined3d_device_show_cursor contract (wined3d device.c).
   // Default FALSE matches the post-SetCursorProperties initial state
   // before the app calls ShowCursor(TRUE); i.e. no cursor visible
-  // until the app explicitly turns it on. macOS draws the cursor
-  // itself; this state is purely for the spec return-value contract.
+  // until the app explicitly turns it on. Visibility only latches once
+  // a cursor image has been set, also per wined3d.
   BOOL m_cursorVisible = FALSE;
+  bool m_cursorImageSet = false;
+#ifdef _WIN32
+  // Win32 cursor realised from a SetCursorProperties bitmap: 32x32
+  // always (wined3d_device_set_cursor_properties), any size clamped to
+  // 32x32 when windowed (DXVK). wined3d covers the remaining sizes
+  // with a present-time software blit dxmt does not implement; those
+  // keep whatever cursor is current.
+  HCURSOR m_hwCursor = nullptr;
+#endif
   // D3D9 device-state machine: Ok → S_OK, Lost → D3DERR_DEVICELOST
   // (unreachable today), NotReset → D3DERR_DEVICENOTRESET. Ex devices
   // return S_OK; use CheckDeviceState instead.
