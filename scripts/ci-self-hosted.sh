@@ -174,9 +174,36 @@ ensure_wine_rosetta_build_tools() {
   done
 }
 
+vulkan_x86_64_link_ready() {
+  local probe_src probe_bin clang_runner=()
+  if [[ "$(uname -m)" == "arm64" ]]; then
+    clang_runner=(arch -x86_64)
+  fi
+
+  probe_bin="$(mktemp "${TMPDIR:-/tmp}/dxmt-vulkan-probe.XXXXXX")"
+  probe_src="${probe_bin}.c"
+  cat > "${probe_src}" <<'EOF'
+extern void *vkGetInstanceProcAddr(void *, const char *);
+int main(void) { return vkGetInstanceProcAddr(0, "vkCreateInstance") != 0; }
+EOF
+
+  if "${clang_runner[@]}" /usr/bin/clang -arch x86_64 "${probe_src}" -L/usr/local/lib -lvulkan -Wl,-undefined,error -o "${probe_bin}" >/dev/null 2>&1; then
+    rm -f "${probe_src}" "${probe_bin}"
+    return 0
+  fi
+  if "${clang_runner[@]}" /usr/bin/clang -arch x86_64 "${probe_src}" -L/usr/local/lib -lMoltenVK -Wl,-undefined,error -o "${probe_bin}" >/dev/null 2>&1; then
+    rm -f "${probe_src}" "${probe_bin}"
+    return 0
+  fi
+
+  rm -f "${probe_src}" "${probe_bin}"
+  return 1
+}
+
 vulkan_system_files_ready() {
   [[ -f /usr/local/lib/libMoltenVK.dylib ]] &&
-    compgen -G '/usr/local/lib/libvulkan*.dylib' >/dev/null
+    compgen -G '/usr/local/lib/libvulkan*.dylib' >/dev/null &&
+    vulkan_x86_64_link_ready
 }
 
 ensure_lunarg_vulkan_sdk() {
@@ -217,10 +244,18 @@ ensure_lunarg_vulkan_sdk() {
 
   log "staging Vulkan SDK ${version} development files into /usr/local"
   sudo_run mkdir -p /usr/local/lib /usr/local/include
+  sudo_run rm -f /usr/local/lib/libMoltenVK.dylib
   sudo_run cp -f "${install_root}/macOS/lib/libMoltenVK.dylib" /usr/local/lib/
   while IFS= read -r dylib; do
+    sudo_run rm -f "/usr/local/lib/$(basename "${dylib}")"
     sudo_run cp -f "${dylib}" /usr/local/lib/
   done < <(find "${install_root}/macOS/lib" -type f -name "libvulkan*.dylib" -print)
+  if [[ ! -e /usr/local/lib/libvulkan.dylib ]]; then
+    local vulkan_runtime
+    vulkan_runtime="$(find /usr/local/lib -maxdepth 1 -type f -name 'libvulkan.1*.dylib' -print | sort | head -n 1)"
+    [[ -n "${vulkan_runtime}" ]] || die "Vulkan SDK did not stage a linkable libvulkan runtime"
+    sudo_run ln -sfn "$(basename "${vulkan_runtime}")" /usr/local/lib/libvulkan.dylib
+  fi
   sudo_run rsync -a "${install_root}/macOS/include/" /usr/local/include/
 
   if [[ -d "${install_root}/macOS/lib/pkgconfig" ]]; then
