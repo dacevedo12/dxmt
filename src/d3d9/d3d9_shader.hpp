@@ -4,8 +4,11 @@
 #include "com/com_object.hpp"
 #include "com/com_pointer.hpp"
 #include "d3d9.h"
+#include "d3d9_shader_scan.hpp"
 #include "dxso_decoder.hpp"
+#include "rc/util_rc_ptr.hpp"
 
+#include <atomic>
 #include <optional>
 #include <unordered_map>
 #include <vector>
@@ -16,13 +19,6 @@ struct DXSO_SHADER_PS_BUMP_ENV_DATA;
 namespace dxmt {
 
 class MTLD3D9Device;
-
-// Walk a D3D9 shader bytecode from version token to D3DSIO_END
-// terminator, returning length in DWORDs (0 on failure). Skips
-// comment tokens to avoid false 0xFFFF patterns; unsafe in theory
-// but safe in practice since apps don't emit IEEE floats ~9.18e-41.
-// walk_dxso_shader (dxso_decoder.hpp) validates instruction shape.
-size_t shader_bytecode_dword_count(const DWORD *byte_code);
 
 // DxsoBoundDcl, DxsoBoundConst, DxsoShaderMetadata, walk_dxso_shader
 // live in dxso_decoder.hpp so airconv can build a DXSO compiler
