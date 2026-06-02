@@ -2226,14 +2226,140 @@ MTLD3D9Device::CreateCubeTexture(
 HRESULT STDMETHODCALLTYPE
 MTLD3D9Device::CreateVertexBuffer(
     UINT Length, DWORD Usage, DWORD FVF, D3DPOOL Pool, IDirect3DVertexBuffer9 **ppVertexBuffer, HANDLE *pSharedHandle
-) { return E_NOTIMPL; }
+) {
+  if (!ppVertexBuffer)
+    return D3DERR_INVALIDCALL;
+  *ppVertexBuffer = nullptr;
+  if (Length == 0)
+    return D3DERR_INVALIDCALL;
 
+  // wined3d buffer.c; SCRATCH not allowed for buffers (unlike
+  // surfaces, scratch buffers have no defined CPU-only role).
+  if (Pool == D3DPOOL_SCRATCH)
+    return D3DERR_INVALIDCALL;
+  // wined3d buffer.c; MANAGED on Ex device is invalid.
+  if (Pool == D3DPOOL_MANAGED && m_isEx)
+    return D3DERR_INVALIDCALL;
+  // wined3d buffer.c; buffers can't be RT or DS. AUTOGENMIPMAP
+  // is texture-only (DXVK d3d9_common_buffer.cpp rejects).
+  if (Usage & (D3DUSAGE_RENDERTARGET | D3DUSAGE_DEPTHSTENCIL | D3DUSAGE_AUTOGENMIPMAP))
+    return D3DERR_INVALIDCALL;
+  // MANAGED + DYNAMIC is spec-forbidden; wined3d permits it at the
+  // d3d9 layer but DXVK d3d9_common_buffer.cpp rejects. Reject
+  // for spec-correctness; apps shipping the combo hit a defined
+  // INVALIDCALL instead of silent acceptance.
+  if (Pool == D3DPOOL_MANAGED && (Usage & D3DUSAGE_DYNAMIC))
+    return D3DERR_INVALIDCALL;
+  // WRITEONLY is buffer-only and is the *expected* flag for vertex
+  // buffers; allow it.
+
+  // pSharedHandle: wined3d device.c returns NOTAVAILABLE rather
+  // than INVALIDCALL for Ex+non-DEFAULT (different from texture/OPS
+  // paths: buffer-specific contract).
+  if (pSharedHandle) {
+    if (!m_isEx)
+      return E_NOTIMPL;
+    if (Pool != D3DPOOL_DEFAULT)
+      return D3DERR_NOTAVAILABLE;
+    return E_NOTIMPL; // cross-process buffer share deferred
+  }
+
+  // Pool → Metal storage. Every D3D9 vertex buffer is Lockable per the
+  // API contract (the WRITEONLY flag is a hint, not a gate), so the
+  // backing has to be CPU-mappable. Shared collapses to the same
+  // physical pages as Private on Apple-Silicon UMA; Private would
+  // save nothing and would force a staging-upload path on every Lock.
+  // Pool only gates validity here; it doesn't change the storage
+  // choice.
+  switch (Pool) {
+  case D3DPOOL_DEFAULT:
+  case D3DPOOL_SYSTEMMEM:
+  case D3DPOOL_MANAGED: // non-Ex MANAGED collapses to CPU-resident
+    break;
+  default:
+    return D3DERR_INVALIDCALL;
+  }
+
+  // 32-bit WoW64: pre-allocate backing (4GB limit). DYNAMIC: per-DISCARD retire-pool (wined3d pattern), bounded by
+  // cmdbuf depth. Safety: within-cmdbuf GPU-read-during-write impossible (retire on DISCARD prevents overlap).
+  WMT::Reference<WMT::Buffer> buffer{};
+  uint64_t gpu_address = 0;
+  void *backing = nullptr;
+  void *host_ptr = nullptr;
+  if (HRESULT hr = acquireOrAllocateBufferBacking(Length, buffer, gpu_address, host_ptr, backing); FAILED(hr))
+    return hr;
+
+  auto *vb = new MTLD3D9VertexBuffer(this, Length, Usage, FVF, Pool, std::move(buffer), gpu_address, host_ptr, backing);
+  if (Pool == D3DPOOL_DEFAULT)
+    vb->markLosable();
+  vb->AddRef();
+  *ppVertexBuffer = vb;
+  return D3D_OK;
+}
 HRESULT STDMETHODCALLTYPE
 MTLD3D9Device::CreateIndexBuffer(
     UINT Length, DWORD Usage, D3DFORMAT Format, D3DPOOL Pool, IDirect3DIndexBuffer9 **ppIndexBuffer,
     HANDLE *pSharedHandle
-) { return E_NOTIMPL; }
+) {
+  if (!ppIndexBuffer)
+    return D3DERR_INVALIDCALL;
+  *ppIndexBuffer = nullptr;
+  if (Length == 0)
+    return D3DERR_INVALIDCALL;
 
+  // Index format must be one of the two D3D9-defined index formats.
+  // wined3d defers this to wined3d_format lookup; dxmt rejects up
+  // front so unsupported formats fail closed without reaching the
+  // Metal allocator.
+  if (Format != D3DFMT_INDEX16 && Format != D3DFMT_INDEX32)
+    return D3DERR_INVALIDCALL;
+
+  // Same pool / usage gating as CreateVertexBuffer (buffer.c).
+  if (Pool == D3DPOOL_SCRATCH)
+    return D3DERR_INVALIDCALL;
+  if (Pool == D3DPOOL_MANAGED && m_isEx)
+    return D3DERR_INVALIDCALL;
+  if (Usage & (D3DUSAGE_RENDERTARGET | D3DUSAGE_DEPTHSTENCIL | D3DUSAGE_AUTOGENMIPMAP))
+    return D3DERR_INVALIDCALL;
+  if (Pool == D3DPOOL_MANAGED && (Usage & D3DUSAGE_DYNAMIC))
+    return D3DERR_INVALIDCALL;
+
+  if (pSharedHandle) {
+    if (!m_isEx)
+      return E_NOTIMPL;
+    if (Pool != D3DPOOL_DEFAULT)
+      return D3DERR_NOTAVAILABLE;
+    return E_NOTIMPL; // cross-process buffer share deferred
+  }
+
+  // Pool → Metal storage (mirrors CreateVertexBuffer; see that body
+  // for the rationale on always going Shared on UMA).
+  switch (Pool) {
+  case D3DPOOL_DEFAULT:
+  case D3DPOOL_SYSTEMMEM:
+  case D3DPOOL_MANAGED:
+    break;
+  default:
+    return D3DERR_INVALIDCALL;
+  }
+
+  // CpuPlaced backing: see CreateVertexBuffer for the 32-bit
+  // rationale, device-pool routing, and DYNAMIC retire-pool shape.
+  WMT::Reference<WMT::Buffer> buffer{};
+  uint64_t gpu_address = 0;
+  void *backing = nullptr;
+  void *host_ptr = nullptr;
+  if (HRESULT hr = acquireOrAllocateBufferBacking(Length, buffer, gpu_address, host_ptr, backing); FAILED(hr))
+    return hr;
+
+  auto *ib =
+      new MTLD3D9IndexBuffer(this, Length, Usage, Format, Pool, std::move(buffer), gpu_address, host_ptr, backing);
+  if (Pool == D3DPOOL_DEFAULT)
+    ib->markLosable();
+  ib->AddRef();
+  *ppIndexBuffer = ib;
+  return D3D_OK;
+}
 HRESULT STDMETHODCALLTYPE
 MTLD3D9Device::CreateRenderTarget(
     UINT Width, UINT Height, D3DFORMAT Format, D3DMULTISAMPLE_TYPE MultiSample, DWORD MultisampleQuality, BOOL Lockable,
@@ -4264,8 +4390,41 @@ MTLD3D9Device::DrawIndexedPrimitive(
 // Validation gate reads from capture (caller-provided or UP-built at queue time).
 // UP build at queue time ensures validation sees shader/RT bindings from draw thread, not FlushDrawBatch thread.
 MTLD3D9Device::D3D9DrawCapture
-MTLD3D9Device::BuildDrawCapture() { return {}; }
-
+MTLD3D9Device::BuildDrawCapture() {
+  // POD state read by Resolve from D9EncodingState; setter-flush invariant ensures batch shares one snapshot.
+  // Ref-counted state via setter ops into m_encodeSideRefs.
+  // BuildDrawCapture must freeze per-draw rename cursors (gpu_address/currentOffset advance on Lock(DISCARD)).
+  D3D9DrawCapture cap;
+  // vb_slots is value-initialized (zero-filled) by the struct default
+  // ctor (= {}), so unbound slots already report buffer=0,gpu_address=0.
+  // The bound buffer pointer is the single source of truth for stream
+  // liveness; wined3d (context.c wined3d_stream_info_from_declaration)
+  // and DXVK both derive it per draw rather than trusting a cached
+  // mask.
+  for (uint32_t s = 0; s < D3D9_MAX_VERTEX_STREAMS; ++s) {
+    auto *vb = m_vertexBuffers[s].ptr();
+    if (!vb)
+      continue;
+    cap.vb_slots[s].offset = m_streamOffsets[s];
+    cap.vb_slots[s].stride = m_streamStrides[s];
+    cap.vb_slots[s].buffer = vb->metalBuffer().handle;
+    cap.vb_slots[s].gpu_address = vb->gpuAddress();
+    // Stamp the open chunk's seq: the buffer's last GPU read lands in
+    // a chunk <= this one, so Lock's plain-map sync can gate on it.
+    vb->markPendingGpuUse(m_currentCmdSeq);
+  }
+  if (m_indexBuffer.ptr() != nullptr) {
+    cap.ib_buffer = m_indexBuffer->metalBuffer().handle;
+    cap.ib_offset = m_indexBuffer->currentOffset();
+    cap.ib_format = m_indexBuffer->indexFormat();
+    m_indexBuffer->markPendingGpuUse(m_currentCmdSeq);
+  } else {
+    cap.ib_buffer = 0;
+    cap.ib_offset = 0;
+    cap.ib_format = D3DFMT_UNKNOWN;
+  }
+  return cap;
+}
 
 void
 MTLD3D9Device::QueueBatchedDraw(BatchedDraw &&draw) {
@@ -5235,14 +5394,75 @@ MTLD3D9Device::seedRecordedStream(UINT StreamNumber) {
 HRESULT STDMETHODCALLTYPE
 MTLD3D9Device::SetStreamSource(
     UINT StreamNumber, IDirect3DVertexBuffer9 *pStreamData, UINT OffsetInBytes, UINT Stride
-) { return E_NOTIMPL; }
-
+) {
+  if (StreamNumber >= D3D9_MAX_VERTEX_STREAMS)
+    return D3DERR_INVALIDCALL;
+  auto *buffer = static_cast<MTLD3D9VertexBuffer *>(pStreamData);
+  if (buffer && buffer->deviceRaw() != this)
+    return D3DERR_INVALIDCALL;
+  if (m_inStateBlockRecord) {
+    seedRecordedStream(StreamNumber);
+    m_recordingBlock->m_snapVertexBuffers[StreamNumber] = buffer;
+    // NULL buffer preserves offset/stride, mirroring the live arm's
+    // wined3d shape on the seeded values.
+    if (buffer) {
+      m_recordingBlock->m_snapStreamOffsets[StreamNumber] = OffsetInBytes;
+      m_recordingBlock->m_snapStreamStrides[StreamNumber] = Stride;
+    }
+    return D3D_OK;
+  }
+  // No-op rebind: same buffer + same offset/stride (or both-NULL, which
+  // preserves offset/stride per wined3d device.c). Offsets and
+  // strides feed BuildDrawCapture directly (not via the POD snapshot),
+  // so a stride-only change still needs the gen bump to propagate.
+  bool buffer_changed = m_vertexBuffers[StreamNumber].ptr() != buffer;
+  if (!buffer_changed) {
+    if (buffer == nullptr)
+      return D3D_OK;
+    if (m_streamOffsets[StreamNumber] == OffsetInBytes && m_streamStrides[StreamNumber] == Stride)
+      return D3D_OK;
+  }
+  m_vertexBuffers[StreamNumber] = buffer;
+  if (buffer) {
+    m_streamOffsets[StreamNumber] = OffsetInBytes;
+    m_streamStrides[StreamNumber] = Stride;
+  }
+  // Buffer == NULL: preserve previous offset/stride (wined3d behaviour).
+  // Op-stream mirror; only push a SetRef when the BUFFER changes (the
+  // ref-counted slot). Offset/stride-only changes flow through
+  // BuildDrawCapture's per-stream snapshot, not D9EncodingRefs, so the
+  // op stream doesn't need to record them. See SetVertexDeclaration for
+  // the dual-tracking shape.
+  if (buffer_changed) {
+    if (buffer)
+      buffer->AddRefPrivate();
+    QueueRefOp(static_cast<PendingRefOp::Slot>(PendingRefOp::VertexBuffer0 + StreamNumber), buffer);
+  }
+  return D3D_OK;
+}
 
 HRESULT STDMETHODCALLTYPE
 MTLD3D9Device::GetStreamSource(
     UINT StreamNumber, IDirect3DVertexBuffer9 **ppStreamData, UINT *pOffsetInBytes, UINT *pStride
-) { return E_NOTIMPL; }
-
+) {
+  // wined3d device.c; buffer out-pointer must be non-null;
+  // offset is optional, stride is required. Match that.
+  if (!ppStreamData || !pStride)
+    return D3DERR_INVALIDCALL;
+  *ppStreamData = nullptr;
+  if (pOffsetInBytes)
+    *pOffsetInBytes = 0;
+  *pStride = 0;
+  if (StreamNumber >= D3D9_MAX_VERTEX_STREAMS)
+    return D3DERR_INVALIDCALL;
+  MTLD3D9VertexBuffer *bound = m_vertexBuffers[StreamNumber].ptr();
+  if (bound)
+    *ppStreamData = ::dxmt::ref<IDirect3DVertexBuffer9>(bound);
+  if (pOffsetInBytes)
+    *pOffsetInBytes = m_streamOffsets[StreamNumber];
+  *pStride = m_streamStrides[StreamNumber];
+  return D3D_OK;
+}
 
 // SetStreamSourceFreq: wined3d device.c d3d9_device_SetStreamSourceFreq.
 // Validation rules match DXVK d3d9_device.cpp: stream index in
@@ -5266,12 +5486,35 @@ MTLD3D9Device::GetStreamSourceFreq(UINT StreamNumber, UINT *pSetting) {
 // no stream-index validation. NULL is allowed (apps unbind before
 // switching to a different draw-call shape).
 HRESULT STDMETHODCALLTYPE
-MTLD3D9Device::SetIndices(IDirect3DIndexBuffer9 *pIndexData) { return E_NOTIMPL; }
-
+MTLD3D9Device::SetIndices(IDirect3DIndexBuffer9 *pIndexData) {
+  auto *buffer = static_cast<MTLD3D9IndexBuffer *>(pIndexData);
+  if (buffer && buffer->deviceRaw() != this)
+    return D3DERR_INVALIDCALL;
+  if (m_inStateBlockRecord) {
+    m_recordingBlock->m_snapIndexBuffer = buffer;
+    m_recordingBlock->m_changes.index_buffer = true;
+    return D3D_OK;
+  }
+  if (m_indexBuffer.ptr() == buffer)
+    return D3D_OK;
+  m_indexBuffer = buffer;
+  // Op-stream mirror; see SetVertexDeclaration for the dual-tracking shape.
+  if (buffer)
+    buffer->AddRefPrivate();
+  QueueRefOp(PendingRefOp::IndexBuffer, buffer);
+  return D3D_OK;
+}
 
 HRESULT STDMETHODCALLTYPE
-MTLD3D9Device::GetIndices(IDirect3DIndexBuffer9 **ppIndexData) { return E_NOTIMPL; }
-
+MTLD3D9Device::GetIndices(IDirect3DIndexBuffer9 **ppIndexData) {
+  if (!ppIndexData)
+    return D3DERR_INVALIDCALL;
+  *ppIndexData = nullptr;
+  MTLD3D9IndexBuffer *bound = m_indexBuffer.ptr();
+  if (bound)
+    *ppIndexData = ::dxmt::ref<IDirect3DIndexBuffer9>(bound);
+  return D3D_OK;
+}
 // Mirror image of CreateVertexShader. Same bytecode-length helper,
 // same InitReturnPtr discipline, same lifetime shape, same kind-
 // mismatch reject (DXVK d3d9_device.cpp).
