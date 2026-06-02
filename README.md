@@ -1,6 +1,6 @@
 # DXMT for GameHub
 
-DXMT for GameHub is a GameHub-oriented downstream version of DXMT, a Metal-based translation layer for Direct3D 11 and 10 on macOS using Wine.
+DXMT for GameHub is a GameHub-oriented downstream version of DXMT, a Metal-based translation layer for Direct3D 12, 11, 10 and 9 on macOS using Wine.
 
 This repository is derived from the original DXMT project by Feifan He / 3Shain:
 
