@@ -104,6 +104,7 @@ ArgumentEncodingContext::ArgumentEncodingContext(CommandQueue &queue, WMT::Devic
     emulated_cmd(device, lib, *this),
     clear_rt_cmd(device, lib, *this),
     resolve_texture_cmd(device, lib, *this),
+    stretch_blit_cmd(device, lib, *this),
     blit_depth_stencil_cmd(device, lib, *this),
     clear_res_cmd(device, lib, *this),
     mv_scale_cmd(device, lib, *this),
@@ -1979,6 +1980,42 @@ ArgumentEncodingContext::present(Rc<Texture> &texture, Rc<Presenter> &presenter,
 }
 
 void
+ArgumentEncodingContext::stretchBlit(
+    Rc<Texture> &&src, TextureViewKey src_view, Rc<Texture> &&dst, TextureViewKey dst_view,
+    WMT::RenderPipelineState pso, WMT::SamplerState sampler,
+    WMTOrigin src_origin, WMTSize src_size,
+    WMTOrigin dst_origin, WMTSize dst_size
+) {
+  assert(!encoder_current);
+  // The src texture-view's level dimensions normalize the sample sub-
+  // rect into uv-space. dxmt::Texture::width/height(view_key) returns
+  // max(info_.width >> view.mip_start, 1); already guards against
+  // zero, so a divide-by-zero is impossible.
+  uint32_t src_view_w = src ? src->width(src_view) : 1;
+  uint32_t src_view_h = src ? src->height(src_view) : 1;
+
+  auto encoder_info = allocate<StretchBlitEncoderData>();
+  encoder_info->type = EncoderType::StretchBlit;
+  encoder_info->id = nextEncoderId();
+  encoder_info->fence_wait = {};
+  encoder_info->fence_update = {encoder_info->id};
+  encoder_current = encoder_info;
+
+  encoder_info->src = access(src, src_view, ResourceAccess::Read);
+  encoder_info->dst = access(dst, dst_view, ResourceAccess::Write);
+  encoder_info->pso = pso;
+  encoder_info->sampler = sampler;
+  encoder_info->src_uv_origin[0] = float(src_origin.x) / float(src_view_w);
+  encoder_info->src_uv_origin[1] = float(src_origin.y) / float(src_view_h);
+  encoder_info->src_uv_size[0] = float(src_size.width) / float(src_view_w);
+  encoder_info->src_uv_size[1] = float(src_size.height) / float(src_view_h);
+  encoder_info->dst_origin = dst_origin;
+  encoder_info->dst_size = dst_size;
+
+  endPass();
+}
+
+void
 ArgumentEncodingContext::present(Rc<Texture> &texture, TextureViewKey view,
                                  Rc<Presenter> &presenter, double after,
                                  DXMTPresentMetadata metadata,
@@ -2064,6 +2101,22 @@ ArgumentEncodingContext::signalEvent(WMT::Reference<WMT::Event> &&event, uint64_
   encoder_info->type = EncoderType::SignalEvent;
   encoder_info->id = ~0ull;
   encoder_info->event = std::move(event);
+  encoder_info->value = value;
+
+  encoder_current = encoder_info;
+  endPass();
+}
+
+void
+ArgumentEncodingContext::signalEventByHandle(obj_handle_t event_handle, uint64_t value) {
+  assert(!encoder_current);
+  auto encoder_info = allocate<SignalEventData>();
+  encoder_info->type = EncoderType::SignalEvent;
+  encoder_info->id = ~0ull;
+  // Reference operator=(Class non_retained); retains, paired with the
+  // SignalEventData destructor's release. The retain runs on the encode
+  // thread so the calling-thread emit site dodges a wine_unix_call.
+  encoder_info->event = WMT::Event{event_handle};
   encoder_info->value = value;
 
   encoder_current = encoder_info;
@@ -2876,6 +2929,52 @@ ArgumentEncodingContext::flushCommands(WMT::CommandBuffer cmdbuf, uint64_t seqId
         encoder.endEncoding();
       }
       data->~ResolveEncoderData();
+      break;
+    }
+    case EncoderType::StretchBlit: {
+      auto data = static_cast<StretchBlitEncoderData *>(current);
+      {
+        auto *dst_allocation = data->dst ? data->dst->allocation : nullptr;
+        auto *dst_descriptor = dst_allocation ? dst_allocation->descriptor : nullptr;
+
+        WMTRenderPassInfo info;
+        WMT::InitializeRenderPassInfo(info);
+        info.colors[0].texture = data->dst.texture();
+        info.colors[0].load_action = WMTLoadActionLoad;
+        info.colors[0].store_action = WMTStoreActionStore;
+        if (dst_descriptor) {
+          info.render_target_width = dst_descriptor->width(data->dst->key);
+          info.render_target_height = dst_descriptor->height(data->dst->key);
+          info.render_target_array_length = 1;
+        }
+        info.default_raster_sample_count = 1;
+
+        NormalizeRenderPassInfo(info);
+        auto encoder = cmdbuf.renderCommandEncoder(info);
+        encoder.setLabel(WMT::String::string("StretchBlitPass", WMTUTF8StringEncoding));
+        data->fence_wait.forEach([&](auto id) { encoder.waitForFence(fence_pool_[id], WMTRenderStageFragment); });
+        if (data->pso && data->sampler) {
+          struct {
+            float src_uv_origin[2];
+            float src_uv_size[2];
+          } metadata{};
+          metadata.src_uv_origin[0] = data->src_uv_origin[0];
+          metadata.src_uv_origin[1] = data->src_uv_origin[1];
+          metadata.src_uv_size[0] = data->src_uv_size[0];
+          metadata.src_uv_size[1] = data->src_uv_size[1];
+          encoder.setRenderPipelineState(data->pso);
+          encoder.setFragmentTexture(data->src.texture(), 0);
+          encoder.setFragmentSamplerState(data->sampler, 0);
+          encoder.setFragmentBytes(&metadata, sizeof(metadata), 0);
+          encoder.setViewport({
+              double(data->dst_origin.x), double(data->dst_origin.y),
+              double(data->dst_size.width), double(data->dst_size.height), 0.0, 1.0});
+          encoder.drawPrimitives(WMTPrimitiveTypeTriangle, 0, 3);
+        }
+        data->fence_update.forEach([&](auto id) { encoder.updateFence(fence_pool_[id], WMTRenderStageFragment); });
+        encoder.endEncoding();
+      }
+      data->~StretchBlitEncoderData();
       break;
     }
     case EncoderType::SpatialUpscale: {

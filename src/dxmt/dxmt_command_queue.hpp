@@ -78,8 +78,7 @@ class CommandChunk {
 public:
   CommandChunk(const CommandChunk &) = delete; // delete copy constructor
 
-  void *
-  allocate_cpu_heap(size_t size, size_t alignment);
+  void *allocate_cpu_heap(size_t size, size_t alignment);
 
   template <CommandWithContext<ArgumentEncodingContext> F>
   void
@@ -87,8 +86,7 @@ public:
     list_enc.emit(std::forward<F>(func), allocate_cpu_heap(list_enc.calculateCommandSize<F>(), 16));
   }
 
-  void
-  encode(WMT::CommandBuffer cmdbuf, ArgumentEncodingContext &enc);
+  void encode(WMT::CommandBuffer cmdbuf, ArgumentEncodingContext &enc);
 
   uint64_t chunk_id;
   uint64_t chunk_event_id;
@@ -102,7 +100,7 @@ public:
 private:
   CommandQueue *queue;
   WMT::Reference<WMT::CommandBuffer> attached_cmdbuf;
-  
+
   CommandList<ArgumentEncodingContext> list_enc;
   AllocationRefTracking ref_tracker;
 
@@ -158,12 +156,25 @@ private:
   dxmt::thread finishThread;
   dxmt::thread readbackThread;
   WMT::Device device;
+
+public:
+  // Public for d3d9's transitional sites: see comment on the second
+  // public block below; this declaration stays in its original position
+  // so the ctor's initializer-list order matches declaration order.
   WMT::Reference<WMT::CommandQueue> commandQueue;
 
+private:
   obj_handle_t shared_event_listener;
   dxmt::thread event_listener_thread;
 
   friend class CommandChunk;
+  // d3d9 transitional access to the queue's staging_allocator while the
+  // async-chunk pivot lands phase by phase. The d3d9 device tracks
+  // upload lifetimes against its own m_completionEvent / m_currentCmdSeq
+  // for the calling-thread sync path; once draws migrate to
+  // chunk->emitcc lambdas (phase 3+) the chunk's ref_tracker takes
+  // over and this friend goes away.
+  friend class MTLD3D9Device;
   uint64_t
   GetNextEncoderId() {
     return encoder_seq++;
@@ -178,6 +189,13 @@ private:
   CaptureState capture_state;
 
 public:
+  // The `commandQueue` field above is public for d3d9's transitional
+  // sites (StretchRect / GetRenderTargetData / present-blit /
+  // generateMipmaps) that still create raw cmdbufs while the chunk
+  // pivot is in progress; each call site migrates to chunks once
+  // converted. d3d11 does not touch this field directly (uses
+  // CurrentChunk + CommitCurrentChunk exclusively). Don't add new
+  // direct uses; route through chunks.
   InternalCommandLibrary cmd_library;
   ArgumentEncodingContext argument_encoding_ctx;
   WMT::Reference<WMT::SharedEvent> event;
@@ -215,13 +233,13 @@ public:
     return current_event_seq_id;
   };
 
-
   uint64_t
   SignaledEventSeqId() {
     return event.signaledValue();
   };
 
-  obj_handle_t GetSharedEventListener() {
+  obj_handle_t
+  GetSharedEventListener() {
     return shared_event_listener;
   }
 
@@ -237,25 +255,37 @@ public:
   */
   void CommitCurrentChunk();
 
-  uint64_t CurrentFrameSeq() {
+  uint64_t
+  CurrentFrameSeq() {
     return frame_count + 1;
   }
 
-  FrameStatistics& CurrentFrameStatistics() {
+  FrameStatistics &
+  CurrentFrameStatistics() {
     return statistics.at(frame_count);
   }
 
+  void PresentBoundary();
+
+  uint32_t
+  GetMaxLatency() {
+    return max_latency_;
+  }
+
+  // Last frame seq for which the present chunk has retired. Used by
+  // d3d9's D3DPRESENT_DONOTWAIT probe to peek whether the next
+  // PresentBoundary would block before actually entering the wait.
+  uint64_t
+  FrameLatencySignaled() {
+    return frame_latency_fence_.signaledValue();
+  }
+
   void
-  PresentBoundary();
-
-  uint32_t GetMaxLatency() { return max_latency_; }
-
-  void SetMaxLatency(uint32_t value) { max_latency_ = value; };
-
-  void
-  WaitCPUFence(uint64_t seq) {
-    cpu_coherent.wait(seq);
+  SetMaxLatency(uint32_t value) {
+    max_latency_ = value;
   };
+
+  void WaitCPUFence(uint64_t seq);
 
   std::tuple<WMT::Buffer, uint64_t>
   AllocateStagingBuffer(size_t size, size_t alignment) {
@@ -287,7 +317,8 @@ public:
       return {};
     auto [block, offset] = argbuf_allocator.allocate(seq, cpu_coherent.signaledValue(), size, 64);
     if constexpr (sizeof(void *) == 4) {
-      auto [shadow_block, shadow_offset] = argbuf_shadow_allocator.allocate(seq, cpu_coherent.signaledValue(), size, 64);
+      auto [shadow_block, shadow_offset] =
+          argbuf_shadow_allocator.allocate(seq, cpu_coherent.signaledValue(), size, 64);
       return {ptr_add(shadow_block.ptr, shadow_offset), block.buffer, offset, size, true};
     } else {
       return {ptr_add(block.mapped_address, offset), block.buffer, offset, size, false};
