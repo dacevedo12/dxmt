@@ -353,7 +353,12 @@ MTLD3D9VolumeTexture::pushLevelToGpu(uint32_t level, const MTLD3D9Volume *vol) {
   size.width = vol->lockedW();
   size.height = vol->lockedH();
   size.depth = vol->lockedD();
-  m_device->stageTextureUpload(tex, level, /*slice=*/0, origin, size, src, row_pitch, /*compressed=*/false);
+  // Source slices are spaced by the full mip's slice pitch (row_pitch x
+  // mip height), which exceeds the staged box height for a sub-box upload.
+  uint32_t src_slice_pitch = row_pitch * d.Height;
+  m_device->stageTextureUpload(
+      tex, level, /*slice=*/0, origin, size, src, row_pitch, /*compressed=*/false, src_slice_pitch
+  );
 }
 
 } // namespace dxmt

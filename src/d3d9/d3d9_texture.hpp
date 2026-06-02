@@ -120,6 +120,10 @@ public:
   mirrorBuffer() const {
     return m_mirrorBuffer;
   }
+  void *
+  mirrorBase() const {
+    return m_mirrorBacking;
+  }
   size_t
   mirrorOffset(UINT level) const {
     return level < m_mirrorOffsets.size() ? m_mirrorOffsets[level] : 0;

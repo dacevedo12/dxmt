@@ -1649,20 +1649,11 @@ public:
   // blit. Allocates slice, memcpys src, posts wmtcmd_blit_copy_from_buffer
   // signaling m_completionEvent for ring recycling. Caller computes
   // src_pitch and is_compressed (Metal contract).
+  // src_slice_pitch is the source stride between depth slices for a 3D
+  // (volume) upload; 0 = contiguous (2D, or a full-box 3D upload).
   void stageTextureUpload(
       WMT::Texture dst, uint32_t mip_level, uint32_t slice, WMTOrigin origin, WMTSize size, const void *src,
-      uint32_t src_pitch, bool is_compressed
-  );
-
-  // Mirror-buffer variant; no host→ring memcpy. Caller supplies a
-  // pre-existing Shared MTLBuffer that already contains the source
-  // bytes at (src_offset, src_offset + src_pitch * row_count). Used by
-  // MANAGED textures whose mirror lives in a Shared buffer (allocated
-  // by MTLD3D9Texture's ctor). Eliminates the mirror→ring memcpy that
-  // dominated loading time in streaming-heavy workloads.
-  void stageTextureUploadFromBuffer(
-      WMT::Texture dst, uint32_t mip_level, uint32_t slice, WMTOrigin origin, WMTSize size, obj_handle_t src_buffer,
-      uint64_t src_offset, uint32_t src_pitch, bool is_compressed
+      uint32_t src_pitch, bool is_compressed, uint32_t src_slice_pitch = 0
   );
 
   // Force a staged Clear (m_pendingClear) onto the CURRENT bindings by
