@@ -58,6 +58,12 @@ public:
   HRESULT STDMETHODCALLTYPE UnlockBox(UINT Level) override;
   HRESULT STDMETHODCALLTYPE AddDirtyBox(const D3DBOX *pDirtyBox) override;
 
+  // Push a just-unlocked level's mirror contents to the GPU (MANAGED) and
+  // auto-mark the dirty box. Called from MTLD3D9Volume::UnlockBox so the
+  // upload fires whichever unlock interface the app uses (texture-level
+  // UnlockBox delegates to the Volume).
+  void flushLevelOnUnlock(uint32_t level, const MTLD3D9Volume *vol);
+
   // MTLD3D9CommonTexture overrides: forwarded inline to the
   // ComObject<IDirect3DVolumeTexture9> base; same diamond pattern as
   // MTLD3D9Texture / MTLD3D9CubeTexture.
