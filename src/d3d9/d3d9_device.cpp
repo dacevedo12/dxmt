@@ -1331,8 +1331,86 @@ MTLD3D9Device::Reset(D3DPRESENT_PARAMETERS *pPresentationParameters) { return E_
 
 
 void
-MTLD3D9Device::createAutoDepthStencil(const D3DPRESENT_PARAMETERS &params) {}
-
+MTLD3D9Device::createAutoDepthStencil(const D3DPRESENT_PARAMETERS &params) {
+  if (!params.EnableAutoDepthStencil) {
+    // EnableAutoDepthStencil=FALSE on a Reset that previously had an
+    // auto-DS: drop the cache. Any app pub-ref to the auto-DS keeps
+    // the surface object alive with its old Metal texture; new draws
+    // see no DS bound (post-Reset state).
+    m_autoDepthStencilSurface = nullptr;
+    return;
+  }
+  WMTPixelFormat fmt = D3DFormatToMetal(params.AutoDepthStencilFormat, D3D9FormatUsage::DepthStencil);
+  if (fmt == WMTPixelFormatInvalid)
+    return;
+  WMTTextureInfo info{};
+  info.pixel_format = fmt;
+  info.width = params.BackBufferWidth;
+  info.height = params.BackBufferHeight;
+  info.depth = 1;
+  info.array_length = 1;
+  info.type = WMTTextureType2D;
+  info.mipmap_level_count = 1;
+  info.sample_count = 1;
+  info.usage = WMTTextureUsageRenderTarget;
+  info.options = WMTResourceStorageModePrivate;
+  Rc<dxmt::Texture> dxmt_ds_texture = new dxmt::Texture(info, m_metalDevice);
+  dxmt::Flags<dxmt::TextureAllocationFlag> ds_flags;
+  ds_flags.set(dxmt::TextureAllocationFlag::CpuInvisible);
+  auto ds_allocation = dxmt_ds_texture->allocate(ds_flags);
+  if (!ds_allocation || !ds_allocation->texture())
+    return;
+  WMT::Texture dsRawTex = ds_allocation->texture();
+  dxmt_ds_texture->rename(std::move(ds_allocation));
+  D3DSURFACE_DESC dsDesc{};
+  dsDesc.Format = params.AutoDepthStencilFormat;
+  dsDesc.Type = D3DRTYPE_SURFACE;
+  dsDesc.Usage = D3DUSAGE_DEPTHSTENCIL;
+  dsDesc.Pool = D3DPOOL_DEFAULT;
+  // sample_count=1 above forces single-sample storage; mirror that
+  // here so GetDesc reads back the actual MSAA mode, not the
+  // requested-but-not-honored one. Matches the swapchain backbuffer's
+  // descriptor coercion in backBufferDescriptors. Real MSAA auto-DS
+  // support would lift both at once.
+  dsDesc.MultiSampleType = D3DMULTISAMPLE_NONE;
+  dsDesc.MultiSampleQuality = 0;
+  dsDesc.Width = params.BackBufferWidth;
+  dsDesc.Height = params.BackBufferHeight;
+  // Identity-preserving Reset path; if the auto-DS already exists
+  // (every call from Reset; the device ctor sees m_autoDepthStencilSurface
+  // null and falls through to fresh-create), reuse the same
+  // MTLD3D9Surface and swap its Metal backing in place. Apps that
+  // held GetDepthStencilSurface() across Reset get the same surface
+  // object back, now pointing at the new texture. Mirrors the
+  // swapchain backbuffer's resetBacking shape.
+  if (m_autoDepthStencilSurface.ptr()) {
+    m_autoDepthStencilSurface->resetBacking(dsDesc, WMT::Reference<WMT::Texture>(dsRawTex), std::move(dxmt_ds_texture));
+  } else {
+    auto *dsSurface = new MTLD3D9Surface(
+        this, dsDesc,
+        /*container=*/static_cast<IDirect3DDevice9 *>(this), WMT::Reference<WMT::Texture>(dsRawTex),
+        /*mipLevel=*/0,
+        /*selfPin=*/false,
+        /*parentTextureType=*/WMTTextureType2D,
+        /*buffer=*/{},
+        /*cpuPtr=*/nullptr,
+        /*pitch=*/0,
+        /*arraySlice=*/0,
+        /*ownedBacking=*/nullptr,
+        /*dxmtTexture=*/std::move(dxmt_ds_texture)
+    );
+    m_autoDepthStencilSurface = dsSurface;
+  }
+  m_depthStencilSurface = m_autoDepthStencilSurface.ptr();
+  // Op-stream mirror: the inline assignment above bypasses
+  // SetDepthStencilSurface, so push the SetRef explicitly. The op
+  // takes one outstanding AddRefPrivate that the walker consumes when
+  // it installs into m_encodeSideRefs.depth_stencil_surface.
+  if (auto *ds = m_autoDepthStencilSurface.ptr()) {
+    ds->AddRefPrivate();
+    QueueRefOp(PendingRefOp::DepthStencilSurface, ds);
+  }
+}
 // Present: device-level forwards to the implicit swapchain. wined3d
 // device.c forwards iSwapChain=0 by hand. Multi-swapchain
 // (CreateAdditionalSwapChain) is a TODO; for now there is only one.
@@ -1371,14 +1449,378 @@ HRESULT STDMETHODCALLTYPE
 MTLD3D9Device::CreateTexture(
     UINT Width, UINT Height, UINT Levels, DWORD Usage, D3DFORMAT Format, D3DPOOL Pool, IDirect3DTexture9 **ppTexture,
     HANDLE *pSharedHandle
-) { return E_NOTIMPL; }
+) {
+  if (!ppTexture)
+    return D3DERR_INVALIDCALL;
+  *ppTexture = nullptr;
+  if (Width == 0 || Height == 0)
+    return D3DERR_INVALIDCALL;
+  if (Width > 16384 || Height > 16384)
+    return D3DERR_INVALIDCALL;
 
+  // wined3d texture.c; D3DPOOL_MANAGED is invalid on d3d9ex
+  // devices. (Non-Ex devices honour MANAGED; we currently downgrade
+  // it to a plain CPU-resident allocation, see the storage map below.)
+  if (Pool == D3DPOOL_MANAGED && m_isEx)
+    return D3DERR_INVALIDCALL;
+
+  // wined3d texture.c; D3DUSAGE_WRITEONLY is buffer-only.
+  if (Usage & D3DUSAGE_WRITEONLY)
+    return D3DERR_INVALIDCALL;
+
+  // RT and DS usage are mutually exclusive at the surface-bind level
+  // and combining them on a texture has no defined meaning.
+  if ((Usage & D3DUSAGE_RENDERTARGET) && (Usage & D3DUSAGE_DEPTHSTENCIL))
+    return D3DERR_INVALIDCALL;
+  // RT/DS textures must live in DEFAULT pool; the GPU-only side has
+  // no managed mirror to push back from CPU.
+  if ((Usage & (D3DUSAGE_RENDERTARGET | D3DUSAGE_DEPTHSTENCIL)) && Pool != D3DPOOL_DEFAULT)
+    return D3DERR_INVALIDCALL;
+
+  // wined3d texture.c; AUTOGENMIPMAP forbids SYSTEMMEM and
+  // restricts levels to 0/1. The texture exposes 1 level to the app;
+  // the Metal allocation holds the full chain that the UnlockRect
+  // auto-fire fills.
+  if (Usage & D3DUSAGE_AUTOGENMIPMAP) {
+    if (Pool == D3DPOOL_SYSTEMMEM)
+      return D3DERR_INVALIDCALL;
+    if (Levels != 0 && Levels != 1)
+      return D3DERR_INVALIDCALL;
+  }
+
+  // pSharedHandle doubles as an initial-data pointer for single-level
+  // SYSTEMMEM textures (the Vista-era user-memory path; the rows are
+  // tightly packed). DXVK accepts it on any device and copies at
+  // create time; wined3d additionally gates it on Ex. Cross-process
+  // sharing (DEFAULT pool) stays unimplemented.
+  const void *initial_data = nullptr;
+  if (pSharedHandle) {
+    if (Pool == D3DPOOL_SYSTEMMEM && Levels == 1) {
+      initial_data = *reinterpret_cast<void **>(pSharedHandle);
+      pSharedHandle = nullptr;
+    } else if (Pool != D3DPOOL_DEFAULT) {
+      return D3DERR_INVALIDCALL;
+    } else {
+      // TODO: cross-process resource share.
+      return E_NOTIMPL;
+    }
+  }
+
+  // Format gating depends on the requested role. Attachment usage on
+  // a format Metal cannot attach (RENDERTARGET on compressed, say) is
+  // rejected here even though wined3d accepts the create: wined3d's GL
+  // backend can convert or render such formats, Metal never can, and
+  // apps ship a create-time fallback for the rejection because native
+  // runtimes and DXVK (CheckImageSupport) reject it too. Accepting
+  // would strand them past their fallback at an unbindable texture.
+  D3D9FormatUsage formatUsage = D3D9FormatUsage::SampleableTexture;
+  if (Usage & D3DUSAGE_RENDERTARGET)
+    formatUsage = D3D9FormatUsage::RenderTarget;
+  else if (Usage & D3DUSAGE_DEPTHSTENCIL)
+    formatUsage = D3D9FormatUsage::DepthStencil;
+  WMTPixelFormat pixelFormat = D3DFormatToMetal(Format, formatUsage);
+  if (pixelFormat == WMTPixelFormatInvalid) {
+    Logger::warn(str::format("d3d9: CreateTexture: unsupported format ", (unsigned)Format, " usage ", (unsigned)Usage));
+    return D3DERR_INVALIDCALL;
+  }
+
+  // Levels=0 means full chain to 1x1. wined3d's wined3d_log2i +1.
+  uint32_t real_levels;
+  if (Levels == 0) {
+    real_levels = 1;
+    UINT m = std::max(Width, Height);
+    while (m > 1) {
+      m >>= 1;
+      ++real_levels;
+    }
+  } else {
+    real_levels = Levels;
+    UINT max_dim = std::max(Width, Height);
+    uint32_t max_levels = 1;
+    UINT m = max_dim;
+    while (m > 1) {
+      m >>= 1;
+      ++max_levels;
+    }
+    if (real_levels > max_levels)
+      return D3DERR_INVALIDCALL;
+  }
+
+  // AUTOGENMIPMAP: app sees one level (D3D9 spec; GetSurfaceLevel /
+  // LockRect on level > 0 returns INVALIDCALL). The Metal allocation
+  // gets the full chain so generateMipmapsForTexture has somewhere to
+  // write; auto-fire on UnlockRect(0) per spec keeps the chain in
+  // sync with level-0 edits.
+  uint32_t metal_levels = real_levels;
+  uint32_t app_levels = real_levels;
+  if (Usage & D3DUSAGE_AUTOGENMIPMAP) {
+    app_levels = 1;
+  }
+
+  // Pool → storage (like CreateOffscreenPlainSurface + usage flags).
+  // RT-promotion: every DEFAULT color texture gets RenderTarget unconditionally.
+  WMTResourceOptions storage;
+  WMTTextureUsage usage_bits = WMTTextureUsageShaderRead;
+  // RT bit: D3DUSAGE_DEPTHSTENCIL (DS is render-target + sampler)
+  // or DEFAULT-pool color (promotion, DXVK pattern).
+  // Skip compressed: BC textures reject RenderTarget on Apple Silicon.
+  if (Usage & D3DUSAGE_DEPTHSTENCIL)
+    usage_bits = (WMTTextureUsage)(usage_bits | WMTTextureUsageRenderTarget);
+  else if (Pool == D3DPOOL_DEFAULT && !IsCompressedFormat(Format))
+    usage_bits = (WMTTextureUsage)(usage_bits | WMTTextureUsageRenderTarget);
+  // PixelFormatView enables the sRGB-aliased sample view. Include BC formats: an
+  // sRGB view of a BC texture decodes correctly on sample (matches DXVK), at the
+  // cost of opting that texture out of AGX lossless. Without it, BC albedo samples
+  // linear (no sRGB decode) and reads too bright, blowing out HDR scenes.
+  if (!(Usage & D3DUSAGE_DEPTHSTENCIL) && Recall_sRGB(D3DFormatToMetal(Format, D3D9FormatUsage::SampleableTexture)) !=
+                                              D3DFormatToMetal(Format, D3D9FormatUsage::SampleableTexture))
+    usage_bits = (WMTTextureUsage)(usage_bits | WMTTextureUsagePixelFormatView);
+  switch (Pool) {
+  case D3DPOOL_DEFAULT:
+    storage = WMTResourceStorageModePrivate;
+    break;
+  case D3DPOOL_SYSTEMMEM:
+  case D3DPOOL_SCRATCH:
+    storage = WMTResourceStorageModeShared;
+    break;
+  case D3DPOOL_MANAGED:
+    // Non-Ex MANAGED. Real D3D9 would keep both a sysmem master and a
+    // GPU mirror with eviction; on Apple Silicon's unified memory the
+    // distinction collapses. Track in project memory if real games
+    // start hitting eviction-sensitive paths.
+    storage = WMTResourceStorageModeShared;
+    break;
+  default:
+    return D3DERR_INVALIDCALL;
+  }
+
+  WMTTextureInfo info{};
+  info.pixel_format = pixelFormat;
+  info.width = Width;
+  info.height = Height;
+  info.depth = 1;
+  info.array_length = 1;
+  info.type = WMTTextureType2D;
+  info.mipmap_level_count = metal_levels;
+  info.sample_count = 1;
+  info.usage = usage_bits;
+  info.options = storage;
+
+  // UMA-correct MANAGED single-buffer: Level=1 uncompressed 2D sampler-only. newTexture aliases level-0; LockRect →
+  // Metal-mapped pBits; on UMA GPU samples host pages directly (no Unlock memcpy).
+  bool buffer_backed_eligible = Pool == D3DPOOL_MANAGED && app_levels == 1 && metal_levels == 1 &&
+                                !(Usage & D3DUSAGE_AUTOGENMIPMAP) && !(Usage & D3DUSAGE_RENDERTARGET) &&
+                                !(Usage & D3DUSAGE_DEPTHSTENCIL) && !(Usage & D3DUSAGE_DYNAMIC) &&
+                                !IsCompressedFormat(Format);
+  // Zero-copy aliasing exposes Metal's linear-texture row alignment
+  // as the LockRect pitch. wined3d and DXVK hand back (near-)tight
+  // pitches, and shipped titles write rows at width*bpp regardless of
+  // the reported value, so a padded pitch shears every such upload.
+  // Widths whose tight pitch misses the alignment take the mirror
+  // path, where the pitch is unconstrained and tight.
+  uint64_t linear_alignment = 1;
+  if (buffer_backed_eligible) {
+    linear_alignment = m_metalDevice.minimumLinearTextureAlignmentForPixelFormat(pixelFormat);
+    if (linear_alignment == 0)
+      linear_alignment = 1;
+    if ((D3DFormatRowPitch(Format, Width) % linear_alignment) != 0)
+      buffer_backed_eligible = false;
+  }
+
+  // All textures rooted in Rc<dxmt::Texture> (survives thread boundaries). Buffer-backed: caller-managed page (pool
+  // reuse, pre-fault optimizations); regular: allocate(). Same MTLD3D9Texture ctor; bufferPitch signals mode.
+  Rc<dxmt::Texture> dxmt_texture;
+  uint32_t backingPitch = 0;
+  if (buffer_backed_eligible) {
+    // The eligibility gate above guarantees the tight pitch satisfies
+    // linear_alignment, so this round-up is a provable no-op kept for
+    // shape parity with the offscreen-plain branch.
+    const uint64_t row_bytes = static_cast<uint64_t>(D3DFormatRowPitch(Format, Width));
+    backingPitch = static_cast<uint32_t>((row_bytes + linear_alignment - 1) & ~(linear_alignment - 1));
+    const uint64_t backing_bytes = static_cast<uint64_t>(backingPitch) * Height;
+    // Pool hit skips newBuffer XPC + page-fault cliff (pre-fault memset cost). Pool fed by VB/IB/mirrors; texture
+    // donation deferred for ref_tracker safety (in-flight chunks retain allocation).
+    WMT::Reference<WMT::Buffer> backingBuffer{};
+    uint64_t backing_gpu_addr = 0;
+    void *backingPtr = nullptr;
+    void *backingHostPtr = nullptr;
+    if (!acquireBufferBacking(
+            static_cast<size_t>(backing_bytes), backingBuffer, backing_gpu_addr, backingHostPtr, backingPtr
+        )) {
+      backingPtr = wsi::aligned_malloc(backing_bytes, DXMT_PAGE_SIZE);
+      if (!backingPtr)
+        return D3DERR_OUTOFVIDEOMEMORY;
+      // Pre-fault every page now so the app's first Lock+memcpy doesn't
+      // pay the 100ms+/page Rosetta x86_32 first-touch cliff streamed
+      // mid-frame. Same pattern as the texture-mirror path.
+      std::memset(backingPtr, 0, backing_bytes);
+
+      WMTBufferInfo binfo{};
+      binfo.length = backing_bytes;
+      // Shared (UMA aliasing), Default cache. Hazard tracking left at
+      // Metal's default (Tracked): Untracked here suppressed barriers
+      // between LockRect-time CPU writes (via the aliased pointer) and
+      // GPU samples within the same cmdbuf, and between blit-encoder
+      // generateMipmaps / replaceRegion fall-throughs and the render
+      // encoder that samples them next.
+      binfo.options = (WMTResourceOptions)(WMTResourceCPUCacheModeDefaultCache | WMTResourceStorageModeShared);
+      binfo.memory.set(backingPtr);
+      backingBuffer = m_metalDevice.newBuffer(binfo);
+      if (backingBuffer == nullptr) {
+        wsi::aligned_free(backingPtr);
+        return D3DERR_OUTOFVIDEOMEMORY;
+      }
+    }
+    info.options = (WMTResourceOptions)(WMTResourceCPUCacheModeDefaultCache | WMTResourceStorageModeShared);
+    dxmt_texture = new dxmt::Texture(
+        static_cast<unsigned>(backing_bytes), static_cast<unsigned>(backingPitch), info, m_metalDevice
+    );
+    dxmt::Flags<dxmt::TextureAllocationFlag> alloc_flags;
+    auto allocation = dxmt_texture->wrapBuffer(std::move(backingBuffer), backingPtr, alloc_flags);
+    if (!allocation || !allocation->texture()) {
+      // dxmt::Texture destructor will run as `dxmt_texture` falls out
+      // of scope; the half-built allocation owns the (buffer, mapped)
+      // pair and tears them down via its dtor's i386 aligned_free.
+      return D3DERR_OUTOFVIDEOMEMORY;
+    }
+    dxmt_texture->rename(std::move(allocation));
+  } else {
+    dxmt_texture = new dxmt::Texture(info, m_metalDevice);
+    dxmt::Flags<dxmt::TextureAllocationFlag> alloc_flags;
+    if (Pool == D3DPOOL_DEFAULT)
+      alloc_flags.set(dxmt::TextureAllocationFlag::CpuInvisible);
+    auto allocation = dxmt_texture->allocate(alloc_flags);
+    if (!allocation || !allocation->texture())
+      return D3DERR_OUTOFVIDEOMEMORY;
+    dxmt_texture->rename(std::move(allocation));
+  }
+
+  auto *tex =
+      new MTLD3D9Texture(this, Width, Height, app_levels, Usage, Format, Pool, std::move(dxmt_texture), backingPitch);
+  if (Pool == D3DPOOL_DEFAULT)
+    tex->markLosable();
+  if (initial_data) {
+    // The lock path absorbs every backing variant; at create time a
+    // SYSTEMMEM lock is a plain host copy. A lock failure here means
+    // the mirror allocation failed; fail the create rather than hand
+    // back a texture that silently dropped its data.
+    D3DLOCKED_RECT lr{};
+    if (FAILED(tex->LockRect(0, &lr, nullptr, 0))) {
+      tex->AddRef();
+      tex->Release();
+      return D3DERR_OUTOFVIDEOMEMORY;
+    }
+    const uint32_t src_pitch = D3DFormatRowPitch(Format, Width);
+    const uint32_t rows = D3DFormatRowCount(Format, Height);
+    const uint8_t *src = static_cast<const uint8_t *>(initial_data);
+    uint8_t *dst = static_cast<uint8_t *>(lr.pBits);
+    const uint32_t copy_pitch = std::min<uint32_t>(src_pitch, lr.Pitch);
+    for (uint32_t r = 0; r < rows; ++r)
+      std::memcpy(dst + static_cast<size_t>(r) * lr.Pitch, src + static_cast<size_t>(r) * src_pitch, copy_pitch);
+    tex->UnlockRect(0);
+  }
+  tex->AddRef();
+  *ppTexture = tex;
+  return D3D_OK;
+}
 HRESULT STDMETHODCALLTYPE
 MTLD3D9Device::CreateVolumeTexture(
     UINT Width, UINT Height, UINT Depth, UINT Levels, DWORD Usage, D3DFORMAT Format, D3DPOOL Pool,
     IDirect3DVolumeTexture9 **ppVolumeTexture, HANDLE *pSharedHandle
-) { return E_NOTIMPL; }
+) {
+  if (!ppVolumeTexture)
+    return D3DERR_INVALIDCALL;
+  *ppVolumeTexture = nullptr;
+  if (pSharedHandle)
+    return E_NOTIMPL; // cross-process shared 3D textures deferred
+  if (Width == 0 || Height == 0 || Depth == 0)
+    return D3DERR_INVALIDCALL;
+  // Mirror GetDeviceCaps's MaxVolumeExtent (2048). The 2D/cube/RT/DS
+  // create paths reject over-cap dimensions up front rather than
+  // forwarding them to the allocator to fail as OUTOFVIDEOMEMORY.
+  if (Width > 2048 || Height > 2048 || Depth > 2048)
+    return D3DERR_INVALIDCALL;
+  // wined3d texture.c; D3DUSAGE_WRITEONLY is buffer-only.
+  if (Usage & D3DUSAGE_WRITEONLY)
+    return D3DERR_INVALIDCALL;
+  switch (Pool) {
+  case D3DPOOL_DEFAULT:
+  case D3DPOOL_SYSTEMMEM:
+  case D3DPOOL_MANAGED:
+  case D3DPOOL_SCRATCH:
+    break;
+  default:
+    return D3DERR_INVALIDCALL;
+  }
+  // D3D9 spec: volume textures can't be render targets or depth-stencil.
+  if (Usage & (D3DUSAGE_RENDERTARGET | D3DUSAGE_DEPTHSTENCIL))
+    return D3DERR_INVALIDCALL;
+  // D3D9 spec: AUTOGENMIPMAP is a 2D/cube-only feature; there's no
+  // hardware path for sampler-time mipmap regen on 3D textures. wined3d
+  // texture.c (d3d9_texture_init) rejects with INVALIDCALL on
+  // WINED3D_RTYPE_TEXTURE_3D; DXVK d3d9_common_texture.cpp mirrors
+  // the same gate inside NormalizeTextureProperties.
+  if (Usage & D3DUSAGE_AUTOGENMIPMAP)
+    return D3DERR_INVALIDCALL;
+  // Lower the format. Volume textures are sampled-only on Apple Silicon
+  // (no 3D RT), so use the SampleableTexture path. Compressed formats
+  // (DXT*) are NOT legal on 3D textures per D3D9 spec; D3DFormatToMetal
+  // returns WMTPixelFormatInvalid for them on the sampleable path.
+  WMTPixelFormat pixelFormat = D3DFormatToMetal(Format, D3D9FormatUsage::SampleableTexture);
+  if (pixelFormat == WMTPixelFormatInvalid)
+    return D3DERR_INVALIDCALL;
 
+  UINT real_levels = Levels;
+  if (real_levels == 0) {
+    real_levels = 1;
+    UINT m = std::max({Width, Height, Depth});
+    while ((m >>= 1) != 0)
+      ++real_levels;
+  } else {
+    uint32_t max_levels = 1;
+    UINT m = std::max({Width, Height, Depth});
+    while (m > 1) {
+      m >>= 1;
+      ++max_levels;
+    }
+    if (real_levels > max_levels)
+      return D3DERR_INVALIDCALL;
+  }
+
+  WMTTextureInfo info{};
+  info.pixel_format = pixelFormat;
+  info.width = Width;
+  info.height = Height;
+  info.depth = Depth;
+  info.array_length = 1;
+  info.type = WMTTextureType3D;
+  info.mipmap_level_count = real_levels;
+  info.sample_count = 1;
+  info.usage = WMTTextureUsageShaderRead;
+  // PixelFormatView for the sRGB-aliased sample view (D3DSAMP_SRGBTEXTURE), same
+  // as the 2D/cube paths. Gated on an sRGB pair existing so non-sRGB LUT volumes
+  // keep AGX lossless.
+  if (Recall_sRGB(pixelFormat) != pixelFormat)
+    info.usage = (WMTTextureUsage)(info.usage | WMTTextureUsagePixelFormatView);
+  info.options = WMTResourceStorageModePrivate;
+
+  Rc<dxmt::Texture> dxmt_texture = new dxmt::Texture(info, m_metalDevice);
+  dxmt::Flags<dxmt::TextureAllocationFlag> alloc_flags;
+  if (Pool == D3DPOOL_DEFAULT)
+    alloc_flags.set(dxmt::TextureAllocationFlag::CpuInvisible);
+  auto allocation = dxmt_texture->allocate(alloc_flags);
+  if (!allocation || !allocation->texture())
+    return D3DERR_OUTOFVIDEOMEMORY;
+  dxmt_texture->rename(std::move(allocation));
+
+  auto *tex =
+      new MTLD3D9VolumeTexture(this, Width, Height, Depth, real_levels, Usage, Format, Pool, std::move(dxmt_texture));
+  if (Pool == D3DPOOL_DEFAULT)
+    tex->markLosable();
+  tex->AddRef();
+  *ppVolumeTexture = tex;
+  return D3D_OK;
+}
 
 // CreateCubeTexture: same validation as CreateTexture, one dimension (EdgeLength).
 // Allocates 6 faces × N levels sharing one TextureCube handle.
@@ -1386,8 +1828,135 @@ HRESULT STDMETHODCALLTYPE
 MTLD3D9Device::CreateCubeTexture(
     UINT EdgeLength, UINT Levels, DWORD Usage, D3DFORMAT Format, D3DPOOL Pool, IDirect3DCubeTexture9 **ppCubeTexture,
     HANDLE *pSharedHandle
-) { return E_NOTIMPL; }
+) {
+  if (!ppCubeTexture)
+    return D3DERR_INVALIDCALL;
+  *ppCubeTexture = nullptr;
+  if (EdgeLength == 0)
+    return D3DERR_INVALIDCALL;
+  if (EdgeLength > 16384)
+    return D3DERR_INVALIDCALL;
 
+  if (Pool == D3DPOOL_MANAGED && m_isEx)
+    return D3DERR_INVALIDCALL;
+  if (Usage & D3DUSAGE_WRITEONLY)
+    return D3DERR_INVALIDCALL;
+  if ((Usage & D3DUSAGE_RENDERTARGET) && (Usage & D3DUSAGE_DEPTHSTENCIL))
+    return D3DERR_INVALIDCALL;
+  if ((Usage & (D3DUSAGE_RENDERTARGET | D3DUSAGE_DEPTHSTENCIL)) && Pool != D3DPOOL_DEFAULT)
+    return D3DERR_INVALIDCALL;
+  if (Usage & D3DUSAGE_AUTOGENMIPMAP) {
+    if (Pool == D3DPOOL_SYSTEMMEM)
+      return D3DERR_INVALIDCALL;
+    if (Levels != 0 && Levels != 1)
+      return D3DERR_INVALIDCALL;
+  }
+
+  if (pSharedHandle)
+    return E_NOTIMPL;
+
+  // Attachment usage on a format Metal cannot attach is rejected at
+  // create; see CreateTexture.
+  D3D9FormatUsage formatUsage = D3D9FormatUsage::SampleableTexture;
+  if (Usage & D3DUSAGE_RENDERTARGET)
+    formatUsage = D3D9FormatUsage::RenderTarget;
+  else if (Usage & D3DUSAGE_DEPTHSTENCIL)
+    formatUsage = D3D9FormatUsage::DepthStencil;
+  WMTPixelFormat pixelFormat = D3DFormatToMetal(Format, formatUsage);
+  if (pixelFormat == WMTPixelFormatInvalid) {
+    Logger::warn(str::format("d3d9: CreateCubeTexture: unsupported format ", (unsigned)Format, " usage ", (unsigned)Usage));
+    return D3DERR_INVALIDCALL;
+  }
+
+  uint32_t real_levels;
+  if (Levels == 0) {
+    real_levels = 1;
+    UINT m = EdgeLength;
+    while (m > 1) {
+      m >>= 1;
+      ++real_levels;
+    }
+  } else {
+    real_levels = Levels;
+    uint32_t max_levels = 1;
+    UINT m = EdgeLength;
+    while (m > 1) {
+      m >>= 1;
+      ++max_levels;
+    }
+    if (real_levels > max_levels)
+      return D3DERR_INVALIDCALL;
+  }
+
+  // AUTOGENMIPMAP: see CreateTexture for the full-chain rationale.
+  uint32_t metal_levels = real_levels;
+  uint32_t app_levels = real_levels;
+  if (Usage & D3DUSAGE_AUTOGENMIPMAP) {
+    app_levels = 1;
+  }
+
+  WMTResourceOptions storage;
+  WMTTextureUsage usage_bits = WMTTextureUsageShaderRead;
+  // RT bit: D3DUSAGE_DEPTHSTENCIL (DS is render-target + sampler)
+  // or DEFAULT-pool color (promotion, DXVK pattern).
+  // Skip compressed: BC textures reject RenderTarget on Apple Silicon.
+  if (Usage & D3DUSAGE_DEPTHSTENCIL)
+    usage_bits = (WMTTextureUsage)(usage_bits | WMTTextureUsageRenderTarget);
+  else if (Pool == D3DPOOL_DEFAULT && !IsCompressedFormat(Format))
+    usage_bits = (WMTTextureUsage)(usage_bits | WMTTextureUsageRenderTarget);
+  // PixelFormatView capability: see CreateTexture above for rationale (BC sRGB
+  // sample views decode correctly; without it BC env-maps read too bright).
+  if (!(Usage & D3DUSAGE_DEPTHSTENCIL) && Recall_sRGB(D3DFormatToMetal(Format, D3D9FormatUsage::SampleableTexture)) !=
+                                              D3DFormatToMetal(Format, D3D9FormatUsage::SampleableTexture))
+    usage_bits = (WMTTextureUsage)(usage_bits | WMTTextureUsagePixelFormatView);
+  switch (Pool) {
+  case D3DPOOL_DEFAULT:
+    storage = WMTResourceStorageModePrivate;
+    break;
+  case D3DPOOL_SYSTEMMEM:
+  case D3DPOOL_SCRATCH:
+  case D3DPOOL_MANAGED:
+    storage = WMTResourceStorageModeShared;
+    break;
+  default:
+    return D3DERR_INVALIDCALL;
+  }
+
+  WMTTextureInfo info{};
+  info.pixel_format = pixelFormat;
+  info.width = EdgeLength;
+  info.height = EdgeLength;
+  info.depth = 1;
+  // Metal TextureCube is a single texture with 6 implicit slices.
+  // array_length=1 selects TextureCube (vs TextureCubeArray which
+  // wants array_length=#cubes).
+  info.array_length = 1;
+  info.type = WMTTextureTypeCube;
+  info.mipmap_level_count = metal_levels;
+  info.sample_count = 1;
+  info.usage = usage_bits;
+  info.options = storage;
+
+  // Wrap in dxmt::Texture so chunk lambdas can capture a Rc<>. Cube
+  // textures take only the regular ctor; MTLBuffer.newTexture rejects
+  // non-Type2D so the buffer-backed shape doesn't apply here.
+  // Pool → flags mirrors CreateTexture above.
+  Rc<dxmt::Texture> dxmt_texture = new dxmt::Texture(info, m_metalDevice);
+  dxmt::Flags<dxmt::TextureAllocationFlag> alloc_flags;
+  if (Pool == D3DPOOL_DEFAULT)
+    alloc_flags.set(dxmt::TextureAllocationFlag::CpuInvisible);
+  auto allocation = dxmt_texture->allocate(alloc_flags);
+  if (!allocation || !allocation->texture())
+    return D3DERR_OUTOFVIDEOMEMORY;
+  dxmt_texture->rename(std::move(allocation));
+
+  auto *tex = new MTLD3D9CubeTexture(this, EdgeLength, app_levels, Usage, Format, Pool, std::move(dxmt_texture));
+  if (Pool == D3DPOOL_DEFAULT)
+    tex->markLosable();
+  tex->AddRef();
+  *ppCubeTexture = tex;
+  return D3D_OK;
+}
 HRESULT STDMETHODCALLTYPE
 MTLD3D9Device::CreateVertexBuffer(
     UINT Length, DWORD Usage, DWORD FVF, D3DPOOL Pool, IDirect3DVertexBuffer9 **ppVertexBuffer, HANDLE *pSharedHandle
@@ -1403,14 +1972,211 @@ HRESULT STDMETHODCALLTYPE
 MTLD3D9Device::CreateRenderTarget(
     UINT Width, UINT Height, D3DFORMAT Format, D3DMULTISAMPLE_TYPE MultiSample, DWORD MultisampleQuality, BOOL Lockable,
     IDirect3DSurface9 **ppSurface, HANDLE *pSharedHandle
-) { return E_NOTIMPL; }
+) {
+  if (!ppSurface)
+    return D3DERR_INVALIDCALL;
+  *ppSurface = nullptr;
+  if (Width == 0 || Height == 0)
+    return D3DERR_INVALIDCALL;
+  // Mirrors GetDeviceCaps's MaxTextureWidth/Height. Silicon GPUs go
+  // higher in practice, but we report 16384 in caps so we should
+  // honour the same bound here.
+  if (Width > 16384 || Height > 16384)
+    return D3DERR_INVALIDCALL;
+  // pSharedHandle: the cross-process handle. Non-Ex devices reject
+  // any non-null pSharedHandle with E_NOTIMPL (matches wined3d's
+  // d3d9_device_CreateRenderTarget early-out). Ex devices accept
+  // the pointer and silently proceed without sharing; wined3d
+  // FIXMEs and proceeds; we match the outcome. Resource sharing
+  // is a future feature; the no-op stance is the right placeholder.
+  if (pSharedHandle && !m_isEx)
+    return E_NOTIMPL;
 
+  // 'NULL' FOURCC sentinel: app wants a colour RT slot bound but
+  // never written. There's no real Metal pixel format; the surface
+  // still needs a placeholder Metal texture so the rest of the dxmt
+  // surface plumbing (refcount, GetRenderTarget round-trips, swizzle
+  // math) doesn't have to special-case a null storage. Allocate a
+  // 1×1 BGRA8 dummy and rely on the batched-draw render-pass open +
+  // bindPSOAndDraw to skip the slot whenever the surface's D3DFORMAT is NULL.
+  // Reference: DXVK src/d3d9/d3d9_common_texture.cpp.
+  const bool isNullRT = IsNullFormat(Format);
+  WMTPixelFormat pixelFormat =
+      isNullRT ? WMTPixelFormatBGRA8Unorm : D3DFormatToMetal(Format, D3D9FormatUsage::RenderTarget);
+  if (pixelFormat == WMTPixelFormatInvalid)
+    return D3DERR_INVALIDCALL;
+
+  // Multisample mapping shared with CreateDepthStencilSurface and
+  // probed by CheckDeviceMultiSampleType; see the helper at the top
+  // of this file for the rationale.
+  auto [sampleCount, msHr] = multisample_type_to_metal_sample_count(MultiSample, m_metalDevice);
+  if (FAILED(msHr))
+    return msHr;
+  (void)MultisampleQuality;
+
+  // Metal rejects MSAA + Shared storage at descriptor validation.
+  // catch it up front with INVALIDCALL so the failure surfaces with
+  // a sensible HRESULT rather than D3DERR_OUTOFVIDEOMEMORY at
+  // newTexture time. D3D9 itself disallows the combination.
+  if (sampleCount > 1 && Lockable)
+    return D3DERR_INVALIDCALL;
+
+  // Build the Metal texture descriptor. Render targets are private-
+  // storage by default; callers that asked for a Lockable RT get
+  // Shared storage instead so CPU map paths can land later. Apple
+  // Silicon's unified memory makes Shared cheap; on discrete GPUs
+  // this would be a perf hit but dxmt only targets Apple Silicon.
+  // Reference: MGL/MGLRenderer.m newCommandQueue / texture descriptor
+  // setup; the MTLTextureUsage.renderTarget + .shaderRead pair is the
+  // canonical RT shape so subsequent SetTexture binds the same handle.
+  WMTTextureInfo info{};
+  info.pixel_format = pixelFormat;
+  // NULL-RT placeholder: 1×1, single sample, plain RT usage. The
+  // Width/Height the app asked for stay on the D3DSURFACE_DESC so
+  // queries round-trip, but no Metal storage proportional to the
+  // real RT size gets allocated.
+  info.width = isNullRT ? 1u : Width;
+  info.height = isNullRT ? 1u : Height;
+  info.depth = 1;
+  info.array_length = 1;
+  info.type = (!isNullRT && sampleCount > 1) ? WMTTextureType2DMultisample : WMTTextureType2D;
+  info.mipmap_level_count = 1;
+  info.sample_count = isNullRT ? 1u : sampleCount;
+  info.usage = static_cast<WMTTextureUsage>(WMTTextureUsageRenderTarget | WMTTextureUsageShaderRead);
+  // PixelFormatView for D3DRS_SRGBWRITEENABLE: the render-pass
+  // attachment swaps to an sRGB-format view of the same texture.
+  // NULL-RT placeholder skips the flag: it never participates in a
+  // colour write that would care about gamma encoding, and BGRA8Unorm
+  // already has an sRGB pair so the alias would succeed but be unused.
+  if (!isNullRT && Recall_sRGB(pixelFormat) != pixelFormat)
+    info.usage = (WMTTextureUsage)(info.usage | WMTTextureUsagePixelFormatView);
+  info.options = Lockable ? WMTResourceStorageModeShared : WMTResourceStorageModePrivate;
+
+  Rc<dxmt::Texture> dxmt_texture = new dxmt::Texture(info, m_metalDevice);
+  dxmt::Flags<dxmt::TextureAllocationFlag> alloc_flags;
+  if (!Lockable)
+    alloc_flags.set(dxmt::TextureAllocationFlag::CpuInvisible);
+  auto allocation = dxmt_texture->allocate(alloc_flags);
+  if (!allocation || !allocation->texture())
+    return D3DERR_OUTOFVIDEOMEMORY;
+  WMT::Texture rawTex = allocation->texture();
+  dxmt_texture->rename(std::move(allocation));
+
+  D3DSURFACE_DESC desc{};
+  desc.Format = Format;
+  desc.Type = D3DRTYPE_SURFACE;
+  desc.Usage = D3DUSAGE_RENDERTARGET;
+  desc.Pool = D3DPOOL_DEFAULT;
+  desc.MultiSampleType = MultiSample;
+  desc.MultiSampleQuality = MultisampleQuality;
+  desc.Width = Width;
+  desc.Height = Height;
+
+  auto *surface = new MTLD3D9Surface(
+      this, desc,
+      /*container=*/static_cast<IDirect3DDevice9 *>(this), WMT::Reference<WMT::Texture>(rawTex),
+      /*mipLevel=*/0,
+      /*selfPin=*/true,
+      /*parentTextureType=*/WMTTextureType2D,
+      /*buffer=*/{},
+      /*cpuPtr=*/cpuPtr,
+      /*pitch=*/pitch,
+      /*arraySlice=*/0,
+      /*ownedBacking=*/ownedBacking,
+      /*dxmtTexture=*/std::move(dxmt_texture)
+  );
+  // CreateRenderTarget surfaces are always D3DPOOL_DEFAULT.
+  surface->markLosable();
+  surface->AddRef();
+  *ppSurface = surface;
+  return D3D_OK;
+}
 HRESULT STDMETHODCALLTYPE
 MTLD3D9Device::CreateDepthStencilSurface(
     UINT Width, UINT Height, D3DFORMAT Format, D3DMULTISAMPLE_TYPE MultiSample, DWORD MultisampleQuality, BOOL Discard,
     IDirect3DSurface9 **ppSurface, HANDLE *pSharedHandle
-) { return E_NOTIMPL; }
+) {
+  if (!ppSurface)
+    return D3DERR_INVALIDCALL;
+  *ppSurface = nullptr;
+  if (Width == 0 || Height == 0)
+    return D3DERR_INVALIDCALL;
+  if (Width > 16384 || Height > 16384)
+    return D3DERR_INVALIDCALL;
+  // pSharedHandle: see CreateRenderTarget for the policy rationale.
+  if (pSharedHandle && !m_isEx)
+    return E_NOTIMPL;
 
+  WMTPixelFormat pixelFormat = D3DFormatToMetal(Format, D3D9FormatUsage::DepthStencil);
+  if (pixelFormat == WMTPixelFormatInvalid)
+    return D3DERR_INVALIDCALL;
+
+  // Shared MSAA-resolve with CreateRenderTarget / CheckDeviceMultiSampleType.
+  auto [sampleCount, msHr] = multisample_type_to_metal_sample_count(MultiSample, MultisampleQuality, m_metalDevice);
+  if (FAILED(msHr))
+    return msHr;
+
+  // Always Private. dxmt's encoder layer splits a frame across multiple
+  // command encoders (on a Clear, an RT/DS change, or a blit), and a
+  // Memoryless depth attachment does not survive an encoder boundary, so
+  // a later encoder's load=Load would read back undefined data mid-frame.
+  // D3D9's Discard hint only means the contents need not survive a Present
+  // or a SetDepthStencilSurface swap; it does not let the app manage Metal
+  // encoder boundaries, so it cannot select Memoryless here.
+  WMTTextureInfo info{};
+  info.pixel_format = pixelFormat;
+  info.width = Width;
+  info.height = Height;
+  info.depth = 1;
+  info.array_length = 1;
+  info.type = sampleCount > 1 ? WMTTextureType2DMultisample : WMTTextureType2D;
+  info.mipmap_level_count = 1;
+  info.sample_count = sampleCount;
+  // Depth-stencil attachments need .renderTarget on Apple GPUs;
+  // ShaderRead is intentionally omitted; depth-textures (the
+  // shadow-map case) come from CreateTexture with D3DUSAGE_DEPTHSTENCIL,
+  // not from CreateDepthStencilSurface.
+  info.usage = WMTTextureUsageRenderTarget;
+  info.options = WMTResourceStorageModePrivate;
+  (void)Discard;
+  Rc<dxmt::Texture> dxmt_texture = new dxmt::Texture(info, m_metalDevice);
+  dxmt::Flags<dxmt::TextureAllocationFlag> alloc_flags;
+  alloc_flags.set(dxmt::TextureAllocationFlag::CpuInvisible);
+  auto allocation = dxmt_texture->allocate(alloc_flags);
+  if (!allocation || !allocation->texture())
+    return D3DERR_OUTOFVIDEOMEMORY;
+  WMT::Texture rawTex = allocation->texture();
+  dxmt_texture->rename(std::move(allocation));
+
+  D3DSURFACE_DESC desc{};
+  desc.Format = Format;
+  desc.Type = D3DRTYPE_SURFACE;
+  desc.Usage = D3DUSAGE_DEPTHSTENCIL;
+  desc.Pool = D3DPOOL_DEFAULT;
+  desc.MultiSampleType = MultiSample;
+  desc.MultiSampleQuality = MultisampleQuality;
+  desc.Width = Width;
+  desc.Height = Height;
+
+  auto *surface = new MTLD3D9Surface(
+      this, desc,
+      /*container=*/static_cast<IDirect3DDevice9 *>(this), WMT::Reference<WMT::Texture>(rawTex),
+      /*mipLevel=*/0,
+      /*selfPin=*/true,
+      /*parentTextureType=*/WMTTextureType2D,
+      /*buffer=*/{},
+      /*cpuPtr=*/nullptr,
+      /*pitch=*/0,
+      /*arraySlice=*/0,
+      /*ownedBacking=*/nullptr,
+      /*dxmtTexture=*/std::move(dxmt_texture)
+  );
+  // CreateDepthStencilSurface surfaces are always D3DPOOL_DEFAULT.
+  surface->markLosable();
+  surface->AddRef();
+  *ppSurface = surface;
+  return D3D_OK;
+}
 // UpdateSurface: SYSTEMMEM → DEFAULT blit. Symmetric inverse of
 // GetRenderTargetData. Validation per DXVK d3d9_device.cpp.
 HRESULT STDMETHODCALLTYPE
@@ -1458,8 +2224,191 @@ MTLD3D9Device::ColorFill(IDirect3DSurface9 *pSurface, const RECT *pRect, D3DCOLO
 HRESULT STDMETHODCALLTYPE
 MTLD3D9Device::CreateOffscreenPlainSurface(
     UINT Width, UINT Height, D3DFORMAT Format, D3DPOOL Pool, IDirect3DSurface9 **ppSurface, HANDLE *pSharedHandle
-) { return E_NOTIMPL; }
+) {
+  if (!ppSurface)
+    return D3DERR_INVALIDCALL;
+  *ppSurface = nullptr;
+  if (Width == 0 || Height == 0)
+    return D3DERR_INVALIDCALL;
+  if (Width > 16384 || Height > 16384)
+    return D3DERR_INVALIDCALL;
 
+  // wined3d device.c; D3DPOOL_MANAGED on offscreen plain is
+  // contract-illegal (managed pool implies a GPU mirror, but offscreen
+  // plain has no defined GPU-bind path that would feed the mirror).
+  if (Pool == D3DPOOL_MANAGED)
+    return D3DERR_INVALIDCALL;
+
+  // pSharedHandle: non-Ex always E_NOTIMPL; Ex+SYSTEMMEM/DEFAULT not yet.
+  // Collapse implementable branches to E_NOTIMPL; illegal to INVALIDCALL.
+  if (pSharedHandle) {
+    if (!m_isEx)
+      return E_NOTIMPL;
+    if (Pool != D3DPOOL_SYSTEMMEM && Pool != D3DPOOL_DEFAULT)
+      return D3DERR_INVALIDCALL;
+    return E_NOTIMPL;
+  }
+
+  // Depth-stencil formats are valid as sampleable textures (shadow
+  // maps go through CreateTexture with D3DUSAGE_DEPTHSTENCIL), but the
+  // plain-surface path has no defined DS attachment role; reject up
+  // front rather than silently allocating something the runtime can't
+  // bind.
+  if (IsDepthStencilFormat(Format))
+    return D3DERR_INVALIDCALL;
+
+  WMTPixelFormat pixelFormat = D3DFormatToMetal(Format, D3D9FormatUsage::SampleableTexture);
+  if (pixelFormat == WMTPixelFormatInvalid)
+    return D3DERR_INVALIDCALL;
+
+  // Pool → Metal storage. D3DPOOL_DEFAULT lives GPU-side and is the
+  // legal StretchRect destination; SYSTEMMEM/SCRATCH live CPU-side and
+  // are the legal UpdateSurface source. Apple Silicon's unified memory
+  // makes Shared a zero-copy fit for the CPU pools.
+  WMTResourceOptions storage;
+  WMTTextureUsage usage;
+  switch (Pool) {
+  case D3DPOOL_DEFAULT:
+    storage = WMTResourceStorageModePrivate;
+    // ShaderRead so the surface can be a blit source / sampled texture
+    // standin for StretchRect; RenderTarget so it can be a StretchRect
+    // destination via render pass when the format gates blit out.
+    // BC-compressed formats can't carry the RenderTarget bit on Apple
+    // Silicon: same gate as CreateTexture. A DEFAULT-pool DXT
+    // offscreen surface stays sampler-only; StretchRect to it goes
+    // through the blit-encoder path, not a render pass.
+    usage = IsCompressedFormat(Format) ? WMTTextureUsageShaderRead
+                                       : (WMTTextureUsage)(WMTTextureUsageShaderRead | WMTTextureUsageRenderTarget);
+    break;
+  case D3DPOOL_SYSTEMMEM:
+  case D3DPOOL_SCRATCH:
+    storage = WMTResourceStorageModeShared;
+    usage = WMTTextureUsageShaderRead;
+    break;
+  default:
+    return D3DERR_INVALIDCALL;
+  }
+
+  WMTTextureInfo info{};
+  info.pixel_format = pixelFormat;
+  info.width = Width;
+  info.height = Height;
+  info.depth = 1;
+  info.array_length = 1;
+  info.type = WMTTextureType2D;
+  info.mipmap_level_count = 1;
+  info.sample_count = 1;
+  info.usage = usage;
+  info.options = storage;
+
+  WMT::Reference<WMT::Texture> texture;
+  WMT::Reference<WMT::Buffer> buffer;
+  void *cpuPtr = nullptr;
+  void *ownedBacking = nullptr;
+  uint32_t pitch = 0;
+  // DEFAULT offscreen: dxmt::Texture keeps MTLTexture alive (EncodingThread). fullView carries intendedUsage for
+  // RT-substitution. SYSTEMMEM/SCRATCH: buffer-backed (can't add RenderTarget on Apple Silicon; lacks 32-bit
+  // addressing).
+  Rc<dxmt::Texture> dxmt_texture;
+
+  if (Pool == D3DPOOL_DEFAULT) {
+    dxmt_texture = new dxmt::Texture(info, m_metalDevice);
+    dxmt::Flags<dxmt::TextureAllocationFlag> alloc_flags;
+    alloc_flags.set(dxmt::TextureAllocationFlag::CpuInvisible);
+    auto allocation = dxmt_texture->allocate(alloc_flags);
+    if (!allocation || !allocation->texture())
+      return D3DERR_OUTOFVIDEOMEMORY;
+    texture = WMT::Reference<WMT::Texture>(allocation->texture());
+    dxmt_texture->rename(std::move(allocation));
+    // DEFAULT surfaces always lockable (MSDN). Private texture can't carry CPU pointer; buffer-backed loses
+    // RenderTarget (Apple Silicon disallows RT on linear textures). Solution: host-side mirror (MANAGED pattern).
+    const uint32_t block_h = IsCompressedFormat(Format) ? 4u : 1u;
+    pitch = D3DFormatRowPitch(Format, Width);
+    if (pitch == 0)
+      return D3DERR_INVALIDCALL;
+    const uint64_t mirror_bytes = static_cast<uint64_t>(pitch) * ((Height + block_h - 1) / block_h);
+    ownedBacking = wsi::aligned_malloc(mirror_bytes, DXMT_PAGE_SIZE);
+    if (!ownedBacking)
+      return D3DERR_OUTOFVIDEOMEMORY;
+    std::memset(ownedBacking, 0, mirror_bytes);
+    cpuPtr = ownedBacking;
+    // buffer stays null → UnlockRect takes the mirror-upload path, not the
+    // zero-copy buffer-backed path SYSTEMMEM/SCRATCH use.
+  } else {
+    // Lockable pools: back the texture with an MTLBuffer so LockRect
+    // can hand out a CPU pointer without a getBytes copy. Pitch is
+    // padded to the device's per-format alignment requirement.
+    uint32_t bpp = D3DFormatBytesPerPixel(Format);
+    if (bpp == 0)
+      return D3DERR_INVALIDCALL;
+    uint64_t alignment = m_metalDevice.minimumLinearTextureAlignmentForPixelFormat(pixelFormat);
+    if (alignment == 0)
+      alignment = 1;
+    uint64_t row_bytes = static_cast<uint64_t>(Width) * bpp;
+    pitch = static_cast<uint32_t>((row_bytes + alignment - 1) & ~(alignment - 1));
+    // Apps that write rows at width*bpp regardless of the reported
+    // pitch shear on the padded value (CreateTexture's zero-copy path
+    // falls back to a tight mirror for the same reason); surface the
+    // divergence until this path grows the same fallback.
+    if (pitch != row_bytes)
+      Logger::warn(str::format(
+          "d3d9: CreateOffscreenPlainSurface: padded pitch ", pitch, " (tight ", (unsigned)row_bytes,
+          ") exposed for format ", (unsigned)Format, " width ", Width
+      ));
+    const uint64_t backing_bytes = static_cast<uint64_t>(pitch) * Height;
+    // 32-bit WoW64: pre-allocate backing in process address space.
+    // LockRect pBits always 32-bit-addressable (WoW64 thunk space limit).
+    ownedBacking = wsi::aligned_malloc(backing_bytes, DXMT_PAGE_SIZE);
+    if (!ownedBacking)
+      return D3DERR_OUTOFVIDEOMEMORY;
+    // Pre-fault: see CreateVertexBuffer's matching comment for the
+    // Rosetta x86_32 first-touch cliff rationale.
+    std::memset(ownedBacking, 0, backing_bytes);
+    WMTBufferInfo binfo{};
+    binfo.length = backing_bytes;
+    binfo.options = storage;
+    binfo.memory.set(ownedBacking);
+    buffer = m_metalDevice.newBuffer(binfo);
+    if (buffer == nullptr) {
+      wsi::aligned_free(ownedBacking);
+      return D3DERR_OUTOFVIDEOMEMORY;
+    }
+    cpuPtr = ownedBacking;
+    texture = buffer.newTexture(info, /*offset=*/0, /*bytes_per_row=*/pitch);
+    if (texture == nullptr) {
+      buffer = WMT::Reference<WMT::Buffer>{};
+      wsi::aligned_free(ownedBacking);
+      return D3DERR_OUTOFVIDEOMEMORY;
+    }
+  }
+
+  D3DSURFACE_DESC desc{};
+  desc.Format = Format;
+  desc.Type = D3DRTYPE_SURFACE;
+  desc.Usage = 0;
+  desc.Pool = Pool;
+  desc.MultiSampleType = D3DMULTISAMPLE_NONE;
+  desc.MultiSampleQuality = 0;
+  desc.Width = Width;
+  desc.Height = Height;
+
+  auto *surface = new MTLD3D9Surface(
+      this, desc,
+      /*container=*/static_cast<IDirect3DDevice9 *>(this), std::move(texture),
+      /*mipLevel=*/0,
+      /*selfPin=*/true,
+      /*parentTextureType=*/WMTTextureType2D, std::move(buffer), cpuPtr, pitch,
+      /*arraySlice=*/0, ownedBacking,
+      /*dxmtTexture=*/std::move(dxmt_texture)
+  );
+  // CreateOffscreenPlainSurface in DEFAULT pool is losable; SYSTEMMEM /
+  // SCRATCH copies live in CPU pools and never go through Reset's gate.
+  if (Pool == D3DPOOL_DEFAULT)
+    surface->markLosable();
+  surface->AddRef();
+  *ppSurface = surface;
+  return D3D_OK;
+}
 HRESULT STDMETHODCALLTYPE
 MTLD3D9Device::SetRenderTarget(DWORD RenderTargetIndex, IDirect3DSurface9 *pRenderTarget) { return E_NOTIMPL; }
 
