@@ -185,12 +185,11 @@ ensure_lunarg_vulkan_sdk() {
   fi
 
   ensure_root
-  local version archive extract_dir install_root installer_app installer_bin
+  local version archive extract_dir moltenvk_lib vulkan_lib vulkan_include pc_dir
   version="$(curl -fsSL https://vulkan.lunarg.com/sdk/latest/mac.txt)"
   [[ -n "${version}" ]] || die "failed to query latest Vulkan SDK version"
   archive="${DOWNLOADS_DIR}/vulkansdk-macos-${version}.zip"
   extract_dir="${DOWNLOADS_DIR}/vulkansdk-macos-${version}"
-  install_root="${TOOLCHAINS_DIR}/vulkan-sdk-${version}"
 
   download_file "https://sdk.lunarg.com/sdk/download/latest/mac/vulkan-sdk.zip" "${archive}"
   if [[ ! -d "${extract_dir}" ]]; then
@@ -199,19 +198,26 @@ ensure_lunarg_vulkan_sdk() {
     unzip -q "${archive}" -d "${extract_dir}"
   fi
 
-  installer_app="$(find "${extract_dir}" -type d -name "InstallVulkan*.app" -print -quit)"
-  [[ -n "${installer_app}" ]] || die "Vulkan SDK installer app was not found in ${archive}"
-  installer_bin="$(find "${installer_app}/Contents/MacOS" -type f -perm -111 -name "InstallVulkan*" -print -quit)"
-  [[ -n "${installer_bin}" ]] || die "Vulkan SDK installer executable was not found"
+  moltenvk_lib="$(find "${extract_dir}" -type f -name "libMoltenVK.dylib" -print -quit)"
+  vulkan_lib="$(find "${extract_dir}" -type f -name "libvulkan*.dylib" -print -quit)"
+  vulkan_include="$(find "${extract_dir}" -type f -path "*/include/vulkan/vulkan.h" -print -quit)"
+  [[ -n "${moltenvk_lib}" ]] || die "libMoltenVK.dylib was not found in ${archive}"
+  [[ -n "${vulkan_lib}" ]] || die "libvulkan dylib was not found in ${archive}"
+  [[ -n "${vulkan_include}" ]] || die "Vulkan headers were not found in ${archive}"
 
-  log "installing Vulkan SDK ${version} system files"
-  sudo_run "${installer_bin}" \
-    --root "${install_root}" \
-    --accept-licenses \
-    --default-answer \
-    --confirm-command install \
-    com.lunarg.vulkan.core \
-    com.lunarg.vulkan.usr
+  log "installing Vulkan SDK ${version} development files"
+  sudo_run mkdir -p /usr/local/lib /usr/local/include
+  sudo_run cp -f "${moltenvk_lib}" /usr/local/lib/
+  while IFS= read -r dylib; do
+    sudo_run cp -f "${dylib}" /usr/local/lib/
+  done < <(find "$(dirname "${vulkan_lib}")" -type f -name "libvulkan*.dylib" -print)
+  sudo_run rsync -a "$(dirname "$(dirname "${vulkan_include}")")/" /usr/local/include/
+
+  pc_dir="$(find "${extract_dir}" -type f -path "*/pkgconfig/vulkan.pc" -print -quit)"
+  if [[ -n "${pc_dir}" ]]; then
+    sudo_run mkdir -p /usr/local/lib/pkgconfig
+    sudo_run cp -f "$(dirname "${pc_dir}")"/*.pc /usr/local/lib/pkgconfig/
+  fi
 
   vulkan_system_files_ready ||
     die "Vulkan SDK install completed but /usr/local libvulkan/libMoltenVK files are missing"
