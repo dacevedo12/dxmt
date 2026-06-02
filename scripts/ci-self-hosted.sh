@@ -130,6 +130,7 @@ ensure_wine_rosetta_build_tools() {
     die "x86_64 Homebrew is required at /usr/local/bin/brew; install it on the runner"
 
   local brew_x86=(arch -x86_64 /usr/local/bin/brew)
+  local brew_updated=0
   local packages=(
     zlib
     pkg-config
@@ -141,6 +142,8 @@ ensure_wine_rosetta_build_tools() {
     gstreamer
     gst-plugins-base
     libffi
+    vulkan-loader
+    molten-vk
     vulkan-headers
     bison
     autoconf
@@ -156,8 +159,16 @@ ensure_wine_rosetta_build_tools() {
     if ! "${brew_x86[@]}" list --formula "${package}" >/dev/null 2>&1; then
       log "installing x86_64 Homebrew formula for Wine: ${package}"
       if ! "${brew_x86[@]}" install --formula "${package}"; then
-        "${brew_x86[@]}" list --formula "${package}" >/dev/null 2>&1 ||
-          die "failed to install x86_64 Homebrew formula for Wine: ${package}"
+        if ! "${brew_x86[@]}" list --formula "${package}" >/dev/null 2>&1; then
+          if [[ "${brew_updated}" -eq 0 ]]; then
+            log "updating x86_64 Homebrew after formula install failure"
+            "${brew_x86[@]}" update --force --quiet ||
+              die "failed to update x86_64 Homebrew"
+            brew_updated=1
+          fi
+          "${brew_x86[@]}" install --formula "${package}" ||
+            die "failed to install x86_64 Homebrew formula for Wine: ${package}"
+        fi
         log "x86_64 Homebrew formula ${package} is installed despite brew returning non-zero"
       fi
     fi
@@ -358,16 +369,9 @@ build_wine_git_source() {
   chmod +x "${source_dir}/scripts/build_on_m1.sh" "${source_dir}/scripts/build_on_intel.sh"
   case "$(uname -m)" in
     arm64)
-      # The x86_64 Homebrew molten-vk formula currently fails to parse on the
-      # self-hosted runner. Wine's build script only needs Vulkan headers for
-      # this CI build, so avoid its hard-coded install attempt.
-      perl -0pi -e 's/(BREW_PACKAGES=\([^)]*) molten-vk( [^)]*\))/$1$2/' \
-        "${source_dir}/scripts/build_on_m1.sh"
       (cd "${source_dir}" && ./scripts/build_on_m1.sh)
       ;;
     x86_64)
-      perl -0pi -e 's/(BREW_PACKAGES=\([^)]*)\n    molten-vk\n([^)]*\))/$1\n$2/' \
-        "${source_dir}/scripts/build_on_intel.sh"
       (cd "${source_dir}" && ./scripts/build_on_intel.sh)
       ;;
     *)
