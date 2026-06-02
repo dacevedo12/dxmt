@@ -778,8 +778,94 @@ MTLD3D9Device::MTLD3D9Device(
                             WMTResourceCPUCacheModeWriteCombined | WMTResourceHazardTrackingModeUntracked |
                             WMTResourceStorageModeShared
                         )}
-    ) {}
+    ) {
+  m_completionEvent = m_metalDevice.newSharedEvent();
+  // Pre-allocate 2 blocks in each ring so the Rosetta x86_32 first-touch
+  // memset cliff (~1.2 s for a 32 MB Metal-registered buffer) is paid
+  // here at device construction; hidden inside the game's overall
+  // startup: instead of mid-frame when the ring exhausts its current
+  // block. GPU completion recycles the blocks indefinitely, so 2 is
+  // enough headroom for typical CPU/GPU overlap without ever allocating
+  // fresh during gameplay. First-touch of a fresh ring block could stall
+  // over a second on the calling thread on the first Draw after Reset.
+  m_constRing.preallocate(2);
+  m_uploadRing.preallocate(2);
+  m_creationParams.AdapterOrdinal = adapter;
+  m_creationParams.DeviceType = deviceType;
+  m_creationParams.hFocusWindow = focusWindow;
+  m_creationParams.BehaviorFlags = behaviorFlags;
+  m_presentParams = validatedParams;
+  // hDeviceWindow falls back to hFocusWindow per D3D9 spec; see
+  // wined3d device.c. Smokes pass NULL for both, which the chain
+  // treats as headless.
+  HWND effectiveWindow = validatedParams.hDeviceWindow ? validatedParams.hDeviceWindow : focusWindow;
+  m_implicitSwapChain = new MTLD3D9SwapChain(this, isEx, validatedParams, effectiveWindow);
+  // Pin the chain alive against the device's lifetime; its public
+  // refcount is driven entirely by GetSwapChain handouts, this one is
+  // private. Released in our destructor.
+  m_implicitSwapChain->AddRefPrivate();
 
+  // D3D9 fixed defaults for sampler state: matches wined3d
+  // dlls/wined3d/stateblock.c (init_default_sampler_states).
+  // Apps depend on these as the GetSamplerState return values pre-Set.
+  for (unsigned i = 0; i < D3D9_MAX_TEXTURE_UNITS; ++i) {
+    m_samplerStates[i][D3DSAMP_ADDRESSU] = D3DTADDRESS_WRAP;
+    m_samplerStates[i][D3DSAMP_ADDRESSV] = D3DTADDRESS_WRAP;
+    m_samplerStates[i][D3DSAMP_ADDRESSW] = D3DTADDRESS_WRAP;
+    m_samplerStates[i][D3DSAMP_BORDERCOLOR] = 0;
+    m_samplerStates[i][D3DSAMP_MAGFILTER] = D3DTEXF_POINT;
+    m_samplerStates[i][D3DSAMP_MINFILTER] = D3DTEXF_POINT;
+    m_samplerStates[i][D3DSAMP_MIPFILTER] = D3DTEXF_NONE;
+    m_samplerStates[i][D3DSAMP_MIPMAPLODBIAS] = 0;
+    m_samplerStates[i][D3DSAMP_MAXMIPLEVEL] = 0;
+    m_samplerStates[i][D3DSAMP_MAXANISOTROPY] = 1;
+    m_samplerStates[i][D3DSAMP_SRGBTEXTURE] = 0;
+    m_samplerStates[i][D3DSAMP_ELEMENTINDEX] = 0;
+    m_samplerStates[i][D3DSAMP_DMAPOFFSET] = 0;
+  }
+
+  initDefaultRenderStates(validatedParams.EnableAutoDepthStencil != 0);
+
+  // Transform state defaults: identity matrices everywhere.
+  // wined3d stateblock.c / DXVK ResetState seeds the same way.
+  for (uint32_t i = 0; i < kMaxTransforms; ++i) {
+    D3DMATRIX m = {};
+    m.m[0][0] = m.m[1][1] = m.m[2][2] = m.m[3][3] = 1.0f;
+    m_transforms[i] = m;
+  }
+
+  // SetStreamSourceFreq defaults to 1 per stream: "draw 1 instance,
+  // step per-vertex". DXVK seeds the same way (d3d9_device.cpp).
+  for (uint32_t i = 0; i < D3D9_MAX_VERTEX_STREAMS; ++i)
+    m_streamFreq[i] = 1;
+
+  // FFP material defaults: wined3d stateblock.c default_material:
+  // Diffuse=(1,1,1,1), other channels zero, Power=0. Apps that
+  // GetMaterial before any SetMaterial rely on this.
+  m_material.Diffuse = {1.0f, 1.0f, 1.0f, 1.0f};
+  m_material.Ambient = {0.0f, 0.0f, 0.0f, 0.0f};
+  m_material.Specular = {0.0f, 0.0f, 0.0f, 0.0f};
+  m_material.Emissive = {0.0f, 0.0f, 0.0f, 0.0f};
+  m_material.Power = 0.0f;
+
+  // Auto-bind implicit backbuffer to RT0 (also reseeds viewport+scissor
+  // to the RT extent). wined3d device.c device_init.
+  SetRenderTarget(0, m_implicitSwapChain->backBuffer());
+
+  // Auto-DS: implicit surface per D3D9 spec. Private storage (Memoryless cannot
+  // survive encoder boundary; batched draws split frames). Load/Store across encoders.
+  createAutoDepthStencil(validatedParams);
+
+  // POD state's encode-side mirror (m_d9EncState) is no longer read
+  // by Resolve/Emit: each BatchedDraw now carries a per-draw
+  // pod_snapshot. Mark every axis dirty so the next QueueBatchedDraw
+  // captures a fresh COW snapshot off the just-initialised shadows.
+  m_encShadowDirty = dxmt::D9ES_DIRTY_ALL;
+  // m_d9EncRefs is no longer read by Resolve (each BatchedDraw carries
+  // its own ref_snapshot). Bump m_encRefsGen so the next
+  // QueueBatchedDraw rebuilds a fresh COW snapshot off the just-bound
+  // calling-thread shadows.
+}
 
 void
 MTLD3D9Device::resetStateToDefaults(bool enableAutoDepthStencil) {
@@ -938,8 +1024,75 @@ MTLD3D9Device::acquireOrAllocateBufferBacking(
   return D3D_OK;
 }
 
-MTLD3D9Device::~MTLD3D9Device() {}
-
+MTLD3D9Device::~MTLD3D9Device() {
+  // Drain the encoder + cmdbuf before anything else; they hold Metal
+  // handles whose dispose path needs the queue and device alive. The
+  // local autorelease pool is required because flushOpenWork's
+  // endEncoding/commit go through autoreleased Metal selectors and
+  // wine's main thread has no outer NSAutoreleasePool.
+  {
+    auto pool = WMT::MakeAutoreleasePool();
+    // Drain queued draws AND any pending-clear / mips-dirty work onto
+    // chunks first (flushOpenWork's drainPendingClear /
+    // flushDeferredBlitWork both post chunks). Then commit and wait so
+    // resources captured in chunk lambdas (Rc<>'s, Com<>'s, retained
+    // Metal buffers) drop before the device's other fields tear down
+    // underneath them.
+    if (!m_pendingDraws.empty())
+      FlushDrawBatch();
+    flushOpenWork();
+    if (m_dxmtQueue) {
+      // Per-FlushDrawBatch signalEvents were dropped (encoder-coalesce
+      // unblock), so a tail-signal must be emitted explicitly before
+      // CommitCurrentChunk to advance m_completionEvent. Otherwise the
+      // m_completionEvent.waitUntilSignaledValue below would block
+      // forever waiting for a value never set.
+      emitCmdbufTailSignal();
+      uint64_t seq = m_dxmtQueue->CurrentSeqId();
+      m_dxmtQueue->CommitCurrentChunk();
+      m_dxmtQueue->WaitCPUFence(seq);
+    }
+    // Wait for the GPU to retire every cmdbuf we ever submitted before
+    // the staging allocator's destructor frees its placed-buffer host
+    // backings. free(mapped_address) inside StagingBufferBlockAllocator::
+    // Block's dtor would otherwise yank memory out from under live GPU
+    // reads. m_currentCmdSeq was incremented past the last committed
+    // cmdbuf; waiting for (m_currentCmdSeq - 1) covers the most recent
+    // commit and is a no-op if the GPU has already caught up.
+    if (m_currentCmdSeq > 1)
+      m_completionEvent.waitUntilSignaledValue(m_currentCmdSeq - 1, UINT64_MAX);
+    // Drain the FIFO under a known-quiescent GPU so all blocks land in
+    // the "adhoc or expired" recycle branch and dispose cleanly.
+    m_constRing.free_blocks(static_cast<uint64_t>(-1));
+    m_uploadRing.free_blocks(static_cast<uint64_t>(-1));
+    // Drain the buffer-backing pool. Entries' WMT::References release
+    // their Metal buffers via the vector's element destructors; the
+    // wsi backings need explicit aligned_free since BufferBackingPoolEntry
+    // has no destructor of its own.
+    for (auto &entry : m_bufferBackingPool) {
+      if (entry.owned_backing)
+        wsi::aligned_free(entry.owned_backing);
+    }
+    m_bufferBackingPool.clear();
+  }
+  // Tear the implicit chain down explicitly so it has the queue + device
+  // available while it releases any Metal handles. After this returns,
+  // member destruction in reverse declaration order finishes off the
+  // queue and Metal device.
+  if (m_implicitSwapChain) {
+    m_implicitSwapChain->ReleasePrivate();
+    m_implicitSwapChain = nullptr;
+  }
+  // Fan-list IB cleanup. Drop the MTLBuffer reference first (releases
+  // the Metal NSObject's retain on the placement) then free the host
+  // backing. Same ordering rule as the texture mirror in
+  // MTLD3D9Texture's dtor.
+  m_fanListIB = WMT::Reference<WMT::Buffer>{};
+  if (m_fanListIBBacking) {
+    wsi::aligned_free(m_fanListIBBacking);
+    m_fanListIBBacking = nullptr;
+  }
+}
 
 // Out-of-line accessor: the inline form would dereference an
 // incomplete dxmt::CommandQueue type at every TU that includes
@@ -1476,15 +1629,161 @@ MTLD3D9Device::CreateAdditionalSwapChain(
   return D3DERR_NOTAVAILABLE;
 }
 HRESULT STDMETHODCALLTYPE
-MTLD3D9Device::GetSwapChain(UINT iSwapChain, IDirect3DSwapChain9 **pSwapChain) { return E_NOTIMPL; }
-
+MTLD3D9Device::GetSwapChain(UINT iSwapChain, IDirect3DSwapChain9 **pSwapChain) {
+  // Mirror wined3d_swapchain_GetBackBuffer (dlls/d3d9/swapchain.c):
+  // do NOT clobber the caller's out-pointer on the failure path. Some
+  // game engines plant a sentinel they expect to survive an
+  // out-of-range probe. Validate first, write null only on success.
+  if (!pSwapChain)
+    return D3DERR_INVALIDCALL;
+  if (iSwapChain != 0)
+    return D3DERR_INVALIDCALL;
+  *pSwapChain = ::dxmt::ref(static_cast<IDirect3DSwapChain9 *>(m_implicitSwapChain));
+  return D3D_OK;
+}
 UINT STDMETHODCALLTYPE
 MTLD3D9Device::GetNumberOfSwapChains() {
   return 1;
 }
 HRESULT STDMETHODCALLTYPE
-MTLD3D9Device::Reset(D3DPRESENT_PARAMETERS *pPresentationParameters) { return E_NOTIMPL; }
+MTLD3D9Device::Reset(D3DPRESENT_PARAMETERS *pPresentationParameters) {
+  // Wine's main thread has no outer NSAutoreleasePool. Reset tears
+  // down and recreates the backbuffer + auto-DS, each of which routes
+  // through Metal APIs that return autoreleased handles (newBuffer,
+  // newTexture, render command encoder). Without a pool here the
+  // autoreleased temporaries leak across every Reset (typical
+  // resolution-change path on WM_SIZE).
+  auto pool = WMT::MakeAutoreleasePool();
+  // MVP Reset: resolution-change path only. Not implemented: state reset to defaults,
+  // stateblock destruction. Does: validate DEFAULT-pool, drain GPU, rebuild swapchain.
+  if (!pPresentationParameters)
+    return D3DERR_INVALIDCALL;
+  if (!m_implicitSwapChain)
+    return D3DERR_INVALIDCALL;
 
+  // Validate + canonicalize (wined3d/DXVK pattern): resolve unknown formats,
+  // validate SwapEffect/BackBufferCount/SampleQuality, write back to caller.
+  if (!ValidatePresentParams(*pPresentationParameters, m_isEx))
+    return D3DERR_INVALIDCALL;
+  if (!CanonicalisePresentParams(*pPresentationParameters, m_creationParams.hFocusWindow))
+    return D3DERR_INVALIDCALL;
+
+  // Non-Ex device + Lost state: Reset is rejected until the driver
+  // transitions Lost → NotReset internally. wined3d device.c
+  // wined3d_device_reset and DXVK D3D9DeviceEx::Reset enforce this;
+  // apps in their TestCooperativeLevel loop poll until they see
+  // NotReset and only then call Reset. Ex devices skip this gate.
+  // their CheckDeviceState surfaces device loss, and Reset on Ex
+  // works from any state. The Lost transition itself is unreachable
+  // today; the gate is correct when it becomes reachable.
+  if (!m_isEx && m_deviceState.load(std::memory_order_relaxed) == DeviceState::Lost)
+    return D3DERR_DEVICELOST;
+
+  // Spec gate: non-Ex devices reject Reset when any app-held
+  // D3DPOOL_DEFAULT resource is still alive. wined3d device.c
+  // runs reset_enum_callback only on !extended; DXVK d3d9_device.cpp:
+  // 562-567 gates with !IsExtended(). Ex devices are expected to
+  // succeed Reset with live DEFAULT resources; the runtime drops
+  // those resources via internal release rather than failing the call.
+  if (!m_isEx && m_losableResourceCount.load(std::memory_order_relaxed) != 0) {
+    m_deviceState.store(DeviceState::NotReset, std::memory_order_relaxed);
+    return D3DERR_INVALIDCALL;
+  }
+
+  // 1. Drain GPU so the old backbuffer / auto-DS textures are safe to
+  //    release. Same wait shape as the dtor; emit a tail-signal,
+  //    commit the chunk, wait for cmdbuf retirement. Per-FlushDrawBatch
+  //    signals are gone (encoder-coalesce unblock), so the chunk-commit
+  //    boundary is the only consistent place to advance the event.
+  FlushDrawBatch();
+  flushOpenWork();
+  if (m_dxmtQueue) {
+    emitCmdbufTailSignal();
+    uint64_t seq = m_dxmtQueue->CurrentSeqId();
+    m_dxmtQueue->CommitCurrentChunk();
+    m_dxmtQueue->WaitCPUFence(seq);
+  }
+  if (m_currentCmdSeq > 1)
+    m_completionEvent.waitUntilSignaledValue(m_currentCmdSeq - 1, UINT64_MAX);
+
+  // Drop per-draw COW snapshots: GPU drain confirms no in-flight cmdbuf reads.
+  // Deferring drop to QueueBatchedDraw would run dtors at wrong time (next frame).
+  //     synchronized moment. wined3d's reset path equivalents
+  //     (device.c reset_device → state_unbind) likewise tear down
+  //     captured state ahead of the rebuild.
+  m_encShadowLastSnap.reset();
+
+  // Unbind ALL RT slots + DS (encoder mirror must be clear).
+  // MRT apps: slots 1+ must be cleared or losable-resource gate blocks Reset.
+  for (uint32_t i = 0; i < D3D_MAX_SIMULTANEOUS_RENDERTARGETS; ++i) {
+    if (m_renderTargets[i].ptr())
+      QueueRefOp(static_cast<PendingRefOp::Slot>(PendingRefOp::RenderTarget0 + i), nullptr);
+    m_renderTargets[i] = nullptr;
+  }
+  if (m_depthStencilSurface.ptr())
+    QueueRefOp(PendingRefOp::DepthStencilSurface, nullptr);
+  m_depthStencilSurface = nullptr;
+
+  // 3. Tell the swapchain to drop + rebuild its backbuffer at the new
+  //    dimensions/format. If that fails (OOM / bad format), the chain
+  //    is left without a backbuffer; drive the state-machine to
+  //    NotReset so the app's next TestCooperativeLevel observes it.
+  HRESULT hr = m_implicitSwapChain->ResetForDeviceReset(*pPresentationParameters);
+  if (FAILED(hr)) {
+    m_deviceState.store(DeviceState::NotReset, std::memory_order_relaxed);
+    return hr;
+  }
+
+  // 4. Update our own cached params. Used by GetPresentParameters and
+  //    the swapchain ctor path's defaults; the swapchain already has
+  //    its own copy via ResetForDeviceReset.
+  std::memcpy(&m_presentParams, pPresentationParameters, sizeof(D3DPRESENT_PARAMETERS));
+
+  // 5. Reset every category of device state to D3D9 defaults; non-Ex
+  //    only. DXVK d3d9_device.cpp skips full state-reset on Ex
+  //    ("D3D9Ex doesn't end scene in Reset"); wined3d device.c
+  //    also skips wined3d_stateblock_reset on extended. Apps that rely
+  //    on Ex-Reset state persistence (e.g. compatibility-mode resolution
+  //    switches) see state stomped if we don't gate.
+  if (!m_isEx) {
+    resetStateToDefaults(m_presentParams.EnableAutoDepthStencil != 0);
+
+    // Invalidate outstanding StateBlocks (per MSDN, Reset destroys them). Self-pinned blocks survive app-held refs but
+    // Capture/Apply hard-fail: snapshot may reference Reset-orphaned resources; replay would corrupt state.
+    for (MTLD3D9StateBlock *sb : m_stateBlocks)
+      sb->invalidate();
+    // Reset closes the implicit scene per MSDN ("Reset...returns all
+    // resources to a state similar to the state immediately after
+    // the device is created"). Apps that called BeginScene before a
+    // Reset would otherwise still see m_inScene=true after; and a
+    // subsequent BeginScene would fail with D3DERR_INVALIDCALL even
+    // though the spec says the post-Reset device is ready to accept
+    // a fresh Begin. Ex Reset doesn't close the scene per the DXVK
+    // comment cited above.
+    m_inScene = false;
+  }
+
+  // 6. Recreate the implicit auto-DS surface at new dimensions if the
+  //    new params still ask for one. createAutoDepthStencil is a no-op
+  //    when EnableAutoDepthStencil is FALSE.
+  createAutoDepthStencil(m_presentParams);
+
+  // 7. Re-bind the new backbuffer to RT0 (matches the ctor's auto-bind
+  //    shape: SetRenderTarget(0, …) also resets viewport/scissor to
+  //    the new RT extents, which is what apps expect post-Reset).
+  if (auto *bb = m_implicitSwapChain->backBuffer()) {
+    SetRenderTarget(0, static_cast<IDirect3DSurface9 *>(bb));
+  }
+  if (m_depthStencilSurface.ptr()) {
+    // SetDepthStencilSurface re-emits the encoder-mirror op so encode-
+    // thread D9EncodingRefs picks up the new auto-DS. Direct device-
+    // pointer is the priv-pinned mirror; surface-side public refcount
+    // unchanged.
+    SetDepthStencilSurface(static_cast<IDirect3DSurface9 *>(m_depthStencilSurface.ptr()));
+  }
+  m_deviceState.store(DeviceState::Ok, std::memory_order_relaxed);
+  return D3D_OK;
+}
 
 void
 MTLD3D9Device::createAutoDepthStencil(const D3DPRESENT_PARAMETERS &params) {
@@ -1573,18 +1872,31 @@ MTLD3D9Device::createAutoDepthStencil(const D3DPRESENT_PARAMETERS &params) {
 HRESULT STDMETHODCALLTYPE
 MTLD3D9Device::Present(
     const RECT *pSourceRect, const RECT *pDestRect, HWND hDestWindowOverride, const RGNDATA *pDirtyRegion
-) { return E_NOTIMPL; }
-
+) {
+  return m_implicitSwapChain->Present(pSourceRect, pDestRect, hDestWindowOverride, pDirtyRegion, 0);
+}
 // Device-level GetBackBuffer is a thin forwarder to the chain identified
 // by iSwapChain (we only have one). wined3d device.c same shape.
 HRESULT STDMETHODCALLTYPE
 MTLD3D9Device::GetBackBuffer(
     UINT iSwapChain, UINT iBackBuffer, D3DBACKBUFFER_TYPE Type, IDirect3DSurface9 **ppBackBuffer
-) { return E_NOTIMPL; }
-
+) {
+  if (iSwapChain != 0)
+    return D3DERR_INVALIDCALL;
+  return m_implicitSwapChain->GetBackBuffer(iBackBuffer, Type, ppBackBuffer);
+}
 HRESULT STDMETHODCALLTYPE
-MTLD3D9Device::GetRasterStatus(UINT iSwapChain, D3DRASTER_STATUS *pRasterStatus) { return E_NOTIMPL; }
-
+MTLD3D9Device::GetRasterStatus(UINT iSwapChain, D3DRASTER_STATUS *pRasterStatus) {
+  // Thin forwarder to the swapchain that owns the raster. wined3d
+  // device.c::d3d9_device_GetRasterStatus and DXVK
+  // D3D9DeviceEx::GetRasterStatus share this shape; same pattern dxmt
+  // uses for GetBackBuffer / GetDisplayMode. The swapchain-level
+  // synthesis math (refresh-rate-derived fake scanline) landed at
+  // f5227c3; the device-level entry was left STUB_HR'd separately.
+  if (iSwapChain != 0)
+    return D3DERR_INVALIDCALL;
+  return m_implicitSwapChain->GetRasterStatus(pRasterStatus);
+}
 HRESULT STDMETHODCALLTYPE
 MTLD3D9Device::SetDialogBoxMode(BOOL bEnableDialogs) {
   // MSDN documents many error conditions; DXVK's note (d3d9_swapchain.cpp:
@@ -1596,11 +1908,33 @@ MTLD3D9Device::SetDialogBoxMode(BOOL bEnableDialogs) {
   return D3D_OK;
 }
 void STDMETHODCALLTYPE
-MTLD3D9Device::SetGammaRamp(UINT iSwapChain, DWORD Flags, const D3DGAMMARAMP *pRamp) {}
-
+MTLD3D9Device::SetGammaRamp(UINT iSwapChain, DWORD Flags, const D3DGAMMARAMP *pRamp) {
+  // Spec is void-return but the swapchain index is real: dxmt only owns
+  // the implicit chain today (additional swapchains aren't implemented
+  // yet), so anything past 0 is silently dropped; same as
+  // wined3d::d3d9_device_SetGammaRamp under multi-swapchain absence.
+  if (iSwapChain != 0 || !m_implicitSwapChain)
+    return;
+  m_implicitSwapChain->SetGammaRampForChain(Flags, pRamp);
+}
 void STDMETHODCALLTYPE
-MTLD3D9Device::GetGammaRamp(UINT iSwapChain, D3DGAMMARAMP *pRamp) {}
-
+MTLD3D9Device::GetGammaRamp(UINT iSwapChain, D3DGAMMARAMP *pRamp) {
+  if (!pRamp)
+    return;
+  if (iSwapChain != 0 || !m_implicitSwapChain) {
+    // Synthesize identity for callers that hr-check the ramp bytes.
+    // the prior void no-op left the struct uninitialised which a few
+    // apps (calibration utilities) mis-read.
+    for (uint32_t i = 0; i < 256; ++i) {
+      WORD v = static_cast<WORD>(i * 257);
+      pRamp->red[i] = v;
+      pRamp->green[i] = v;
+      pRamp->blue[i] = v;
+    }
+    return;
+  }
+  m_implicitSwapChain->GetGammaRampForChain(pRamp);
+}
 HRESULT STDMETHODCALLTYPE
 MTLD3D9Device::CreateTexture(
     UINT Width, UINT Height, UINT Levels, DWORD Usage, D3DFORMAT Format, D3DPOOL Pool, IDirect3DTexture9 **ppTexture,
@@ -3037,8 +3371,105 @@ MTLD3D9Device::GetRenderTargetData(IDirect3DSurface9 *pRenderTarget, IDirect3DSu
 // Swapchain uses single persistent backbuffer (same as DXVK windowed shortcut).
 // Same-extent + same-format only; resolve/stretch/convert deferred.
 HRESULT STDMETHODCALLTYPE
-MTLD3D9Device::GetFrontBufferData(UINT iSwapChain, IDirect3DSurface9 *pDestSurface) { return E_NOTIMPL; }
+MTLD3D9Device::GetFrontBufferData(UINT iSwapChain, IDirect3DSurface9 *pDestSurface) {
+  // Wine main thread has no outer NSAutoreleasePool. Routes through
+  // the swapchain's frontbuffer fetch which calls Metal APIs.
+  auto pool = WMT::MakeAutoreleasePool();
+  // TODO: multi-swapchain (CreateAdditionalSwapChain) when it lands;
+  // until then iSwapChain must be 0.
+  if (iSwapChain != 0)
+    return D3DERR_INVALIDCALL;
+  if (!pDestSurface)
+    return D3DERR_INVALIDCALL;
+  auto *dst = static_cast<MTLD3D9Surface *>(pDestSurface);
+  if (dst->deviceRaw() != this)
+    return D3DERR_INVALIDCALL;
+  const D3DSURFACE_DESC &dd = dst->desc();
+  if (dd.Pool != D3DPOOL_SYSTEMMEM && dd.Pool != D3DPOOL_SCRATCH)
+    return D3DERR_INVALIDCALL;
 
+  MTLD3D9Surface *front = m_implicitSwapChain->backBuffer();
+  const D3DSURFACE_DESC &sd = front->desc();
+  if (sd.Format != dd.Format)
+    return D3DERR_INVALIDCALL;
+  // TODO: MSAA backbuffer resolve (DXVK swapchain.cpp; temp
+  // 1-sample image + resolveImage + texture-to-buffer copy). Today the
+  // backbuffer is always 1-sample because CreateDevice rejects MSAA
+  // present params, but the explicit gate keeps this path safe if/when
+  // present-time MSAA propagates.
+  if (sd.MultiSampleType != D3DMULTISAMPLE_NONE)
+    return D3DERR_INVALIDCALL;
+  // TODO: stretched / partial copy when dst extent != src (DXVK
+  // swapchain.cpp). For now require exact match.
+  if (sd.Width != dd.Width || sd.Height != dd.Height)
+    return D3DERR_INVALIDCALL;
+
+  // Same shape as GetRenderTargetData: drain pending draws onto a chunk,
+  // post the blit on its own chunk, wait for it.
+  if (!m_pendingOps.empty())
+    FlushDrawBatch();
+
+  WMT::Reference<WMT::Texture> src_tex_retain(front->metalTexture());
+  WMT::Reference<WMT::Texture> dst_tex_retain(dst->metalTexture());
+  WMT::Reference<WMT::Buffer> dst_buf_retain(dst->metalBuffer());
+  obj_handle_t src_texture_handle = front->metalTexture().handle;
+  obj_handle_t dst_texture_handle = dst->metalTexture().handle;
+  obj_handle_t dst_buffer_handle = dst->metalBuffer().handle;
+  uint32_t src_mip = front->mipLevel();
+  uint32_t dst_mip = dst->mipLevel();
+  uint32_t dst_pitch = dst->pitch();
+  uint32_t width = sd.Width;
+  uint32_t height = sd.Height;
+  uint32_t dst_height = dd.Height;
+
+  uint64_t signal_seq = m_currentCmdSeq;
+  obj_handle_t event_handle = m_completionEvent.handle;
+
+  auto *chunk = m_dxmtQueue->CurrentChunk();
+  chunk->emitcc([src_tex_retain = std::move(src_tex_retain), dst_tex_retain = std::move(dst_tex_retain),
+                 dst_buf_retain = std::move(dst_buf_retain), src_texture_handle, dst_texture_handle, dst_buffer_handle,
+                 src_mip, dst_mip, dst_pitch, width, height, dst_height, event_handle,
+                 signal_seq](ArgumentEncodingContext &ctx) mutable {
+    ctx.startBlitPass();
+    // See GetRenderTargetData for the rationale on routing the copy
+    // at the dst's backing buffer when one exists.
+    if (dst_buffer_handle != 0) {
+      auto &cmd = ctx.encodeBlitCommand<wmtcmd_blit_copy_from_texture_to_buffer>();
+      cmd.type = WMTBlitCommandCopyFromTextureToBuffer;
+      cmd.src = src_texture_handle;
+      cmd.slice = 0;
+      cmd.level = src_mip;
+      cmd.origin = WMTOrigin{0, 0, 0};
+      cmd.size = WMTSize{width, height, 1};
+      cmd.dst = dst_buffer_handle;
+      cmd.offset = 0;
+      cmd.bytes_per_row = dst_pitch;
+      cmd.bytes_per_image = dst_pitch * dst_height;
+    } else {
+      auto &cmd = ctx.encodeBlitCommand<wmtcmd_blit_copy_from_texture_to_texture>();
+      cmd.type = WMTBlitCommandCopyFromTextureToTexture;
+      cmd.src = src_texture_handle;
+      cmd.src_slice = 0;
+      cmd.src_level = src_mip;
+      cmd.src_origin = WMTOrigin{0, 0, 0};
+      cmd.src_size = WMTSize{width, height, 1};
+      cmd.dst = dst_texture_handle;
+      cmd.dst_slice = 0;
+      cmd.dst_level = dst_mip;
+      cmd.dst_origin = WMTOrigin{0, 0, 0};
+    }
+    ctx.endPass();
+    ctx.signalEventByHandle(event_handle, signal_seq);
+  });
+  ++m_currentCmdSeq;
+  refreshSignaledAndTrimRings();
+
+  uint64_t seq = m_dxmtQueue->CurrentSeqId();
+  m_dxmtQueue->CommitCurrentChunk();
+  m_dxmtQueue->WaitCPUFence(seq);
+  m_completionEvent.waitUntilSignaledValue(signal_seq, UINT64_MAX);
+  return D3D_OK;
+}
 // StretchRect: DEFAULT→DEFAULT surface blit. Validation per DXVK
 // d3d9_device.cpp. MVP path: same-format, same-extent, no MSAA,
 // no depth-stencil. Stretch / format-convert / resolve / DS land in
@@ -3475,8 +3906,27 @@ MTLD3D9Device::SetRenderTarget(DWORD RenderTargetIndex, IDirect3DSurface9 *pRend
 }
 
 HRESULT STDMETHODCALLTYPE
-MTLD3D9Device::GetRenderTarget(DWORD RenderTargetIndex, IDirect3DSurface9 **ppRenderTarget) { return E_NOTIMPL; }
-
+MTLD3D9Device::GetRenderTarget(DWORD RenderTargetIndex, IDirect3DSurface9 **ppRenderTarget) {
+  // Mirror wined3d_device_GetRenderTarget shape (and the same shape
+  // MTLD3D9Device::GetSwapChain / MTLD3D9SwapChain::GetBackBuffer use):
+  // do NOT touch the out-pointer on the INVALIDCALL path. Apps planting
+  // a sentinel they expect to survive an out-of-range probe see it
+  // preserved on OOR index.
+  if (!ppRenderTarget)
+    return D3DERR_INVALIDCALL;
+  if (RenderTargetIndex >= D3D_MAX_SIMULTANEOUS_RENDERTARGETS)
+    return D3DERR_INVALIDCALL;
+  // wined3d device.c d3d9_device_GetRenderTarget: returning NOTFOUND
+  // when the slot is unbound matches the D3D9 contract. wined3d
+  // explicitly sets the out-ptr to null on the NOTFOUND path; replicate.
+  MTLD3D9Surface *bound = m_renderTargets[RenderTargetIndex].ptr();
+  if (!bound) {
+    *ppRenderTarget = nullptr;
+    return D3DERR_NOTFOUND;
+  }
+  *ppRenderTarget = ::dxmt::ref<IDirect3DSurface9>(bound);
+  return D3D_OK;
+}
 
 HRESULT STDMETHODCALLTYPE
 MTLD3D9Device::SetDepthStencilSurface(IDirect3DSurface9 *pNewZStencil) {
@@ -5930,8 +6380,9 @@ MTLD3D9Device::ComposeRects(
 HRESULT STDMETHODCALLTYPE
 MTLD3D9Device::PresentEx(
     const RECT *pSourceRect, const RECT *pDestRect, HWND hDestWindowOverride, const RGNDATA *pDirtyRegion, DWORD dwFlags
-) { return E_NOTIMPL; }
-
+) {
+  return m_implicitSwapChain->Present(pSourceRect, pDestRect, hDestWindowOverride, pDirtyRegion, dwFlags);
+}
 // Device9Ex bookkeeping returns. Pre-Reset / pre-frame-pacing dxmt
 // has nothing meaningful to back any of these with; Metal doesn't
 // expose GPU-thread-priority or vblank waits, residency is implicit,
@@ -5997,8 +6448,20 @@ MTLD3D9Device::GetMaximumFrameLatency(UINT *pMaxLatency) {
   return D3D_OK;
 }
 HRESULT STDMETHODCALLTYPE
-MTLD3D9Device::CheckDeviceState(HWND hDestinationWindow) { return E_NOTIMPL; }
-
+MTLD3D9Device::CheckDeviceState(HWND hDestinationWindow) {
+  // Mirror the Present path's occlusion probe; DXVK's CheckDeviceState
+  // routes through the same wsi::isMinimized check. The previous bare
+  // S_OK return left Ex apps that poll CheckDeviceState (instead of
+  // letting Present surface S_PRESENT_OCCLUDED) running their render
+  // loop full-speed while minimized. Falls back to the swapchain's
+  // own window when the caller passes null (DXVK does the same).
+  HWND hWindow = hDestinationWindow;
+  if (!hWindow && m_implicitSwapChain)
+    hWindow = m_implicitSwapChain->hWindow();
+  if (hWindow && wsi::isMinimized(hWindow))
+    return S_PRESENT_OCCLUDED;
+  return D3D_OK;
+}
 // Shared Usage-bit validation for the three Create*Ex methods. DXVK
 // d3d9_device.cpp (and the equivalent depth-stencil/offscreen
 // blocks) gates the new D3D9Ex Usage bits: only the three RESTRICT_*
