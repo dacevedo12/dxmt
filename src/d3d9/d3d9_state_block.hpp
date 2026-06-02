@@ -48,6 +48,15 @@ public:
     m_changes = changes;
   }
 
+  // Freeze the captured stream offset against further Captures (the wined3d
+  // store_stream_offset quirk). CreateStateBlock calls this after the initial
+  // capture so a re-Capture updates the bound buffer and stride but not the
+  // offset.
+  void
+  freezeStreamOffset() {
+    m_changes.store_stream_offset = false;
+  }
+
   // dxmt-internal: Reset path marks every outstanding StateBlock
   // invalid. Per MSDN the runtime destroys all StateBlocks at Reset;
   // dxmt's blocks have a self-pin so they survive externally-held

@@ -107,6 +107,12 @@ struct D3D9StateBlockChanges {
   // from live state on a stream's first record so a freq-only or
   // source-only record doesn't restore zeros for the rest).
   uint16_t streams = 0;
+  // wined3d store_stream_offset: a CreateStateBlock block captures the stream
+  // offset at create time, but a SUBSEQUENT Capture updates only the buffer
+  // and stride, freezing the offset. CreateStateBlock clears this after the
+  // initial capture; Begin/End-recorded blocks leave it set so their captures
+  // keep updating the offset. wined3d stateblock.c.
+  bool store_stream_offset = true;
   bool material = false;
   // I + B register files only; the F file is range-tracked below so a
   // recorded handful of registers doesn't restore the whole 256-slot
@@ -232,7 +238,9 @@ struct D3D9StateBlockChanges {
     ps_constants = true;
     ps_const_f_lo = 0;
     ps_const_f_hi = D3D9_MAX_PS_CONST_F;
-    textures = (1u << D3D9_MAX_TEXTURE_UNITS) - 1;
+    // Bound textures are a D3DSBT_ALL category, not part of PIXELSTATE:
+    // wined3d stateblock_savedstates_set_pixel does not mark them, so an
+    // applied PIXELSTATE block must leave the bound textures untouched.
   }
 
   // D3DSBT_VERTEXSTATE subset: render states from wined3d's
@@ -301,15 +309,13 @@ struct D3D9StateBlockChanges {
     vs_const_f_lo = 0;
     vs_const_f_hi = D3D9_MAX_VS_CONST_F;
     vertex_declaration = true;
-    streams = 0xFFFF;
-    index_buffer = true;
-    material = true;
     lights = true;
-    transforms = true;
-    clip_planes = true;
-    viewport = true;
-    scissor = true;
-    fvf = true;
+    // The VERTEXSTATE subset is the vertex pipeline only. The stream / index
+    // / material / transform / clip-plane / viewport / scissor / fvf
+    // categories belong to D3DSBT_ALL, not here: wined3d
+    // stateblock_savedstates_set_vertex marks none of them, so an applied
+    // VERTEXSTATE block must leave the bound vertex buffers, index buffer,
+    // transforms etc. untouched.
   }
 };
 
