@@ -464,7 +464,8 @@ enum WMTPixelFormat : uint32_t {
 
   WMTPixelFormatBGRA4Unorm = WMTPixelFormatGBARSwizzle | WMTPixelFormatABGR4Unorm,
 
-  WMTPixelFormatCustomSwizzle = WMTPixelFormatRGB1Swizzle | WMTPixelFormatR001Swizzle | WMTPixelFormat0R01Swizzle | WMTPixelFormatGBARSwizzle,
+  WMTPixelFormatCustomSwizzle =
+      WMTPixelFormatRGB1Swizzle | WMTPixelFormatR001Swizzle | WMTPixelFormat0R01Swizzle | WMTPixelFormatGBARSwizzle,
 };
 
 #define ORIGINAL_FORMAT(format) (format & ~WMTPixelFormatCustomSwizzle)
@@ -519,7 +520,7 @@ struct WMTTextureInfo {
   enum WMTTextureUsage usage  : 8;
   enum WMTResourceOptions options;
   uint32_t reserved;
-  mach_port_t mach_port; // in/out
+  mach_port_t mach_port;    // in/out
   uint64_t gpu_resource_id; // out
 };
 
@@ -1139,7 +1140,7 @@ enum WMTBarrierScope : uint8_t {
 };
 
 struct wmtcmd_compute_memory_barrier {
-enum WMTComputeCommandType type;
+  enum WMTComputeCommandType type;
   uint16_t reserved[3];
   struct WMTMemoryPointer next;
   enum WMTBarrierScope scope;
@@ -1190,6 +1191,24 @@ enum WMTRenderCommandType : uint16_t {
   WMTRenderCommandDXMTTessellationMeshDrawIndirect,
   WMTRenderCommandDXMTTessellationMeshDrawIndexedIndirect,
   WMTRenderCommandDispatchThreadsPerTile,
+  // setFragmentSamplerState / setVertexTexture / setVertexSamplerState:
+  // PS sampler-stage binding plus VTF (vertex-texture-fetch) bindings.
+  // setFragmentTexture already exists at WMTRenderCommandSetFragmentTexture
+  // above; these complete the [[texture(N)]] / [[sampler(N)]] surface that
+  // dxso_compile.cpp+ emits per used sampler. Appended to keep the
+  // existing enum values stable.
+  WMTRenderCommandSetFragmentSamplerState,
+  WMTRenderCommandSetVertexTexture,
+  WMTRenderCommandSetVertexSamplerState,
+  // setBlendColorRed:green:blue:alpha: D3D9's D3DRS_BLENDFACTOR
+  // (D3DCOLOR 0xAARRGGBB) drives Metal's encoder-scoped blend
+  // constant, consumed by the BLENDFACTOR / INVBLENDFACTOR factor
+  // enums. Distinct from the older WMTRenderCommandSetBlendFactor-
+  // AndStencilRef op which bundles stencil ref into the same call;
+  // d3d9's stencil ref already rides along with the DSSO bind, so
+  // the two need to be independent. Appended to keep prior enum
+  // values stable.
+  WMTRenderCommandSetBlendColor,
 };
 
 struct wmtcmd_render_nop {
@@ -1239,6 +1258,18 @@ struct wmtcmd_render_settexture {
   uint16_t reserved[3];
   struct WMTMemoryPointer next;
   obj_handle_t texture;
+  uint8_t index;
+};
+
+// Same shape as wmtcmd_render_settexture but the obj_handle_t is an
+// MTLSamplerState. Kept as a separate struct (rather than reusing
+// settexture) so callers can't accidentally mix the two: the encoder-
+// side sampler/texture bind paths are independent on Metal.
+struct wmtcmd_render_setsamplerstate {
+  enum WMTRenderCommandType type;
+  uint16_t reserved[3];
+  struct WMTMemoryPointer next;
+  obj_handle_t sampler;
   uint8_t index;
 };
 
@@ -1449,6 +1480,20 @@ struct wmtcmd_render_setblendcolor {
   float blue;
   float alpha;
   uint8_t stencil_ref;
+};
+
+// Standalone blend-constant carrier for D3DRS_BLENDFACTOR. Mirrors
+// the float-only payload of setBlendColorRed:green:blue:alpha:; the
+// stencil ref is intentionally omitted so the d3d9 path can drive
+// blend constant and DSSO/stencil-ref independently.
+struct wmtcmd_render_setblendcolor_only {
+  enum WMTRenderCommandType type;
+  uint16_t reserved[3];
+  struct WMTMemoryPointer next;
+  float red;
+  float green;
+  float blue;
+  float alpha;
 };
 
 struct wmtcmd_render_dxmt_geometry_draw {
@@ -1720,6 +1765,14 @@ struct WMTLayerProps {
   bool display_sync_enabled;
   bool framebuffer_only;
   enum WMTPixelFormat pixel_format;
+  // CAMetalLayer.maximumDrawableCount: caps how many drawables can
+  // be in flight. Default Apple value is 3, which is over-deep for
+  // 60fps games: presents pile up in the queue and Present Delay
+  // grows to 2-3 vsync intervals. 2 is the standard for low-latency
+  // games on Apple Silicon (matches MoltenVK / Game Porting Toolkit
+  // defaults). Value of 0 leaves Apple's default in place; used by
+  // callers that don't want to opt in to the property surface.
+  uint32_t maximum_drawable_count;
 };
 
 WINEMETAL_API void MetalLayer_setProps(obj_handle_t layer, const struct WMTLayerProps *props);

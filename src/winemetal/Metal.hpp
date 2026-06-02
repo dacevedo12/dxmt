@@ -417,7 +417,31 @@ public:
   }
 
   void
-  drawPrimitives(WMTPrimitiveType primitive_type, uint32_t vertex_start, uint32_t vertex_count) {
+  setDepthStencilState(DepthStencilState dsso, uint8_t stencil_ref = 0) {
+    struct wmtcmd_render_setdsso cmd;
+    cmd.type = WMTRenderCommandSetDSSO;
+    cmd.next.set(nullptr);
+    cmd.dsso = dsso;
+    cmd.stencil_ref = stencil_ref;
+    MTLRenderCommandEncoder_encodeCommands(handle, (const wmtcmd_base *)&cmd);
+  }
+
+  void
+  setBlendColor(float red, float green, float blue, float alpha) {
+    struct wmtcmd_render_setblendcolor_only cmd;
+    cmd.type = WMTRenderCommandSetBlendColor;
+    cmd.next.set(nullptr);
+    cmd.red = red;
+    cmd.green = green;
+    cmd.blue = blue;
+    cmd.alpha = alpha;
+    MTLRenderCommandEncoder_encodeCommands(handle, (const wmtcmd_base *)&cmd);
+  }
+
+  void
+  drawPrimitives(
+      WMTPrimitiveType primitive_type, uint32_t vertex_start, uint32_t vertex_count, uint32_t instance_count = 1
+  ) {
     struct wmtcmd_render_draw cmd;
     cmd.type = WMTRenderCommandDraw;
     cmd.next.set(nullptr);
@@ -425,7 +449,26 @@ public:
     cmd.vertex_start = vertex_start;
     cmd.vertex_count = vertex_count;
     cmd.base_instance = 0;
-    cmd.instance_count = 1;
+    cmd.instance_count = instance_count;
+    MTLRenderCommandEncoder_encodeCommands(handle, (const wmtcmd_base *)&cmd);
+  }
+
+  void
+  drawIndexedPrimitives(
+      WMTPrimitiveType primitive_type, uint64_t index_count, WMTIndexType index_type, Buffer index_buffer,
+      uint64_t index_buffer_offset, int32_t base_vertex, uint32_t instance_count = 1
+  ) {
+    struct wmtcmd_render_draw_indexed cmd;
+    cmd.type = WMTRenderCommandDrawIndexed;
+    cmd.next.set(nullptr);
+    cmd.primitive_type = primitive_type;
+    cmd.index_type = index_type;
+    cmd.index_count = index_count;
+    cmd.index_buffer = index_buffer.handle;
+    cmd.index_buffer_offset = index_buffer_offset;
+    cmd.instance_count = instance_count;
+    cmd.base_vertex = base_vertex;
+    cmd.base_instance = 0;
     MTLRenderCommandEncoder_encodeCommands(handle, (const wmtcmd_base *)&cmd);
   }
 
@@ -440,6 +483,36 @@ public:
   };
 
   void
+  setFragmentSamplerState(SamplerState sampler, uint8_t index) {
+    struct wmtcmd_render_setsamplerstate cmd;
+    cmd.type = WMTRenderCommandSetFragmentSamplerState;
+    cmd.next.set(nullptr);
+    cmd.sampler = sampler;
+    cmd.index = index;
+    MTLRenderCommandEncoder_encodeCommands(handle, (const wmtcmd_base *)&cmd);
+  }
+
+  void
+  setVertexTexture(Texture texture, uint8_t index) {
+    struct wmtcmd_render_settexture cmd;
+    cmd.type = WMTRenderCommandSetVertexTexture;
+    cmd.next.set(nullptr);
+    cmd.texture = texture;
+    cmd.index = index;
+    MTLRenderCommandEncoder_encodeCommands(handle, (const wmtcmd_base *)&cmd);
+  }
+
+  void
+  setVertexSamplerState(SamplerState sampler, uint8_t index) {
+    struct wmtcmd_render_setsamplerstate cmd;
+    cmd.type = WMTRenderCommandSetVertexSamplerState;
+    cmd.next.set(nullptr);
+    cmd.sampler = sampler;
+    cmd.index = index;
+    MTLRenderCommandEncoder_encodeCommands(handle, (const wmtcmd_base *)&cmd);
+  }
+
+  void
   setFragmentBytes(const void *buf, uint64_t length, uint8_t index) {
     struct wmtcmd_render_setbytes cmd;
     cmd.type = WMTRenderCommandSetFragmentBytes;
@@ -447,6 +520,25 @@ public:
     cmd.bytes.set((void *)buf);
     cmd.length = length;
     cmd.index = index;
+    MTLRenderCommandEncoder_encodeCommands(handle, (const wmtcmd_base *)&cmd);
+  }
+
+  void
+  setRasterizerState(
+      WMTTriangleFillMode fill_mode, WMTCullMode cull_mode, WMTWinding winding,
+      WMTDepthClipMode depth_clip_mode = WMTDepthClipModeClip, float depth_bias = 0.0f, float slope_scale = 0.0f,
+      float depth_bias_clamp = 0.0f
+  ) {
+    struct wmtcmd_render_setrasterizerstate cmd;
+    cmd.type = WMTRenderCommandSetRasterizerState;
+    cmd.next.set(nullptr);
+    cmd.fill_mode = fill_mode;
+    cmd.cull_mode = cull_mode;
+    cmd.depth_clip_mode = depth_clip_mode;
+    cmd.winding = winding;
+    cmd.depth_bias = depth_bias;
+    cmd.scole_scale = slope_scale; // sic: typo in winemetal.h struct
+    cmd.depth_bias_clamp = depth_bias_clamp;
     MTLRenderCommandEncoder_encodeCommands(handle, (const wmtcmd_base *)&cmd);
   }
 
@@ -459,6 +551,15 @@ public:
     cmd.viewport_count = 1;
     MTLRenderCommandEncoder_encodeCommands(handle, (const wmtcmd_base *)&cmd);
   };
+
+  void
+  setScissorRect(WMTScissorRect rect) {
+    struct wmtcmd_render_setscissorrect cmd;
+    cmd.type = WMTRenderCommandSetScissorRect;
+    cmd.next.set(nullptr);
+    cmd.scissor_rect = rect;
+    MTLRenderCommandEncoder_encodeCommands(handle, (const wmtcmd_base *)&cmd);
+  }
 
   void
   waitForFence(Fence fence, WMTRenderStages before) {
@@ -516,6 +617,35 @@ public:
     cmd.len = len;
     cmd.dst_buffer = dst.handle;
     cmd.dst_offset = dst_offset;
+    MTLBlitCommandEncoder_encodeCommands(handle, (const wmtcmd_base *)&cmd);
+  }
+
+  void
+  generateMipmaps(Texture texture) {
+    struct wmtcmd_blit_generate_mipmaps cmd;
+    cmd.type = WMTBlitCommandGenerateMipmaps;
+    cmd.next.set(nullptr);
+    cmd.texture = texture.handle;
+    MTLBlitCommandEncoder_encodeCommands(handle, (const wmtcmd_base *)&cmd);
+  }
+
+  void
+  copyFromBufferToTexture(
+      Buffer src, uint64_t src_offset, uint32_t bytes_per_row, uint32_t bytes_per_image, WMTSize size, Texture dst,
+      uint32_t dst_slice, uint32_t dst_level, WMTOrigin dst_origin
+  ) {
+    struct wmtcmd_blit_copy_from_buffer_to_texture cmd;
+    cmd.type = WMTBlitCommandCopyFromBufferToTexture;
+    cmd.next.set(nullptr);
+    cmd.src = src.handle;
+    cmd.src_offset = src_offset;
+    cmd.bytes_per_row = bytes_per_row;
+    cmd.bytes_per_image = bytes_per_image;
+    cmd.size = size;
+    cmd.dst = dst.handle;
+    cmd.slice = dst_slice;
+    cmd.level = dst_level;
+    cmd.origin = dst_origin;
     MTLBlitCommandEncoder_encodeCommands(handle, (const wmtcmd_base *)&cmd);
   }
 };
@@ -656,7 +786,9 @@ public:
 
   BlitCommandEncoder
   blitCommandEncoderWithSampleBuffers(WMTSampleBufferAttachmentInfo *attachments, uint64_t num_attachments) {
-    return BlitCommandEncoder{MTLCommandBuffer_blitCommandEncoderWithSampleBuffers(handle, attachments, num_attachments)};
+    return BlitCommandEncoder{
+        MTLCommandBuffer_blitCommandEncoderWithSampleBuffers(handle, attachments, num_attachments)
+    };
   }
 
   ComputeCommandEncoder

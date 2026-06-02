@@ -187,6 +187,19 @@ DXILInitialize(
   return params.ret;
 }
 
+AIRCONV_API int
+DXSOInitialize(const void *pBytecode, size_t BytecodeSize, dxso_shader_t *ppShader) {
+  struct dxso_initialize_params params;
+  params.bytecode = pBytecode;
+  params.bytecode_size = BytecodeSize;
+  params.shader = ppShader;
+  NTSTATUS status;
+  status = UNIX_CALL(dxso_initialize, &params);
+  if (status)
+    return -1;
+  return params.ret;
+}
+
 AIRCONV_API void
 DXILDestroy(dxil_shader_t pShader) {
   struct sm50_destroy_params params;
@@ -212,6 +225,28 @@ DXILCompile(
   return params.ret;
 }
 
+AIRCONV_API void
+DXSODestroy(dxso_shader_t pShader) {
+  struct dxso_destroy_params params;
+  params.shader = pShader;
+  UNIX_CALL(dxso_destroy, &params);
+}
+
+AIRCONV_API int
+DXSOCompile(dxso_shader_t pShader, struct DXSO_SHADER_COMPILATION_ARGUMENT_DATA *pArgs,
+            const char *FunctionName, dxso_bitcode_t *ppBitcode) {
+  struct dxso_compile_params params;
+  params.shader = pShader;
+  params.args = pArgs;
+  params.func_name = FunctionName;
+  params.bitcode = ppBitcode;
+  NTSTATUS status;
+  status = UNIX_CALL(dxso_compile, &params);
+  if (status)
+    return -1;
+  return params.ret;
+}
+
 AIRCONV_API void DXILGetArgumentsInfo(
   dxil_shader_t pShader, struct MTL_SM50_SHADER_ARGUMENT *pConstantBuffers,
   struct MTL_SM50_SHADER_ARGUMENT *pArguments
@@ -222,3 +257,18 @@ AIRCONV_API void DXILGetArgumentsInfo(
   params.arguments = pArguments;
   UNIX_CALL(dxil_get_arguments_info, &params);
 };
+
+AIRCONV_API void
+DXSOGetCompiledBitcode(dxso_bitcode_t pBitcode, struct SM50_COMPILED_BITCODE *pData) {
+  struct dxso_get_compiled_bitcode_params params;
+  params.bitcode = pBitcode;
+  params.data_out = pData;
+  UNIX_CALL(dxso_get_compiled_bitcode, &params);
+}
+
+AIRCONV_API void
+DXSODestroyBitcode(dxso_bitcode_t pBitcode) {
+  struct dxso_destroy_bitcode_params params;
+  params.bitcode = pBitcode;
+  UNIX_CALL(dxso_destroy_bitcode, &params);
+}

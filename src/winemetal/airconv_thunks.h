@@ -4,6 +4,14 @@
 #ifndef __WINEMETAL_AIRCONV_THUNKS_H
 #define __WINEMETAL_AIRCONV_THUNKS_H
 
+// Slot numbers below MUST match the position of the corresponding
+// thunk_* entry in __wine_unix_call_funcs[] / __wine_unix_call_wow64_funcs[]
+// in src/winemetal/unix/winemetal_unix.c. The explicit `= N` anchors
+// each block to its current table position; entries inside a block
+// auto-increment from there. When upstream inserts new dispatcher
+// entries before a block, the anchor needs to move forward by the
+// same amount or every UNIX_CALL in the block routes to the wrong
+// thunk and silently fails.
 enum airconv_unixcalls {
   unix_sm50_initialize = 74,
   unix_sm50_destroy,
@@ -22,6 +30,15 @@ enum airconv_unixcalls {
   unix_dxil_destroy,
   unix_dxil_compile,
   unix_dxil_get_arguments_info,
+  // 148..152. Sits immediately after upstream's apitrace + sparse
+  // dispatcher entries (136..147) in winemetal_unix.c. Keep in lock-step with the
+  // thunk_DXSO* / thunk32_DXSO* positions in BOTH dispatch tables; if
+  // upstream inserts more entries above this block, move both forward.
+  unix_dxso_initialize = 148,
+  unix_dxso_destroy,
+  unix_dxso_compile,
+  unix_dxso_get_compiled_bitcode,
+  unix_dxso_destroy_bitcode,
 };
 
 struct sm50_initialize_params {
@@ -122,6 +139,34 @@ struct sm50_get_arguments_info_params {
   struct MTL_SM50_SHADER_ARGUMENT *arguments;
 };
 
+struct dxso_initialize_params {
+  const void *bytecode;
+  size_t bytecode_size;
+  dxso_shader_t *shader;
+  int ret;
+};
+
+struct dxso_destroy_params {
+  dxso_shader_t shader;
+};
+
+struct dxso_compile_params {
+  dxso_shader_t shader;
+  struct DXSO_SHADER_COMPILATION_ARGUMENT_DATA *args;
+  const char *func_name;
+  dxso_bitcode_t *bitcode;
+  int ret;
+};
+
+struct dxso_get_compiled_bitcode_params {
+  dxso_bitcode_t bitcode;
+  struct SM50_COMPILED_BITCODE *data_out;
+};
+
+struct dxso_destroy_bitcode_params {
+  dxso_bitcode_t bitcode;
+};
+
 #if defined(__LP64__) || defined(_WIN64)
 #define COMPATIBLE_STRUCT32(stru, size) _Static_assert(sizeof(struct stru##32) == size, "incompatible struct size");
 #else
@@ -138,6 +183,32 @@ struct sm50_initialize_params32 {
 };
 
 COMPATIBLE_STRUCT32(sm50_initialize_params, 24)
+
+struct dxso_initialize_params32 {
+  uint32_t bytecode;
+  unsigned int bytecode_size;
+  uint32_t shader;
+  int ret;
+};
+
+COMPATIBLE_STRUCT32(dxso_initialize_params, 16)
+
+struct dxso_compile_params32 {
+  dxso_shader_t shader;
+  uint32_t args;
+  uint32_t func_name;
+  uint32_t bitcode;
+  int ret;
+};
+
+COMPATIBLE_STRUCT32(dxso_compile_params, 24)
+
+struct dxso_get_compiled_bitcode_params32 {
+  dxso_bitcode_t bitcode;
+  uint32_t data_out;
+};
+
+COMPATIBLE_STRUCT32(dxso_get_compiled_bitcode_params, 16)
 
 struct sm50_compile_params32 {
   sm50_shader_t shader;
