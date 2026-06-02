@@ -45,7 +45,14 @@ jobs:
         env:
           MAC_RUNNER_SUDO_PASS: ${{ secrets.MAC_RUNNER_SUDO_PASS }}
           WINE_ACCESS_TOKEN: ${{ secrets.WINE_ACCESS_TOKEN }}
-        run: scripts/ci-self-hosted.sh ensure-wine x86_64
+        run: |
+          case "${WINE_ACCESS_TOKEN}" in
+            ghp_*) echo "Wine token kind: classic" ;;
+            github_pat_*) echo "Wine token kind: fine-grained" ;;
+            "") echo "::error::WINE_ACCESS_TOKEN is empty"; exit 1 ;;
+            *) echo "Wine token kind: unknown" ;;
+          esac
+          scripts/ci-self-hosted.sh ensure-wine x86_64
 
   setup-llvm-project:
     runs-on: self-macos-runner

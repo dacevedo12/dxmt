@@ -193,23 +193,51 @@ safe_name() {
   printf '%s' "$1" | tr -c 'A-Za-z0-9._-' '-'
 }
 
+wine_github_repo() {
+  printf '%s\n' "${WINE_GIT_URL}" |
+    sed -E 's#^https://github.com/##; s#^git@github.com:##; s#\.git$##; s#/$##'
+}
+
 git_with_wine_auth() {
   if [[ -n "${WINE_ACCESS_TOKEN:-}" ]]; then
-    local askpass
-    askpass="${RUNNER_TEMP:-${DOWNLOADS_DIR}}/dxmt-wine-git-askpass.sh"
-    mkdir -p "$(dirname "${askpass}")"
-    cat > "${askpass}" <<'EOF'
-#!/bin/sh
-case "$1" in
-  *Username*) printf '%s\n' x-access-token ;;
-  *Password*) printf '%s\n' "$WINE_ACCESS_TOKEN" ;;
-  *) printf '\n' ;;
-esac
-EOF
-    chmod 700 "${askpass}"
-    GIT_ASKPASS="${askpass}" git "$@"
+    git \
+      -c credential.helper= \
+      -c "http.https://github.com/.extraHeader=AUTHORIZATION: Bearer ${WINE_ACCESS_TOKEN}" \
+      "$@"
   else
     git "$@"
+  fi
+}
+
+check_wine_access() {
+  [[ -n "${WINE_ACCESS_TOKEN:-}" ]] || die "WINE_ACCESS_TOKEN is empty; set the repository secret for private Wine access"
+
+  local repo status body
+  repo="$(wine_github_repo)"
+  body="${DOWNLOADS_DIR}/wine-access-check.json"
+  log "checking Wine repository access for ${repo}"
+  status="$(curl -sS \
+    --connect-timeout 15 \
+    --max-time 60 \
+    -H "Accept: application/vnd.github+json" \
+    -H "Authorization: Bearer ${WINE_ACCESS_TOKEN}" \
+    -H "X-GitHub-Api-Version: 2022-11-28" \
+    -o "${body}" \
+    -w '%{http_code}' \
+    "https://api.github.com/repos/${repo}/branches/${WINE_GIT_BRANCH}")" ||
+    die "failed to check Wine repository access"
+
+  if [[ "${status}" != "200" ]]; then
+    if [[ -s "${body}" ]]; then
+      python3 - "${body}" <<'PY' >&2 || true
+import json
+import sys
+with open(sys.argv[1], "r", encoding="utf-8") as fp:
+    data = json.load(fp)
+print(f"[dxmt-ci] GitHub API message: {data.get('message')}")
+PY
+    fi
+    die "Wine repository access check failed with HTTP ${status}; verify WINE_ACCESS_TOKEN is the classic PAT with repo scope"
   fi
 }
 
@@ -217,6 +245,7 @@ sync_wine_git_source() {
   local source_dir="$1"
   local old_commit new_commit
   export GIT_TERMINAL_PROMPT=0
+  check_wine_access
 
   if [[ ! -d "${source_dir}/.git" ]]; then
     rm -rf "${source_dir}"
