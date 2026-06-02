@@ -786,8 +786,11 @@ MTLD3D9Device::resetStateToDefaults(bool enableAutoDepthStencil) {}
 
 
 void
-MTLD3D9Device::initDefaultRenderStates(bool enableAutoDepthStencil) {}
-
+MTLD3D9Device::initDefaultRenderStates(bool enableAutoDepthStencil) {
+  // D3D9 spec defaults from DXVK reference (same D3DRS_* indexing).
+  // Float states stored as IEEE-754 bit pattern; apps Set/Get as DWORD.
+  init_default_render_states(m_renderStates, enableAutoDepthStencil);
+}
 
 bool
 MTLD3D9Device::acquireBufferBacking(
@@ -3762,8 +3765,40 @@ MTLD3D9Device::GetRenderState(D3DRENDERSTATETYPE State, DWORD *pValue) {
 // is INVALIDCALL. The block round-trips every D3D9 state-block
 // category on Apply.
 HRESULT STDMETHODCALLTYPE
-MTLD3D9Device::CreateStateBlock(D3DSTATEBLOCKTYPE Type, IDirect3DStateBlock9 **ppSB) { return E_NOTIMPL; }
-
+MTLD3D9Device::CreateStateBlock(D3DSTATEBLOCKTYPE Type, IDirect3DStateBlock9 **ppSB) {
+  if (!ppSB)
+    return D3DERR_INVALIDCALL;
+  *ppSB = nullptr;
+  if (Type != D3DSBT_ALL && Type != D3DSBT_VERTEXSTATE && Type != D3DSBT_PIXELSTATE)
+    return D3DERR_INVALIDCALL;
+  // Issuing CreateStateBlock between Begin/EndStateBlock is an error;
+  // the runtime is mid-recording and conflating the two would
+  // corrupt the recorded mask. wined3d returns INVALIDCALL.
+  if (m_inStateBlockRecord)
+    return D3DERR_INVALIDCALL;
+  auto *sb = new MTLD3D9StateBlock(this, Type);
+  // D3D9: CreateStateBlock captures state immediately (wined3d pattern).
+  // Mask drives which categories Apply restores (D3DSBT_ALL/PIXELSTATE/VERTEXSTATE).
+  D3D9StateBlockChanges changes;
+  switch (Type) {
+  case D3DSBT_ALL:
+    changes.markAll();
+    break;
+  case D3DSBT_PIXELSTATE:
+    changes.markPixelStateSubset();
+    break;
+  case D3DSBT_VERTEXSTATE:
+    changes.markVertexStateSubset();
+    break;
+  default:
+    break; // Unreachable; Type was already validated above.
+  }
+  sb->setChanges(changes);
+  sb->Capture();
+  sb->AddRef();
+  *ppSB = sb;
+  return D3D_OK;
+}
 
 HRESULT STDMETHODCALLTYPE
 MTLD3D9Device::BeginStateBlock() {
@@ -3778,8 +3813,26 @@ MTLD3D9Device::BeginStateBlock() {
 }
 
 HRESULT STDMETHODCALLTYPE
-MTLD3D9Device::EndStateBlock(IDirect3DStateBlock9 **ppSB) { return E_NOTIMPL; }
-
+MTLD3D9Device::EndStateBlock(IDirect3DStateBlock9 **ppSB) {
+  if (!ppSB)
+    return D3DERR_INVALIDCALL;
+  *ppSB = nullptr;
+  if (!m_inStateBlockRecord)
+    return D3DERR_INVALIDCALL;
+  m_inStateBlockRecord = false;
+  // Hand the recorded mask to the new block before Capture so
+  // Capture can later be a no-op for un-marked categories (today
+  // it still over-captures and Apply gates on the mask). The mask
+  // captures exactly which Set* calls landed between Begin/End,
+  // matching wined3d's wined3d_saved_states.
+  auto *sb = new MTLD3D9StateBlock(this, D3DSBT_ALL);
+  sb->setChanges(m_recordingChanges);
+  m_recordingChanges.reset();
+  sb->Capture();
+  sb->AddRef();
+  *ppSB = sb;
+  return D3D_OK;
+}
 // SetClipStatus/GetClipStatus: vestigial FFP-era occlusion bookkeeping.
 // wined3d device.c routes to wined3d_device_set_clip_status /
 // get_clip_status which both succeed; the wined3d layer just stores the
@@ -5130,8 +5183,28 @@ MTLD3D9Device::GetStreamSource(
 // either pass a divisor / count or one of the two flags). Setting==1
 // (the spec default) reverts the stream to per-vertex stepping.
 HRESULT STDMETHODCALLTYPE
-MTLD3D9Device::SetStreamSourceFreq(UINT StreamNumber, UINT Setting) { return E_NOTIMPL; }
-
+MTLD3D9Device::SetStreamSourceFreq(UINT StreamNumber, UINT Setting) {
+  if (StreamNumber >= D3D9_MAX_VERTEX_STREAMS)
+    return D3DERR_INVALIDCALL;
+  // Native D3D9 (Wine visual.c stream_test) accepts a plain frequency
+  // other than 1 and INSTANCEDATA with a zero divider; both round-trip
+  // through Get; the draw path clamps the GPU step rate to >= 1. Only a
+  // zero setting, both flags at once, and INSTANCEDATA on stream 0 are
+  // rejected. dxmt previously inherited DXVK's stricter validation,
+  // which over-rejected the first two and broke conformance.
+  if (HRESULT hr = validate_stream_source_freq(StreamNumber, Setting); FAILED(hr))
+    return hr;
+  if (m_inStateBlockRecord)
+    m_recordingChanges.streams = true;
+  // Unchanged-value short-circuit. stream_freq is in pod_snapshot;
+  // a no-op rewrite would force a fresh COW snapshot rebuild on the
+  // next QueueBatchedDraw.
+  if (m_streamFreq[StreamNumber] == Setting)
+    return D3D_OK;
+  m_streamFreq[StreamNumber] = Setting;
+  m_encShadowDirty |= dxmt::D9ES_DIRTY_STREAM_FREQ;
+  return D3D_OK;
+}
 
 HRESULT STDMETHODCALLTYPE
 MTLD3D9Device::GetStreamSourceFreq(UINT StreamNumber, UINT *pSetting) {
