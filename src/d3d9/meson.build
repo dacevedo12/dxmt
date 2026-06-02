@@ -3,6 +3,10 @@ d3d9_res = wrc_generator.process('version.rc')
 d3d9_src = [
   'd3d9.cpp',
   'd3d9_device.cpp',
+  'd3d9_shader.cpp',
+  'd3d9_shader_scan.cpp',
+  'd3d9_vertex_declaration.cpp',
+  'd3d9_fvf.cpp',
   'd3d9_state_block.cpp',
   'd3d9_state_defaults.cpp',
   'd3d9_validation.cpp',
