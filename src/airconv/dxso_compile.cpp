@@ -421,7 +421,12 @@ compile_dxso(
   // Per-slot hardware-PCF flag: flips SM2+ sample to sample_compare.
   // SM1.x texm3x*/texbem sample depth2d raw (bound as env/bump maps).
   std::array<bool, 16> samp_compare{};
-  if (!is_vertex) {
+  // Texture/sampler bindings run for BOTH stages: vertex texture fetch (VTF,
+  // SM3.0) lets a VS sample a texture (e.g. a displacement map driving vertex
+  // deformation). The dcl carries the sampler kind on
+  // the VS side (no host ps_samp_layout); the texldl/texldd handler below
+  // emits the sample once these args exist.
+  {
     for (const auto &d : shader->metadata.dcls) {
       if (d.bound_to.type == DxsoRegisterType::Sampler && d.bound_to.num < samp_kind.size())
         samp_kind[d.bound_to.num] = d.dcl.texture_type;
@@ -1927,6 +1932,388 @@ compile_dxso(
       DxsoDstRegister tdst = ins.dst;
       tdst.mask = DxsoRegMask(trimmed);
       store_dst(tdst, result);
+      break;
+    }
+    case DxsoOpcode::Tex:
+    case DxsoOpcode::TexLdl:
+    case DxsoOpcode::TexLdd: {
+      // Tex opcode variants: SM1.0-1.3 implicit t<n>,
+      // SM1.4 texld src, SM2+ texld/texldl/texldd with sampler src[1].
+      // VTF: a VS may sample via texldl/texldd (SM3.0 vertex texture fetch);
+      // the SM<2 implicit-tex form is pixel-only, so still gate that branch.
+      if (!ins.has_dst)
+        break;
+      bool is_grad = ins.opcode == DxsoOpcode::TexLdd;
+      uint32_t slot;
+      Value *coord4;
+      if (ins.opcode == DxsoOpcode::Tex && shader->header.major < 2) {
+        slot = ins.dst.base.num;
+        if (slot >= 16 || tex_arg_idx[slot] < 0)
+          break;
+        if (shader->header.minor == 4) {
+          if (ins.src_count < 1)
+            break;
+          coord4 = load_src(ins.src[0]);
+        } else {
+          if (!tex_inputs || slot >= 8)
+            break;
+          auto *gep = builder.CreateGEP(texInputArrTy, tex_inputs, {builder.getInt32(0), builder.getInt32(slot)});
+          coord4 = builder.CreateLoad(float4Ty, gep);
+        }
+      } else {
+        uint32_t need_srcs = is_grad ? 4u : 2u;
+        if (ins.src_count < need_srcs)
+          break;
+        if (ins.src[1].base.type != DxsoRegisterType::Sampler)
+          break;
+        slot = ins.src[1].base.num;
+        if (slot >= 16 || tex_arg_idx[slot] < 0)
+          break;
+        coord4 = load_src(ins.src[0]);
+      }
+      if (!coord4)
+        break;
+      // Coord shape follows the dcl'd texture type: 2D reads xy, Cube
+      // reads xyz (Metal's cube sampler takes a direction vector, not
+      // a face/uv pair), 3D reads xyz. TexLdl reads lane 3 as the LOD
+      // regardless of the texture type; DXVK
+      // src/dxso/dxso_compiler.cpp does the same composite-extract
+      // on w independent of dimensions.
+      int xy[2] = {0, 1};
+      int xyz[3] = {0, 1, 2};
+      Value *coord;
+      llvm::air::Texture::ResourceKind air_kind;
+      if (samp_kind[slot] == DxsoTextureType::Texture2D || samp_kind[slot] == DxsoTextureType::Texture2DDepth) {
+        coord = builder.CreateShuffleVector(coord4, coord4, ArrayRef<int>(xy, 2));
+        air_kind = samp_kind[slot] == DxsoTextureType::Texture2DDepth ? llvm::air::Texture::depth_2d
+                                                                      : llvm::air::Texture::texture_2d;
+      } else if (samp_kind[slot] == DxsoTextureType::TextureCube) {
+        coord = builder.CreateShuffleVector(coord4, coord4, ArrayRef<int>(xyz, 3));
+        air_kind = llvm::air::Texture::texturecube;
+      } else {
+        // Texture3D; the only remaining kind the bind loop emits
+        // args for.
+        coord = builder.CreateShuffleVector(coord4, coord4, ArrayRef<int>(xyz, 3));
+        air_kind = llvm::air::Texture::texture3d;
+      }
+      Value *tex_handle = fn->getArg(tex_arg_idx[slot]);
+      Value *samp_handle = fn->getArg(samp_arg_idx[slot]);
+      const int32_t no_offset[3] = {0, 0, 0};
+      llvm::air::Texture tex_desc{
+          .kind = air_kind,
+          .sample_type = llvm::air::Texture::sample_float,
+          .memory_access = llvm::air::Texture::access_sample,
+      };
+      // SM2+ texld carries an opcode-specific mode in the token's
+      // bits 16..23: Regular (0), Project (1), Bias (2). DXVK
+      // src/dxso/dxso_compiler.cpp. Project divides the
+      // coord by w before sampling; Bias passes w as a LOD bias.
+      // TexLdl/TexLdd ignore the mode; they always carry an explicit
+      // LOD or explicit gradients, so Project/Bias don't apply.
+      auto mode = static_cast<DxsoTexLdMode>(ins.specific_data);
+      bool is_proj = ins.opcode == DxsoOpcode::Tex && mode == DxsoTexLdMode::Project;
+      bool is_bias = ins.opcode == DxsoOpcode::Tex && mode == DxsoTexLdMode::Bias;
+      if (is_proj) {
+        Value *w = builder.CreateExtractElement(coord4, builder.getInt32(3));
+        Value *w_splat = builder.CreateVectorSplat(cast<FixedVectorType>(coord->getType())->getNumElements(), w);
+        coord = builder.CreateFDiv(coord, w_splat);
+      }
+      Value *texel = nullptr;
+      if (samp_compare[slot]) {
+        // Hardware PCF: sample_compare(coord.xy, ref) returns the filtered
+        // 0/1 comparison of ref vs the stored depth. The reference is the
+        // projected depth: coord.z, divided by w for a projective texldp
+        // (the is_proj block above already divided coord.xy by w; the ref
+        // needs the same divide). D3D9 HW shadow maps sample at LOD 0, so
+        // use the sample_level{0} overload (matches the DXIL
+        // SampleCmpLevelZero path). The scalar result is splatted to
+        // xyzw below, same as the raw-depth path.
+        Value *ref = builder.CreateExtractElement(coord4, builder.getInt32(2));
+        if (is_proj) {
+          Value *w = builder.CreateExtractElement(coord4, builder.getInt32(3));
+          ref = builder.CreateFDiv(ref, w);
+        }
+        auto [t, residency] = air.CreateSampleCmp(
+            tex_desc, tex_handle, samp_handle, coord,
+            /*ArrayIndex=*/nullptr, ref, no_offset, llvm::air::sample_level{air.getFloat(0)}
+        );
+        (void)residency;
+        texel = t;
+      } else if (is_grad) {
+        // ddx in src[2], ddy in src[3]; shuffle each to the coord
+        // shape (DXVK src/dxso/dxso_compiler.cpp derives the
+        // gradient mask from sampler.dimensions).
+        Value *ddx4 = load_src(ins.src[2]);
+        Value *ddy4 = load_src(ins.src[3]);
+        if (!ddx4 || !ddy4)
+          break;
+        Value *ddx;
+        Value *ddy;
+        if (samp_kind[slot] == DxsoTextureType::Texture2D) {
+          ddx = builder.CreateShuffleVector(ddx4, ddx4, ArrayRef<int>(xy, 2));
+          ddy = builder.CreateShuffleVector(ddy4, ddy4, ArrayRef<int>(xy, 2));
+        } else {
+          ddx = builder.CreateShuffleVector(ddx4, ddx4, ArrayRef<int>(xyz, 3));
+          ddy = builder.CreateShuffleVector(ddy4, ddy4, ArrayRef<int>(xyz, 3));
+        }
+        auto [t, residency] = air.CreateSampleGrad(
+            tex_desc, tex_handle, samp_handle, coord,
+            /*ArrayIndex=*/nullptr, ddx, ddy, no_offset
+        );
+        (void)residency;
+        texel = t;
+      } else if (ins.opcode == DxsoOpcode::TexLdl) {
+        Value *lod = builder.CreateExtractElement(coord4, builder.getInt32(3));
+        auto [t, residency] = air.CreateSample(
+            tex_desc, tex_handle, samp_handle, coord,
+            /*ArrayIndex=*/nullptr, no_offset, llvm::air::sample_level{lod}
+        );
+        (void)residency;
+        texel = t;
+      } else if (is_bias) {
+        Value *bias = builder.CreateExtractElement(coord4, builder.getInt32(3));
+        auto [t, residency] = air.CreateSample(
+            tex_desc, tex_handle, samp_handle, coord,
+            /*ArrayIndex=*/nullptr, no_offset, llvm::air::sample_bias{bias}
+        );
+        (void)residency;
+        texel = t;
+      } else {
+        auto [t, residency] = air.CreateSample(
+            tex_desc, tex_handle, samp_handle, coord,
+            /*ArrayIndex=*/nullptr, no_offset
+        );
+        (void)residency; // D3D9 has no residency feedback; discard.
+        texel = t;
+      }
+      // depth_2d sample (and sample_compare) returns a scalar float;
+      // the rest of the DXSO pipeline operates on float4. Splat to
+      // all four lanes per the NVIDIA/ATI INTZ / hardware-PCF
+      // contract: `texld r#, t#, s#` against a depth texture
+      // returns the shadow factor / depth value replicated in
+      // r#.xyzw, which is what shadow-modulating shaders rely on
+      // when they read r#.x as the shadow factor. Without this,
+      // sampling Depth32Float_Stencil8 as MSL texture2d<float>
+      // leaves r#.yzw undefined and the visible result is per-pixel
+      // brightness variation on every shaded surface; most visible
+      // on alpha-blended geometry like smoke / particles.
+      if (samp_kind[slot] == DxsoTextureType::Texture2DDepth && texel) {
+        texel = builder.CreateVectorSplat(4, texel);
+      }
+      store_dst(ins.dst, texel);
+      break;
+    }
+    case DxsoOpcode::TexKill: {
+      // texkill <reg>: discard the fragment if any tested lane of
+      // the source is < 0. DXVK src/dxso/dxso_compiler.cpp:
+      //  - SM 2.0+ and SM 1.4 read the source through the dst slot
+      //    and apply the dst writemask to select which lanes test.
+      //  - SM 1.0-1.3 read the interpolated TEXCOORD<dst.num> via the
+      //    PixelTexcoord register file and test xyz unconditionally.
+      // Early-Z opt-out: AIR's metallib linker detects
+      // discard_fragment and disables early fragment tests on its
+      // own, and the DXSO path never opts in (only DXBC does, via
+      // dxbc_converter_cfg.cpp), so kill-bearing PS already runs
+      // late. No explicit ExecutionModeEarlyFragment-style negation
+      // needed here.
+      if (is_vertex)
+        break;
+      bool sm14_or_later = shader->header.major >= 2 || (shader->header.major == 1 && shader->header.minor == 4);
+      Value *coord4 = nullptr;
+      bool test_lane[4] = {false, false, false, false};
+      if (sm14_or_later) {
+        // Mirror the dst slot as a src; identity swizzle, no
+        // modifier. has_relative / relative are propagated verbatim
+        // per DXVK src/dxso/dxso_compiler.cpp; SM3 dst-relative
+        // texkill works end-to-end once load_src grows relative-
+        // addressing for non-Const operand types.
+        DxsoSrcRegister src{};
+        src.base = ins.dst.base;
+        src.has_relative = ins.dst.has_relative;
+        src.relative = ins.dst.relative;
+        coord4 = load_src(src);
+        if (!coord4)
+          break;
+        for (uint32_t i = 0; i < 4; ++i)
+          test_lane[i] = ins.dst.mask[i];
+      } else {
+        // SM 1.0-1.3 form. Source is the interpolated TEXCOORD
+        // <dst.num> register, which our PS path already pre-loads
+        // into tex_inputs at function entry (the same slot t# texld
+        // would read for SM 1.4 / 2.0+). The writemask is ignored;
+        // only xyz contribute (DXVK lines 3079-3087 collapse to a
+        // 3-component reg before the < 0 test).
+        if (!tex_inputs || ins.dst.base.num >= 8)
+          break;
+        auto *gep =
+            builder.CreateGEP(texInputArrTy, tex_inputs, {builder.getInt32(0), builder.getInt32(ins.dst.base.num)});
+        coord4 = builder.CreateLoad(float4Ty, gep);
+        test_lane[0] = test_lane[1] = test_lane[2] = true;
+      }
+      Value *zero_f = ConstantFP::get(Type::getFloatTy(context), 0.0);
+      Value *any_neg = nullptr;
+      for (uint32_t i = 0; i < 4; ++i) {
+        if (!test_lane[i])
+          continue;
+        Value *lane = builder.CreateExtractElement(coord4, builder.getInt32(i));
+        Value *lt = builder.CreateFCmpOLT(lane, zero_f);
+        any_neg = any_neg ? builder.CreateOr(any_neg, lt) : lt;
+      }
+      if (!any_neg)
+        break;
+      auto *kill_bb = BasicBlock::Create(context, "texkill", fn);
+      auto *cont_bb = BasicBlock::Create(context, "texkill.cont", fn);
+      builder.CreateCondBr(any_neg, kill_bb, cont_bb);
+      builder.SetInsertPoint(kill_bb);
+      air.CreateDiscard();
+      builder.CreateBr(cont_bb);
+      builder.SetInsertPoint(cont_bb);
+      break;
+    }
+    case DxsoOpcode::TexCoord: {
+      // SM 1.0-1.3 `texcoord t<n>` (no source): clamp the interpolated
+      // TEXCOORD<n> to [0,1] and write back to t<n>. SM 1.4 `texcrd
+      // dst, src`: copy src to dst (no clamp); src swizzle and Dz/Dw
+      // modifier are lowered by load_src. wined3d glsl_shader.c
+      // shader_glsl_texcoord:6432-6471.
+      if (is_vertex || !ins.has_dst)
+        break;
+      bool sm14 = shader->header.major == 1 && shader->header.minor == 4;
+      Value *coord4 = nullptr;
+      if (sm14) {
+        if (ins.src_count < 1)
+          break;
+        coord4 = load_src(ins.src[0]);
+      } else {
+        if (!tex_inputs || ins.dst.base.num >= 8)
+          break;
+        auto *gep =
+            builder.CreateGEP(texInputArrTy, tex_inputs, {builder.getInt32(0), builder.getInt32(ins.dst.base.num)});
+        Value *raw = builder.CreateLoad(float4Ty, gep);
+        coord4 = air.CreateFPUnOp(llvm::air::AIRBuilder::saturate, raw);
+      }
+      store_dst(ins.dst, coord4);
+      break;
+    }
+    case DxsoOpcode::TexDp3:
+    case DxsoOpcode::TexDp3Tex: {
+      // SM 1.x: 3-component dot product of the texcoord input at
+      // tex_inputs[dst.num] (interpolated TEXCOORD<n>) and src[0].
+      // TexDp3 stores the scalar dot product splat to dst (no sampling
+      // happens). TexDp3Tex feeds the scalar as a 1D coord into a
+      // sampler[dst.num] sample, lookup result lands in dst.
+      // DXVK dxso_compiler.cpp.
+      if (is_vertex || !ins.has_dst || ins.src_count < 1 || !tex_inputs)
+        break;
+      uint32_t slot = ins.dst.base.num;
+      if (slot >= 8)
+        break;
+      Value *src4 = load_src(ins.src[0]);
+      if (!src4)
+        break;
+      auto *gep = builder.CreateGEP(texInputArrTy, tex_inputs, {builder.getInt32(0), builder.getInt32(slot)});
+      Value *coord4 = builder.CreateLoad(float4Ty, gep);
+      int xyz[3] = {0, 1, 2};
+      Value *coord3 = builder.CreateShuffleVector(coord4, coord4, ArrayRef<int>(xyz, 3));
+      Value *src3 = builder.CreateShuffleVector(src4, src4, ArrayRef<int>(xyz, 3));
+      Value *dot = compute_dot(coord3, src3, 3);
+      if (ins.opcode == DxsoOpcode::TexDp3) {
+        // Splat the dot result to all 4 lanes; store_dst applies the
+        // writemask. Mirrors the existing Dp3 / Dp4 opcode pattern.
+        store_dst(ins.dst, builder.CreateVectorSplat(4, dot));
+        break;
+      }
+      // TexDp3Tex: sample at sampler[slot] using `dot` as the texcoord.
+      if (tex_arg_idx[slot] < 0)
+        break;
+      Value *sample_coord;
+      llvm::air::Texture::ResourceKind air_kind;
+      if (samp_kind[slot] == DxsoTextureType::Texture2D || samp_kind[slot] == DxsoTextureType::Texture2DDepth) {
+        // 1D coord under a 2D sampler: pack as (dot, 0) per DXVK
+        // shape (coord3 indices[0]=dot, [1]=[2]=[3]=0).
+        auto *float2Ty = FixedVectorType::get(Type::getFloatTy(context), 2);
+        Value *c = UndefValue::get(float2Ty);
+        c = builder.CreateInsertElement(c, dot, builder.getInt32(0));
+        c = builder.CreateInsertElement(c, ConstantFP::get(Type::getFloatTy(context), 0.0f), builder.getInt32(1));
+        sample_coord = c;
+        air_kind = samp_kind[slot] == DxsoTextureType::Texture2DDepth ? llvm::air::Texture::depth_2d
+                                                                      : llvm::air::Texture::texture_2d;
+      } else if (samp_kind[slot] == DxsoTextureType::TextureCube) {
+        auto *float3Ty = FixedVectorType::get(Type::getFloatTy(context), 3);
+        Value *c = UndefValue::get(float3Ty);
+        c = builder.CreateInsertElement(c, dot, builder.getInt32(0));
+        c = builder.CreateInsertElement(c, ConstantFP::get(Type::getFloatTy(context), 0.0f), builder.getInt32(1));
+        c = builder.CreateInsertElement(c, ConstantFP::get(Type::getFloatTy(context), 0.0f), builder.getInt32(2));
+        sample_coord = c;
+        air_kind = llvm::air::Texture::texturecube;
+      } else {
+        auto *float3Ty = FixedVectorType::get(Type::getFloatTy(context), 3);
+        Value *c = UndefValue::get(float3Ty);
+        c = builder.CreateInsertElement(c, dot, builder.getInt32(0));
+        c = builder.CreateInsertElement(c, ConstantFP::get(Type::getFloatTy(context), 0.0f), builder.getInt32(1));
+        c = builder.CreateInsertElement(c, ConstantFP::get(Type::getFloatTy(context), 0.0f), builder.getInt32(2));
+        sample_coord = c;
+        air_kind = llvm::air::Texture::texture3d;
+      }
+      Value *tex_handle = fn->getArg(tex_arg_idx[slot]);
+      Value *samp_handle = fn->getArg(samp_arg_idx[slot]);
+      const int32_t no_offset[3] = {0, 0, 0};
+      llvm::air::Texture tex_desc{
+          .kind = air_kind,
+          .sample_type = llvm::air::Texture::sample_float,
+          .memory_access = llvm::air::Texture::access_sample,
+      };
+      auto [texel, residency] = air.CreateSample(
+          tex_desc, tex_handle, samp_handle, sample_coord,
+          /*ArrayIndex=*/nullptr, no_offset
+      );
+      (void)residency;
+      store_dst(ins.dst, texel);
+      break;
+    }
+    case DxsoOpcode::TexReg2Rgb: {
+      // SM 1.x dependent texture read: sample 2D/3D/cube texture at
+      // sampler <dst.num> using src.rgb as the coord. DXVK
+      // dxso_compiler.cpp swizzles (0,1,2,2); for 2D only
+      // .rg is used, for 3D/cube all three. wined3d glsl_shader.c
+      // shader_glsl_texreg2rgb:6832.
+      if (is_vertex || !ins.has_dst || ins.src_count < 1)
+        break;
+      uint32_t slot = ins.dst.base.num;
+      if (slot >= 16 || tex_arg_idx[slot] < 0)
+        break;
+      Value *src4 = load_src(ins.src[0]);
+      if (!src4)
+        break;
+      int xy[2] = {0, 1};
+      int xyz[3] = {0, 1, 2};
+      Value *coord;
+      llvm::air::Texture::ResourceKind air_kind;
+      if (samp_kind[slot] == DxsoTextureType::Texture2D || samp_kind[slot] == DxsoTextureType::Texture2DDepth) {
+        coord = builder.CreateShuffleVector(src4, src4, ArrayRef<int>(xy, 2));
+        air_kind = samp_kind[slot] == DxsoTextureType::Texture2DDepth ? llvm::air::Texture::depth_2d
+                                                                      : llvm::air::Texture::texture_2d;
+      } else if (samp_kind[slot] == DxsoTextureType::TextureCube) {
+        coord = builder.CreateShuffleVector(src4, src4, ArrayRef<int>(xyz, 3));
+        air_kind = llvm::air::Texture::texturecube;
+      } else {
+        coord = builder.CreateShuffleVector(src4, src4, ArrayRef<int>(xyz, 3));
+        air_kind = llvm::air::Texture::texture3d;
+      }
+      Value *tex_handle = fn->getArg(tex_arg_idx[slot]);
+      Value *samp_handle = fn->getArg(samp_arg_idx[slot]);
+      const int32_t no_offset[3] = {0, 0, 0};
+      llvm::air::Texture tex_desc{
+          .kind = air_kind,
+          .sample_type = llvm::air::Texture::sample_float,
+          .memory_access = llvm::air::Texture::access_sample,
+      };
+      auto [texel, residency] = air.CreateSample(
+          tex_desc, tex_handle, samp_handle, coord,
+          /*ArrayIndex=*/nullptr, no_offset
+      );
+      (void)residency;
+      store_dst(ins.dst, texel);
       break;
     }
     default: {
