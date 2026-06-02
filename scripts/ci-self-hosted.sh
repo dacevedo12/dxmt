@@ -143,6 +143,9 @@ ensure_wine_rosetta_build_tools() {
     libffi
     vulkan-headers
     bison
+    autoconf
+    automake
+    libtool
     gnu-tar
     dylibbundler
     gh
