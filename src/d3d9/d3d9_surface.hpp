@@ -237,7 +237,6 @@ private:
   uint32_t m_mip_level;
   uint32_t m_array_slice;
   bool m_self_pinned;
-  DWORD m_priority = 0;
   ComPrivateData m_privateData;
   WMTPixelFormat m_metalFormat = static_cast<WMTPixelFormat>(0);
   // CPU pointer + pitch handed back from LockRect; both 0/null when
