@@ -84,6 +84,7 @@ ensure_brew() {
   command -v brew >/dev/null || die "Homebrew is required on the self-hosted runner"
   export HOMEBREW_NO_AUTO_UPDATE="${HOMEBREW_NO_AUTO_UPDATE:-1}"
   export HOMEBREW_NO_INSTALL_CLEANUP="${HOMEBREW_NO_INSTALL_CLEANUP:-1}"
+  export HOMEBREW_NO_ENV_HINTS="${HOMEBREW_NO_ENV_HINTS:-1}"
 }
 
 ensure_brew_packages() {
@@ -140,7 +141,6 @@ ensure_wine_rosetta_build_tools() {
     gstreamer
     gst-plugins-base
     libffi
-    molten-vk
     vulkan-headers
     bison
     gnu-tar
