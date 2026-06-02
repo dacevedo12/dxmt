@@ -355,9 +355,16 @@ build_wine_git_source() {
   chmod +x "${source_dir}/scripts/build_on_m1.sh" "${source_dir}/scripts/build_on_intel.sh"
   case "$(uname -m)" in
     arm64)
+      # The x86_64 Homebrew molten-vk formula currently fails to parse on the
+      # self-hosted runner. Wine's build script only needs Vulkan headers for
+      # this CI build, so avoid its hard-coded install attempt.
+      perl -0pi -e 's/(BREW_PACKAGES=\([^)]*) molten-vk( [^)]*\))/$1$2/' \
+        "${source_dir}/scripts/build_on_m1.sh"
       (cd "${source_dir}" && ./scripts/build_on_m1.sh)
       ;;
     x86_64)
+      perl -0pi -e 's/(BREW_PACKAGES=\([^)]*)\n    molten-vk\n([^)]*\))/$1\n$2/' \
+        "${source_dir}/scripts/build_on_intel.sh"
       (cd "${source_dir}" && ./scripts/build_on_intel.sh)
       ;;
     *)
