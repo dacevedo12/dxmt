@@ -6894,8 +6894,25 @@ MTLD3D9Device::DeletePatch(UINT Handle) {
 // supported?" probe; D3D_OK means yes. With ppQuery, allocate a real
 // IDirect3DQuery9.
 HRESULT STDMETHODCALLTYPE
-MTLD3D9Device::CreateQuery(D3DQUERYTYPE Type, IDirect3DQuery9 **ppQuery) { return E_NOTIMPL; }
+MTLD3D9Device::CreateQuery(D3DQUERYTYPE Type, IDirect3DQuery9 **ppQuery) {
+  // Support-probe: ppQuery=NULL queries type support. Null *ppQuery before any
+  // failure return (sentinels). Return NOTAVAILABLE for unsupported types.
+  if (ppQuery)
+    *ppQuery = nullptr;
 
+  bool supported =
+      (Type == D3DQUERYTYPE_OCCLUSION || Type == D3DQUERYTYPE_EVENT || Type == D3DQUERYTYPE_TIMESTAMP ||
+       Type == D3DQUERYTYPE_TIMESTAMPDISJOINT || Type == D3DQUERYTYPE_TIMESTAMPFREQ);
+  if (!supported)
+    return D3DERR_NOTAVAILABLE;
+  if (!ppQuery)
+    return D3D_OK;
+
+  auto *q = new MTLD3D9Query(this, Type);
+  q->AddRef();
+  *ppQuery = q;
+  return D3D_OK;
+}
 
 HRESULT STDMETHODCALLTYPE
 MTLD3D9Device::SetConvolutionMonoKernel(UINT, UINT, float *, float *) {
