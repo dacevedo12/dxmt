@@ -106,6 +106,7 @@ enum class EncoderType {
   TemporalUpscale,
   WaitForEvent,
   SampleTimestamp,
+  StretchBlit,
 };
 
 struct EncoderData {
@@ -249,6 +250,26 @@ struct ResolveEncoderData : EncoderData {
   std::optional<WMTScissorRect> src_rect;
   WMTOrigin dst_origin;
   WMTSize resolve_size;
+};
+
+// Render-pass sample/store blit for StretchRect when the fast blit-copy
+// path doesn't fit (size mismatch or format aliases that share storage
+// but use distinct Metal pixel formats). The PSO is built from
+// vs_blit_quad / fs_blit_quad (dxmt_command.metal); the fragment stage
+// samples `src` with `sampler` at slot 0 over the normalized sub-rect
+// `src_uv_origin` + `src_uv_size`. Viewport is set to (dst_origin,
+// dst_size) on the encoder side. Sibling of ResolveEncoderData: same
+// shape, different sampler-shaped shader.
+struct StretchBlitEncoderData : EncoderData {
+  TextureViewRef src;
+  TextureViewRef dst;
+  WMT::RenderPipelineState pso;
+  WMT::SamplerState sampler;
+  // Normalized [0,1] sub-rect within the bound source texture/view.
+  float src_uv_origin[2];
+  float src_uv_size[2];
+  WMTOrigin dst_origin;
+  WMTSize dst_size;
 };
 
 class Presenter;
@@ -694,6 +715,15 @@ public:
 
   void signalEvent(uint64_t value);
   void signalEvent(WMT::Reference<WMT::Event> &&event, uint64_t value);
+  // Handle-only variant: keeps the retain (one wine_unix_call) off
+  // the calling thread by deferring the Reference construction to the
+  // encode-thread emit. Use it when the event lifetime is owned by an
+  // outer object that outlives every chunk that ends up signalling it
+  // (e.g. the d3d9 device's m_completionEvent across its own chunks).
+  // Named distinctly from the Reference overload because
+  // WMT::Reference<WMT::Event> implicitly converts to obj_handle_t,
+  // which would make `signalEvent(std::move(ref), v)` ambiguous.
+  void signalEventByHandle(obj_handle_t event_handle, uint64_t value);
   void waitEvent(WMT::Reference<WMT::Event> &&event, uint64_t value);
 
   uint64_t
@@ -710,6 +740,18 @@ public:
       Rc<Texture> &&src, TextureViewKey src_view, Rc<Texture> &&dst, TextureViewKey dst_view,
       WMT::RenderPipelineState pso = {}, std::optional<WMTScissorRect> src_rect = std::nullopt,
       WMTOrigin dst_origin = {}, WMTSize resolve_size = {}
+  );
+  // Stretch-blit via render-pass sample/store. The caller (typically
+  // StretchBlitContext) supplies the PSO + sampler; this method computes
+  // normalized uv from pixel-space src_origin/src_size against the bound
+  // src texture's level dimensions and records the encoder data. The
+  // execute-time encoder body lives in EncoderType::StretchBlit's case
+  // in the main encoder dispatch loop.
+  void stretchBlit(
+      Rc<Texture> &&src, TextureViewKey src_view, Rc<Texture> &&dst, TextureViewKey dst_view,
+      WMT::RenderPipelineState pso, WMT::SamplerState sampler,
+      WMTOrigin src_origin, WMTSize src_size,
+      WMTOrigin dst_origin, WMTSize dst_size
   );
 
   RenderEncoderData *startRenderPass(
@@ -859,6 +901,7 @@ public:
   EmulatedCommandContext emulated_cmd;
   ClearRenderTargetContext clear_rt_cmd;
   ResolveTextureContext resolve_texture_cmd;
+  StretchBlitContext stretch_blit_cmd;
   DepthStencilBlitContext blit_depth_stencil_cmd;
   ClearResourceKernelContext clear_res_cmd;
   MTLFXMVScaleContext mv_scale_cmd;

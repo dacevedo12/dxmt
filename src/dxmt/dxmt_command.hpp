@@ -319,6 +319,42 @@ private:
   std::unordered_map<PSOKey, WMT::Reference<WMT::RenderPipelineState>, PSOKeyHash> psos_;
 };
 
+// Render-pass sample/store blit for D3D9 StretchRect when the fast
+// blit-copy path doesn't fit; different src/dst extents, or pairs of
+// format aliases that share storage layout but use distinct Metal
+// pixel formats (X8R8G8B8 ↔ A8R8G8B8 → BGRX8Unorm vs BGRA8Unorm). The
+// PSO is keyed on dst format only; the sampler is keyed on filter
+// (POINT/LINEAR). Mirrors ResolveTextureContext's shape; minimum
+// viable additions are a sampler cache and a separate fragment shader
+// that calls `source.sample()` instead of `source.read()`.
+class StretchBlitContext {
+public:
+  StretchBlitContext(WMT::Device device, InternalCommandLibrary &lib, ArgumentEncodingContext &ctx);
+
+  // Filter is POINT or LINEAR; anything else should be rejected at the
+  // d3d9 call site (D3DTEXF_ANISOTROPIC etc. are not legal for
+  // StretchRect per the IDL).
+  enum class Filter : uint8_t { Point = 0, Linear = 1 };
+
+  void blit(
+      Rc<Texture> src, TextureViewKey src_view, Rc<Texture> dst, TextureViewKey dst_view,
+      Filter filter, WMTOrigin src_origin, WMTSize src_size,
+      WMTOrigin dst_origin, WMTSize dst_size
+  );
+
+private:
+  WMT::RenderPipelineState getPSO(WMTPixelFormat dst_format);
+  WMT::SamplerState getSampler(Filter filter);
+
+  ArgumentEncodingContext &ctx_;
+  WMT::Device device_;
+  WMT::Reference<WMT::Function> vs_blit_;
+  WMT::Reference<WMT::Function> fs_blit_;
+  std::unordered_map<WMTPixelFormat, WMT::Reference<WMT::RenderPipelineState>> psos_;
+  WMT::Reference<WMT::SamplerState> sampler_point_;
+  WMT::Reference<WMT::SamplerState> sampler_linear_;
+};
+
 class DepthStencilBlitContext {
 
 public:

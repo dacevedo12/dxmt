@@ -138,6 +138,11 @@ CommandQueue::CommitCurrentChunk() {
 }
 
 void
+CommandQueue::WaitCPUFence(uint64_t seq) {
+  cpu_coherent.wait(seq);
+}
+
+void
 CommandQueue::PresentBoundary() {
   statistics.compute(frame_count);
   frame_count++;
