@@ -52,6 +52,10 @@ public:
   metalBuffer() const {
     return m_buffer;
   }
+  void *
+  cpuPtr() const {
+    return m_cpu_ptr;
+  }
   uint32_t
   pitch() const {
     return m_pitch;
@@ -167,8 +171,8 @@ public:
   }
 
   // dxmt-internal: parent texture sets the mirror source after ctor so
-  // UnlockRect can route to stageTextureUploadFromBuffer. Called once
-  // per per-level surface in MTLD3D9Texture's buildLevelsAndMirror.
+  // UnlockRect knows which buffer backs this level. Called once per
+  // per-level surface in MTLD3D9Texture's buildLevelsAndMirror.
   void
   setMirrorSource(obj_handle_t buffer_handle, uint32_t level_offset) {
     m_mirror_src_buffer = buffer_handle;

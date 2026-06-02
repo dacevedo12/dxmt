@@ -391,7 +391,7 @@ MTLD3D9Surface::UnlockRect() {
     (void)m_mirror_src_buffer;
     (void)m_mirror_level_offset;
     const void *src = static_cast<const uint8_t *>(m_cpu_ptr) + src_row_off + src_col_off;
-    m_device->stageTextureUpload(m_texture, m_mip_level, m_array_slice, origin, size, src, m_pitch, compressed);
+    m_device->stageTextureUpload(m_texture, m_dxmtTexture, m_mip_level, m_array_slice, origin, size, src, m_pitch, compressed);
   }
   // Reset locked-rect bookkeeping so a subsequent LockRect with a
   // wider area doesn't accidentally inherit stale narrow bounds.
