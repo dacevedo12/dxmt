@@ -67,29 +67,7 @@ TextureView::TextureView(TextureAllocation *allocation, unsigned index, TextureV
     allocation(allocation),
     key(descriptor, index, allocation->descriptor->miplevelCount()) {
   auto parent = allocation->texture();
-  auto parent_format = parent ? parent.pixelFormat() : WMTPixelFormatInvalid;
   auto view_format = descriptor.format;
-  bool compressed_srgb_srv =
-      !(descriptor.intendedUsage & WMTTextureUsageRenderTarget) &&
-      IsBlockCompressionFormat(descriptor.format) &&
-      Is_sRGBVariant(descriptor.format) &&
-      Forget_sRGB(descriptor.format) == parent_format;
-  bool full_parent_view =
-      compressed_srgb_srv &&
-      descriptor.type == allocation->descriptor->textureType() &&
-      descriptor.firstMiplevel == 0 &&
-      descriptor.miplevelCount == allocation->descriptor->miplevelCount() &&
-      descriptor.firstArraySlice == 0 &&
-      descriptor.arraySize == allocation->descriptor->arrayLength();
-
-  if (compressed_srgb_srv) {
-    view_format = parent_format;
-    if (full_parent_view) {
-      texture = parent;
-      gpuResourceID = allocation->gpuResourceID;
-      return;
-    }
-  }
 
   auto view = parent.newTextureView(
       view_format, descriptor.type, descriptor.firstMiplevel, descriptor.miplevelCount,
