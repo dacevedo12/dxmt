@@ -42,6 +42,14 @@ public:
 
   void changeGammaRamp(const DXMTGammaRamp *gamma_ramp);
 
+  // Compositing mode for the final present blit, following DXGI_ALPHA_MODE:
+  // 0 UNSPECIFIED / 2 STRAIGHT scale the output by the backbuffer alpha,
+  // 1 PREMULTIPLIED adds it, 3 IGNORE presents the colour opaque. The
+  // upstream default (0) suits DXGI layer compositing, where the backbuffer
+  // alpha is a real coverage value. A D3D9 present is an opaque copy and the
+  // backbuffer alpha is scene scratch, so the d3d9 swapchain selects IGNORE.
+  void setPresentAlphaMode(uint32_t mode) { present_alpha_mode_ = mode; }
+
   class PresentState {
   public:
     DXMTPresentMetadata metadata;
@@ -71,7 +79,12 @@ public:
   WMT::MetalDrawable encodeCommands(
       WMT::CommandBuffer cmdbuf, WMT::Texture backbuffer, DXMTPresentMetadata metadata,
       std::function<void(WMT::RenderCommandEncoder)> &&wait_fences,
-      std::function<void(WMT::RenderCommandEncoder)> &&update_fences
+      std::function<void(WMT::RenderCommandEncoder)> &&update_fences,
+      // Optional out-param: microseconds spent inside layer_.nextDrawable.
+      // Useful to disambiguate "encode is slow" from "GPU back-pressure
+      // blocks drawable acquisition"; the latter shows up as a multi-
+      // hundred-millisecond duration. Default nullptr ignores.
+      uint64_t *out_next_drawable_us = nullptr
   );
 
 private:
@@ -93,10 +106,31 @@ private:
   uint64_t gamma_version_ = 0;
   std::array<float, DXMT_GAMMA_CP_COUNT * 4> gamma_lut_rgba_;
   WMT::Reference<WMT::Texture> gamma_lut_texture_;
+  // Set by changeGammaRamp (calling thread) when gamma_lut_rgba_ holds new
+  // data; the actual gamma_lut_texture_ upload is deferred to
+  // synchronizeLayerProperties, which runs it after the present drain so the
+  // shared-storage texture is never written while the GPU samples it.
+  bool gamma_lut_dirty_ = false;
   WMT::Reference<WMT::RenderPipelineState> present_blit_;
   WMT::Reference<WMT::RenderPipelineState> present_scale_;
+  // Whether the live present PSO was built with the gamma function constant
+  // set; i.e. whether its fragment shader samples the gamma LUT at texture
+  // index 1. Set alongside the PSO rebuild in synchronizeLayerProperties and
+  // read in encodeCommands so the LUT is bound only when the shader uses it;
+  // shares the PSOs' calling-thread-build / encode-thread-read handoff.
+  bool gamma_enabled_ = false;
+  // DXGI_ALPHA_MODE for the present composite (see setPresentAlphaMode). The
+  // default 0 preserves the upstream DXGI path; d3d9 overrides it to 3 (IGNORE).
+  uint32_t present_alpha_mode_ = 0;
   std::atomic_flag pso_valid = 0;
   uint64_t frame_requested_ = 0;
   CpuFence frame_presented_ = 0;
+
+  // Present blit-vs-scale trace (DXMT_LOG_LEVEL=trace): encodeCommands logs
+  // backbuffer vs live-drawable size whenever either changes, to catch
+  // sharpness regressions after a windowed<->fullscreen mode change.
+  // Zero-cost above trace level; last_* dedupe to one line per transition.
+  uint64_t dbg_last_bb_w_ = 0, dbg_last_bb_h_ = 0;
+  uint64_t dbg_last_live_w_ = 0, dbg_last_live_h_ = 0;
 };
 } // namespace dxmt
