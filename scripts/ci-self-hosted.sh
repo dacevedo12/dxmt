@@ -203,16 +203,15 @@ gh_wine() {
   GH_TOKEN="${WINE_ACCESS_TOKEN}" gh "$@"
 }
 
-setup_wine_git_auth() {
+ensure_gh_wine() {
   command -v gh >/dev/null || die "gh is required for private Wine repository access"
   [[ -n "${WINE_ACCESS_TOKEN:-}" ]] || die "WINE_ACCESS_TOKEN is empty; set the repository secret for private Wine access"
-  gh_wine auth setup-git --hostname github.com
 }
 
 check_wine_access() {
   [[ -n "${WINE_ACCESS_TOKEN:-}" ]] || die "WINE_ACCESS_TOKEN is empty; set the repository secret for private Wine access"
 
-  local repo status body
+  local repo status body commit
   repo="$(wine_github_repo)"
   body="${DOWNLOADS_DIR}/wine-access-check.json"
   log "checking Wine repository access for ${repo}"
@@ -227,7 +226,19 @@ check_wine_access() {
     "https://api.github.com/repos/${repo}/branches/${WINE_GIT_BRANCH}")" ||
     die "failed to check Wine repository access"
 
-  if [[ "${status}" != "200" ]]; then
+  if [[ "${status}" == "200" ]]; then
+    commit="$(python3 - "${body}" <<'PY'
+import json
+import sys
+with open(sys.argv[1], "r", encoding="utf-8") as fp:
+    data = json.load(fp)
+print(((data.get("commit") or {}).get("sha") or "").strip())
+PY
+)"
+    [[ -n "${commit}" ]] || die "Wine repository access check did not return a branch commit"
+    WINE_SOURCE_COMMIT="${commit}"
+    return
+  else
     if [[ -s "${body}" ]]; then
       python3 - "${body}" <<'PY' >&2 || true
 import json
@@ -241,37 +252,44 @@ PY
   fi
 }
 
+download_wine_source_tarball() {
+  local source_dir="$1"
+  local repo archive
+  repo="$(wine_github_repo)"
+  archive="${DOWNLOADS_DIR}/wine-${WINE_GIT_BRANCH}-${WINE_SOURCE_COMMIT}.tar.gz"
+
+  if [[ ! -f "${archive}" ]]; then
+    log "downloading Wine source tarball ${repo}@${WINE_SOURCE_COMMIT}"
+    gh_wine api \
+      -H "Accept: application/vnd.github+json" \
+      "/repos/${repo}/tarball/${WINE_GIT_BRANCH}" > "${archive}" ||
+      die "failed to download Wine source tarball"
+  fi
+
+  rm -rf "${source_dir}"
+  mkdir -p "${source_dir}"
+  tar -zxf "${archive}" --strip-components 1 -C "${source_dir}"
+  printf '%s\n' "${WINE_SOURCE_COMMIT}" > "${source_dir}/.dxmt-ci-source-commit"
+}
+
 sync_wine_git_source() {
   local source_dir="$1"
-  local old_commit new_commit
+  local source_stamp
   export GIT_TERMINAL_PROMPT=0
-  setup_wine_git_auth
+  ensure_gh_wine
+  WINE_SOURCE_COMMIT=""
   check_wine_access
+  source_stamp="${source_dir}/.dxmt-ci-source-commit"
 
-  if [[ ! -d "${source_dir}/.git" ]]; then
-    rm -rf "${source_dir}"
-    log "cloning Wine source ${WINE_GIT_URL} (${WINE_GIT_BRANCH})"
-    gh_wine repo clone "$(wine_github_repo)" "${source_dir}" -- \
-      --quiet --depth 1 --single-branch --branch "${WINE_GIT_BRANCH}" --no-tags ||
-      die "failed to clone Wine source ${WINE_GIT_URL} (${WINE_GIT_BRANCH})"
-    WINE_SOURCE_COMMIT="$(git -C "${source_dir}" rev-parse HEAD)" ||
-      die "failed to resolve Wine source commit"
+  if [[ -d "${source_dir}" &&
+        -f "${source_stamp}" &&
+        "$(cat "${source_stamp}")" == "${WINE_SOURCE_COMMIT}" ]]; then
+    log "Wine source already prepared from ${WINE_SOURCE_COMMIT}: ${source_dir}"
     return
   fi
 
-  old_commit="$(git -C "${source_dir}" rev-parse HEAD 2>/dev/null || true)"
-  git -C "${source_dir}" remote set-url origin "${WINE_GIT_URL}"
-  log "fetching Wine source ${WINE_GIT_BRANCH}"
-  git -C "${source_dir}" fetch --quiet --depth 1 --no-tags origin "${WINE_GIT_BRANCH}" ||
-    die "failed to fetch Wine source ${WINE_GIT_BRANCH}"
-  git -C "${source_dir}" reset --hard FETCH_HEAD >&2 ||
-    die "failed to reset Wine source to FETCH_HEAD"
-  new_commit="$(git -C "${source_dir}" rev-parse HEAD)" ||
-    die "failed to resolve Wine source commit"
-  if [[ -n "${old_commit}" && "${old_commit}" != "${new_commit}" ]]; then
-    rm -f "${source_dir}/.generated"
-  fi
-  WINE_SOURCE_COMMIT="${new_commit}"
+  log "preparing Wine source ${WINE_GIT_BRANCH}@${WINE_SOURCE_COMMIT}"
+  download_wine_source_tarball "${source_dir}"
 }
 
 wine_install_ready() {

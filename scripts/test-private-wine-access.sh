@@ -58,6 +58,7 @@ api_headers="${tmp_dir}/api-headers.txt"
 api_body="${tmp_dir}/api-body.json"
 branch_headers="${tmp_dir}/branch-headers.txt"
 branch_body="${tmp_dir}/branch-body.json"
+tarball_body="${tmp_dir}/tarball.bin"
 curl_status() {
   local url="$1"
   local headers="$2"
@@ -139,19 +140,16 @@ commit = data.get("commit") or {}
 print(f"[dxmt-test] branch commit={commit.get('sha')}")
 PY
 
-echo "[dxmt-test] git ls-remote"
-if command -v gh >/dev/null; then
-  echo "[dxmt-test] gh repo view"
-  GH_TOKEN="${TOKEN}" gh repo view "${REPO}" --json nameWithOwner,isPrivate,defaultBranchRef \
-    --jq '"[dxmt-test] gh repo=" + .nameWithOwner + " private=" + (.isPrivate|tostring) + " default_branch=" + .defaultBranchRef.name'
-  echo "[dxmt-test] gh auth setup-git"
-  GH_TOKEN="${TOKEN}" gh auth setup-git --hostname github.com
+echo "[dxmt-test] checking tarball API"
+if ! command -v gh >/dev/null; then
+  echo "error: gh is required to test private repository tarball downloads" >&2
+  exit 1
 fi
+GH_TOKEN="${TOKEN}" gh api "/repos/${REPO}/tarball/${BRANCH}" > "${tarball_body}"
 
-GIT_TERMINAL_PROMPT=0 \
-git \
-  -c protocol.version=2 \
-  ls-remote --heads "https://github.com/${REPO}.git" "${BRANCH}" |
-  sed 's/^/[dxmt-test] /'
+if command -v tar >/dev/null; then
+  echo "[dxmt-test] tarball first entries"
+  tar -ztf "${tarball_body}" | sed -n '1,5p' | sed 's/^/[dxmt-test] /'
+fi
 
 echo "[dxmt-test] ok"
