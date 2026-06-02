@@ -301,6 +301,14 @@ MTLD3D9Surface::LockRect(D3DLOCKED_RECT *pLockedRect, const RECT *pRect, DWORD F
                  static_cast<UINT>(pRect->bottom) >= m_desc.Height);
   if (!full_resource || m_desc.Pool != D3DPOOL_DEFAULT)
     Flags &= ~D3DLOCK_DISCARD;
+  // Lockable render target: the GPU is the writer, so the mirror is
+  // refreshed before the pointer goes out unless the caller discards.
+  // Tested after the DISCARD normalization above so a partial-rect
+  // DISCARD still reads back, matching DXVK's lock order; wined3d maps
+  // render targets through the same sysmem download. Only
+  // CreateRenderTarget surfaces carry both the usage bit and a mirror.
+  if ((m_desc.Usage & D3DUSAGE_RENDERTARGET) && m_texture != nullptr && !(Flags & D3DLOCK_DISCARD))
+    m_device->readbackSurfaceMirror(this);
 
   // Row-byte offset: y_in_blocks * pitch. For uncompressed, blocks
   // are 1×1 so this is just y * pitch. For DXT, y must be /4 first.
@@ -353,9 +361,10 @@ MTLD3D9Surface::UnlockRect() {
   if (!m_locked)
     return m_is_texture_mip ? D3D_OK : D3DERR_INVALIDCALL;
   m_locked = false;
-  // Buffer-backed surfaces (offscreen-plain, lockable RT/DS): GPU-visible,
-  // no upload step. Texture-mirror surfaces (MANAGED, DEFAULT plain,
-  // DYNAMIC textures): explicit upload to Metal texture via m_uploadRing.
+  // Buffer-backed surfaces (SYSTEMMEM/SCRATCH offscreen-plain): GPU-
+  // visible, no upload step. Mirror-backed surfaces (MANAGED, DEFAULT
+  // plain, DYNAMIC textures, lockable RTs): explicit upload to the
+  // Metal texture via m_uploadRing.
   if (m_buffer == nullptr && m_cpu_ptr != nullptr && m_texture != nullptr &&
       (m_desc.Pool == D3DPOOL_MANAGED || m_desc.Pool == D3DPOOL_DEFAULT) && !m_locked_readonly) {
     // Push only the dirty rect to GPU. wined3d does the same; copying
