@@ -6,11 +6,13 @@ TOOLCHAINS_DIR="${CI_ROOT}/toolchains"
 DOWNLOADS_DIR="${CI_ROOT}/downloads"
 ARTIFACTS_DIR="${CI_ROOT}/artifacts"
 CCACHE_ROOT="${CI_ROOT}/ccache"
+SOURCES_DIR="${CI_ROOT}/sources"
 RUN_KEY="${GITHUB_RUN_ID:-local}-${GITHUB_RUN_ATTEMPT:-1}"
 
 LLVM_VERSION="${LLVM_VERSION:-llvmorg-15.0.7}"
-WINE_VERSION="${WINE_VERSION:-v8.16-3shain}"
-WINE_URL="${WINE_URL:-https://github.com/3Shain/wine/releases/download/v8.16-3shain/wine.tar.gz}"
+WINE_VERSION="${WINE_VERSION:-proton-11.0-macos}"
+WINE_GIT_URL="${WINE_GIT_URL:-https://github.com/gamesir123/wine-proton-macos.git}"
+WINE_GIT_BRANCH="${WINE_GIT_BRANCH:-proton-11.0-macos}"
 WINE_ARM64EC_VERSION="${WINE_ARM64EC_VERSION:-wine-11.2}"
 WINE_ARM64EC_URL="${WINE_ARM64EC_URL:-https://github.com/3Shain/wine/releases/download/wine-11.2/wine-11.2.tar.gz}"
 LLVM_MINGW_VERSION="${LLVM_MINGW_VERSION:-20251216}"
@@ -18,7 +20,7 @@ LLVM_MINGW_DIR="${LLVM_MINGW_DIR:-llvm-mingw-20251216-ucrt-macos-universal}"
 MESON_VERSION="${MESON_VERSION:-1.10.0}"
 
 log() {
-  printf '[dxmt-ci] %s\n' "$*"
+  printf '[dxmt-ci] %s\n' "$*" >&2
 }
 
 die() {
@@ -64,10 +66,16 @@ setup_paths() {
 }
 
 ensure_root() {
+  if [[ -d "${CI_ROOT}" && -w "${CI_ROOT}" ]]; then
+    mkdir -p "${TOOLCHAINS_DIR}" "${DOWNLOADS_DIR}" "${ARTIFACTS_DIR}" "${CCACHE_ROOT}" "${SOURCES_DIR}"
+    return
+  fi
+
   if [[ ! -d "${CI_ROOT}" ]]; then
     sudo_run mkdir -p "${CI_ROOT}"
   fi
-  sudo_run mkdir -p "${TOOLCHAINS_DIR}" "${DOWNLOADS_DIR}" "${ARTIFACTS_DIR}" "${CCACHE_ROOT}"
+
+  sudo_run mkdir -p "${TOOLCHAINS_DIR}" "${DOWNLOADS_DIR}" "${ARTIFACTS_DIR}" "${CCACHE_ROOT}" "${SOURCES_DIR}"
   sudo_run chown -R "$(id -u):$(id -g)" "${CI_ROOT}"
 }
 
@@ -181,37 +189,151 @@ download_file() {
   fi
 }
 
-ensure_wine() {
-  local flavor="$1"
-  ensure_root
-  local version url target archive strip_args=()
-  case "${flavor}" in
-    x86_64)
-      version="${WINE_VERSION}"
-      url="${WINE_URL}"
-      target="${TOOLCHAINS_DIR}/wine-x86_64-${version}"
-      archive="${DOWNLOADS_DIR}/wine-x86_64-${version}.tar.gz"
+safe_name() {
+  printf '%s' "$1" | tr -c 'A-Za-z0-9._-' '-'
+}
+
+git_with_wine_auth() {
+  if [[ -n "${WINE_ACCESS_TOKEN:-}" ]]; then
+    local askpass
+    askpass="${RUNNER_TEMP:-${DOWNLOADS_DIR}}/dxmt-wine-git-askpass.sh"
+    mkdir -p "$(dirname "${askpass}")"
+    cat > "${askpass}" <<'EOF'
+#!/bin/sh
+case "$1" in
+  *Username*) printf '%s\n' x-access-token ;;
+  *Password*) printf '%s\n' "$WINE_ACCESS_TOKEN" ;;
+  *) printf '\n' ;;
+esac
+EOF
+    chmod 700 "${askpass}"
+    GIT_ASKPASS="${askpass}" git "$@"
+  else
+    git "$@"
+  fi
+}
+
+sync_wine_git_source() {
+  local source_dir="$1"
+  local old_commit new_commit
+  export GIT_TERMINAL_PROMPT=0
+
+  if [[ ! -d "${source_dir}/.git" ]]; then
+    rm -rf "${source_dir}"
+    log "cloning Wine source ${WINE_GIT_URL} (${WINE_GIT_BRANCH})"
+    git_with_wine_auth clone --depth 1 --single-branch --branch "${WINE_GIT_BRANCH}" \
+      "${WINE_GIT_URL}" "${source_dir}" ||
+      die "failed to clone Wine source ${WINE_GIT_URL} (${WINE_GIT_BRANCH})"
+    WINE_SOURCE_COMMIT="$(git -C "${source_dir}" rev-parse HEAD)" ||
+      die "failed to resolve Wine source commit"
+    return
+  fi
+
+  old_commit="$(git -C "${source_dir}" rev-parse HEAD 2>/dev/null || true)"
+  git -C "${source_dir}" remote set-url origin "${WINE_GIT_URL}"
+  log "fetching Wine source ${WINE_GIT_BRANCH}"
+  git_with_wine_auth -C "${source_dir}" fetch --depth 1 origin "${WINE_GIT_BRANCH}" ||
+    die "failed to fetch Wine source ${WINE_GIT_BRANCH}"
+  git -C "${source_dir}" reset --hard FETCH_HEAD >&2 ||
+    die "failed to reset Wine source to FETCH_HEAD"
+  new_commit="$(git -C "${source_dir}" rev-parse HEAD)" ||
+    die "failed to resolve Wine source commit"
+  if [[ -n "${old_commit}" && "${old_commit}" != "${new_commit}" ]]; then
+    rm -f "${source_dir}/.generated"
+  fi
+  WINE_SOURCE_COMMIT="${new_commit}"
+}
+
+wine_install_ready() {
+  local install_dir="$1"
+  [[ -x "${install_dir}/bin/winebuild" ]] &&
+    [[ -f "${install_dir}/lib/wine/i386-windows/libwinecrt0.a" ]] &&
+    [[ -f "${install_dir}/lib/wine/i386-windows/libntdll.a" ]] &&
+    [[ -f "${install_dir}/lib/wine/i386-windows/dbghelp.dll" ]] &&
+    [[ -f "${install_dir}/lib/wine/x86_64-windows/libwinecrt0.a" ]] &&
+    [[ -f "${install_dir}/lib/wine/x86_64-windows/libntdll.a" ]] &&
+    [[ -f "${install_dir}/lib/wine/x86_64-windows/dbghelp.dll" ]] &&
+    [[ -f "${install_dir}/lib/wine/x86_64-unix/winemac.so" ]] &&
+    [[ -f "${install_dir}/lib/wine/x86_64-unix/ntdll.so" ]]
+}
+
+build_wine_git_source() {
+  local source_dir="$1"
+  chmod +x "${source_dir}/scripts/build_on_m1.sh" "${source_dir}/scripts/build_on_intel.sh"
+  case "$(uname -m)" in
+    arm64)
+      (cd "${source_dir}" && ./scripts/build_on_m1.sh)
       ;;
-    arm64ec)
-      version="${WINE_ARM64EC_VERSION}"
-      url="${WINE_ARM64EC_URL}"
-      target="${TOOLCHAINS_DIR}/wine-arm64ec-${version}"
-      archive="${DOWNLOADS_DIR}/wine-arm64ec-${version}.tar.gz"
-      strip_args=(--strip-components 2)
+    x86_64)
+      (cd "${source_dir}" && ./scripts/build_on_intel.sh)
       ;;
     *)
-      die "unknown Wine flavor: ${flavor}"
+      die "unsupported host architecture for Wine build: $(uname -m)"
       ;;
   esac
+}
+
+ensure_wine_x86_64() {
+  ensure_root
+  local source_dir target install_dir commit stamp
+  source_dir="${SOURCES_DIR}/wine-proton-macos-$(safe_name "${WINE_GIT_BRANCH}")"
+  target="${TOOLCHAINS_DIR}/wine-x86_64-${WINE_VERSION}"
+  WINE_SOURCE_COMMIT=""
+  sync_wine_git_source "${source_dir}"
+  commit="${WINE_SOURCE_COMMIT}"
+  [[ -n "${commit}" ]] || die "Wine source commit is empty"
+  install_dir="${source_dir}/install"
+  stamp="${install_dir}/.dxmt-ci-source-commit"
+
+  if wine_install_ready "${install_dir}" &&
+     [[ -f "${stamp}" ]] &&
+     [[ "$(cat "${stamp}")" == "${commit}" ]]; then
+    log "Wine x86_64 already prepared from ${commit}: ${install_dir}"
+  else
+    log "building Wine x86_64 from ${commit}"
+    rm -rf "${source_dir}/build" "${source_dir}/install"
+    rm -f "${source_dir}/.generated"
+    build_wine_git_source "${source_dir}"
+    wine_install_ready "${install_dir}" ||
+      die "Wine build finished but required install artifacts are missing: ${install_dir}"
+    printf '%s\n' "${commit}" > "${stamp}"
+  fi
+
+  ln -sfn "${install_dir}" "${target}"
+}
+
+ensure_wine_arm64ec() {
+  ensure_root
+  local version url target archive
+  version="${WINE_ARM64EC_VERSION}"
+  url="${WINE_ARM64EC_URL}"
+  target="${TOOLCHAINS_DIR}/wine-arm64ec-${version}"
+  archive="${DOWNLOADS_DIR}/wine-arm64ec-${version}.tar.gz"
+
   if [[ -f "${target}/.dxmt-ci-ready" ]]; then
-    log "Wine ${flavor} already prepared: ${target}"
+    log "Wine arm64ec already prepared: ${target}"
     return
   fi
   rm -rf "${target}"
   mkdir -p "${target}"
   download_file "${url}" "${archive}"
-  tar -zxf "${archive}" "${strip_args[@]}" -C "${target}"
+  tar -zxf "${archive}" --strip-components 2 -C "${target}"
   touch "${target}/.dxmt-ci-ready"
+}
+
+ensure_wine() {
+  local flavor="$1"
+  case "${flavor}" in
+    x86_64)
+      ensure_wine_x86_64
+      ;;
+    arm64ec)
+      ensure_wine_arm64ec
+      ;;
+    *)
+      die "unknown Wine flavor: ${flavor}"
+      ;;
+  esac
 }
 
 ensure_llvm_mingw() {

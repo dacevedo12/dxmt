@@ -16,8 +16,9 @@ concurrency:
 env:
   DXMT_CI_ROOT: /opt/dxmt-ci
   LLVM_VERSION: llvmorg-15.0.7
-  WINE_VERSION: v8.16-3shain
-  WINE_URL: https://github.com/3Shain/wine/releases/download/v8.16-3shain/wine.tar.gz
+  WINE_VERSION: proton-11.0-macos
+  WINE_GIT_URL: https://github.com/gamesir123/wine-proton-macos.git
+  WINE_GIT_BRANCH: proton-11.0-macos
   HOMEBREW_NO_AUTO_UPDATE: "1"
   HOMEBREW_NO_INSTALL_CLEANUP: "1"
 
@@ -43,6 +44,7 @@ jobs:
       - name: Prepare Wine
         env:
           MAC_RUNNER_SUDO_PASS: ${{ secrets.MAC_RUNNER_SUDO_PASS }}
+          WINE_ACCESS_TOKEN: ${{ secrets.WINE_ACCESS_TOKEN }}
         run: scripts/ci-self-hosted.sh ensure-wine x86_64
 
   setup-llvm-project:
