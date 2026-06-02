@@ -64,9 +64,6 @@ CommandQueue::CommandQueue(WMT::Device device) :
     chunk.queue = this;
     chunk.reset();
   };
-  if (apitrace_enabled_) {
-    max_latency_ = 1;
-  }
   event = device.newSharedEvent();
 
   std::string env = env::getEnvVar("DXMT_CAPTURE_FRAME");

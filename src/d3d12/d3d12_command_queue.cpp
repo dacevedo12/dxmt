@@ -2039,6 +2039,7 @@ private:
             CreateSemaphore(nullptr, frame_latency_, DXGI_MAX_SWAP_CHAIN_BUFFERS,
                             nullptr);
       }
+      queue_->device_->GetDXMTDevice().queue().SetMaxLatency(frame_latency_);
       ResizeBuffers(desc_.BufferCount, desc_.Width, desc_.Height, desc_.Format,
                     desc_.Flags);
     }
@@ -7690,7 +7691,7 @@ private:
         auto allocator_uses = std::make_shared<std::vector<SubmittedCommandAllocatorUse>>(
             std::move(operation.allocator_uses));
         auto *chunk = device_->GetDXMTDevice().queue().CurrentChunk();
-        chunk->deferred_readbacks.push_back([allocator_uses = std::move(allocator_uses)]() {
+        chunk->completion_callbacks.push_back([allocator_uses = std::move(allocator_uses)]() {
           for (auto &use : *allocator_uses) {
             if (use.allocator)
               use.allocator->CompleteCommandListSubmission(use.serial);
@@ -7757,7 +7758,7 @@ private:
       enc.signalEvent(std::move(event), value);
     });
     state->AddRefPrivate();
-    chunk->deferred_readbacks.push_back([state, value]() {
+    chunk->completion_callbacks.push_back([state, value]() {
       state->SetCompletedValue(value);
       state->ReleasePrivate();
     });

@@ -72,7 +72,9 @@ log_verbose(const char *message, uint64_t arg0 = 0, uint64_t arg1 = 0) {
 uint64_t
 seal_after_frame() {
   if (!seal_after_frame_configured.exchange(true, std::memory_order_acq_rel)) {
-    const auto value = env::getEnvVar("APITRACE_D3D12_SEAL_CHECKPOINT_AFTER_FRAME");
+    auto value = env::getEnvVar("APITRACE_METAL_SEAL_CHECKPOINT_AFTER_FRAME");
+    if (value.empty())
+      value = env::getEnvVar("DXMT_APITRACE_SEAL_CHECKPOINT_AFTER_FRAME");
     if (!value.empty()) {
       try {
         seal_after_frame_cache.store(std::stoull(value), std::memory_order_relaxed);
