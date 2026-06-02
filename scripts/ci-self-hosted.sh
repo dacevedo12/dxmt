@@ -117,6 +117,46 @@ ensure_homebrew_build_tools() {
   ensure_command_or_formula gh gh
 }
 
+ensure_wine_rosetta_build_tools() {
+  if [[ "$(uname -m)" != "arm64" ]]; then
+    return
+  fi
+
+  arch -x86_64 /usr/bin/true >/dev/null 2>&1 ||
+    die "Rosetta 2 is required for Wine x86_64 builds; install it on the runner"
+
+  [[ -x /usr/local/bin/brew ]] ||
+    die "x86_64 Homebrew is required at /usr/local/bin/brew; install it on the runner"
+
+  local brew_x86=(arch -x86_64 /usr/local/bin/brew)
+  local packages=(
+    zlib
+    pkg-config
+    freetype
+    gnutls
+    libgcrypt
+    sdl2
+    ffmpeg
+    gstreamer
+    gst-plugins-base
+    libffi
+    molten-vk
+    vulkan-headers
+    bison
+    gnu-tar
+    dylibbundler
+    gh
+    mingw-w64
+  )
+
+  for package in "${packages[@]}"; do
+    if ! "${brew_x86[@]}" list --formula "${package}" >/dev/null 2>&1; then
+      log "installing x86_64 Homebrew formula for Wine: ${package}"
+      "${brew_x86[@]}" install --formula "${package}"
+    fi
+  done
+}
+
 ensure_meson() {
   setup_paths
   if command -v meson >/dev/null 2>&1 &&
@@ -177,6 +217,7 @@ setup_host() {
   ensure_root
   setup_paths
   ensure_homebrew_build_tools
+  ensure_wine_rosetta_build_tools
   ensure_meson
   check_apple_tools
 }
