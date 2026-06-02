@@ -1997,9 +1997,21 @@ public:
                                                    REFIID riid, void **resource) override {
     BeginDeviceCall("CreateReservedResource");
     InitReturnPtr(resource);
-    // TODO(d3d12): implement reserved resources together with tile mappings.
-    WARN("D3D12Device: reserved resources are unsupported");
-    return E_NOTIMPL;
+    if (!resource)
+      return E_POINTER;
+    if (desc && desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER &&
+        optimized_clear_value)
+      return WARN_E_INVALIDARG(__func__);
+    if (!IsValidReservedResourceDesc(desc, initial_state))
+      return WARN_E_INVALIDARG(__func__);
+
+    WARN("D3D12Device: creating reserved resource with fully-backed storage; tile mappings remain unsupported");
+    const auto heap_properties = GetDefaultResourceHeapProperties();
+    auto resource_object = d3d12::CreateResource(
+        static_cast<IMTLD3D12Device *>(this), &heap_properties,
+        D3D12_HEAP_FLAG_NONE, desc, initial_state, 0,
+        optimized_clear_value);
+    return resource_object->QueryInterface(riid, resource);
   }
 
   HRESULT STDMETHODCALLTYPE CreateSharedHandle(ID3D12DeviceChild *object,
@@ -3123,6 +3135,41 @@ private:
     }
 
     return true;
+  }
+
+  bool IsValidReservedResourceDesc(const D3D12_RESOURCE_DESC *desc,
+                                   D3D12_RESOURCE_STATES initial_state) const {
+    if (!desc)
+      return false;
+    if (!d3d12::IsSupportedResourceDesc(*desc))
+      return false;
+    if (desc->Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D &&
+        IsBcFormat(device_->device(), desc->Format))
+      return false;
+
+    const auto heap_properties = GetDefaultResourceHeapProperties();
+    if (!IsValidInitialState(heap_properties, initial_state))
+      return false;
+    if (!IsValidResourceStateForDesc(*desc, initial_state))
+      return false;
+    if (!IsValidResourceAlignment(*desc))
+      return false;
+    if (desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER &&
+        (desc->Flags & D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS))
+      return false;
+    if (!IsValidCrossAdapterTextureDesc(heap_properties, D3D12_HEAP_FLAG_NONE,
+                                        *desc))
+      return false;
+
+    return true;
+  }
+
+  D3D12_HEAP_PROPERTIES GetDefaultResourceHeapProperties() const {
+    D3D12_HEAP_PROPERTIES properties = {};
+    properties.Type = D3D12_HEAP_TYPE_DEFAULT;
+    properties.CreationNodeMask = 1;
+    properties.VisibleNodeMask = 1;
+    return properties;
   }
 
   bool IsValidPlacedResourceDesc(const d3d12::Heap &heap, UINT64 heap_offset,
