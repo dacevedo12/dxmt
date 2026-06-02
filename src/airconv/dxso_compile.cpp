@@ -1506,6 +1506,450 @@ compile_dxso(
     case DxsoOpcode::DefI:
     case DxsoOpcode::DefB:
       break;
+    case DxsoOpcode::Mov:
+      // vs_1_x uses mov a0.x (no mova before SM2). Floor to int (wined3d),
+      // store masked. SM2+ illegal mov-to-a0; FXC emits mova instead.
+      if (is_vertex && shader->header.major == 1 && a0_slot && ins.has_dst && ins.src_count >= 1 &&
+          ins.dst.base.type == DxsoRegisterType::Addr && ins.dst.base.num == 0) {
+        if (Value *src = load_src(ins.src[0])) {
+          Value *floored = air.CreateFPUnOp(llvm::air::AIRBuilder::floor, src);
+          Value *as_int = builder.CreateFPToSI(floored, int4Ty);
+          Value *cur = builder.CreateLoad(int4Ty, a0_slot);
+          for (uint32_t i = 0; i < 4; ++i) {
+            if (!ins.dst.mask[i])
+              continue;
+            Value *lane = builder.CreateExtractElement(as_int, builder.getInt32(i));
+            cur = builder.CreateInsertElement(cur, lane, builder.getInt32(i));
+          }
+          builder.CreateStore(cur, a0_slot);
+        }
+        break;
+      }
+      fold_unary(ins, [&](Value *a) { return a; });
+      break;
+    case DxsoOpcode::Mova: {
+      // mova a0.<mask>, src: round to nearest even, convert to int,
+      // store into a0. SM1.x predates the `mova` opcode and a plain
+      // `mov` to a0 floors instead of rounds (DXVK
+      // src/dxso/dxso_compiler.cpp), but Mova is SM2+ only,
+      // so always round. Anything other than the VS address register
+      // as the destination is malformed bytecode.
+      if (!a0_slot || !ins.has_dst || ins.src_count < 1 || ins.dst.base.type != DxsoRegisterType::Addr ||
+          ins.dst.base.num != 0)
+        break;
+      Value *src = load_src(ins.src[0]);
+      if (!src)
+        break;
+      Value *rounded = air.CreateFPUnOp(llvm::air::AIRBuilder::rint, src);
+      Value *as_int = builder.CreateFPToSI(rounded, int4Ty);
+      Value *cur = builder.CreateLoad(int4Ty, a0_slot);
+      for (uint32_t i = 0; i < 4; ++i) {
+        if (!ins.dst.mask[i])
+          continue;
+        Value *lane = builder.CreateExtractElement(as_int, builder.getInt32(i));
+        cur = builder.CreateInsertElement(cur, lane, builder.getInt32(i));
+      }
+      builder.CreateStore(cur, a0_slot);
+      break;
+    }
+    case DxsoOpcode::Abs:
+      fold_unary(ins, [&](Value *a) { return air.CreateFPUnOp(llvm::air::AIRBuilder::fabs, a); });
+      break;
+    case DxsoOpcode::Frc:
+      // frc(x) = x - floor(x). Matches the D3D9 reference behavior on
+      // negative inputs ([0, 1) result regardless of sign).
+      fold_unary(ins, [&](Value *a) {
+        return builder.CreateFSub(a, air.CreateFPUnOp(llvm::air::AIRBuilder::floor, a));
+      });
+      break;
+    case DxsoOpcode::Rcp:
+      // 1.0 / x. AGX has a fast-recip primitive InstCombine doesn't
+      // emit; if the AIR builder's air.recip ever shows lower-error
+      // codegen, swap to it here.
+      fold_unary(ins, [&](Value *a) {
+        auto *one = builder.CreateVectorSplat(4, ConstantFP::get(Type::getFloatTy(context), 1.0));
+        return builder.CreateFDiv(one, a);
+      });
+      break;
+    case DxsoOpcode::Rsq:
+      // 1.0 / sqrt(|x|). Negative inputs are clamped to abs to match
+      // D3D9: DXVK src/dxso/dxso_compiler.cpp (inversesqrt(abs))
+      // sqrt() on a negative would return NaN.
+      fold_unary(ins, [&](Value *a) {
+        return air.CreateFPUnOp(llvm::air::AIRBuilder::rsqrt, air.CreateFPUnOp(llvm::air::AIRBuilder::fabs, a));
+      });
+      break;
+    case DxsoOpcode::Exp:
+      // D3D9 Exp / Log are base-2 (one of the FFP unfortunate names).
+      fold_unary(ins, [&](Value *a) { return air.CreateFPUnOp(llvm::air::AIRBuilder::exp2, a); });
+      break;
+    case DxsoOpcode::ExpP:
+      // SM<2 ExpP: special four-lane result (not per-lane exp2).
+      // .x=2^floor(s), .y=frac(s), .z=2^s, .w=1. Read .y for bone-index.
+      if (shader->header.major < 2) {
+        if (Value *src = load_src(ins.src[0])) {
+          auto *fTy = Type::getFloatTy(context);
+          Value *s = builder.CreateExtractElement(src, builder.getInt32(0));
+          Value *fl = air.CreateFPUnOp(llvm::air::AIRBuilder::floor, s);
+          Value *r = PoisonValue::get(float4Ty);
+          r = builder.CreateInsertElement(r, air.CreateFPUnOp(llvm::air::AIRBuilder::exp2, fl), builder.getInt32(0));
+          r = builder.CreateInsertElement(r, builder.CreateFSub(s, fl), builder.getInt32(1));
+          r = builder.CreateInsertElement(r, air.CreateFPUnOp(llvm::air::AIRBuilder::exp2, s), builder.getInt32(2));
+          r = builder.CreateInsertElement(r, ConstantFP::get(fTy, 1.0), builder.getInt32(3));
+          store_dst(ins.dst, r);
+        }
+      } else {
+        fold_unary(ins, [&](Value *a) { return air.CreateFPUnOp(llvm::air::AIRBuilder::exp2, a); });
+      }
+      break;
+    case DxsoOpcode::Log:
+    case DxsoOpcode::LogP:
+      // D3D9 log is log2(|x|). LogP is the partial-precision alias;
+      // DXVK src/dxso/dxso_compiler.cpp collapses both to the
+      // same opcode.
+      fold_unary(ins, [&](Value *a) {
+        return air.CreateFPUnOp(llvm::air::AIRBuilder::log2, air.CreateFPUnOp(llvm::air::AIRBuilder::fabs, a));
+      });
+      break;
+    case DxsoOpcode::Pow:
+      // D3D9 pow(a, b) = 2^(b * log2(|a|)). Base is implicitly abs'd;
+      // air.fast_pow on a negative base with non-integer exponent
+      // returns NaN, which diverges. DXVK src/dxso/dxso_compiler.cpp.
+      // air.fast_pow rather than llvm.pow because AGX's pipeline
+      // compiler rejects llvm.* intrinsics in metallib bodies as
+      // unrecognized opcodes (XPC_ERROR_CONNECTION_INTERRUPTED at
+      // link, no diagnostic at metallib-write).
+      fold_binary(ins, [&](Value *a, Value *b) {
+        return air.CreateFPBinOp(llvm::air::AIRBuilder::pow, air.CreateFPUnOp(llvm::air::AIRBuilder::fabs, a), b);
+      });
+      break;
+    case DxsoOpcode::DsX:
+    case DxsoOpcode::DsY: {
+      // SM3+ explicit gradient: dst = ddx(src) or ddy(src). Quad
+      // derivatives are PS-only. Mirrors DXVK
+      // src/dxso/dxso_compiler.cpp (opDpdx / opDpdy).
+      if (is_vertex)
+        break;
+      Value *a = load_src(ins.src[0]);
+      if (!a)
+        break;
+      store_dst(ins.dst, air.CreateDerivative(a, ins.opcode == DxsoOpcode::DsY));
+      break;
+    }
+    case DxsoOpcode::Sgn: {
+      // dst = sign(src): +1 if src > 0, -1 if src < 0, 0 if src == 0.
+      // DXVK src/dxso/dxso_compiler.cpp emits OpFSign; same
+      // tri-state result. Metal AIR has no direct sign intrinsic,
+      // so unfold to a fcmp/select pair on the <4 x float>. The
+      // SM<3 src[1]/src[2] scratch operands DXVK consumes for
+      // sw-emulation are ignored, matching the SM3+ HW path.
+      if (!ins.has_dst || ins.src_count < 1)
+        break;
+      Value *a = load_src(ins.src[0]);
+      if (!a)
+        break;
+      auto *zero4 = ConstantAggregateZero::get(float4Ty);
+      auto *one4 = ConstantVector::getSplat(ElementCount::getFixed(4), ConstantFP::get(Type::getFloatTy(context), 1.0));
+      auto *neg1_4 =
+          ConstantVector::getSplat(ElementCount::getFixed(4), ConstantFP::get(Type::getFloatTy(context), -1.0));
+      Value *gt = builder.CreateFCmpOGT(a, zero4);
+      Value *lt = builder.CreateFCmpOLT(a, zero4);
+      Value *result = builder.CreateSelect(gt, one4, builder.CreateSelect(lt, neg1_4, zero4));
+      store_dst(ins.dst, result);
+      break;
+    }
+    case DxsoOpcode::Dst: {
+      // FFP distance vector helper.
+      // dst.x = 1
+      // dst.y = src0.y * src1.y
+      // dst.z = src0.z
+      // dst.w = src1.w
+      // Mirrors DXVK src/dxso/dxso_compiler.cpp. Used by FFP
+      // attenuation lighting; rare in modern shaders but FXC still
+      // emits it under fixed-function expansion.
+      if (ins.src_count < 2)
+        break;
+      Value *a = load_src(ins.src[0]);
+      Value *b = load_src(ins.src[1]);
+      if (!a || !b)
+        break;
+      auto *fTy = Type::getFloatTy(context);
+      auto *one_f = ConstantFP::get(fTy, 1.0);
+      Value *ay = builder.CreateExtractElement(a, builder.getInt32(1));
+      Value *by = builder.CreateExtractElement(b, builder.getInt32(1));
+      Value *az = builder.CreateExtractElement(a, builder.getInt32(2));
+      Value *bw = builder.CreateExtractElement(b, builder.getInt32(3));
+      Value *result = ConstantAggregateZero::get(float4Ty);
+      result = builder.CreateInsertElement(result, one_f, builder.getInt32(0));
+      result = builder.CreateInsertElement(result, builder.CreateFMul(ay, by), builder.getInt32(1));
+      result = builder.CreateInsertElement(result, az, builder.getInt32(2));
+      result = builder.CreateInsertElement(result, bw, builder.getInt32(3));
+      store_dst(ins.dst, result);
+      break;
+    }
+    case DxsoOpcode::Lit: {
+      // FFP lighting: dst=(1, max(src.x,0), (src.x>=0 && src.y>=0) ?
+      // pow(max(src.y,0), clamp(src.w,-127.9961,127.9961)) : 0, 1).
+      if (ins.src_count < 1)
+        break;
+      Value *a = load_src(ins.src[0]);
+      if (!a)
+        break;
+      auto *fTy = Type::getFloatTy(context);
+      auto *zero_f = ConstantFP::get(fTy, 0.0);
+      auto *one_f = ConstantFP::get(fTy, 1.0);
+      Value *sx = builder.CreateExtractElement(a, builder.getInt32(0));
+      Value *sy = builder.CreateExtractElement(a, builder.getInt32(1));
+      Value *sw = builder.CreateExtractElement(a, builder.getInt32(3));
+      auto *pmax_f = ConstantFP::get(fTy, 127.9961f);
+      auto *pmin_f = ConstantFP::get(fTy, -127.9961f);
+      Value *p = air.CreateFPBinOp(
+          llvm::air::AIRBuilder::fmin, air.CreateFPBinOp(llvm::air::AIRBuilder::fmax, sw, pmin_f), pmax_f
+      );
+      Value *y_lane = air.CreateFPBinOp(llvm::air::AIRBuilder::fmax, sx, zero_f);
+      Value *base = air.CreateFPBinOp(llvm::air::AIRBuilder::fmax, sy, zero_f);
+      Value *z_pow = air.CreateFPBinOp(llvm::air::AIRBuilder::pow, base, p);
+      Value *xge = builder.CreateFCmpOGE(sx, zero_f);
+      Value *yge = builder.CreateFCmpOGE(sy, zero_f);
+      Value *cond = builder.CreateAnd(xge, yge);
+      Value *z_lane = builder.CreateSelect(cond, z_pow, zero_f);
+      Value *result = ConstantAggregateZero::get(float4Ty);
+      result = builder.CreateInsertElement(result, one_f, builder.getInt32(0));
+      result = builder.CreateInsertElement(result, y_lane, builder.getInt32(1));
+      result = builder.CreateInsertElement(result, z_lane, builder.getInt32(2));
+      result = builder.CreateInsertElement(result, one_f, builder.getInt32(3));
+      store_dst(ins.dst, result);
+      break;
+    }
+    case DxsoOpcode::Crs: {
+      // 3D cross: dst.x = a.y*b.z - a.z*b.y, .y = a.z*b.x - a.x*b.z,
+      // .z = a.x*b.y - a.y*b.x. dst.w is don't-care (mask blends it
+      // away). Mirrors DXVK src/dxso/dxso_compiler.cpp: same
+      // (a.yzx * b.zxy - a.zxy * b.yzx) shuffle shape.
+      if (!ins.has_dst || ins.src_count < 2)
+        break;
+      Value *a = load_src(ins.src[0]);
+      Value *b = load_src(ins.src[1]);
+      if (!a || !b)
+        break;
+      int yzxw[4] = {1, 2, 0, 3};
+      int zxyw[4] = {2, 0, 1, 3};
+      Value *a_yzx = builder.CreateShuffleVector(a, a, ArrayRef<int>(yzxw, 4));
+      Value *b_zxy = builder.CreateShuffleVector(b, b, ArrayRef<int>(zxyw, 4));
+      Value *a_zxy = builder.CreateShuffleVector(a, a, ArrayRef<int>(zxyw, 4));
+      Value *b_yzx = builder.CreateShuffleVector(b, b, ArrayRef<int>(yzxw, 4));
+      Value *result = builder.CreateFSub(builder.CreateFMul(a_yzx, b_zxy), builder.CreateFMul(a_zxy, b_yzx));
+      store_dst(ins.dst, result);
+      break;
+    }
+    case DxsoOpcode::SinCos: {
+      // dst.x = cos(src.x), dst.y = sin(src.x). DXVK
+      // src/dxso/dxso_compiler.cpp; same shape; the SM2-only
+      // src[1]/src[2] sincos approximation tables are ignored both
+      // there and here (modern HW computes sin/cos directly). The
+      // dst mask is applied by store_dst, so the typical .xy /
+      // .x / .y mask trims the broadcast vector to written lanes.
+      if (!ins.has_dst || ins.src_count < 1)
+        break;
+      Value *a = load_src(ins.src[0]);
+      if (!a)
+        break;
+      Value *ax = builder.CreateExtractElement(a, builder.getInt32(0));
+      Value *cosx = air.CreateFPUnOp(llvm::air::AIRBuilder::cos, ax);
+      Value *sinx = air.CreateFPUnOp(llvm::air::AIRBuilder::sin, ax);
+      Value *result = ConstantAggregateZero::get(float4Ty);
+      result = builder.CreateInsertElement(result, cosx, builder.getInt32(0));
+      result = builder.CreateInsertElement(result, sinx, builder.getInt32(1));
+      store_dst(ins.dst, result);
+      break;
+    }
+    case DxsoOpcode::Dp2Add: {
+      // Scalar: dot2(src[0].xy, src[1].xy) + src[2].x. Broadcast to
+      // the dst's masked lanes. DXVK src/dxso/dxso_compiler.cpp;
+      // same shape: emitDot on .xy + FAdd of src[2].x.
+      if (!ins.has_dst || ins.src_count < 3)
+        break;
+      Value *a = load_src(ins.src[0]);
+      Value *b = load_src(ins.src[1]);
+      Value *c = load_src(ins.src[2]);
+      if (!a || !b || !c)
+        break;
+      Value *dot2 = compute_dot(a, b, 2);
+      Value *cx = builder.CreateExtractElement(c, builder.getInt32(0));
+      Value *result = builder.CreateFAdd(dot2, cx);
+      store_dst(ins.dst, builder.CreateVectorSplat(4, result));
+      break;
+    }
+    case DxsoOpcode::Nrm: {
+      // 3D normalize: r = a / sqrt(a.x*a.x + a.y*a.y + a.z*a.z),
+      // broadcast to all dst lanes (dst mask trims). DXVK
+      // src/dxso/dxso_compiler.cpp; same shape: rsqrt(dot3),
+      // multiply src * splat. The d3d9FloatEmulation FLT_MAX clamp
+      // is a DXVK option, not the default; skip until a shader needs
+      // it.
+      if (!ins.has_dst || ins.src_count < 1)
+        break;
+      Value *a = load_src(ins.src[0]);
+      if (!a)
+        break;
+      Value *dot3 = compute_dot(a, a, 3);
+      Value *rcp_len = air.CreateFPUnOp(llvm::air::AIRBuilder::rsqrt, dot3);
+      Value *splat = builder.CreateVectorSplat(4, rcp_len);
+      store_dst(ins.dst, builder.CreateFMul(a, splat));
+      break;
+    }
+    case DxsoOpcode::Add:
+      fold_binary(ins, [&](Value *a, Value *b) { return builder.CreateFAdd(a, b); });
+      break;
+    case DxsoOpcode::Sub:
+      fold_binary(ins, [&](Value *a, Value *b) { return builder.CreateFSub(a, b); });
+      break;
+    case DxsoOpcode::Mul:
+      fold_binary(ins, [&](Value *a, Value *b) { return builder.CreateFMul(a, b); });
+      break;
+    case DxsoOpcode::Min:
+      fold_binary(ins, [&](Value *a, Value *b) { return air.CreateFPBinOp(llvm::air::AIRBuilder::fmin, a, b); });
+      break;
+    case DxsoOpcode::Max:
+      fold_binary(ins, [&](Value *a, Value *b) { return air.CreateFPBinOp(llvm::air::AIRBuilder::fmax, a, b); });
+      break;
+    case DxsoOpcode::Slt:
+      // (a < b) ? 1.0 : 0.0, lane-wise. Ordered compare; NaN inputs
+      // pick the 0.0 side, matching DXVK's opFOrdLessThan.
+      fold_binary(ins, [&](Value *a, Value *b) {
+        return builder.CreateSelect(builder.CreateFCmpOLT(a, b), v4splat(1.0), v4splat(0.0));
+      });
+      break;
+    case DxsoOpcode::Sge:
+      // (a >= b) ? 1.0 : 0.0. Ordered compare; same NaN behavior as
+      // Slt. DXVK uses opFOrdGreaterThanEqual.
+      fold_binary(ins, [&](Value *a, Value *b) {
+        return builder.CreateSelect(builder.CreateFCmpOGE(a, b), v4splat(1.0), v4splat(0.0));
+      });
+      break;
+    case DxsoOpcode::Cmp:
+      // (src0 >= 0) ? src1 : src2, lane-wise. NaN goes to the false
+      // (src2) branch via the ordered compare. FXC only emits Cmp in
+      // PS bytecode; the arm is harmless if a hand-authored VS
+      // shader encodes it. DXVK src/dxso/dxso_compiler.cpp.
+      fold_ternary(ins, [&](Value *a, Value *b, Value *c) {
+        return builder.CreateSelect(builder.CreateFCmpOGE(a, v4splat(0.0)), b, c);
+      });
+      break;
+    case DxsoOpcode::Cnd:
+      // SM1.x conditional: (src0 > 0.5) ? src1 : src2, lane-wise.
+      // DXVK src/dxso/dxso_compiler.cpp.
+      fold_ternary(ins, [&](Value *a, Value *b, Value *c) {
+        return builder.CreateSelect(builder.CreateFCmpOGT(a, v4splat(0.5)), b, c);
+      });
+      break;
+    case DxsoOpcode::Lrp:
+      // src0 * (src1 - src2) + src2; the standard mix/lerp. DXVK
+      // src/dxso/dxso_compiler.cpp emitMix derives the same
+      // arithmetic via mad(src0, src1 - src2, src2).
+      fold_ternary(ins, [&](Value *s0, Value *s1, Value *s2) {
+        return builder.CreateFAdd(builder.CreateFMul(s0, builder.CreateFSub(s1, s2)), s2);
+      });
+      break;
+    case DxsoOpcode::Mad:
+      if (ins.has_dst && ins.src_count >= 3) {
+        Value *a = load_src(ins.src[0]);
+        Value *b = load_src(ins.src[1]);
+        Value *c = load_src(ins.src[2]);
+        if (a && b && c)
+          store_dst(ins.dst, builder.CreateFAdd(builder.CreateFMul(a, b), c));
+      }
+      break;
+    case DxsoOpcode::Dp3:
+    case DxsoOpcode::Dp4:
+      // dp{3,4} broadcasts the dot to all four dst lanes; store_dst's
+      // mask blend then trims to the writemask the shader requested.
+      if (ins.has_dst && ins.src_count >= 2) {
+        Value *a = load_src(ins.src[0]);
+        Value *b = load_src(ins.src[1]);
+        if (a && b) {
+          int n = (ins.opcode == DxsoOpcode::Dp3) ? 3 : 4;
+          store_dst(ins.dst, builder.CreateVectorSplat(4, compute_dot(a, b, n)));
+        }
+      }
+      break;
+    case DxsoOpcode::M4x4:
+    case DxsoOpcode::M4x3:
+    case DxsoOpcode::M3x4:
+    case DxsoOpcode::M3x3:
+    case DxsoOpcode::M3x2: {
+      // M<N>x<M> dst, vec, mat: N-element dot of `vec` against M
+      // consecutive matrix rows starting at src1.base.num. dst.lane[i]
+      // = dot(vec, mat[i]). Mirrors DXVK src/dxso/dxso_compiler.cpp
+      // emitMatrixAlu; that walks src1.id.num the same
+      // way to pick up the next row.
+      if (!ins.has_dst || ins.src_count < 2)
+        break;
+      int dotCount = 0;
+      int compCount = 0;
+      switch (ins.opcode) {
+      case DxsoOpcode::M4x4:
+        dotCount = 4;
+        compCount = 4;
+        break;
+      case DxsoOpcode::M4x3:
+        dotCount = 4;
+        compCount = 3;
+        break;
+      case DxsoOpcode::M3x4:
+        dotCount = 3;
+        compCount = 4;
+        break;
+      case DxsoOpcode::M3x3:
+        dotCount = 3;
+        compCount = 3;
+        break;
+      case DxsoOpcode::M3x2:
+        dotCount = 3;
+        compCount = 2;
+        break;
+      default:
+        break;
+      }
+      // Trim the dst mask to the first compCount set lanes; DXVK
+      // src/dxso/dxso_compiler.cpp. m4x3 r0.xyzw still writes
+      // only three rows; lane 3 of the dst is preserved instead of
+      // being stomped to zero. The i-th dot lands at the i-th set
+      // mask lane so a mask like .yzw routes dot0→y, dot1→z, dot2→w.
+      int target_lane[4] = {-1, -1, -1, -1};
+      uint8_t trimmed = 0;
+      int kept = 0;
+      for (int i = 0; i < 4 && kept < compCount; ++i) {
+        if (ins.dst.mask[i]) {
+          target_lane[kept++] = i;
+          trimmed |= static_cast<uint8_t>(1u << i);
+        }
+      }
+      if (kept == 0)
+        break;
+      Value *v = load_src(ins.src[0]);
+      if (!v)
+        break;
+      Value *result = ConstantAggregateZero::get(float4Ty);
+      bool ok = true;
+      for (int i = 0; i < kept; ++i) {
+        DxsoSrcRegister row = ins.src[1];
+        row.base.num = static_cast<uint16_t>(row.base.num + i);
+        Value *r = load_src(row);
+        if (!r) {
+          ok = false;
+          break;
+        }
+        Value *d = compute_dot(v, r, dotCount);
+        result = builder.CreateInsertElement(result, d, builder.getInt32(target_lane[i]));
+      }
+      if (!ok)
+        break;
+      DxsoDstRegister tdst = ins.dst;
+      tdst.mask = DxsoRegMask(trimmed);
+      store_dst(tdst, result);
+      break;
+    }
     default: {
       // Silent fall-through is how "almost-correct shader" symptoms
       // reach the pipeline: an unhandled op is dropped, the resulting
