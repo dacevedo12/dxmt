@@ -37,7 +37,9 @@ airconv_dep_darwin = declare_dependency(
   link_args           : [ llvm_ld_flags_darwin, llvm_deps ] # meh
 )
 
-executable('airconv', airconv_src + airconv_cli_src,
+# Exposed as a global so the wine-free shader-translation goldens
+# (tests/dx9/unit/airconv_golden.py) can drive this build-machine binary.
+airconv_native_exe = executable('airconv', airconv_src + airconv_cli_src,
   include_directories : [ dxmt_include_path, llvm_include_path_darwin ],
   cpp_args            : [ airconv_args ],
   dependencies        : [ dxbc_parser_native_dep, dxil_parser_native_dep ],
