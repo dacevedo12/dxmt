@@ -95,6 +95,7 @@ public:
   uint64_t frame_;
   uint64_t signal_frame_latency_fence_;
   QueryReadbacks readback;
+  std::vector<std::function<void()>> completion_callbacks;
   std::vector<std::function<void()>> deferred_readbacks;
   uint64_t resource_initializer_event_id;
 
@@ -113,6 +114,9 @@ public:
   void
   reset() {
     signal_frame_latency_fence_ = ~0ull;
+    for (auto &callback : completion_callbacks)
+      callback();
+    completion_callbacks.clear();
     readback = {};
     deferred_readbacks.clear();
     list_enc.reset();
