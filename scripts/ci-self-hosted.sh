@@ -143,7 +143,6 @@ ensure_wine_rosetta_build_tools() {
     gst-plugins-base
     libffi
     vulkan-loader
-    molten-vk
     vulkan-headers
     bison
     autoconf
@@ -173,6 +172,49 @@ ensure_wine_rosetta_build_tools() {
       fi
     fi
   done
+}
+
+vulkan_system_files_ready() {
+  [[ -f /usr/local/lib/libMoltenVK.dylib ]] &&
+    compgen -G '/usr/local/lib/libvulkan*.dylib' >/dev/null
+}
+
+ensure_lunarg_vulkan_sdk() {
+  if vulkan_system_files_ready; then
+    return
+  fi
+
+  ensure_root
+  local version archive extract_dir install_root installer_app installer_bin
+  version="$(curl -fsSL https://vulkan.lunarg.com/sdk/latest/mac.txt)"
+  [[ -n "${version}" ]] || die "failed to query latest Vulkan SDK version"
+  archive="${DOWNLOADS_DIR}/vulkansdk-macos-${version}.zip"
+  extract_dir="${DOWNLOADS_DIR}/vulkansdk-macos-${version}"
+  install_root="${TOOLCHAINS_DIR}/vulkan-sdk-${version}"
+
+  download_file "https://sdk.lunarg.com/sdk/download/latest/mac/vulkan-sdk.zip" "${archive}"
+  if [[ ! -d "${extract_dir}" ]]; then
+    log "extracting Vulkan SDK ${version}"
+    mkdir -p "${extract_dir}"
+    unzip -q "${archive}" -d "${extract_dir}"
+  fi
+
+  installer_app="$(find "${extract_dir}" -type d -name "InstallVulkan*.app" -print -quit)"
+  [[ -n "${installer_app}" ]] || die "Vulkan SDK installer app was not found in ${archive}"
+  installer_bin="$(find "${installer_app}/Contents/MacOS" -type f -perm -111 -name "InstallVulkan*" -print -quit)"
+  [[ -n "${installer_bin}" ]] || die "Vulkan SDK installer executable was not found"
+
+  log "installing Vulkan SDK ${version} system files"
+  sudo_run "${installer_bin}" \
+    --root "${install_root}" \
+    --accept-licenses \
+    --default-answer \
+    --confirm-command install \
+    com.lunarg.vulkan.core \
+    com.lunarg.vulkan.usr
+
+  vulkan_system_files_ready ||
+    die "Vulkan SDK install completed but /usr/local libvulkan/libMoltenVK files are missing"
 }
 
 ensure_meson() {
@@ -236,6 +278,7 @@ setup_host() {
   setup_paths
   ensure_homebrew_build_tools
   ensure_wine_rosetta_build_tools
+  ensure_lunarg_vulkan_sdk
   ensure_meson
   check_apple_tools
 }
@@ -369,9 +412,15 @@ build_wine_git_source() {
   chmod +x "${source_dir}/scripts/build_on_m1.sh" "${source_dir}/scripts/build_on_intel.sh"
   case "$(uname -m)" in
     arm64)
+      # MoltenVK comes from the LunarG Vulkan SDK. The x86_64 Homebrew formula
+      # currently fails to parse on the self-hosted runner.
+      perl -0pi -e 's/(BREW_PACKAGES=\([^)]*) molten-vk( [^)]*\))/$1$2/' \
+        "${source_dir}/scripts/build_on_m1.sh"
       (cd "${source_dir}" && ./scripts/build_on_m1.sh)
       ;;
     x86_64)
+      perl -0pi -e 's/(BREW_PACKAGES=\([^)]*)\n    molten-vk\n([^)]*\))/$1\n$2/' \
+        "${source_dir}/scripts/build_on_intel.sh"
       (cd "${source_dir}" && ./scripts/build_on_intel.sh)
       ;;
     *)
