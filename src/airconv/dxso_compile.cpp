@@ -2694,6 +2694,385 @@ compile_dxso(
       store_dst(ins.dst, texel);
       break;
     }
+    case DxsoOpcode::If: {
+      // SM2+ `if b#` reads a bool register and `if p#` reads a
+      // predicate. DXVK src/dxso/dxso_compiler.cpp.
+      // Predicate p0.<comp> reads through p0_slot. Bool reads
+      // first try the def-baked literal table (defb b#, true|false),
+      // then fall back to a runtime load from the b# bitmask
+      // binding (DXVK src/d3d9/d3d9_constant_set.h bConsts[1]:
+      // bit i = b#i).
+      if (ins.src_count < 1)
+        break;
+      const auto &s = ins.src[0];
+      Value *cond = nullptr;
+      if (s.base.type == DxsoRegisterType::ConstBool) {
+        for (const auto &c : shader->metadata.consts) {
+          if (c.bound_to.type == DxsoRegisterType::ConstBool && c.bound_to.num == s.base.num &&
+              c.def.kind == DxsoDefKind::Bool) {
+            bool taken = c.def.payload.u32[0] != 0;
+            if (s.modifier == DxsoRegModifier::Not)
+              taken = !taken;
+            cond = builder.getInt1(taken);
+            break;
+          }
+        }
+        if (!cond && s.base.num < 16) {
+          auto *u32Ty = Type::getInt32Ty(context);
+          auto *bcPtr = fn->getArg(bc_arg_idx);
+          Value *bits = builder.CreateLoad(u32Ty, bcPtr);
+          Value *mask = builder.getInt32(1u << s.base.num);
+          Value *masked = builder.CreateAnd(bits, mask);
+          cond = builder.CreateICmpNE(masked, builder.getInt32(0));
+          if (s.modifier == DxsoRegModifier::Not)
+            cond = builder.CreateNot(cond);
+        }
+      } else if (s.base.type == DxsoRegisterType::Predicate && s.base.num == 0) {
+        Value *pmask = builder.CreateLoad(bool4Ty, p0_slot);
+        cond = builder.CreateExtractElement(pmask, builder.getInt32(s.swizzle[0]));
+        if (s.modifier == DxsoRegModifier::Not)
+          cond = builder.CreateNot(cond);
+      }
+      if (!cond)
+        break;
+      auto *then_bb = BasicBlock::Create(context, "if.then", fn);
+      auto *else_bb = BasicBlock::Create(context, "if.else", fn);
+      auto *merge_bb = BasicBlock::Create(context, "if.end", fn);
+      builder.CreateCondBr(cond, then_bb, else_bb);
+      builder.SetInsertPoint(then_bb);
+      cf_stack.push_back({else_bb, merge_bb, false});
+      break;
+    }
+    case DxsoOpcode::Ifc: {
+      // Structured control flow. DXVK src/dxso/dxso_compiler.cpp.
+      // Pre-create both true and false BBs so that an `if` without an
+      // `else` still has a fall-through edge into the merge block.
+      if (ins.src_count < 2)
+        break;
+      Value *a = load_src(ins.src[0]);
+      Value *b = load_src(ins.src[1]);
+      if (!a || !b)
+        break;
+      Value *ax = builder.CreateExtractElement(a, builder.getInt32(0));
+      Value *bx = builder.CreateExtractElement(b, builder.getInt32(0));
+      // DxsoComparison: 1=GT, 2=EQ, 3=GE, 4=LT, 5=NE, 6=LE. NotEqual
+      // is unordered per DXVK src/dxso/dxso_compiler.cpp; the
+      // rest are ordered.
+      Value *cond = nullptr;
+      switch (ins.specific_data) {
+      case 1:
+        cond = builder.CreateFCmpOGT(ax, bx);
+        break;
+      case 2:
+        cond = builder.CreateFCmpOEQ(ax, bx);
+        break;
+      case 3:
+        cond = builder.CreateFCmpOGE(ax, bx);
+        break;
+      case 4:
+        cond = builder.CreateFCmpOLT(ax, bx);
+        break;
+      case 5:
+        cond = builder.CreateFCmpUNE(ax, bx);
+        break;
+      case 6:
+        cond = builder.CreateFCmpOLE(ax, bx);
+        break;
+      default:
+        break;
+      }
+      if (!cond)
+        break;
+      auto *then_bb = BasicBlock::Create(context, "if.then", fn);
+      auto *else_bb = BasicBlock::Create(context, "if.else", fn);
+      auto *merge_bb = BasicBlock::Create(context, "if.end", fn);
+      builder.CreateCondBr(cond, then_bb, else_bb);
+      builder.SetInsertPoint(then_bb);
+      cf_stack.push_back({else_bb, merge_bb, false});
+      break;
+    }
+    case DxsoOpcode::Else: {
+      if (cf_stack.empty())
+        break;
+      IfBlock &b = cf_stack.back();
+      if (b.saw_else)
+        break;
+      builder.CreateBr(b.merge_bb);
+      builder.SetInsertPoint(b.else_bb);
+      b.saw_else = true;
+      break;
+    }
+    case DxsoOpcode::EndIf: {
+      if (cf_stack.empty())
+        break;
+      IfBlock b = cf_stack.back();
+      cf_stack.pop_back();
+      builder.CreateBr(b.merge_bb);
+      if (!b.saw_else) {
+        // No else arm; close the empty else_bb with a fall-through
+        // before switching to the merge block.
+        builder.SetInsertPoint(b.else_bb);
+        builder.CreateBr(b.merge_bb);
+      }
+      builder.SetInsertPoint(b.merge_bb);
+      break;
+    }
+    case DxsoOpcode::Rep:
+    case DxsoOpcode::Loop: {
+      // Rep src0 (i#.x = count): DXVK src/dxso/dxso_compiler.cpp.
+      // Loop aL, src1 (i#.x = count, .y = init aL, .z = stride);
+      // DXVK src/dxso/dxso_compiler.cpp. Counts can come from a
+      // def-baked literal (defi i#, ...) or from the runtime i#
+      // binding ([[buffer(1)]]); the same emitter handles both since
+      // LoopFrame carries Values, not int32_t constants.
+      bool is_loop = ins.opcode == DxsoOpcode::Loop;
+      if (ins.src_count < (is_loop ? 2u : 1u))
+        break;
+      const auto &s = ins.src[is_loop ? 1u : 0u];
+      if (s.base.type != DxsoRegisterType::ConstInt)
+        break;
+      auto *i32Ty = Type::getInt32Ty(context);
+      auto *int4Ty = FixedVectorType::get(i32Ty, 4);
+      Value *count = nullptr;
+      Value *init_aL = builder.getInt32(0);
+      Value *stride = builder.getInt32(0);
+      const DxsoBoundConst *match = nullptr;
+      for (const auto &c : shader->metadata.consts) {
+        if (c.bound_to.type == DxsoRegisterType::ConstInt && c.bound_to.num == s.base.num &&
+            c.def.kind == DxsoDefKind::Int32) {
+          match = &c;
+          break;
+        }
+      }
+      if (match) {
+        count = builder.getInt32(match->def.payload.i32[0]);
+        if (is_loop) {
+          init_aL = builder.getInt32(match->def.payload.i32[1]);
+          stride = builder.getInt32(match->def.payload.i32[2]);
+        }
+      } else if (s.base.num < 16) {
+        // Runtime i# read. The binding is `int4 *i` at slot 1; GEP
+        // by reg num then load the lane the loop emitter needs.
+        auto *icPtr = fn->getArg(ic_arg_idx);
+        Value *idx = builder.getInt32(s.base.num);
+        auto *gep = builder.CreateGEP(int4Ty, icPtr, idx);
+        Value *vec = builder.CreateLoad(int4Ty, gep);
+        count = builder.CreateExtractElement(vec, builder.getInt32(0));
+        if (is_loop) {
+          init_aL = builder.CreateExtractElement(vec, builder.getInt32(1));
+          stride = builder.CreateExtractElement(vec, builder.getInt32(2));
+        }
+      } else {
+        break;
+      }
+      auto *header_bb = BasicBlock::Create(context, "loop.header", fn);
+      auto *body_bb = BasicBlock::Create(context, "loop.body", fn);
+      auto *latch_bb = BasicBlock::Create(context, "loop.latch", fn);
+      auto *merge_bb = BasicBlock::Create(context, "loop.end", fn);
+      Value *counter = builder.CreateAlloca(i32Ty, nullptr, "loop.i");
+      builder.CreateStore(builder.getInt32(0), counter);
+      Value *aL_backup = nullptr;
+      if (is_loop) {
+        // Save the outer-scope aL before overwriting with init so a
+        // nested Loop can restore on EndLoop. DXVK
+        // src/dxso/dxso_compiler.cpp / 2500-2507.
+        aL_backup = builder.CreateAlloca(i32Ty, nullptr, "aL.backup");
+        Value *outer = builder.CreateLoad(i32Ty, aL_slot);
+        builder.CreateStore(outer, aL_backup);
+        builder.CreateStore(init_aL, aL_slot);
+      }
+      builder.CreateBr(header_bb);
+      builder.SetInsertPoint(header_bb);
+      Value *cur = builder.CreateLoad(i32Ty, counter);
+      Value *cond = builder.CreateICmpSLT(cur, count);
+      builder.CreateCondBr(cond, body_bb, merge_bb);
+      builder.SetInsertPoint(body_bb);
+      loop_stack.push_back({counter, aL_backup, count, stride, header_bb, latch_bb, merge_bb});
+      break;
+    }
+    case DxsoOpcode::SetP: {
+      // setp_<cmp> p0.<mask>, src0, src1; lane-wise compare, masked
+      // store into p0. DXVK src/dxso/dxso_compiler.cpp. NotEqual
+      // is unordered; the rest are ordered.
+      if (!ins.has_dst || ins.src_count < 2)
+        break;
+      if (ins.dst.base.type != DxsoRegisterType::Predicate || ins.dst.base.num != 0)
+        break;
+      Value *a = load_src(ins.src[0]);
+      Value *b = load_src(ins.src[1]);
+      if (!a || !b)
+        break;
+      Value *cmp = nullptr;
+      switch (ins.specific_data) {
+      case 1:
+        cmp = builder.CreateFCmpOGT(a, b);
+        break;
+      case 2:
+        cmp = builder.CreateFCmpOEQ(a, b);
+        break;
+      case 3:
+        cmp = builder.CreateFCmpOGE(a, b);
+        break;
+      case 4:
+        cmp = builder.CreateFCmpOLT(a, b);
+        break;
+      case 5:
+        cmp = builder.CreateFCmpUNE(a, b);
+        break;
+      case 6:
+        cmp = builder.CreateFCmpOLE(a, b);
+        break;
+      default:
+        break;
+      }
+      if (!cmp)
+        break;
+      Value *cur = builder.CreateLoad(bool4Ty, p0_slot);
+      for (uint32_t i = 0; i < 4; ++i) {
+        if (!ins.dst.mask[i])
+          continue;
+        Value *lane = builder.CreateExtractElement(cmp, builder.getInt32(i));
+        cur = builder.CreateInsertElement(cur, lane, builder.getInt32(i));
+      }
+      builder.CreateStore(cur, p0_slot);
+      break;
+    }
+    case DxsoOpcode::Break:
+    case DxsoOpcode::BreakC: {
+      // Early loop exit. DXVK src/dxso/dxso_compiler.cpp / 2559.
+      // Break unconditionally jumps to the enclosing loop's merge BB;
+      // BreakC wraps the jump in a comparison whose true edge takes
+      // the break and whose false edge continues the body. Both must
+      // leave builder in an open block so subsequent body
+      // instructions still have a place to emit (LLVM tolerates the
+      // unreachable BB if no successor consumes it).
+      if (loop_stack.empty())
+        break;
+      BasicBlock *merge_bb = loop_stack.back().merge_bb;
+      auto *next_bb = BasicBlock::Create(context, "break.cont", fn);
+      if (ins.opcode == DxsoOpcode::Break) {
+        builder.CreateBr(merge_bb);
+      } else {
+        if (ins.src_count < 2)
+          break;
+        Value *a = load_src(ins.src[0]);
+        Value *b = load_src(ins.src[1]);
+        if (!a || !b)
+          break;
+        Value *ax = builder.CreateExtractElement(a, builder.getInt32(0));
+        Value *bx = builder.CreateExtractElement(b, builder.getInt32(0));
+        Value *cond = nullptr;
+        switch (ins.specific_data) {
+        case 1:
+          cond = builder.CreateFCmpOGT(ax, bx);
+          break;
+        case 2:
+          cond = builder.CreateFCmpOEQ(ax, bx);
+          break;
+        case 3:
+          cond = builder.CreateFCmpOGE(ax, bx);
+          break;
+        case 4:
+          cond = builder.CreateFCmpOLT(ax, bx);
+          break;
+        case 5:
+          cond = builder.CreateFCmpUNE(ax, bx);
+          break;
+        case 6:
+          cond = builder.CreateFCmpOLE(ax, bx);
+          break;
+        default:
+          break;
+        }
+        if (!cond)
+          break;
+        builder.CreateCondBr(cond, merge_bb, next_bb);
+      }
+      builder.SetInsertPoint(next_bb);
+      break;
+    }
+    // SM 1.x TexM3x{2,3}Pad: literal no-ops. Dependent ops read via
+    // register-file lookup, not preserved state. Explicit case avoids spurious warnings.
+    case DxsoOpcode::TexDepth: {
+      // SM 1.4 TexDepth: depth = clamp(r.x / min(r.y, 1.0), 0, 1).
+      // r.y clamped to 1.0, negative x saturates to 0.
+      if (is_vertex || !ins.has_dst || oDepth_arg_idx < 0 || !oDepth_slot)
+        break;
+      auto *gep_r = builder.CreateGEP(tempArrTy, temps, {builder.getInt32(0), builder.getInt32(ins.dst.base.num)});
+      Value *r4 = builder.CreateLoad(float4Ty, gep_r);
+      auto *fT = Type::getFloatTy(context);
+      Value *rx = builder.CreateExtractElement(r4, builder.getInt32(0));
+      Value *ry = builder.CreateExtractElement(r4, builder.getInt32(1));
+      Value *one_f = ConstantFP::get(fT, 1.0f);
+      Value *ry_clamped = air.CreateFPBinOp(llvm::air::AIRBuilder::fmin, ry, one_f);
+      Value *depth = builder.CreateFDiv(rx, ry_clamped);
+      depth = air.CreateFPUnOp(llvm::air::AIRBuilder::saturate, depth);
+      // oDepth_slot is a float4; lane 0 is what the epilogue extracts
+      // for [[depth]]. Splat for stable contents on the unused lanes.
+      builder.CreateStore(builder.CreateVectorSplat(4, depth), oDepth_slot);
+      break;
+    }
+    case DxsoOpcode::TexM3x2Depth: {
+      // SM 1.3 TexM3x2Depth: re-derive rows, dots against src[0], emit depth.
+      // depth = (row1·src == 0) ? 1 : clamp((row0·src)/(row1·src), 0, 1).
+      if (is_vertex || !ins.has_dst || ins.src_count < 1 || !tex_inputs || oDepth_arg_idx < 0 || !oDepth_slot)
+        break;
+      uint32_t slot = ins.dst.base.num;
+      if (slot < 1 || slot >= 8)
+        break;
+      Value *src4 = load_src(ins.src[0]);
+      if (!src4)
+        break;
+      int xyz[3] = {0, 1, 2};
+      Value *src3 = builder.CreateShuffleVector(src4, src4, ArrayRef<int>(xyz, 3));
+      auto loadRow = [&](uint32_t row_slot) -> Value * {
+        auto *gep = builder.CreateGEP(texInputArrTy, tex_inputs, {builder.getInt32(0), builder.getInt32(row_slot)});
+        Value *row4 = builder.CreateLoad(float4Ty, gep);
+        return builder.CreateShuffleVector(row4, row4, ArrayRef<int>(xyz, 3));
+      };
+      Value *tmp_x = compute_dot(loadRow(slot - 1), src3, 3);
+      Value *tmp_y = compute_dot(loadRow(slot), src3, 3);
+      auto *fT = Type::getFloatTy(context);
+      Value *zero_f = ConstantFP::get(fT, 0.0f);
+      Value *one_f = ConstantFP::get(fT, 1.0f);
+      Value *q = builder.CreateFDiv(tmp_x, tmp_y);
+      Value *q_sat = air.CreateFPUnOp(llvm::air::AIRBuilder::saturate, q);
+      Value *y_is_zero = builder.CreateFCmpOEQ(tmp_y, zero_f);
+      Value *depth = builder.CreateSelect(y_is_zero, one_f, q_sat);
+      builder.CreateStore(builder.CreateVectorSplat(4, depth), oDepth_slot);
+      break;
+    }
+    case DxsoOpcode::TexM3x2Pad:
+    case DxsoOpcode::TexM3x3Pad:
+      break;
+    case DxsoOpcode::EndRep:
+    case DxsoOpcode::EndLoop: {
+      if (loop_stack.empty())
+        break;
+      LoopFrame f = loop_stack.back();
+      loop_stack.pop_back();
+      builder.CreateBr(f.latch_bb);
+      builder.SetInsertPoint(f.latch_bb);
+      auto *i32Ty = Type::getInt32Ty(context);
+      Value *cur = builder.CreateLoad(i32Ty, f.counter_slot);
+      Value *next = builder.CreateAdd(cur, builder.getInt32(1));
+      builder.CreateStore(next, f.counter_slot);
+      if (f.aL_backup_slot) {
+        // Loop (not Rep); step aL by stride. Stride may be zero
+        // (def-baked or runtime); the unconditional add is fine
+        // either way and keeps the IR shape uniform.
+        Value *aL = builder.CreateLoad(i32Ty, aL_slot);
+        Value *aL_next = builder.CreateAdd(aL, f.aL_stride);
+        builder.CreateStore(aL_next, aL_slot);
+      }
+      builder.CreateBr(f.header_bb);
+      builder.SetInsertPoint(f.merge_bb);
+      if (f.aL_backup_slot) {
+        Value *outer = builder.CreateLoad(i32Ty, f.aL_backup_slot);
+        builder.CreateStore(outer, aL_slot);
+      }
+      break;
+    }
     default: {
       // Silent fall-through is how "almost-correct shader" symptoms
       // reach the pipeline: an unhandled op is dropped, the resulting
