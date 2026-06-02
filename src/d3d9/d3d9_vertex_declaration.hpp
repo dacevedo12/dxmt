@@ -49,6 +49,19 @@ public:
   elementCount() const {
     return static_cast<UINT>(m_elements.size());
   }
+  // The FVF this declaration corresponds to: the source FVF for a decl
+  // SetFVF synthesized, 0 for one CreateVertexDeclaration built from
+  // elements (D3D9 does not reverse a general element list to an FVF, so
+  // GetFVF after SetVertexDeclaration reports 0). wined3d stores the same
+  // fvf on the declaration; GetFVF reads the bound decl's value.
+  DWORD
+  fvf() const {
+    return m_fvf;
+  }
+  void
+  setFvf(DWORD fvf) {
+    m_fvf = fvf;
+  }
 
 private:
   MTLD3D9Device *m_device;
@@ -57,6 +70,7 @@ private:
   // wined3d_element_count + 1). Apps reading via GetDeclaration with
   // a NULL out-array expect this count to include the terminator.
   std::vector<D3DVERTEXELEMENT9> m_elements;
+  DWORD m_fvf = 0;
   bool m_self_pinned = true;
 };
 
