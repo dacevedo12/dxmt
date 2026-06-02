@@ -40,8 +40,14 @@ private:
 
   MTLD3D9Device *m_device;
   D3DQUERYTYPE m_type;
-  // Tracks whether D3DISSUE_END has run; GetData before END is
-  // INVALIDCALL per the D3D9 contract. wined3d query.c enforces.
+  // Query state machine mirrors wined3d query.c: a fresh query is CREATED, a
+  // D3DISSUE_BEGIN moves it to BUILDING, a D3DISSUE_END to SIGNALLED. m_began
+  // records the BEGIN so GetData can separate a never-issued query (CREATED:
+  // the d3d9 wrapper turns wined3d's INVALIDCALL into a poisoned-buffer S_OK)
+  // from one mid-window (BUILDING: S_FALSE).
+  bool m_began = false;
+  // Tracks whether D3DISSUE_END has run (QUERY_SIGNALLED). Before any END the
+  // CREATED / BUILDING paths above apply. wined3d query.c enforces the order.
   bool m_ended = false;
   // EVENT-query GPU completion seq. Captured at Issue(D3DISSUE_END):
   // the queue's CurrentSeqId: the chunk-in-flight that all-prior work
