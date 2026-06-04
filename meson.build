@@ -250,11 +250,22 @@ endif
 
 add_project_arguments('-DDXMT_PAGE_SIZE=4096', language: 'cpp')
 
-dxmt_version = vcs_tag(
-  command: ['git', 'describe', '--always'],
-  input:  'version.h.in',
-  output: 'version.h',
-)
+dxmt_version_override = get_option('dxmt_version')
+if dxmt_version_override == ''
+  dxmt_version = vcs_tag(
+    command: ['git', 'describe', '--always'],
+    input:  'version.h.in',
+    output: 'version.h',
+  )
+else
+  dxmt_version_conf = configuration_data()
+  dxmt_version_conf.set('VCS_TAG', dxmt_version_override)
+  dxmt_version = configure_file(
+    input: 'version.h.in',
+    output: 'version.h',
+    configuration: dxmt_version_conf,
+  )
+endif
 
 if dxmt_crossbuild
   wine_builtin_dll = get_option('wine_builtin_dll')

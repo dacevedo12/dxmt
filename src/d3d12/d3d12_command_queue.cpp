@@ -1197,6 +1197,61 @@ AppendAllSubresourcesRange(const Resource &resource,
   return true;
 }
 
+static bool
+AppendDefaultRenderTargetSubresourceRanges(
+    const Resource &resource, std::vector<SubresourceRange> &ranges) {
+  const auto &desc = resource.GetResourceDesc();
+  if (desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER)
+    return AppendAllSubresourcesRange(resource, ranges);
+
+  const UINT array_size = GetResourceArraySliceCount(resource);
+  const UINT plane_count = GetPlaneCount(resource);
+  if (!array_size || !plane_count)
+    return false;
+
+  for (UINT plane = 0; plane < plane_count; plane++) {
+    if (!AppendTextureSubresourceRanges(resource, 0, 1, 0, array_size, plane,
+                                        ranges))
+      return false;
+  }
+  return true;
+}
+
+static bool
+AppendDefaultUnorderedAccessSubresourceRanges(
+    const Resource &resource, std::vector<SubresourceRange> &ranges) {
+  const auto &desc = resource.GetResourceDesc();
+  if (desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER)
+    return AppendAllSubresourcesRange(resource, ranges);
+
+  const UINT array_size = GetResourceArraySliceCount(resource);
+  const UINT plane_count = GetPlaneCount(resource);
+  if (!array_size || !plane_count)
+    return false;
+
+  for (UINT plane = 0; plane < plane_count; plane++) {
+    if (!AppendTextureSubresourceRanges(resource, 0, 1, 0, array_size, plane,
+                                        ranges))
+      return false;
+  }
+  return true;
+}
+
+static bool
+AppendDefaultDepthStencilSubresourceRanges(
+    const Resource &resource, std::vector<SubresourceRange> &ranges) {
+  const auto &desc = resource.GetResourceDesc();
+  if (desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER)
+    return AppendAllSubresourcesRange(resource, ranges);
+
+  const UINT array_size = GetResourceArraySliceCount(resource);
+  if (!array_size)
+    return false;
+
+  return AppendTextureSubresourceRanges(resource, 0, 1, 0, array_size, 0,
+                                        ranges);
+}
+
 static WMTSize
 GetSubresourceSize(const Resource &resource, UINT subresource,
                    const D3D12_BOX *box) {
@@ -1603,7 +1658,7 @@ GetRenderTargetSubresourceRanges(Resource &resource,
   if (resource.GetResourceDesc().Dimension == D3D12_RESOURCE_DIMENSION_BUFFER)
     return AppendAllSubresourcesRange(resource, ranges);
   if (!descriptor.has_desc)
-    return AppendAllSubresourcesRange(resource, ranges);
+    return AppendDefaultRenderTargetSubresourceRanges(resource, ranges);
 
   const auto &rtv = descriptor.desc.rtv;
   switch (rtv.ViewDimension) {
@@ -1642,7 +1697,7 @@ GetDepthStencilSubresourceRanges(Resource &resource,
                                  const DescriptorRecord &descriptor,
                                  std::vector<SubresourceRange> &ranges) {
   if (!descriptor.has_desc)
-    return AppendAllSubresourcesRange(resource, ranges);
+    return AppendDefaultDepthStencilSubresourceRanges(resource, ranges);
 
   const auto &dsv = descriptor.desc.dsv;
   switch (dsv.ViewDimension) {
@@ -1769,7 +1824,7 @@ GetUnorderedAccessSubresourceRanges(Resource &resource,
   if (resource.GetResourceDesc().Dimension == D3D12_RESOURCE_DIMENSION_BUFFER)
     return AppendAllSubresourcesRange(resource, ranges);
   if (!descriptor.has_desc)
-    return AppendAllSubresourcesRange(resource, ranges);
+    return AppendDefaultUnorderedAccessSubresourceRanges(resource, ranges);
 
   const auto &uav = descriptor.desc.uav;
   switch (uav.ViewDimension) {

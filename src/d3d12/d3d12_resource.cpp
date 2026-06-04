@@ -535,7 +535,7 @@ CopyTextureRowsToMemory(void *dst_data, UINT dst_row_pitch,
   return S_OK;
 }
 
-class ResourceImpl final : public ComObjectWithInitialRef<ID3D12Resource>,
+class ResourceImpl final : public ComObjectWithInitialRef<ID3D12Resource2>,
                            public Resource {
 public:
   ResourceImpl(IMTLD3D12Device *device,
@@ -586,7 +586,9 @@ public:
     *ppvObject = nullptr;
     if (riid == __uuidof(IUnknown) || riid == __uuidof(ID3D12Object) ||
         riid == __uuidof(ID3D12DeviceChild) ||
-        riid == __uuidof(ID3D12Pageable) || riid == __uuidof(ID3D12Resource)) {
+        riid == __uuidof(ID3D12Pageable) || riid == __uuidof(ID3D12Resource) ||
+        riid == __uuidof(ID3D12Resource1) ||
+        riid == __uuidof(ID3D12Resource2)) {
       *ppvObject = ref(this);
       return S_OK;
     }
@@ -619,6 +621,42 @@ public:
   HRESULT STDMETHODCALLTYPE GetDevice(REFIID riid, void **device) override {
     return device_->QueryInterface(riid, device);
   }
+
+  HRESULT STDMETHODCALLTYPE GetProtectedResourceSession(
+      REFIID riid, void **protected_session) override {
+    InitReturnPtr(protected_session);
+    if (!protected_session)
+      return E_POINTER;
+
+    return DXGI_ERROR_NOT_FOUND;
+  }
+
+  D3D12_RESOURCE_DESC1 MakeDesc1() const {
+    D3D12_RESOURCE_DESC1 desc = {};
+    desc.Dimension = desc_.Dimension;
+    desc.Alignment = desc_.Alignment;
+    desc.Width = desc_.Width;
+    desc.Height = desc_.Height;
+    desc.DepthOrArraySize = desc_.DepthOrArraySize;
+    desc.MipLevels = desc_.MipLevels;
+    desc.Format = desc_.Format;
+    desc.SampleDesc = desc_.SampleDesc;
+    desc.Layout = desc_.Layout;
+    desc.Flags = desc_.Flags;
+    return desc;
+  }
+
+#ifdef WIDL_EXPLICIT_AGGREGATE_RETURNS
+  D3D12_RESOURCE_DESC1 *STDMETHODCALLTYPE
+  GetDesc1(D3D12_RESOURCE_DESC1 *__ret) override {
+    *__ret = MakeDesc1();
+    return __ret;
+  }
+#else
+  D3D12_RESOURCE_DESC1 STDMETHODCALLTYPE GetDesc1() override {
+    return MakeDesc1();
+  }
+#endif
 
   HRESULT STDMETHODCALLTYPE Map(UINT sub_resource, const D3D12_RANGE *read_range,
                                 void **data) override {
