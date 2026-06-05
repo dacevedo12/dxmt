@@ -11,7 +11,11 @@ endif
 
 subdir('dxmt')
 subdir('dxgi')
+# d3d12 (Metal4 backend) is 64-bit only: it reinterpret_casts 64-bit
+# handles to uintptr_t, which the i386 / WoW64 target rejects.
+if host_machine.cpu_family() != 'x86'
 subdir('d3d12')
+endif
 subdir('d3d11')
 subdir('d3d10')
 subdir('d3d9')
