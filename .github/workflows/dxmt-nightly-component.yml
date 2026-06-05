@@ -243,9 +243,10 @@ jobs:
             *) echo "::error::component archive must end with .tzst"; exit 1 ;;
           esac
 
-          curl -fsS -X POST "${COMPONENT_API_BASE}/resource/v1/admin/upload" \
+          curl -fsS -X POST "${COMPONENT_API_BASE}/resource/v1/public/upload" \
             -H "CIAuth-Token: ${CIAUTH_TOKEN}" \
             -F "file=@${package_file}" \
+            -F "dir=simulator" \
             -o upload-response.json
 
           python3 - upload-response.json component-update.json <<'PY'
