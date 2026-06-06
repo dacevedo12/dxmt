@@ -472,8 +472,12 @@ CommandQueue::WaitForFinishThread() {
     std::vector<std::function<void()>> completion_callbacks;
     completion_callbacks.swap(chunk.completion_callbacks);
 
+    EnqueueReadbacks(chunk);
+    chunk.reset();
+
     // Completion callbacks can re-enter D3D12 and wait on this queue. Publish
-    // command-buffer completion first so the finish thread cannot self-deadlock.
+    // command-buffer completion after releasing command-list storage so the CPU
+    // command heap cannot be recycled while chunk.reset() still walks it.
     cpu_coherent.signal(internal_seq);
     if (DxmtQueueDiagShouldLog(finish_log_count)) {
       WARN("DXMT queue diagnostic: FinishThread signaled"
@@ -487,8 +491,6 @@ CommandQueue::WaitForFinishThread() {
     for (auto &callback : completion_callbacks)
       callback();
 
-    EnqueueReadbacks(chunk);
-    chunk.reset();
     chunk_ongoing.fetch_sub(1, std::memory_order_release);
     chunk_ongoing.notify_one();
     if (DxmtQueueDiagShouldLog(finish_log_count)) {

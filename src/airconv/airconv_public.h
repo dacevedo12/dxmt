@@ -153,7 +153,6 @@ typedef struct sm50_ptr64_t {
 #endif
 
 typedef sm50_ptr64_t sm50_shader_t;
-typedef sm50_ptr64_t dxil_shader_t;
 typedef sm50_ptr64_t sm50_bitcode_t;
 typedef sm50_ptr64_t sm50_error_t;
 
@@ -346,30 +345,8 @@ AIRCONV_API void SM50GetArgumentsInfo(
   struct MTL_SM50_SHADER_ARGUMENT *pArguments
 );
 
-AIRCONV_API int DXILInitialize(
-  const void *pBytecode, size_t BytecodeSize, dxil_shader_t *ppShader,
-  struct MTL_SHADER_REFLECTION *pRefl, sm50_error_t *ppError
-);
-AIRCONV_API void DXILDestroy(dxil_shader_t pShader);
-AIRCONV_API int DXILCompile(
-  dxil_shader_t pShader, struct SM50_SHADER_COMPILATION_ARGUMENT_DATA *pArgs,
-  const char *FunctionName, sm50_bitcode_t *ppBitcode, sm50_error_t *ppError
-);
-AIRCONV_API void DXILGetArgumentsInfo(
-  dxil_shader_t pShader, struct MTL_SM50_SHADER_ARGUMENT *pConstantBuffers,
-  struct MTL_SM50_SHADER_ARGUMENT *pArguments
-);
-
 #ifdef __cplusplus
 };
-
-namespace dxmt::dxil {
-struct DxilTranslationInfo;
-}
-
-namespace dxmt::airconv {
-const dxil::DxilTranslationInfo *GetDxilTranslationInfo(dxil_shader_t pShader);
-}
 
 inline std::string SM50GetErrorMessageString(sm50_error_t pError) {
   std::string str;

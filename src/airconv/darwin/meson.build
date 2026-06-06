@@ -37,6 +37,20 @@ airconv_dep_darwin = declare_dependency(
   link_args           : [ llvm_ld_flags_darwin, llvm_deps ] # meh
 )
 
+airconv_dx12_metal4_lib_darwin = static_library('airconv_dx12_metal4', airconv_dx12_metal4_src,
+  include_directories : [ dxmt_include_path, llvm_include_path_darwin ],
+  cpp_args            : [ airconv_args ],
+  dependencies        : [ dxbc_parser_native_dep, dxil_parser_native_dep ],
+  link_args           : llvm_ld_flags_darwin,
+  native              : dxmt_crossbuild
+)
+
+airconv_dx12_metal4_dep_darwin = declare_dependency(
+  link_with           : [ airconv_dx12_metal4_lib_darwin ],
+  include_directories : [ dxmt_include_path, include_directories('..') ],
+  link_args           : [ llvm_ld_flags_darwin, llvm_deps ]
+)
+
 executable('airconv', airconv_src + airconv_cli_src,
   include_directories : [ dxmt_include_path, llvm_include_path_darwin ],
   cpp_args            : [ airconv_args ],

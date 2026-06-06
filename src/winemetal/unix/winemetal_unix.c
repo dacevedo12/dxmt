@@ -3757,37 +3757,36 @@ thunk_SM50GetArgumentsInfo(void *args) {
 }
 
 static NTSTATUS
-thunk_DXILInitialize(void *args) {
+thunk_AirconvUnsupportedInitialize(void *args) {
   struct sm50_initialize_params *params = args;
-
-  params->ret =
-      DXILInitialize(params->bytecode, params->bytecode_size, params->shader, params->reflection, params->error);
-
-  return STATUS_SUCCESS;
-}
-
-static NTSTATUS
-thunk_DXILDestroy(void *args) {
-  struct sm50_destroy_params *params = args;
-
-  DXILDestroy(params->shader);
+  if (params->shader)
+    *params->shader = 0;
+  if (params->error)
+    *params->error = 0;
+  params->ret = -1;
 
   return STATUS_SUCCESS;
 }
 
 static NTSTATUS
-thunk_DXILCompile(void *args) {
+thunk_AirconvUnsupportedDestroy(void *args) {
+  return STATUS_SUCCESS;
+}
+
+static NTSTATUS
+thunk_AirconvUnsupportedCompile(void *args) {
   struct sm50_compile_params *params = args;
-
-  params->ret = DXILCompile(params->shader, params->args, params->func_name, params->bitcode, params->error);
+  if (params->bitcode)
+    *params->bitcode = 0;
+  if (params->error)
+    *params->error = 0;
+  params->ret = -1;
 
   return STATUS_SUCCESS;
 }
 
 static NTSTATUS
-thunk_DXILGetArgumentsInfo(void *args) {
-  struct sm50_get_arguments_info_params *params = args;
-  DXILGetArgumentsInfo((dxil_shader_t)params->shader, params->constant_buffers, params->arguments);
+thunk_AirconvUnsupportedGetArgumentsInfo(void *args) {
   return STATUS_SUCCESS;
 }
 
@@ -4108,41 +4107,23 @@ thunk32_SM50GetArgumentsInfo(void *args) {
 }
 
 static NTSTATUS
-thunk32_DXILInitialize(void *args) {
+thunk32_AirconvUnsupportedInitialize(void *args) {
   struct sm50_initialize_params32 *params = args;
-
-  params->ret = DXILInitialize(
-      UInt32ToPtr(params->bytecode), params->bytecode_size, UInt32ToPtr(params->shader),
-      UInt32ToPtr(params->reflection), UInt32ToPtr(params->error)
-  );
+  params->ret = -1;
 
   return STATUS_SUCCESS;
 }
 
 static NTSTATUS
-thunk32_DXILCompile(void *args) {
+thunk32_AirconvUnsupportedCompile(void *args) {
   struct sm50_compile_params32 *params = args;
-  struct SM50_SHADER_COMPILATION_ARGUMENT_DATA first_arg;
-  struct SM50_SHADER_COMPILATION_ARGUMENT_DATA32 *args32 = UInt32ToPtr(params->args);
-  sm50_compilation_argument32_convert(&first_arg, args32);
-
-  params->ret = DXILCompile(
-      params->shader, &first_arg, UInt32ToPtr(params->func_name), UInt32ToPtr(params->bitcode),
-      UInt32ToPtr(params->error)
-  );
-
-  sm50_compilation_argument32_free(&first_arg);
+  params->ret = -1;
 
   return STATUS_SUCCESS;
 }
 
 static NTSTATUS
-thunk32_DXILGetArgumentsInfo(void *args) {
-  struct sm50_get_arguments_info_params32 *params = args;
-  DXILGetArgumentsInfo(
-      (dxil_shader_t)params->shader, UInt32ToPtr(params->constant_buffers),
-      UInt32ToPtr(params->arguments)
-  );
+thunk32_AirconvUnsupportedGetArgumentsInfo(void *args) {
   return STATUS_SUCCESS;
 }
 #endif /* DXMT_NATIVE */
@@ -5184,10 +5165,10 @@ const void *__wine_unix_call_funcs[] = {
     &_MTLCommandEncoder_setLabel,
     &_MTLDevice_setShouldMaximizeConcurrentCompilation,
     &thunk_SM50GetArgumentsInfo,
-    &thunk_DXILInitialize,
-    &thunk_DXILDestroy,
-    &thunk_DXILCompile,
-    &thunk_DXILGetArgumentsInfo,
+    &thunk_AirconvUnsupportedInitialize,
+    &thunk_AirconvUnsupportedDestroy,
+    &thunk_AirconvUnsupportedCompile,
+    &thunk_AirconvUnsupportedGetArgumentsInfo,
     &_MTLCommandBuffer_error,
     &_MTLCommandBuffer_logs,
     &_MTLLogContainer_enumerate,
@@ -5336,10 +5317,10 @@ const void *__wine_unix_call_wow64_funcs[] = {
     &_MTLCommandEncoder_setLabel,
     &_MTLDevice_setShouldMaximizeConcurrentCompilation,
     &thunk32_SM50GetArgumentsInfo,
-    &thunk32_DXILInitialize,
-    &thunk_DXILDestroy,
-    &thunk32_DXILCompile,
-    &thunk32_DXILGetArgumentsInfo,
+    &thunk32_AirconvUnsupportedInitialize,
+    &thunk_AirconvUnsupportedDestroy,
+    &thunk32_AirconvUnsupportedCompile,
+    &thunk32_AirconvUnsupportedGetArgumentsInfo,
     &_MTLCommandBuffer_error,
     &_MTLCommandBuffer_logs,
     &_MTLLogContainer_enumerate,

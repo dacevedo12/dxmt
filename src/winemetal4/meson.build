@@ -31,7 +31,7 @@ endif
 
 winemetal4_dll = shared_library('winemetal4', winemetal4_src,
   name_prefix         : '',
-  dependencies        : [ airconv_forward_dep ] + (wine_install_path != '' ? [ lib_winecrt0, lib_ntdll, lib_dbghelp ] : []),
+  dependencies        : [ airconv_dx12_metal4_forward_dep ] + (wine_install_path != '' ? [ lib_winecrt0, lib_ntdll, lib_dbghelp ] : []),
   include_directories : dxmt_include_path,
   install             : true,
   install_dir         : windows_builtin_install_dir,

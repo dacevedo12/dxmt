@@ -1,5 +1,5 @@
 #include "stddef.h"
-#include "airconv_public.h"
+#include "airconv_dx12_metal4.h"
 
 #ifndef __WINEMETAL_AIRCONV_THUNKS_H
 #define __WINEMETAL_AIRCONV_THUNKS_H

@@ -32,7 +32,7 @@ endif
 winemetal4_unix_link_depends += files('exports.list')
 winemetal4_unix_link_depends += apitrace_metal_native_link_depends
 
-winemetal4_unix_deps = [ airconv_dep_darwin ] + apitrace_metal_native_deps
+winemetal4_unix_deps = [ airconv_dx12_metal4_dep_darwin ] + apitrace_metal_native_deps
 winemetal4_unix_include_dirs = [
   dxmt_include_path,
   include_directories('../../../external/metal-cpp'),

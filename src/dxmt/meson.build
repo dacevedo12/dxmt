@@ -72,7 +72,7 @@ dxmt_dep = declare_dependency(
 
 if dxmt_crossbuild
 dxmt12_lib = static_library('dxmt12', dxmt_src, dxmt_shaders_header, dxmt_version,
-  dependencies        : [ util_dep, airconv_forward_dep, winemetal4_dep ] + apitrace_d3d_pe_deps,
+  dependencies        : [ util_dep, airconv_dx12_metal4_forward_dep, winemetal4_dep ] + apitrace_d3d_pe_deps,
   include_directories : [ dxmt_include_path ],
   cpp_args            : ['-DDXMT_DX12_METAL4=1'],
   link_depends        : dxmt_link_depends,

@@ -3,8 +3,6 @@ airconv_src = files([
  'air_type.cpp',
  'air_signature.cpp',
  'air_operations.cpp',
- 'dxil_air_converter.cpp',
- 'dxil_converter.cpp',
  'dxbc_converter.cpp',
  'dxbc_converter_gs.cpp',
  'dxbc_converter_ts.cpp',
@@ -17,6 +15,11 @@ airconv_src = files([
  'nt/dxbc_converter_base.cpp',
  'transforms/lower_16bit_texread.cpp',
  'transforms/simdgroup_implicit_membarrier.cpp',
+])
+
+airconv_dx12_metal4_src = airconv_src + files([
+ 'dxil_air_converter.cpp',
+ 'dxil_converter.cpp',
 ])
 
 airconv_cli_src = files(['airconv_cli.cpp'])
@@ -57,6 +60,10 @@ airconv_forward_dep = declare_dependency(
   include_directories : [ dxmt_include_path, include_directories('.') ],
 )
 
+airconv_dx12_metal4_forward_dep = declare_dependency(
+  include_directories : [ dxmt_include_path, include_directories('.') ],
+)
+
 airconv_shaders = [
   'shaders/air_msad.metal',
   'shaders/air_samplepos.metal',
@@ -70,6 +77,7 @@ airconv_shaders_ir = metalir_generator.process(
 airconv_shaders_header = hexdump_generator.process(airconv_shaders_ir)
 
 airconv_src += airconv_shaders_header
+airconv_dx12_metal4_src += airconv_shaders_header
 
 build_airconv_for_windows = get_option('build_airconv_for_windows')
 

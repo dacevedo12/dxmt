@@ -6225,7 +6225,7 @@ private:
     return std::nullopt;
   }
 
-  static const MTL_SM50_SHADER_ARGUMENT *
+  static const DXMT12_MTL4_SHADER_ARGUMENT *
   ResolveShaderBindingArgument(const PipelineState &pipeline,
                                PipelineStage stage,
                                SM50BindingType binding_type,
@@ -6264,7 +6264,7 @@ private:
     return nullptr;
   }
 
-  static const MTL_SM50_SHADER_ARGUMENT *
+  static const DXMT12_MTL4_SHADER_ARGUMENT *
   ResolveShaderBindingArgumentBySlot(const PipelineState &pipeline,
                                      PipelineStage stage,
                                      SM50BindingType binding_type,
@@ -6447,7 +6447,7 @@ private:
   void BindDescriptor(ArgumentEncodingContext &enc, PipelineStage stage,
                       D3D12_DESCRIPTOR_RANGE_TYPE range_type, UINT slot,
                       const DescriptorRecord &descriptor,
-                      const MTL_SM50_SHADER_ARGUMENT *argument) {
+                      const DXMT12_MTL4_SHADER_ARGUMENT *argument) {
     switch (range_type) {
     case D3D12_DESCRIPTOR_RANGE_TYPE_CBV:
       BindConstantBufferDescriptor(enc, stage, slot, descriptor);
@@ -6784,7 +6784,7 @@ private:
   void BindShaderResourceDescriptor(ArgumentEncodingContext &enc,
                                     PipelineStage stage, UINT slot,
                                     const DescriptorRecord &descriptor,
-                                    const MTL_SM50_SHADER_ARGUMENT *argument) {
+                                    const DXMT12_MTL4_SHADER_ARGUMENT *argument) {
     if (descriptor.type != DescriptorRecordType::ShaderResourceView)
       return;
     if (slot >= kSRVBindings) {
@@ -6974,7 +6974,7 @@ private:
   void BindUnorderedAccessDescriptor(ArgumentEncodingContext &enc,
                                      PipelineStage stage, UINT slot,
                                      const DescriptorRecord &descriptor,
-                                     const MTL_SM50_SHADER_ARGUMENT *argument) {
+                                     const DXMT12_MTL4_SHADER_ARGUMENT *argument) {
     if (descriptor.type != DescriptorRecordType::UnorderedAccessView)
       return;
     if (slot >= kUAVBindings) {

@@ -11,7 +11,9 @@
 #import <ColorSync/ColorSync.h>
 #import <CoreFoundation/CFRunLoop.h>
 #import <Metal/Metal.h>
+#import <Metal/MTL4ArgumentTable.h>
 #import <Metal/MTL4ComputeCommandEncoder.h>
+#import <Metal/MTL4RenderPass.h>
 #import <Metal/MTL4CommandQueue.h>
 #import <Metal/MTL4Counters.h>
 #import <MetalFX/MetalFX.h>
@@ -34,22 +36,50 @@ typedef int NTSTATUS;
 
 @class DXMTMetal4CommandQueue;
 
+@protocol MTLDrawableWithTexture <MTLDrawable>
+@property(readonly) id<MTLTexture> texture;
+@end
+
+@protocol MTLDeviceMetal4SPI <MTLDevice>
+- (nullable id<MTL4ArgumentTable>)newArgumentTableWithDescriptor:(MTL4ArgumentTableDescriptor *)descriptor
+                                                           error:(NSError **)error;
+@end
+
+static NSObject *dxmt_metal4_compiler_lock;
+
+typedef NS_ENUM(uint64_t, DXMTMetal4CommandBufferState) {
+  DXMTMetal4CommandBufferStateNotEnqueued = 0,
+  DXMTMetal4CommandBufferStateCommitted = 2,
+  DXMTMetal4CommandBufferStateCompleted = 4,
+  DXMTMetal4CommandBufferStateError = 5,
+};
+
 @interface DXMTMetal4CommandBuffer : NSObject
 @property(nonatomic, retain) DXMTMetal4CommandQueue *owner;
-@property(nonatomic, retain) id<MTLCommandBuffer> oldBuffer;
 @property(nonatomic, retain) id<MTL4CommandAllocator> allocator;
-@property(nonatomic, retain) id<MTL4CommandBuffer> currentMetal4Buffer;
-@property(nonatomic, retain) NSMutableArray *pendingMetal4Buffers;
+@property(nonatomic, retain) id<MTL4CommandBuffer> metal4Buffer;
 @property(nonatomic, retain) id<MTLResidencySet> residencySet;
-@property(nonatomic, assign) uint64_t lastMetal4DoneValue;
+@property(nonatomic, retain) NSMutableArray *pendingWaitEvents;
+@property(nonatomic, retain) NSMutableArray *pendingSignalEvents;
+@property(nonatomic, retain) id<MTLDrawable> pendingDrawable;
+@property(nonatomic, assign) BOOL hasPresentDuration;
+@property(nonatomic, assign) double presentDuration;
+@property(nonatomic, assign) uint64_t completionValue;
+@property(nonatomic, assign) DXMTMetal4CommandBufferState internalStatus;
+@property(nonatomic, retain) NSError *feedbackError;
+@property(nonatomic, assign) double feedbackGPUStartTime;
+@property(nonatomic, assign) double feedbackGPUEndTime;
 - (instancetype)initWithQueue:(DXMTMetal4CommandQueue *)queue;
+- (id<MTL4CommandBuffer>)commandBuffer;
 - (id<MTL4ComputeCommandEncoder>)metal4ComputeEncoder;
+- (id<MTL4RenderCommandEncoder>)metal4RenderCommandEncoderWithDescriptor:(MTL4RenderPassDescriptor *)descriptor;
 - (void)useResidencyAllocation:(id<MTLAllocation>)allocation;
-- (void)prepareResidencyForMetal4Segment;
-- (void)finishMetal4SegmentForOldQueue;
+- (id<MTL4ArgumentTable>)newArgumentTableWithLabel:(NSString *)label;
+- (id<MTLBuffer>)newUploadBufferWithBytes:(const void *)bytes length:(NSUInteger)length;
+- (void)prepareResidencyForCommit;
 - (void)commit;
 - (void)waitUntilCompleted;
-- (MTLCommandBufferStatus)status;
+- (enum WMTCommandBufferStatus)status;
 - (NSError *)error;
 - (id)logs;
 - (double)kernelStartTime;
@@ -58,17 +88,63 @@ typedef int NTSTATUS;
 - (double)GPUEndTime;
 - (void)encodeSignalEvent:(id<MTLSharedEvent>)event value:(uint64_t)value;
 - (void)encodeWaitForEvent:(id<MTLSharedEvent>)event value:(uint64_t)value;
-- (id<MTLBlitCommandEncoder>)oldBlitCommandEncoder;
-- (id<MTLBlitCommandEncoder>)oldBlitCommandEncoderWithSampleBufferAttachments:(struct WMTSampleBufferAttachmentInfo *)attachments
-                                                                         count:(uint64_t)count;
-- (id<MTLComputeCommandEncoder>)oldComputeCommandEncoderWithConcurrent:(BOOL)concurrent;
-- (id<MTLRenderCommandEncoder>)oldRenderCommandEncoderWithDescriptor:(MTLRenderPassDescriptor *)descriptor;
 - (void)presentDrawable:(id<MTLDrawable>)drawable;
 - (void)presentDrawable:(id<MTLDrawable>)drawable afterMinimumDuration:(double)duration;
 - (void)dxmtWriteTimestampIntoHeap:(id<MTL4CounterHeap>)heap atIndex:(NSUInteger)index;
 @end
 
-static NSMutableDictionary *dxmt_metal4_blit_owners;
+@interface DXMTMetal4QueueEvent : NSObject
+@property(nonatomic, retain) id<MTLSharedEvent> event;
+@property(nonatomic, assign) uint64_t value;
+- (instancetype)initWithEvent:(id<MTLSharedEvent>)event value:(uint64_t)value;
+@end
+
+@implementation DXMTMetal4QueueEvent
+- (instancetype)initWithEvent:(id<MTLSharedEvent>)event value:(uint64_t)value {
+  self = [super init];
+  if (self) {
+    _event = [event retain];
+    _value = value;
+  }
+  return self;
+}
+
+- (void)dealloc {
+  [_event release];
+  [super dealloc];
+}
+@end
+
+static NSMutableDictionary *dxmt_metal4_compilers_by_device;
+
+__attribute__((constructor)) static void
+dxmt_metal4_init_locks(void) {
+  dxmt_metal4_compiler_lock = [NSObject new];
+}
+
+static NSValue *
+dxmt_metal4_device_key(id<MTLDevice> device) {
+  return [NSValue valueWithPointer:(const void *)device];
+}
+
+static void
+dxmt_metal4_register_compiler(id<MTLDevice> device, id<MTL4Compiler> compiler) {
+  @synchronized(dxmt_metal4_compiler_lock) {
+    if (!dxmt_metal4_compilers_by_device)
+      dxmt_metal4_compilers_by_device = [[NSMutableDictionary alloc] init];
+    [dxmt_metal4_compilers_by_device setObject:compiler forKey:dxmt_metal4_device_key(device)];
+  }
+}
+
+static id<MTL4Compiler>
+dxmt_metal4_compiler_for_device(id<MTLDevice> device) {
+  @synchronized(dxmt_metal4_compiler_lock) {
+    return [dxmt_metal4_compilers_by_device objectForKey:dxmt_metal4_device_key(device)];
+  }
+}
+
+static NSMutableDictionary *dxmt_metal4_encoder_owners;
+static NSMutableDictionary *dxmt_metal4_encoder_states;
 
 static NSValue *
 dxmt_metal4_encoder_key(obj_handle_t encoder) {
@@ -76,33 +152,50 @@ dxmt_metal4_encoder_key(obj_handle_t encoder) {
 }
 
 static void
-dxmt_metal4_register_blit_encoder(obj_handle_t encoder, DXMTMetal4CommandBuffer *command_buffer) {
+dxmt_metal4_register_encoder(obj_handle_t encoder, DXMTMetal4CommandBuffer *command_buffer) {
   @synchronized([DXMTMetal4CommandBuffer class]) {
-    if (!dxmt_metal4_blit_owners)
-      dxmt_metal4_blit_owners = [[NSMutableDictionary alloc] init];
-    [dxmt_metal4_blit_owners setObject:command_buffer forKey:dxmt_metal4_encoder_key(encoder)];
-  }
-}
-
-static DXMTMetal4CommandBuffer *
-dxmt_metal4_blit_encoder_owner(obj_handle_t encoder) {
-  @synchronized([DXMTMetal4CommandBuffer class]) {
-    return [dxmt_metal4_blit_owners objectForKey:dxmt_metal4_encoder_key(encoder)];
+    if (!dxmt_metal4_encoder_owners)
+      dxmt_metal4_encoder_owners = [[NSMutableDictionary alloc] init];
+    [dxmt_metal4_encoder_owners setObject:command_buffer forKey:dxmt_metal4_encoder_key(encoder)];
   }
 }
 
 static void
-dxmt_metal4_unregister_blit_encoder(obj_handle_t encoder) {
+dxmt_metal4_register_encoder_state(obj_handle_t encoder, NSObject *state) {
   @synchronized([DXMTMetal4CommandBuffer class]) {
-    [dxmt_metal4_blit_owners removeObjectForKey:dxmt_metal4_encoder_key(encoder)];
+    if (!dxmt_metal4_encoder_states)
+      dxmt_metal4_encoder_states = [[NSMutableDictionary alloc] init];
+    [dxmt_metal4_encoder_states setObject:state forKey:dxmt_metal4_encoder_key(encoder)];
+  }
+}
+
+static id
+dxmt_metal4_encoder_state(obj_handle_t encoder) {
+  @synchronized([DXMTMetal4CommandBuffer class]) {
+    return [dxmt_metal4_encoder_states objectForKey:dxmt_metal4_encoder_key(encoder)];
+  }
+}
+
+static DXMTMetal4CommandBuffer *
+dxmt_metal4_encoder_owner(obj_handle_t encoder) {
+  @synchronized([DXMTMetal4CommandBuffer class]) {
+    return [dxmt_metal4_encoder_owners objectForKey:dxmt_metal4_encoder_key(encoder)];
+  }
+}
+
+static void
+dxmt_metal4_unregister_encoder(obj_handle_t encoder) {
+  @synchronized([DXMTMetal4CommandBuffer class]) {
+    [dxmt_metal4_encoder_owners removeObjectForKey:dxmt_metal4_encoder_key(encoder)];
+    [dxmt_metal4_encoder_states removeObjectForKey:dxmt_metal4_encoder_key(encoder)];
   }
 }
 
 
 @interface DXMTMetal4CommandQueue : NSObject
 @property(nonatomic, retain) id<MTLDevice> device;
-@property(nonatomic, retain) id<MTLCommandQueue> oldQueue;
 @property(nonatomic, retain) id<MTL4CommandQueue> metal4Queue;
+@property(nonatomic, retain) id<MTL4Compiler> compiler;
 @property(nonatomic, retain) id<MTLSharedEvent> event;
 @property(nonatomic, assign) uint64_t eventValue;
 - (instancetype)initWithDevice:(id<MTLDevice>)device maxCommandBufferCount:(uint64_t)maxCommandBufferCount;
@@ -116,23 +209,27 @@ dxmt_metal4_unregister_blit_encoder(obj_handle_t encoder) {
     return nil;
 
   _device = [device retain];
-  _oldQueue = [(id<MTLDevice>)device newCommandQueueWithMaxCommandBufferCount:maxCommandBufferCount];
   _metal4Queue = [(id<MTLDevice>)device newMTL4CommandQueue];
+  NSError *compilerError = nil;
+  MTL4CompilerDescriptor *compilerDesc = [[MTL4CompilerDescriptor alloc] init];
+  _compiler = [(id<MTLDevice>)device newCompilerWithDescriptor:compilerDesc error:&compilerError];
+  [compilerDesc release];
   _event = [(id<MTLDevice>)device newSharedEvent];
   _eventValue = 0;
 
-  if (!_oldQueue || !_metal4Queue || !_event) {
+  if (!_metal4Queue || !_compiler || !_event) {
     [self release];
     return nil;
   }
 
+  dxmt_metal4_register_compiler(device, _compiler);
   return self;
 }
 
 - (void)dealloc {
   [_device release];
-  [_oldQueue release];
   [_metal4Queue release];
+  [_compiler release];
   [_event release];
   [super dealloc];
 }
@@ -151,19 +248,22 @@ dxmt_metal4_unregister_blit_encoder(obj_handle_t encoder) {
     return nil;
 
   _owner = [queue retain];
-  _oldBuffer = [queue.oldQueue commandBuffer];
-  [_oldBuffer retain];
   _allocator = [queue.device newCommandAllocator];
-  _currentMetal4Buffer = nil;
-  _pendingMetal4Buffers = [[NSMutableArray alloc] init];
+  _metal4Buffer = [queue.device newCommandBuffer];
+  [_metal4Buffer beginCommandBufferWithAllocator:_allocator];
+  _pendingWaitEvents = [[NSMutableArray alloc] init];
+  _pendingSignalEvents = [[NSMutableArray alloc] init];
   MTLResidencySetDescriptor *residencyDesc = [[MTLResidencySetDescriptor alloc] init];
   residencyDesc.initialCapacity = 1024;
   NSError *residencyError = nil;
   _residencySet = [queue.device newResidencySetWithDescriptor:residencyDesc error:&residencyError];
   [residencyDesc release];
-  _lastMetal4DoneValue = 0;
+  _completionValue = 0;
+  _internalStatus = DXMTMetal4CommandBufferStateNotEnqueued;
+  _feedbackGPUStartTime = 0.0;
+  _feedbackGPUEndTime = 0.0;
 
-  if (!_oldBuffer || !_allocator || !_pendingMetal4Buffers || !_residencySet) {
+  if (!_allocator || !_metal4Buffer || !_pendingWaitEvents || !_pendingSignalEvents || !_residencySet) {
     [self release];
     return nil;
   }
@@ -172,49 +272,27 @@ dxmt_metal4_unregister_blit_encoder(obj_handle_t encoder) {
 }
 
 - (void)dealloc {
-  [_currentMetal4Buffer release];
-  [_pendingMetal4Buffers release];
+  [_pendingDrawable release];
+  [_feedbackError release];
+  [_pendingWaitEvents release];
+  [_pendingSignalEvents release];
   [_residencySet release];
+  [_metal4Buffer release];
   [_allocator release];
-  [_oldBuffer release];
   [_owner release];
   [super dealloc];
 }
 
-- (void)beginMetal4SegmentIfNeeded {
-  if (_currentMetal4Buffer)
-    return;
-
-  uint64_t readyValue = [_owner nextEventValue];
-  [_oldBuffer encodeSignalEvent:_owner.event value:readyValue];
-  [_owner.metal4Queue waitForEvent:_owner.event value:readyValue];
-
-  _currentMetal4Buffer = [_owner.device newCommandBuffer];
-  [_currentMetal4Buffer beginCommandBufferWithAllocator:_allocator];
+- (id<MTL4CommandBuffer>)commandBuffer {
+  return _metal4Buffer;
 }
 
 - (id<MTL4ComputeCommandEncoder>)metal4ComputeEncoder {
-  [self beginMetal4SegmentIfNeeded];
-  return [_currentMetal4Buffer computeCommandEncoder];
+  return [_metal4Buffer computeCommandEncoder];
 }
 
-- (void)finishMetal4SegmentForOldQueue {
-  if (!_currentMetal4Buffer)
-    return;
-
-  [self prepareResidencyForMetal4Segment];
-  [_currentMetal4Buffer endCommandBuffer];
-  id<MTL4CommandBuffer> commandBuffers[1] = {_currentMetal4Buffer};
-  [_pendingMetal4Buffers addObject:_currentMetal4Buffer];
-  [_owner.metal4Queue commit:commandBuffers count:1];
-
-  uint64_t doneValue = [_owner nextEventValue];
-  [_owner.metal4Queue signalEvent:_owner.event value:doneValue];
-  [_oldBuffer encodeWaitForEvent:_owner.event value:doneValue];
-  _lastMetal4DoneValue = doneValue;
-
-  [_currentMetal4Buffer release];
-  _currentMetal4Buffer = nil;
+- (id<MTL4RenderCommandEncoder>)metal4RenderCommandEncoderWithDescriptor:(MTL4RenderPassDescriptor *)descriptor {
+  return [_metal4Buffer renderCommandEncoderWithDescriptor:descriptor];
 }
 
 - (void)useResidencyAllocation:(id<MTLAllocation>)allocation {
@@ -223,107 +301,140 @@ dxmt_metal4_unregister_blit_encoder(obj_handle_t encoder) {
   [_residencySet addAllocation:allocation];
 }
 
-- (void)prepareResidencyForMetal4Segment {
+- (id<MTL4ArgumentTable>)newArgumentTableWithLabel:(NSString *)label {
+  MTL4ArgumentTableDescriptor *descriptor = [[MTL4ArgumentTableDescriptor alloc] init];
+  descriptor.maxBufferBindCount = 31;
+  descriptor.maxTextureBindCount = 128;
+  descriptor.maxSamplerStateBindCount = 16;
+  descriptor.initializeBindings = YES;
+  descriptor.label = label;
+  NSError *error = nil;
+  id<MTL4ArgumentTable> table = [(id<MTLDeviceMetal4SPI>)_owner.device newArgumentTableWithDescriptor:descriptor
+                                                                                                error:&error];
+  if (!table) {
+    fprintf(stderr, "err:   DXMT Metal4 argument table creation failed for %s: %s\n",
+            label ? label.UTF8String : "<unnamed>",
+            error.localizedDescription ? error.localizedDescription.UTF8String : "<no error>");
+  }
+  [descriptor release];
+  return table;
+}
+
+- (id<MTLBuffer>)newUploadBufferWithBytes:(const void *)bytes length:(NSUInteger)length {
+  if (!length)
+    length = 1;
+  id<MTLBuffer> buffer = [_owner.device newBufferWithLength:length options:MTLResourceStorageModeShared];
+  if (!buffer)
+    return nil;
+  if (bytes)
+    memcpy([buffer contents], bytes, length);
+  [self useResidencyAllocation:(id<MTLAllocation>)buffer];
+  return buffer;
+}
+
+- (void)prepareResidencyForCommit {
   [_residencySet commit];
   [_residencySet requestResidency];
-  [_currentMetal4Buffer useResidencySet:_residencySet];
+  [_metal4Buffer useResidencySet:_residencySet];
 }
 
 - (void)commit {
-  [self finishMetal4SegmentForOldQueue];
-  [_oldBuffer commit];
+  if (_internalStatus != DXMTMetal4CommandBufferStateNotEnqueued)
+    return;
+
+  for (DXMTMetal4QueueEvent *wait in _pendingWaitEvents)
+    [_owner.metal4Queue waitForEvent:wait.event value:wait.value];
+
+  [self prepareResidencyForCommit];
+  [_metal4Buffer endCommandBuffer];
+
+  _completionValue = [_owner nextEventValue];
+  MTL4CommitOptions *options = [[MTL4CommitOptions alloc] init];
+
+  id<MTL4CommandBuffer> commandBuffers[1] = {_metal4Buffer};
+  _internalStatus = DXMTMetal4CommandBufferStateCommitted;
+  [_owner.metal4Queue commit:commandBuffers count:1 options:options];
+  [options release];
+
+  if (_pendingDrawable) {
+    [_owner.metal4Queue signalDrawable:_pendingDrawable];
+    if (_hasPresentDuration)
+      [_pendingDrawable presentAfterMinimumDuration:_presentDuration];
+    else
+      [_pendingDrawable present];
+  }
+
+  for (DXMTMetal4QueueEvent *signal in _pendingSignalEvents)
+    [_owner.metal4Queue signalEvent:signal.event value:signal.value];
+  [_owner.metal4Queue signalEvent:_owner.event value:_completionValue];
+
 }
 
 - (void)waitUntilCompleted {
-  [_oldBuffer waitUntilCompleted];
-  uint64_t doneValue = _lastMetal4DoneValue;
-  if (doneValue)
-    [_owner.event waitUntilSignaledValue:doneValue timeoutMS:UINT64_MAX];
-  [_pendingMetal4Buffers removeAllObjects];
+  if (_internalStatus == DXMTMetal4CommandBufferStateNotEnqueued)
+    [self commit];
+  if (_completionValue) {
+    [_owner.event waitUntilSignaledValue:_completionValue timeoutMS:UINT64_MAX];
+    if (_internalStatus == DXMTMetal4CommandBufferStateCommitted)
+      _internalStatus = DXMTMetal4CommandBufferStateCompleted;
+  }
 }
 
-- (MTLCommandBufferStatus)status {
-  return [_oldBuffer status];
+- (enum WMTCommandBufferStatus)status {
+  return (enum WMTCommandBufferStatus)_internalStatus;
 }
 
 - (NSError *)error {
-  return [_oldBuffer error];
+  return _feedbackError;
 }
 
 - (id)logs {
-  return [_oldBuffer logs];
+  return nil;
 }
 
 - (double)kernelStartTime {
-  return [_oldBuffer kernelStartTime];
+  return 0.0;
 }
 
 - (double)kernelEndTime {
-  return [_oldBuffer kernelEndTime];
+  return 0.0;
 }
 
 - (double)GPUStartTime {
-  return [_oldBuffer GPUStartTime];
+  return _feedbackGPUStartTime;
 }
 
 - (double)GPUEndTime {
-  return [_oldBuffer GPUEndTime];
+  return _feedbackGPUEndTime;
 }
 
 - (void)encodeSignalEvent:(id<MTLSharedEvent>)event value:(uint64_t)value {
-  [self finishMetal4SegmentForOldQueue];
-  [_oldBuffer encodeSignalEvent:event value:value];
+  DXMTMetal4QueueEvent *op = [[DXMTMetal4QueueEvent alloc] initWithEvent:event value:value];
+  [_pendingSignalEvents addObject:op];
+  [op release];
 }
 
 - (void)encodeWaitForEvent:(id<MTLSharedEvent>)event value:(uint64_t)value {
-  [self finishMetal4SegmentForOldQueue];
-  [_oldBuffer encodeWaitForEvent:event value:value];
-}
-
-- (id<MTLBlitCommandEncoder>)oldBlitCommandEncoder {
-  [self finishMetal4SegmentForOldQueue];
-  return [_oldBuffer blitCommandEncoder];
-}
-
-- (id<MTLBlitCommandEncoder>)oldBlitCommandEncoderWithSampleBufferAttachments:(struct WMTSampleBufferAttachmentInfo *)attachments
-                                                                         count:(uint64_t)count {
-  [self finishMetal4SegmentForOldQueue];
-  MTLBlitPassDescriptor *blit_desc = [[MTLBlitPassDescriptor alloc] init];
-  for (uint64_t i = 0; i < count; i++) {
-    MTLBlitPassSampleBufferAttachmentDescriptor *desc = blit_desc.sampleBufferAttachments[i];
-    desc.sampleBuffer = (id<MTLCounterSampleBuffer>)attachments[i].sample_buffer;
-    desc.startOfEncoderSampleIndex = attachments[i].start_of_encoder_sample_index;
-    desc.endOfEncoderSampleIndex = attachments[i].end_of_encoder_sample_index;
-  }
-
-  id<MTLBlitCommandEncoder> encoder = [_oldBuffer blitCommandEncoderWithDescriptor:blit_desc];
-  [blit_desc release];
-  return encoder;
-}
-
-- (id<MTLComputeCommandEncoder>)oldComputeCommandEncoderWithConcurrent:(BOOL)concurrent {
-  [self finishMetal4SegmentForOldQueue];
-  return [_oldBuffer computeCommandEncoderWithDispatchType:concurrent ? MTLDispatchTypeConcurrent : MTLDispatchTypeSerial];
-}
-
-- (id<MTLRenderCommandEncoder>)oldRenderCommandEncoderWithDescriptor:(MTLRenderPassDescriptor *)descriptor {
-  [self finishMetal4SegmentForOldQueue];
-  return [_oldBuffer renderCommandEncoderWithDescriptor:descriptor];
+  DXMTMetal4QueueEvent *op = [[DXMTMetal4QueueEvent alloc] initWithEvent:event value:value];
+  [_pendingWaitEvents addObject:op];
+  [op release];
 }
 
 - (void)presentDrawable:(id<MTLDrawable>)drawable {
-  [self finishMetal4SegmentForOldQueue];
-  [_oldBuffer presentDrawable:drawable];
+  [_pendingDrawable release];
+  _pendingDrawable = [drawable retain];
+  _hasPresentDuration = NO;
 }
 
 - (void)presentDrawable:(id<MTLDrawable>)drawable afterMinimumDuration:(double)duration {
-  [self finishMetal4SegmentForOldQueue];
-  [_oldBuffer presentDrawable:drawable afterMinimumDuration:duration];
+  [_pendingDrawable release];
+  _pendingDrawable = [drawable retain];
+  _presentDuration = duration;
+  _hasPresentDuration = YES;
 }
 
 - (void)dxmtWriteTimestampIntoHeap:(id<MTL4CounterHeap>)heap atIndex:(NSUInteger)index {
-  [self beginMetal4SegmentIfNeeded];
-  [_currentMetal4Buffer writeTimestampIntoHeap:heap atIndex:index];
+  [_metal4Buffer writeTimestampIntoHeap:heap atIndex:index];
 }
 @end
 
@@ -332,6 +443,197 @@ DXMTMetal4CommandBuffer_writeTimestampIntoHeap(obj_handle_t cmdbuf, obj_handle_t
   [(DXMTMetal4CommandBuffer *)cmdbuf dxmtWriteTimestampIntoHeap:(id<MTL4CounterHeap>)heap
                                                         atIndex:(NSUInteger)index];
 }
+
+struct dxmt_metal4_argument_binding {
+  id<MTLBuffer> buffer;
+  uint64_t offset;
+};
+
+struct dxmt_metal4_argument_state {
+  id<MTL4ArgumentTable> table;
+  DXMTMetal4CommandBuffer *owner;
+  struct dxmt_metal4_argument_binding buffers[31];
+  NSMutableArray *upload_buffers;
+};
+
+static void
+dxmt_metal4_argument_state_init(
+    struct dxmt_metal4_argument_state *state,
+    DXMTMetal4CommandBuffer *owner,
+    NSString *label) {
+  memset(state, 0, sizeof(*state));
+  state->owner = owner;
+  state->table = [owner newArgumentTableWithLabel:label];
+  state->upload_buffers = [[NSMutableArray alloc] init];
+}
+
+static void
+dxmt_metal4_argument_state_destroy(struct dxmt_metal4_argument_state *state) {
+  [state->upload_buffers release];
+  [state->table release];
+}
+
+static void
+dxmt_metal4_argument_set_buffer(
+    struct dxmt_metal4_argument_state *state,
+    id<MTLBuffer> buffer,
+    uint64_t offset,
+    uint8_t index) {
+  if (!state->table || index >= 31)
+    return;
+  state->buffers[index].buffer = buffer;
+  state->buffers[index].offset = offset;
+  [state->owner useResidencyAllocation:(id<MTLAllocation>)buffer];
+  [state->table setAddress:buffer ? [buffer gpuAddress] + offset : 0 atIndex:index];
+}
+
+static void
+dxmt_metal4_argument_set_buffer_offset(
+    struct dxmt_metal4_argument_state *state,
+    uint64_t offset,
+    uint8_t index) {
+  if (index >= 31)
+    return;
+  dxmt_metal4_argument_set_buffer(state, state->buffers[index].buffer, offset, index);
+}
+
+static void
+dxmt_metal4_argument_set_bytes(
+    struct dxmt_metal4_argument_state *state,
+    const void *bytes,
+    uint64_t length,
+    uint8_t index) {
+  id<MTLBuffer> upload = [state->owner newUploadBufferWithBytes:bytes length:(NSUInteger)length];
+  if (!upload)
+    return;
+  [state->upload_buffers addObject:upload];
+  dxmt_metal4_argument_set_buffer(state, upload, 0, index);
+  [upload release];
+}
+
+static void
+dxmt_metal4_argument_set_texture(struct dxmt_metal4_argument_state *state, id<MTLTexture> texture, uint8_t index) {
+  if (!state->table || index >= 128)
+    return;
+  [state->owner useResidencyAllocation:(id<MTLAllocation>)texture];
+  [state->table setTexture:texture ? [texture gpuResourceID] : (MTLResourceID){0} atIndex:index];
+}
+
+static MTLStages
+dxmt_metal4_render_stages(enum WMTRenderStages stages) {
+  MTLStages ret = 0;
+  if (stages & WMTRenderStageVertex)
+    ret |= MTLStageVertex;
+  if (stages & WMTRenderStageFragment)
+    ret |= MTLStageFragment;
+  if (stages & WMTRenderStageTile)
+    ret |= MTLStageTile;
+  if (stages & WMTRenderStageObject)
+    ret |= MTLStageObject;
+  if (stages & WMTRenderStageMesh)
+    ret |= MTLStageMesh;
+  return ret;
+}
+
+static NSUInteger
+dxmt_metal4_index_buffer_length(id<MTLBuffer> buffer, uint64_t offset) {
+  if (!buffer)
+    return 0;
+  NSUInteger length = [buffer length];
+  if (offset >= length)
+    return 0;
+  return length - (NSUInteger)offset;
+}
+
+static MTLGPUAddress
+dxmt_metal4_buffer_address(obj_handle_t buffer, uint64_t offset) {
+  id<MTLBuffer> metal_buffer = (id<MTLBuffer>)buffer;
+  return metal_buffer ? [metal_buffer gpuAddress] + offset : 0;
+}
+
+struct dxmt_metal4_render_argument_state {
+  struct dxmt_metal4_argument_state vertex;
+  struct dxmt_metal4_argument_state fragment;
+  struct dxmt_metal4_argument_state object;
+  struct dxmt_metal4_argument_state mesh;
+  struct dxmt_metal4_argument_state tile;
+};
+
+static void
+dxmt_metal4_render_argument_state_init(
+    struct dxmt_metal4_render_argument_state *state,
+    DXMTMetal4CommandBuffer *owner) {
+  dxmt_metal4_argument_state_init(&state->vertex, owner, @"DXMT4 Vertex Arguments");
+  dxmt_metal4_argument_state_init(&state->fragment, owner, @"DXMT4 Fragment Arguments");
+  dxmt_metal4_argument_state_init(&state->object, owner, @"DXMT4 Object Arguments");
+  dxmt_metal4_argument_state_init(&state->mesh, owner, @"DXMT4 Mesh Arguments");
+  dxmt_metal4_argument_state_init(&state->tile, owner, @"DXMT4 Tile Arguments");
+}
+
+static void
+dxmt_metal4_render_argument_state_destroy(struct dxmt_metal4_render_argument_state *state) {
+  dxmt_metal4_argument_state_destroy(&state->tile);
+  dxmt_metal4_argument_state_destroy(&state->mesh);
+  dxmt_metal4_argument_state_destroy(&state->object);
+  dxmt_metal4_argument_state_destroy(&state->fragment);
+  dxmt_metal4_argument_state_destroy(&state->vertex);
+}
+
+static void
+dxmt_metal4_render_set_argument_tables(
+    id<MTL4RenderCommandEncoder> encoder,
+    struct dxmt_metal4_render_argument_state *state) {
+  [encoder setArgumentTable:state->vertex.table atStages:MTLRenderStageVertex];
+  [encoder setArgumentTable:state->fragment.table atStages:MTLRenderStageFragment];
+  [encoder setArgumentTable:state->object.table atStages:MTLRenderStageObject];
+  [encoder setArgumentTable:state->mesh.table atStages:MTLRenderStageMesh];
+  [encoder setArgumentTable:state->tile.table atStages:MTLRenderStageTile];
+}
+
+@interface DXMTMetal4ComputeEncoderState : NSObject {
+@public
+  struct dxmt_metal4_argument_state arguments;
+  MTLSize threadgroupSize;
+}
+- (instancetype)initWithOwner:(DXMTMetal4CommandBuffer *)owner;
+@end
+
+@implementation DXMTMetal4ComputeEncoderState
+- (instancetype)initWithOwner:(DXMTMetal4CommandBuffer *)owner {
+  self = [super init];
+  if (self) {
+    dxmt_metal4_argument_state_init(&arguments, owner, @"DXMT4 Compute Arguments");
+    threadgroupSize = MTLSizeMake(0, 0, 0);
+  }
+  return self;
+}
+
+- (void)dealloc {
+  dxmt_metal4_argument_state_destroy(&arguments);
+  [super dealloc];
+}
+@end
+
+@interface DXMTMetal4RenderEncoderState : NSObject {
+@public
+  struct dxmt_metal4_render_argument_state arguments;
+}
+- (instancetype)initWithOwner:(DXMTMetal4CommandBuffer *)owner;
+@end
+
+@implementation DXMTMetal4RenderEncoderState
+- (instancetype)initWithOwner:(DXMTMetal4CommandBuffer *)owner {
+  self = [super init];
+  if (self)
+    dxmt_metal4_render_argument_state_init(&arguments, owner);
+  return self;
+}
+
+- (void)dealloc {
+  dxmt_metal4_render_argument_state_destroy(&arguments);
+  [super dealloc];
+}
+@end
 
 #if DXMT_APITRACE_METAL
 typedef NS_ENUM(uint32_t, DXMTApitraceEncoderKind) {
@@ -1899,8 +2201,8 @@ _NSAutoreleasePool_alloc_init(void *obj) {
 static NTSTATUS
 _MTLCommandQueue_commandBuffer(void *obj) {
   struct unixcall_generic_obj_obj_ret *params = obj;
-  params->ret = (obj_handle_t)[[DXMTMetal4CommandBuffer alloc]
-      initWithQueue:(DXMTMetal4CommandQueue *)params->handle];
+  params->ret = (obj_handle_t)[[[DXMTMetal4CommandBuffer alloc]
+      initWithQueue:(DXMTMetal4CommandQueue *)params->handle] autorelease];
   return STATUS_SUCCESS;
 }
 
@@ -2464,7 +2766,7 @@ static NTSTATUS
 _MTLCommandBuffer_blitCommandEncoder(void *obj) {
   struct unixcall_generic_obj_obj_ret *params = obj;
   params->ret = (obj_handle_t)[(DXMTMetal4CommandBuffer *)params->handle metal4ComputeEncoder];
-  dxmt_metal4_register_blit_encoder(params->ret, (DXMTMetal4CommandBuffer *)params->handle);
+  dxmt_metal4_register_encoder(params->ret, (DXMTMetal4CommandBuffer *)params->handle);
 #if DXMT_APITRACE_METAL
   if (dxmt_apitrace_runtime_enabled()) {
     pthread_mutex_lock(&dxmt_apitrace_lock);
@@ -2483,8 +2785,13 @@ _MTLCommandBuffer_blitCommandEncoder(void *obj) {
 static NTSTATUS
 _MTLCommandBuffer_computeCommandEncoder(void *obj) {
   struct unixcall_generic_obj_uint64_obj_ret *params = obj;
-  params->ret = (obj_handle_t)[(DXMTMetal4CommandBuffer *)params->handle
-      oldComputeCommandEncoderWithConcurrent:params->arg ? YES : NO];
+  (void)params->arg;
+  DXMTMetal4CommandBuffer *owner = (DXMTMetal4CommandBuffer *)params->handle;
+  params->ret = (obj_handle_t)[owner metal4ComputeEncoder];
+  dxmt_metal4_register_encoder(params->ret, owner);
+  DXMTMetal4ComputeEncoderState *state = [[DXMTMetal4ComputeEncoderState alloc] initWithOwner:owner];
+  dxmt_metal4_register_encoder_state(params->ret, state);
+  [state release];
 #if DXMT_APITRACE_METAL
   if (dxmt_apitrace_runtime_enabled()) {
     pthread_mutex_lock(&dxmt_apitrace_lock);
@@ -2504,7 +2811,7 @@ static NTSTATUS
 _MTLCommandBuffer_renderCommandEncoder(void *obj) {
   struct unixcall_generic_obj_uint64_obj_ret *params = obj;
   struct WMTRenderPassInfo *info = (struct WMTRenderPassInfo *)params->arg;
-  MTLRenderPassDescriptor *descriptor = [[MTLRenderPassDescriptor alloc] init];
+  MTL4RenderPassDescriptor *descriptor = [[MTL4RenderPassDescriptor alloc] init];
   for (unsigned i = 0; i < 8; i++) {
     descriptor.colorAttachments[i].clearColor = MTLClearColorMake(
         info->colors[i].clear_color.r, info->colors[i].clear_color.g, info->colors[i].clear_color.b,
@@ -2553,7 +2860,12 @@ _MTLCommandBuffer_renderCommandEncoder(void *obj) {
     descriptor.tileHeight = info->tile_height;
   }
 
-  params->ret = (obj_handle_t)[(DXMTMetal4CommandBuffer *)params->handle oldRenderCommandEncoderWithDescriptor:descriptor];
+  params->ret = (obj_handle_t)[(DXMTMetal4CommandBuffer *)params->handle metal4RenderCommandEncoderWithDescriptor:descriptor];
+  DXMTMetal4CommandBuffer *owner = (DXMTMetal4CommandBuffer *)params->handle;
+  dxmt_metal4_register_encoder(params->ret, owner);
+  DXMTMetal4RenderEncoderState *state = [[DXMTMetal4RenderEncoderState alloc] initWithOwner:owner];
+  dxmt_metal4_register_encoder_state(params->ret, state);
+  [state release];
 #if DXMT_APITRACE_METAL
   if (dxmt_apitrace_runtime_enabled()) {
     pthread_mutex_lock(&dxmt_apitrace_lock);
@@ -2575,7 +2887,7 @@ static NTSTATUS
 _MTLCommandEncoder_endEncoding(void *obj) {
   struct unixcall_generic_obj_noret *params = obj;
   [(id)params->handle endEncoding];
-  dxmt_metal4_unregister_blit_encoder(params->handle);
+  dxmt_metal4_unregister_encoder(params->handle);
 #if DXMT_APITRACE_METAL
   if (dxmt_apitrace_runtime_enabled()) {
     pthread_mutex_lock(&dxmt_apitrace_lock);
@@ -2873,7 +3185,7 @@ _MTLBlitCommandEncoder_encodeCommands(void *obj) {
   struct unixcall_generic_obj_cmd_noret *params = obj;
   const struct wmtcmd_base *next = params->cmd_head.ptr;
   id<MTL4ComputeCommandEncoder> encoder = (id<MTL4ComputeCommandEncoder>)params->encoder;
-  DXMTMetal4CommandBuffer *owner = dxmt_metal4_blit_encoder_owner(params->encoder);
+  DXMTMetal4CommandBuffer *owner = dxmt_metal4_encoder_owner(params->encoder);
 #if DXMT_APITRACE_METAL
   if (dxmt_apitrace_runtime_enabled()) {
     pthread_mutex_lock(&dxmt_apitrace_lock);
@@ -3003,8 +3315,14 @@ static NTSTATUS
 _MTLComputeCommandEncoder_encodeCommands(void *obj) {
   struct unixcall_generic_obj_cmd_noret *params = obj;
   const struct wmtcmd_base *next = params->cmd_head.ptr;
-  id<MTLComputeCommandEncoder> encoder = (id<MTLComputeCommandEncoder>)params->encoder;
-  MTLSize threadgroup_size = {0, 0, 0};
+  id<MTL4ComputeCommandEncoder> encoder = (id<MTL4ComputeCommandEncoder>)params->encoder;
+  DXMTMetal4CommandBuffer *owner = dxmt_metal4_encoder_owner(params->encoder);
+  DXMTMetal4ComputeEncoderState *state = dxmt_metal4_encoder_state(params->encoder);
+  if (!state) {
+    state = [[[DXMTMetal4ComputeEncoderState alloc] initWithOwner:owner] autorelease];
+    dxmt_metal4_register_encoder_state(params->encoder, state);
+  }
+  struct dxmt_metal4_argument_state *args = &state->arguments;
 #if DXMT_APITRACE_METAL
   if (dxmt_apitrace_runtime_enabled()) {
     pthread_mutex_lock(&dxmt_apitrace_lock);
@@ -3022,69 +3340,77 @@ _MTLComputeCommandEncoder_encodeCommands(void *obj) {
       break;
     case WMTComputeCommandDispatch: {
       struct wmtcmd_compute_dispatch *body = (struct wmtcmd_compute_dispatch *)next;
+      [encoder setArgumentTable:args->table];
       [encoder dispatchThreadgroups:MTLSizeMake(body->size.width, body->size.height, body->size.depth)
-              threadsPerThreadgroup:threadgroup_size];
+              threadsPerThreadgroup:state->threadgroupSize];
       break;
     }
     case WMTComputeCommandDispatchThreads: {
       struct wmtcmd_compute_dispatch *body = (struct wmtcmd_compute_dispatch *)next;
+      [encoder setArgumentTable:args->table];
       [encoder dispatchThreads:MTLSizeMake(body->size.width, body->size.height, body->size.depth)
-          threadsPerThreadgroup:threadgroup_size];
+          threadsPerThreadgroup:state->threadgroupSize];
       break;
     }
     case WMTComputeCommandDispatchIndirect: {
       struct wmtcmd_compute_dispatch_indirect *body = (struct wmtcmd_compute_dispatch_indirect *)next;
-      [encoder dispatchThreadgroupsWithIndirectBuffer:(id<MTLBuffer>)body->indirect_args_buffer
-                                 indirectBufferOffset:body->indirect_args_offset
-                                threadsPerThreadgroup:threadgroup_size];
+      [owner useResidencyAllocation:(id<MTLAllocation>)body->indirect_args_buffer];
+      [encoder setArgumentTable:args->table];
+      [encoder dispatchThreadgroupsWithIndirectBuffer:dxmt_metal4_buffer_address(body->indirect_args_buffer, body->indirect_args_offset)
+                                threadsPerThreadgroup:state->threadgroupSize];
       break;
     }
     case WMTComputeCommandSetPSO: {
       struct wmtcmd_compute_setpso *body = (struct wmtcmd_compute_setpso *)next;
       [encoder setComputePipelineState:(id<MTLComputePipelineState>)body->pso];
-      threadgroup_size.width = body->threadgroup_size.width;
-      threadgroup_size.height = body->threadgroup_size.height;
-      threadgroup_size.depth = body->threadgroup_size.depth;
+      state->threadgroupSize = MTLSizeMake(
+          body->threadgroup_size.width,
+          body->threadgroup_size.height,
+          body->threadgroup_size.depth);
       break;
     }
     case WMTComputeCommandSetBuffer: {
       struct wmtcmd_compute_setbuffer *body = (struct wmtcmd_compute_setbuffer *)next;
-      [encoder setBuffer:(id<MTLBuffer>)body->buffer offset:body->offset atIndex:body->index];
+      dxmt_metal4_argument_set_buffer(args, (id<MTLBuffer>)body->buffer, body->offset, body->index);
       break;
     }
     case WMTComputeCommandSetBufferOffset: {
       struct wmtcmd_compute_setbufferoffset *body = (struct wmtcmd_compute_setbufferoffset *)next;
-      [encoder setBufferOffset:body->offset atIndex:body->index];
+      dxmt_metal4_argument_set_buffer_offset(args, body->offset, body->index);
       break;
     }
     case WMTComputeCommandUseResource: {
       struct wmtcmd_compute_useresource *body = (struct wmtcmd_compute_useresource *)next;
-      [encoder useResource:(id<MTLResource>)body->resource usage:(MTLResourceUsage)body->usage];
+      (void)body->usage;
+      [owner useResidencyAllocation:(id<MTLAllocation>)body->resource];
       break;
     }
     case WMTComputeCommandSetBytes: {
       struct wmtcmd_compute_setbytes *body = (struct wmtcmd_compute_setbytes *)next;
-      [encoder setBytes:body->bytes.ptr length:body->length atIndex:body->index];
+      dxmt_metal4_argument_set_bytes(args, body->bytes.ptr, body->length, body->index);
       break;
     }
     case WMTComputeCommandSetTexture: {
       struct wmtcmd_compute_settexture *body = (struct wmtcmd_compute_settexture *)next;
-      [encoder setTexture:(id<MTLTexture>)body->texture atIndex:body->index];
+      dxmt_metal4_argument_set_texture(args, (id<MTLTexture>)body->texture, body->index);
       break;
     }
     case WMTComputeCommandUpdateFence: {
       struct wmtcmd_compute_fence_op *body = (struct wmtcmd_compute_fence_op *)next;
-      [encoder updateFence:(id<MTLFence>)body->fence];
+      [(id)encoder barrierAfterStages:MTLStageDispatch beforeQueueStages:MTLStageDispatch visibilityOptions:MTL4VisibilityOptionDevice];
+      [(id)encoder updateFence:(id<MTLFence>)body->fence afterEncoderStages:MTLStageDispatch];
       break;
     }
     case WMTComputeCommandWaitForFence: {
       struct wmtcmd_compute_fence_op *body = (struct wmtcmd_compute_fence_op *)next;
-      [encoder waitForFence:(id<MTLFence>)body->fence];
+      [(id)encoder waitForFence:(id<MTLFence>)body->fence beforeEncoderStages:MTLStageDispatch];
+      [(id)encoder barrierAfterQueueStages:MTLStageDispatch beforeStages:MTLStageDispatch visibilityOptions:MTL4VisibilityOptionDevice];
       break;
     }
     case WMTComputeCommandMemoryBarrier: {
       struct wmtcmd_compute_memory_barrier *body = (struct wmtcmd_compute_memory_barrier *)next;
-      [encoder memoryBarrierWithScope:(MTLBarrierScope)body->scope];
+      (void)body->scope;
+      [(id)encoder barrierAfterEncoderStages:MTLStageDispatch beforeEncoderStages:MTLStageDispatch visibilityOptions:MTL4VisibilityOptionDevice];
       break;
     }
     }
@@ -3098,7 +3424,14 @@ static NTSTATUS
 _MTLRenderCommandEncoder_encodeCommands(void *obj) {
   struct unixcall_generic_obj_cmd_noret *params = obj;
   const struct wmtcmd_base *next = params->cmd_head.ptr;
-  id<MTLRenderCommandEncoder> encoder = (id<MTLRenderCommandEncoder>)params->encoder;
+  id<MTL4RenderCommandEncoder> encoder = (id<MTL4RenderCommandEncoder>)params->encoder;
+  DXMTMetal4CommandBuffer *owner = dxmt_metal4_encoder_owner(params->encoder);
+  DXMTMetal4RenderEncoderState *state = dxmt_metal4_encoder_state(params->encoder);
+  if (!state) {
+    state = [[[DXMTMetal4RenderEncoderState alloc] initWithOwner:owner] autorelease];
+    dxmt_metal4_register_encoder_state(params->encoder, state);
+  }
+  struct dxmt_metal4_render_argument_state *args = &state->arguments;
 #if DXMT_APITRACE_METAL
   if (dxmt_apitrace_runtime_enabled()) {
     pthread_mutex_lock(&dxmt_apitrace_lock);
@@ -3118,59 +3451,59 @@ _MTLRenderCommandEncoder_encodeCommands(void *obj) {
       break;
     case WMTRenderCommandUseResource: {
       struct wmtcmd_render_useresource *body = (struct wmtcmd_render_useresource *)next;
-      [encoder useResource:(id<MTLResource>)body->resource
-                     usage:(MTLResourceUsage)body->usage
-                    stages:(MTLRenderStages)body->stages];
+      (void)body->usage;
+      (void)body->stages;
+      [owner useResidencyAllocation:(id<MTLAllocation>)body->resource];
       break;
     }
     case WMTRenderCommandSetVertexBuffer: {
       struct wmtcmd_render_setbuffer *body = (struct wmtcmd_render_setbuffer *)next;
-      [encoder setVertexBuffer:(id<MTLBuffer>)body->buffer offset:body->offset atIndex:body->index];
+      dxmt_metal4_argument_set_buffer(&args->vertex, (id<MTLBuffer>)body->buffer, body->offset, body->index);
       break;
     }
     case WMTRenderCommandSetVertexBufferOffset: {
       struct wmtcmd_render_setbufferoffset *body = (struct wmtcmd_render_setbufferoffset *)next;
-      [encoder setVertexBufferOffset:body->offset atIndex:body->index];
+      dxmt_metal4_argument_set_buffer_offset(&args->vertex, body->offset, body->index);
       break;
     }
     case WMTRenderCommandSetFragmentBuffer: {
       struct wmtcmd_render_setbuffer *body = (struct wmtcmd_render_setbuffer *)next;
-      [encoder setFragmentBuffer:(id<MTLBuffer>)body->buffer offset:body->offset atIndex:body->index];
+      dxmt_metal4_argument_set_buffer(&args->fragment, (id<MTLBuffer>)body->buffer, body->offset, body->index);
       break;
     }
     case WMTRenderCommandSetFragmentBufferOffset: {
       struct wmtcmd_render_setbufferoffset *body = (struct wmtcmd_render_setbufferoffset *)next;
-      [encoder setFragmentBufferOffset:body->offset atIndex:body->index];
+      dxmt_metal4_argument_set_buffer_offset(&args->fragment, body->offset, body->index);
       break;
     }
     case WMTRenderCommandSetMeshBuffer: {
       struct wmtcmd_render_setbuffer *body = (struct wmtcmd_render_setbuffer *)next;
-      [encoder setMeshBuffer:(id<MTLBuffer>)body->buffer offset:body->offset atIndex:body->index];
+      dxmt_metal4_argument_set_buffer(&args->mesh, (id<MTLBuffer>)body->buffer, body->offset, body->index);
       break;
     }
     case WMTRenderCommandSetMeshBufferOffset: {
       struct wmtcmd_render_setbufferoffset *body = (struct wmtcmd_render_setbufferoffset *)next;
-      [encoder setMeshBufferOffset:body->offset atIndex:body->index];
+      dxmt_metal4_argument_set_buffer_offset(&args->mesh, body->offset, body->index);
       break;
     }
     case WMTRenderCommandSetObjectBuffer: {
       struct wmtcmd_render_setbuffer *body = (struct wmtcmd_render_setbuffer *)next;
-      [encoder setObjectBuffer:(id<MTLBuffer>)body->buffer offset:body->offset atIndex:body->index];
+      dxmt_metal4_argument_set_buffer(&args->object, (id<MTLBuffer>)body->buffer, body->offset, body->index);
       break;
     }
     case WMTRenderCommandSetObjectBufferOffset: {
       struct wmtcmd_render_setbufferoffset *body = (struct wmtcmd_render_setbufferoffset *)next;
-      [encoder setObjectBufferOffset:body->offset atIndex:body->index];
+      dxmt_metal4_argument_set_buffer_offset(&args->object, body->offset, body->index);
       break;
     }
     case WMTRenderCommandSetFragmentBytes: {
       struct wmtcmd_render_setbytes *body = (struct wmtcmd_render_setbytes *)next;
-      [encoder setFragmentBytes:body->bytes.ptr length:body->length atIndex:body->index];
+      dxmt_metal4_argument_set_bytes(&args->fragment, body->bytes.ptr, body->length, body->index);
       break;
     }
     case WMTRenderCommandSetFragmentTexture: {
       struct wmtcmd_render_settexture *body = (struct wmtcmd_render_settexture *)next;
-      [encoder setFragmentTexture:(id<MTLTexture>)body->texture atIndex:body->index];
+      dxmt_metal4_argument_set_texture(&args->fragment, (id<MTLTexture>)body->texture, body->index);
       break;
     }
     case WMTRenderCommandSetRasterizerState: {
@@ -3216,6 +3549,7 @@ _MTLRenderCommandEncoder_encodeCommands(void *obj) {
     }
     case WMTRenderCommandDraw: {
       struct wmtcmd_render_draw *body = (struct wmtcmd_render_draw *)next;
+      dxmt_metal4_render_set_argument_tables(encoder, args);
       [encoder drawPrimitives:(MTLPrimitiveType)body->primitive_type
                   vertexStart:body->vertex_start
                   vertexCount:body->vertex_count
@@ -3225,11 +3559,14 @@ _MTLRenderCommandEncoder_encodeCommands(void *obj) {
     }
     case WMTRenderCommandDrawIndexed: {
       struct wmtcmd_render_draw_indexed *body = (struct wmtcmd_render_draw_indexed *)next;
+      id<MTLBuffer> index_buffer = (id<MTLBuffer>)body->index_buffer;
+      [owner useResidencyAllocation:(id<MTLAllocation>)index_buffer];
+      dxmt_metal4_render_set_argument_tables(encoder, args);
       [encoder drawIndexedPrimitives:(MTLPrimitiveType)body->primitive_type
                           indexCount:body->index_count
                            indexType:(MTLIndexType)body->index_type
-                         indexBuffer:(id<MTLBuffer>)body->index_buffer
-                   indexBufferOffset:body->index_buffer_offset
+                         indexBuffer:dxmt_metal4_buffer_address(body->index_buffer, body->index_buffer_offset)
+                   indexBufferLength:dxmt_metal4_index_buffer_length(index_buffer, body->index_buffer_offset)
                        instanceCount:body->instance_count
                           baseVertex:body->base_vertex
                         baseInstance:body->base_instance];
@@ -3237,23 +3574,28 @@ _MTLRenderCommandEncoder_encodeCommands(void *obj) {
     }
     case WMTRenderCommandDrawIndirect: {
       struct wmtcmd_render_draw_indirect *body = (struct wmtcmd_render_draw_indirect *)next;
+      [owner useResidencyAllocation:(id<MTLAllocation>)body->indirect_args_buffer];
+      dxmt_metal4_render_set_argument_tables(encoder, args);
       [encoder drawPrimitives:(MTLPrimitiveType)body->primitive_type
-                indirectBuffer:(id<MTLBuffer>)body->indirect_args_buffer
-          indirectBufferOffset:body->indirect_args_offset];
+                indirectBuffer:dxmt_metal4_buffer_address(body->indirect_args_buffer, body->indirect_args_offset)];
       break;
     }
     case WMTRenderCommandDrawIndexedIndirect: {
       struct wmtcmd_render_draw_indexed_indirect *body = (struct wmtcmd_render_draw_indexed_indirect *)next;
+      id<MTLBuffer> index_buffer = (id<MTLBuffer>)body->index_buffer;
+      [owner useResidencyAllocation:(id<MTLAllocation>)index_buffer];
+      [owner useResidencyAllocation:(id<MTLAllocation>)body->indirect_args_buffer];
+      dxmt_metal4_render_set_argument_tables(encoder, args);
       [encoder drawIndexedPrimitives:(MTLPrimitiveType)body->primitive_type
                            indexType:(MTLIndexType)body->index_type
-                         indexBuffer:(id<MTLBuffer>)body->index_buffer
-                   indexBufferOffset:body->index_buffer_offset
-                      indirectBuffer:(id<MTLBuffer>)body->indirect_args_buffer
-                indirectBufferOffset:body->indirect_args_offset];
+                         indexBuffer:dxmt_metal4_buffer_address(body->index_buffer, body->index_buffer_offset)
+                   indexBufferLength:dxmt_metal4_index_buffer_length(index_buffer, body->index_buffer_offset)
+                      indirectBuffer:dxmt_metal4_buffer_address(body->indirect_args_buffer, body->indirect_args_offset)];
       break;
     }
     case WMTRenderCommandDrawMeshThreadgroups: {
       struct wmtcmd_render_draw_meshthreadgroups *body = (struct wmtcmd_render_draw_meshthreadgroups *)next;
+      dxmt_metal4_render_set_argument_tables(encoder, args);
       [encoder drawMeshThreadgroups:MTLSizeMake(
                                         body->threadgroup_per_grid.width, body->threadgroup_per_grid.height,
                                         body->threadgroup_per_grid.depth
@@ -3271,8 +3613,9 @@ _MTLRenderCommandEncoder_encodeCommands(void *obj) {
     case WMTRenderCommandDrawMeshThreadgroupsIndirect: {
       struct wmtcmd_render_draw_meshthreadgroups_indirect *body =
           (struct wmtcmd_render_draw_meshthreadgroups_indirect *)next;
-      [encoder drawMeshThreadgroupsWithIndirectBuffer:(id<MTLBuffer>)body->indirect_args_buffer
-                                 indirectBufferOffset:body->indirect_args_offset
+      [owner useResidencyAllocation:(id<MTLAllocation>)body->indirect_args_buffer];
+      dxmt_metal4_render_set_argument_tables(encoder, args);
+      [encoder drawMeshThreadgroupsWithIndirectBuffer:dxmt_metal4_buffer_address(body->indirect_args_buffer, body->indirect_args_offset)
                           threadsPerObjectThreadgroup:MTLSizeMake(
                                                           body->object_threadgroup_size.width,
                                                           body->object_threadgroup_size.height,
@@ -3287,14 +3630,16 @@ _MTLRenderCommandEncoder_encodeCommands(void *obj) {
     }
     case WMTRenderCommandMemoryBarrier: {
       struct wmtcmd_render_memory_barrier *body = (struct wmtcmd_render_memory_barrier *)next;
-      [encoder memoryBarrierWithScope:(MTLBarrierScope)body->scope
-                          afterStages:(MTLRenderStages)body->stages_after
-                         beforeStages:(MTLRenderStages)body->stages_before];
+      MTLStages before = dxmt_metal4_render_stages(body->stages_before);
+      MTLStages after = dxmt_metal4_render_stages(body->stages_after);
+      MTL4VisibilityOptions visibility = body->scope ? MTL4VisibilityOptionDevice : MTL4VisibilityOptionNone;
+      [(id)encoder barrierAfterEncoderStages:after beforeEncoderStages:before visibilityOptions:visibility];
       break;
     }
     case WMTRenderCommandDXMTGeometryDraw: {
       struct wmtcmd_render_dxmt_geometry_draw *body = (struct wmtcmd_render_dxmt_geometry_draw *)next;
-      [encoder setObjectBufferOffset:body->draw_arguments_offset atIndex:21];
+      dxmt_metal4_argument_set_buffer_offset(&args->object, body->draw_arguments_offset, 21);
+      dxmt_metal4_render_set_argument_tables(encoder, args);
       [encoder drawMeshThreadgroups:MTLSizeMake(body->warp_count, body->instance_count, 1)
           threadsPerObjectThreadgroup:MTLSizeMake(body->vertex_per_warp, 1, 1)
             threadsPerMeshThreadgroup:MTLSizeMake(1, 1, 1)];
@@ -3302,8 +3647,9 @@ _MTLRenderCommandEncoder_encodeCommands(void *obj) {
     }
     case WMTRenderCommandDXMTGeometryDrawIndexed: {
       struct wmtcmd_render_dxmt_geometry_draw_indexed *body = (struct wmtcmd_render_dxmt_geometry_draw_indexed *)next;
-      [encoder setObjectBuffer:(id<MTLBuffer>)body->index_buffer offset:body->index_buffer_offset atIndex:20];
-      [encoder setObjectBufferOffset:body->draw_arguments_offset atIndex:21];
+      dxmt_metal4_argument_set_buffer(&args->object, (id<MTLBuffer>)body->index_buffer, body->index_buffer_offset, 20);
+      dxmt_metal4_argument_set_buffer_offset(&args->object, body->draw_arguments_offset, 21);
+      dxmt_metal4_render_set_argument_tables(encoder, args);
       [encoder drawMeshThreadgroups:MTLSizeMake(body->warp_count, body->instance_count, 1)
           threadsPerObjectThreadgroup:MTLSizeMake(body->vertex_per_warp, 1, 1)
             threadsPerMeshThreadgroup:MTLSizeMake(1, 1, 1)];
@@ -3311,29 +3657,32 @@ _MTLRenderCommandEncoder_encodeCommands(void *obj) {
     }
     case WMTRenderCommandDXMTGeometryDrawIndirect: {
       struct wmtcmd_render_dxmt_geometry_draw_indirect *body = (struct wmtcmd_render_dxmt_geometry_draw_indirect *)next;
-      [encoder setObjectBuffer:(id<MTLBuffer>)body->indirect_args_buffer offset:body->indirect_args_offset atIndex:21];
-      [encoder drawMeshThreadgroupsWithIndirectBuffer:(id<MTLBuffer>)body->dispatch_args_buffer
-                                 indirectBufferOffset:body->dispatch_args_offset
+      dxmt_metal4_argument_set_buffer(&args->object, (id<MTLBuffer>)body->indirect_args_buffer, body->indirect_args_offset, 21);
+      [owner useResidencyAllocation:(id<MTLAllocation>)body->dispatch_args_buffer];
+      dxmt_metal4_render_set_argument_tables(encoder, args);
+      [encoder drawMeshThreadgroupsWithIndirectBuffer:dxmt_metal4_buffer_address(body->dispatch_args_buffer, body->dispatch_args_offset)
                           threadsPerObjectThreadgroup:MTLSizeMake(body->vertex_per_warp, 1, 1)
                             threadsPerMeshThreadgroup:MTLSizeMake(1, 1, 1)];
-      [encoder setObjectBuffer:(id<MTLBuffer>)body->imm_draw_arguments offset:0 atIndex:21];
+      dxmt_metal4_argument_set_buffer(&args->object, (id<MTLBuffer>)body->imm_draw_arguments, 0, 21);
       break;
     }
     case WMTRenderCommandDXMTGeometryDrawIndexedIndirect: {
       struct wmtcmd_render_dxmt_geometry_draw_indexed_indirect *body =
           (struct wmtcmd_render_dxmt_geometry_draw_indexed_indirect *)next;
-      [encoder setObjectBuffer:(id<MTLBuffer>)body->index_buffer offset:body->index_buffer_offset atIndex:20];
-      [encoder setObjectBuffer:(id<MTLBuffer>)body->indirect_args_buffer offset:body->indirect_args_offset atIndex:21];
-      [encoder drawMeshThreadgroupsWithIndirectBuffer:(id<MTLBuffer>)body->dispatch_args_buffer
-                                 indirectBufferOffset:body->dispatch_args_offset
+      dxmt_metal4_argument_set_buffer(&args->object, (id<MTLBuffer>)body->index_buffer, body->index_buffer_offset, 20);
+      dxmt_metal4_argument_set_buffer(&args->object, (id<MTLBuffer>)body->indirect_args_buffer, body->indirect_args_offset, 21);
+      [owner useResidencyAllocation:(id<MTLAllocation>)body->dispatch_args_buffer];
+      dxmt_metal4_render_set_argument_tables(encoder, args);
+      [encoder drawMeshThreadgroupsWithIndirectBuffer:dxmt_metal4_buffer_address(body->dispatch_args_buffer, body->dispatch_args_offset)
                           threadsPerObjectThreadgroup:MTLSizeMake(body->vertex_per_warp, 1, 1)
                             threadsPerMeshThreadgroup:MTLSizeMake(1, 1, 1)];
-      [encoder setObjectBuffer:(id<MTLBuffer>)body->imm_draw_arguments offset:0 atIndex:21];
+      dxmt_metal4_argument_set_buffer(&args->object, (id<MTLBuffer>)body->imm_draw_arguments, 0, 21);
       break;
     }
     case WMTRenderCommandDXMTTessellationMeshDraw: {
       struct wmtcmd_render_dxmt_tessellation_mesh_draw *body = (struct wmtcmd_render_dxmt_tessellation_mesh_draw *)next;
-      [encoder setObjectBufferOffset:body->draw_arguments_offset atIndex:21];
+      dxmt_metal4_argument_set_buffer_offset(&args->object, body->draw_arguments_offset, 21);
+      dxmt_metal4_render_set_argument_tables(encoder, args);
       [encoder drawMeshThreadgroups:MTLSizeMake(body->patch_per_mesh_instance, body->instance_count, 1)
           threadsPerObjectThreadgroup:MTLSizeMake(body->threads_per_patch, body->patch_per_group, 1)
             threadsPerMeshThreadgroup:MTLSizeMake(32, 1, 1)];
@@ -3341,8 +3690,9 @@ _MTLRenderCommandEncoder_encodeCommands(void *obj) {
     }
     case WMTRenderCommandDXMTTessellationMeshDrawIndexed: {
       struct wmtcmd_render_dxmt_tessellation_mesh_draw_indexed *body = (struct wmtcmd_render_dxmt_tessellation_mesh_draw_indexed *)next;
-      [encoder setObjectBuffer:(id<MTLBuffer>)body->index_buffer offset:body->index_buffer_offset atIndex:20];
-      [encoder setObjectBufferOffset:body->draw_arguments_offset atIndex:21];
+      dxmt_metal4_argument_set_buffer(&args->object, (id<MTLBuffer>)body->index_buffer, body->index_buffer_offset, 20);
+      dxmt_metal4_argument_set_buffer_offset(&args->object, body->draw_arguments_offset, 21);
+      dxmt_metal4_render_set_argument_tables(encoder, args);
       [encoder drawMeshThreadgroups:MTLSizeMake(body->patch_per_mesh_instance, body->instance_count, 1)
           threadsPerObjectThreadgroup:MTLSizeMake(body->threads_per_patch, body->patch_per_group, 1)
             threadsPerMeshThreadgroup:MTLSizeMake(32, 1, 1)];
@@ -3351,34 +3701,40 @@ _MTLRenderCommandEncoder_encodeCommands(void *obj) {
 
     case WMTRenderCommandDXMTTessellationMeshDrawIndirect: {
       struct wmtcmd_render_dxmt_tessellation_mesh_draw_indirect *body = (struct wmtcmd_render_dxmt_tessellation_mesh_draw_indirect *)next;
-      [encoder setObjectBuffer:(id<MTLBuffer>)body->indirect_args_buffer offset:body->indirect_args_offset atIndex:21];
-      [encoder drawMeshThreadgroupsWithIndirectBuffer:(id<MTLBuffer>)body->dispatch_args_buffer
-                                 indirectBufferOffset:body->dispatch_args_offset
+      dxmt_metal4_argument_set_buffer(&args->object, (id<MTLBuffer>)body->indirect_args_buffer, body->indirect_args_offset, 21);
+      [owner useResidencyAllocation:(id<MTLAllocation>)body->dispatch_args_buffer];
+      dxmt_metal4_render_set_argument_tables(encoder, args);
+      [encoder drawMeshThreadgroupsWithIndirectBuffer:dxmt_metal4_buffer_address(body->dispatch_args_buffer, body->dispatch_args_offset)
                           threadsPerObjectThreadgroup:MTLSizeMake(body->threads_per_patch, body->patch_per_group, 1)
                             threadsPerMeshThreadgroup:MTLSizeMake(32, 1, 1)];
-      [encoder setObjectBuffer:(id<MTLBuffer>)body->imm_draw_arguments offset:0 atIndex:21];
+      dxmt_metal4_argument_set_buffer(&args->object, (id<MTLBuffer>)body->imm_draw_arguments, 0, 21);
       break;
     }
     case WMTRenderCommandDXMTTessellationMeshDrawIndexedIndirect: {
       struct wmtcmd_render_dxmt_tessellation_mesh_draw_indexed_indirect *body =
           (struct wmtcmd_render_dxmt_tessellation_mesh_draw_indexed_indirect *)next;
-      [encoder setObjectBuffer:(id<MTLBuffer>)body->index_buffer offset:body->index_buffer_offset atIndex:20];
-      [encoder setObjectBuffer:(id<MTLBuffer>)body->indirect_args_buffer offset:body->indirect_args_offset atIndex:21];
-      [encoder drawMeshThreadgroupsWithIndirectBuffer:(id<MTLBuffer>)body->dispatch_args_buffer
-                                 indirectBufferOffset:body->dispatch_args_offset
+      dxmt_metal4_argument_set_buffer(&args->object, (id<MTLBuffer>)body->index_buffer, body->index_buffer_offset, 20);
+      dxmt_metal4_argument_set_buffer(&args->object, (id<MTLBuffer>)body->indirect_args_buffer, body->indirect_args_offset, 21);
+      [owner useResidencyAllocation:(id<MTLAllocation>)body->dispatch_args_buffer];
+      dxmt_metal4_render_set_argument_tables(encoder, args);
+      [encoder drawMeshThreadgroupsWithIndirectBuffer:dxmt_metal4_buffer_address(body->dispatch_args_buffer, body->dispatch_args_offset)
                           threadsPerObjectThreadgroup:MTLSizeMake(body->threads_per_patch, body->patch_per_group, 1)
                             threadsPerMeshThreadgroup:MTLSizeMake(32, 1, 1)];
-      [encoder setObjectBuffer:(id<MTLBuffer>)body->imm_draw_arguments offset:0 atIndex:21];
+      dxmt_metal4_argument_set_buffer(&args->object, (id<MTLBuffer>)body->imm_draw_arguments, 0, 21);
       break;
     }
     case WMTRenderCommandUpdateFence: {
       struct wmtcmd_render_fence_op *body = (struct wmtcmd_render_fence_op *)next;
-      [encoder updateFence:(id<MTLFence>)body->fence afterStages:(MTLRenderStages)body->stages];
+      MTLStages stages = dxmt_metal4_render_stages(body->stages);
+      [(id)encoder barrierAfterStages:stages beforeQueueStages:stages visibilityOptions:MTL4VisibilityOptionDevice];
+      [(id)encoder updateFence:(id<MTLFence>)body->fence afterEncoderStages:stages];
       break;
     }
     case WMTRenderCommandWaitForFence: {
       struct wmtcmd_render_fence_op *body = (struct wmtcmd_render_fence_op *)next;
-      [encoder waitForFence:(id<MTLFence>)body->fence beforeStages:(MTLRenderStages)body->stages];
+      MTLStages stages = dxmt_metal4_render_stages(body->stages);
+      [(id)encoder waitForFence:(id<MTLFence>)body->fence beforeEncoderStages:stages];
+      [(id)encoder barrierAfterQueueStages:stages beforeStages:stages visibilityOptions:MTL4VisibilityOptionDevice];
       break;
     }
     case WMTRenderCommandSetViewport: {
@@ -3650,6 +4006,13 @@ static const int SIGNALS[] = {
 static NTSTATUS
 _MTLDevice_newTemporalScaler(void *obj) {
   struct unixcall_mtldevice_newfxtemporalscaler *params = obj;
+  id<MTLDevice> device = (id<MTLDevice>)params->device;
+  id<MTL4Compiler> compiler = dxmt_metal4_compiler_for_device(device);
+  if (!compiler) {
+    fprintf(stderr, "err:   DXMT Metal4 scaler unavailable: missing MTL4Compiler\n");
+    params->ret = 0;
+    return STATUS_SUCCESS;
+  }
   MTLFXTemporalScalerDescriptor *desc = [[MTLFXTemporalScalerDescriptor alloc] init];
   const struct WMTFXTemporalScalerInfo *info = params->info.ptr;
   desc.colorTextureFormat = to_metal_pixel_format(info->color_format);
@@ -3679,7 +4042,9 @@ _MTLDevice_newTemporalScaler(void *obj) {
       sigaction(SIGNALS[i], &new_action, &old_action[i]);
   }
 
-  params->ret = (obj_handle_t)[desc newTemporalScalerWithDevice:(id<MTLDevice>)params->device];
+  params->ret = (obj_handle_t)[desc newTemporalScalerWithDevice:device compiler:compiler];
+  if (!params->ret)
+    fprintf(stderr, "err:   DXMT Metal4 scaler unavailable: temporal scaler creation failed\n");
 
   if (@available(macOS 16, *)) {} else {
     for (unsigned int i = 0; i < sizeof(SIGNALS) / sizeof(int); i++)
@@ -3693,6 +4058,13 @@ _MTLDevice_newTemporalScaler(void *obj) {
 static NTSTATUS
 _MTLDevice_newSpatialScaler(void *obj) {
   struct unixcall_mtldevice_newfxspatialscaler *params = obj;
+  id<MTLDevice> device = (id<MTLDevice>)params->device;
+  id<MTL4Compiler> compiler = dxmt_metal4_compiler_for_device(device);
+  if (!compiler) {
+    fprintf(stderr, "err:   DXMT Metal4 scaler unavailable: missing MTL4Compiler\n");
+    params->ret = 0;
+    return STATUS_SUCCESS;
+  }
   MTLFXSpatialScalerDescriptor *desc = [[MTLFXSpatialScalerDescriptor alloc] init];
   const struct WMTFXSpatialScalerInfo *info = params->info.ptr;
   desc.colorTextureFormat = to_metal_pixel_format(info->color_format);
@@ -3701,7 +4073,9 @@ _MTLDevice_newSpatialScaler(void *obj) {
   desc.inputHeight = info->input_height;
   desc.outputWidth = info->output_width;
   desc.outputHeight = info->output_height;
-  params->ret = (obj_handle_t)[desc newSpatialScalerWithDevice:(id<MTLDevice>)params->device];
+  params->ret = (obj_handle_t)[desc newSpatialScalerWithDevice:device compiler:compiler];
+  if (!params->ret)
+    fprintf(stderr, "err:   DXMT Metal4 scaler unavailable: spatial scaler creation failed\n");
   [desc release];
   return STATUS_SUCCESS;
 }
@@ -3710,9 +4084,7 @@ static NTSTATUS
 _MTLCommandBuffer_encodeTemporalScale(void *obj) {
   struct unixcall_mtlcommandbuffer_temporal_scale *params = obj;
   DXMTMetal4CommandBuffer *wrapper = (DXMTMetal4CommandBuffer *)params->cmdbuf;
-  [wrapper finishMetal4SegmentForOldQueue];
-  id<MTLCommandBuffer> cmdbuf = wrapper.oldBuffer;
-  id<MTLFXTemporalScaler> scaler = (id<MTLFXTemporalScaler>)params->scaler;
+  id<MTL4FXTemporalScaler> scaler = (id<MTL4FXTemporalScaler>)params->scaler;
   scaler.colorTexture = (id<MTLTexture>)params->color;
   scaler.outputTexture = (id<MTLTexture>)params->output;
   scaler.depthTexture = (id<MTLTexture>)params->depth;
@@ -3729,7 +4101,12 @@ _MTLCommandBuffer_encodeTemporalScale(void *obj) {
   scaler.jitterOffsetX = props->jitter_offset_x;
   scaler.jitterOffsetY = props->jitter_offset_y;
   scaler.preExposure = props->pre_exposure;
-  [scaler encodeToCommandBuffer:cmdbuf];
+  [wrapper useResidencyAllocation:(id<MTLAllocation>)params->color];
+  [wrapper useResidencyAllocation:(id<MTLAllocation>)params->output];
+  [wrapper useResidencyAllocation:(id<MTLAllocation>)params->depth];
+  [wrapper useResidencyAllocation:(id<MTLAllocation>)params->motion];
+  [wrapper useResidencyAllocation:(id<MTLAllocation>)params->exposure];
+  [scaler encodeToCommandBuffer:[wrapper commandBuffer]];
   return STATUS_SUCCESS;
 }
 
@@ -3737,13 +4114,13 @@ static NTSTATUS
 _MTLCommandBuffer_encodeSpatialScale(void *obj) {
   struct unixcall_mtlcommandbuffer_spatial_scale *params = obj;
   DXMTMetal4CommandBuffer *wrapper = (DXMTMetal4CommandBuffer *)params->cmdbuf;
-  [wrapper finishMetal4SegmentForOldQueue];
-  id<MTLCommandBuffer> cmdbuf = wrapper.oldBuffer;
-  id<MTLFXSpatialScaler> scaler = (id<MTLFXSpatialScaler>)params->scaler;
+  id<MTL4FXSpatialScaler> scaler = (id<MTL4FXSpatialScaler>)params->scaler;
   scaler.colorTexture = (id<MTLTexture>)params->color;
   scaler.outputTexture = (id<MTLTexture>)params->output;
   scaler.fence = (id<MTLFence>)params->fence;
-  [scaler encodeToCommandBuffer:cmdbuf];
+  [wrapper useResidencyAllocation:(id<MTLAllocation>)params->color];
+  [wrapper useResidencyAllocation:(id<MTLAllocation>)params->output];
+  [scaler encodeToCommandBuffer:[wrapper commandBuffer]];
   return STATUS_SUCCESS;
 }
 
@@ -4243,7 +4620,7 @@ static NTSTATUS
 thunk_DXILInitialize(void *args) {
   struct sm50_initialize_params *params = args;
 
-  params->ret = DXILInitialize(params->bytecode, params->bytecode_size,
+  params->ret = DXMT12DXILInitialize(params->bytecode, params->bytecode_size,
                                params->shader, params->reflection,
                                params->error);
 
@@ -4254,7 +4631,7 @@ static NTSTATUS
 thunk_DXILDestroy(void *args) {
   struct sm50_destroy_params *params = args;
 
-  DXILDestroy(params->shader);
+  DXMT12DXILDestroy(params->shader);
 
   return STATUS_SUCCESS;
 }
@@ -4267,7 +4644,7 @@ thunk_DXILCompile(void *args) {
 
   sm50_bitcode_t native_bitcode = NULL;
   sm50_error_t native_error = NULL;
-  params->ret = DXILCompile(params->shader, native_args, params->func_name,
+  params->ret = DXMT12DXILCompile(params->shader, native_args, params->func_name,
                             &native_bitcode, &native_error);
   dxmt_airconv_store_compile_outputs(params->bitcode, native_bitcode,
                                      params->error, native_error);
@@ -4280,7 +4657,7 @@ thunk_DXILCompile(void *args) {
 static NTSTATUS
 thunk_DXILGetArgumentsInfo(void *args) {
   struct sm50_get_arguments_info_params *params = args;
-  DXILGetArgumentsInfo((dxil_shader_t)params->shader, params->constant_buffers, params->arguments);
+  DXMT12DXILGetArgumentsInfo((dxmt12_airconv_shader_t)params->shader, params->constant_buffers, params->arguments);
   return STATUS_SUCCESS;
 }
 
@@ -4604,7 +4981,7 @@ static NTSTATUS
 thunk32_DXILInitialize(void *args) {
   struct sm50_initialize_params32 *params = args;
 
-  params->ret = DXILInitialize(
+  params->ret = DXMT12DXILInitialize(
       UInt32ToPtr(params->bytecode), params->bytecode_size, UInt32ToPtr(params->shader),
       UInt32ToPtr(params->reflection), UInt32ToPtr(params->error)
   );
@@ -4619,7 +4996,7 @@ thunk32_DXILCompile(void *args) {
   struct SM50_SHADER_COMPILATION_ARGUMENT_DATA32 *args32 = UInt32ToPtr(params->args);
   sm50_compilation_argument32_convert(&first_arg, args32);
 
-  params->ret = DXILCompile(
+  params->ret = DXMT12DXILCompile(
       params->shader, &first_arg, UInt32ToPtr(params->func_name), UInt32ToPtr(params->bitcode),
       UInt32ToPtr(params->error)
   );
@@ -4632,8 +5009,8 @@ thunk32_DXILCompile(void *args) {
 static NTSTATUS
 thunk32_DXILGetArgumentsInfo(void *args) {
   struct sm50_get_arguments_info_params32 *params = args;
-  DXILGetArgumentsInfo(
-      (dxil_shader_t)params->shader, UInt32ToPtr(params->constant_buffers),
+  DXMT12DXILGetArgumentsInfo(
+      (dxmt12_airconv_shader_t)params->shader, UInt32ToPtr(params->constant_buffers),
       UInt32ToPtr(params->arguments)
   );
   return STATUS_SUCCESS;
@@ -5338,11 +5715,8 @@ _MTLCounterSampleBuffer_resolveCounterRange(void *obj) {
 static NTSTATUS
 _MTLCommandBuffer_blitCommandEncoderWithSampleBuffers(void *obj) {
   struct unixcall_mtlcommandbuffer_blitcommandencoderwithsamplebuffers *params = obj;
-  DXMTMetal4CommandBuffer *cmdbuf = (DXMTMetal4CommandBuffer *)params->cmdbuf;
-  struct WMTSampleBufferAttachmentInfo *attachments = params->attachments.ptr;
-
-  params->ret = (obj_handle_t)[cmdbuf oldBlitCommandEncoderWithSampleBufferAttachments:attachments
-                                                                                  count:params->num_attachments];
+  fprintf(stderr, "err:   DXMT Metal4 timestamp sample-buffer blit path is unavailable\n");
+  params->ret = 0;
   return STATUS_SUCCESS;
 }
 
@@ -5538,8 +5912,8 @@ _WMTApitracePresentDrawable(void *obj) {
     return STATUS_SUCCESS;
   pthread_mutex_lock(&dxmt_apitrace_lock);
   if (dxmt_apitrace_ensure_session_locked()) {
-    id<MTLDrawable> drawable = (id<MTLDrawable>)params->drawable;
-    id<MTLTexture> texture = [drawable respondsToSelector:@selector(texture)] ? [(id<MTLDrawable>)drawable texture] : nil;
+    id<MTLDrawableWithTexture> drawable = (id<MTLDrawableWithTexture>)params->drawable;
+    id<MTLTexture> texture = [drawable respondsToSelector:@selector(texture)] ? [drawable texture] : nil;
     uint32_t width = texture ? (uint32_t)texture.width : 0;
     uint32_t height = texture ? (uint32_t)texture.height : 0;
     apitrace_metal_present_drawable(

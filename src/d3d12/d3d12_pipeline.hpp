@@ -3,7 +3,7 @@
 #include "d3d12_root_signature.hpp"
 #include "Metal.hpp"
 #include "DXILParser/DXILParser.hpp"
-#include "airconv_public.h"
+#include "airconv_dx12_metal4.h"
 #include <d3d12.h>
 #include <array>
 #include <cstdint>
@@ -39,20 +39,20 @@ struct PipelineDxilShader {
   PipelineShaderBytecodeKind kind = PipelineShaderBytecodeKind::Unknown;
   std::vector<uint8_t> bytecode;
   dxil::Parser parser;
-  dxil_shader_t shader = nullptr;
-  MTL_SHADER_REFLECTION reflection = {};
-  std::vector<MTL_SM50_SHADER_ARGUMENT> argument_info;
+  dxmt12_airconv_shader_t shader = nullptr;
+  DXMT12_MTL4_SHADER_REFLECTION reflection = {};
+  std::vector<DXMT12_MTL4_SHADER_ARGUMENT> argument_info;
 
   const dxil::DxilTranslationInfo *translation() const {
     const auto &info = parser.dxilTranslation();
     return info ? &*info : nullptr;
   }
 
-  const MTL_SM50_SHADER_ARGUMENT *constantBufferInfo() const {
+  const DXMT12_MTL4_SHADER_ARGUMENT *constantBufferInfo() const {
     return argument_info.empty() ? nullptr : argument_info.data();
   }
 
-  const MTL_SM50_SHADER_ARGUMENT *resourceArgumentInfo() const {
+  const DXMT12_MTL4_SHADER_ARGUMENT *resourceArgumentInfo() const {
     return argument_info.size() <= reflection.NumConstantBuffers
                ? nullptr
                : argument_info.data() + reflection.NumConstantBuffers;

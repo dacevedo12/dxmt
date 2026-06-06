@@ -3,6 +3,7 @@ subdir('airconv')
 
 if not dxmt_crossbuild
 subdir('nativemetal')
+winemetal4_dep = winemetal_dep
 else
 subdir('winemetal')
 subdir('winemetal4')

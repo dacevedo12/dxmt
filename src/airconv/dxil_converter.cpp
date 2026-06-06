@@ -238,8 +238,8 @@ DXILFail(sm50_error_t *ppError, const std::string &message) {
 } // namespace
 
 AIRCONV_API int
-DXILInitialize(const void *pBytecode, size_t BytecodeSize,
-               dxil_shader_t *ppShader, MTL_SHADER_REFLECTION *pRefl,
+DXMT12DXILInitialize(const void *pBytecode, size_t BytecodeSize,
+               dxmt12_airconv_shader_t *ppShader, MTL_SHADER_REFLECTION *pRefl,
                sm50_error_t *ppError) {
   if (ppError)
     *ppError = nullptr;
@@ -287,17 +287,17 @@ DXILInitialize(const void *pBytecode, size_t BytecodeSize,
     }
     pRefl->ArgumentTableQwords = qwords;
   }
-  *ppShader = dxil_shader_t(shader.release());
+  *ppShader = dxmt12_airconv_shader_t(shader.release());
   return 0;
 }
 
 AIRCONV_API void
-DXILDestroy(dxil_shader_t pShader) {
+DXMT12DXILDestroy(dxmt12_airconv_shader_t pShader) {
   delete (DXILShaderInternal *)pShader;
 }
 
 AIRCONV_API int
-DXILCompile(dxil_shader_t pShader, SM50_SHADER_COMPILATION_ARGUMENT_DATA *pArgs,
+DXMT12DXILCompile(dxmt12_airconv_shader_t pShader, SM50_SHADER_COMPILATION_ARGUMENT_DATA *pArgs,
             const char *FunctionName, sm50_bitcode_t *ppBitcode,
             sm50_error_t *ppError) {
   if (ppError)
@@ -343,7 +343,7 @@ SM50GetArgumentsInfo(sm50_shader_t pShader,
                      struct MTL_SM50_SHADER_ARGUMENT *pArguments);
 
 AIRCONV_API void
-DXILGetArgumentsInfo(dxil_shader_t pShader,
+DXMT12DXILGetArgumentsInfo(dxmt12_airconv_shader_t pShader,
                      struct MTL_SM50_SHADER_ARGUMENT *pConstantBuffers,
                      struct MTL_SM50_SHADER_ARGUMENT *pArguments) {
   auto *shader = (DXILShaderInternal *)pShader;
@@ -362,7 +362,7 @@ DXILGetArgumentsInfo(dxil_shader_t pShader,
 namespace dxmt::airconv {
 
 const dxil::DxilTranslationInfo *
-GetDxilTranslationInfo(dxil_shader_t pShader) {
+GetDxmt12DxilTranslationInfo(dxmt12_airconv_shader_t pShader) {
   if (!pShader)
     return nullptr;
 

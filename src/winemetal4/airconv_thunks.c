@@ -170,9 +170,98 @@ AIRCONV_API void SM50GetArgumentsInfo(
 };
 
 AIRCONV_API int
-DXILInitialize(
-    const void *pBytecode, size_t BytecodeSize, dxil_shader_t *ppShader, struct MTL_SHADER_REFLECTION *pRefl,
-    sm50_error_t *ppError
+DXMT12SM50Initialize(
+    const void *pBytecode, size_t BytecodeSize, dxmt12_airconv_shader_t *ppShader,
+    DXMT12_MTL4_SHADER_REFLECTION *pRefl, dxmt12_airconv_error_t *ppError
+) {
+  return SM50Initialize(pBytecode, BytecodeSize, ppShader, pRefl, ppError);
+}
+
+AIRCONV_API void
+DXMT12SM50Destroy(dxmt12_airconv_shader_t pShader) {
+  SM50Destroy(pShader);
+}
+
+AIRCONV_API int
+DXMT12SM50Compile(
+    dxmt12_airconv_shader_t pShader, struct SM50_SHADER_COMPILATION_ARGUMENT_DATA *pArgs, const char *FunctionName,
+    dxmt12_airconv_bitcode_t *ppBitcode, dxmt12_airconv_error_t *ppError
+) {
+  return SM50Compile(pShader, pArgs, FunctionName, ppBitcode, ppError);
+}
+
+AIRCONV_API void
+DXMT12SM50GetCompiledBitcode(dxmt12_airconv_bitcode_t pBitcode, struct SM50_COMPILED_BITCODE *pData) {
+  SM50GetCompiledBitcode(pBitcode, pData);
+}
+
+AIRCONV_API void
+DXMT12SM50DestroyBitcode(dxmt12_airconv_bitcode_t pBitcode) {
+  SM50DestroyBitcode(pBitcode);
+}
+
+AIRCONV_API size_t
+DXMT12SM50GetErrorMessage(dxmt12_airconv_error_t pError, char *pBuffer, size_t BufferSize) {
+  return SM50GetErrorMessage(pError, pBuffer, BufferSize);
+}
+
+AIRCONV_API void
+DXMT12SM50FreeError(dxmt12_airconv_error_t pError) {
+  SM50FreeError(pError);
+}
+
+AIRCONV_API int
+DXMT12SM50CompileTessellationPipelineHull(
+    dxmt12_airconv_shader_t pVertexShader, dxmt12_airconv_shader_t pHullShader,
+    struct SM50_SHADER_COMPILATION_ARGUMENT_DATA *pHullShaderArgs, const char *FunctionName,
+    dxmt12_airconv_bitcode_t *ppBitcode, dxmt12_airconv_error_t *ppError
+) {
+  return SM50CompileTessellationPipelineHull(
+      pVertexShader, pHullShader, pHullShaderArgs, FunctionName, ppBitcode, ppError);
+}
+
+AIRCONV_API int
+DXMT12SM50CompileTessellationPipelineDomain(
+    dxmt12_airconv_shader_t pHullShader, dxmt12_airconv_shader_t pDomainShader,
+    struct SM50_SHADER_COMPILATION_ARGUMENT_DATA *pDomainShaderArgs, const char *FunctionName,
+    dxmt12_airconv_bitcode_t *ppBitcode, dxmt12_airconv_error_t *ppError
+) {
+  return SM50CompileTessellationPipelineDomain(
+      pHullShader, pDomainShader, pDomainShaderArgs, FunctionName, ppBitcode, ppError);
+}
+
+AIRCONV_API int
+DXMT12SM50CompileGeometryPipelineVertex(
+    dxmt12_airconv_shader_t pVertexShader, dxmt12_airconv_shader_t pGeometryShader,
+    struct SM50_SHADER_COMPILATION_ARGUMENT_DATA *pVertexShaderArgs, const char *FunctionName,
+    dxmt12_airconv_bitcode_t *ppBitcode, dxmt12_airconv_error_t *ppError
+) {
+  return SM50CompileGeometryPipelineVertex(
+      pVertexShader, pGeometryShader, pVertexShaderArgs, FunctionName, ppBitcode, ppError);
+}
+
+AIRCONV_API int
+DXMT12SM50CompileGeometryPipelineGeometry(
+    dxmt12_airconv_shader_t pVertexShader, dxmt12_airconv_shader_t pGeometryShader,
+    struct SM50_SHADER_COMPILATION_ARGUMENT_DATA *pGeometryShaderArgs, const char *FunctionName,
+    dxmt12_airconv_bitcode_t *ppBitcode, dxmt12_airconv_error_t *ppError
+) {
+  return SM50CompileGeometryPipelineGeometry(
+      pVertexShader, pGeometryShader, pGeometryShaderArgs, FunctionName, ppBitcode, ppError);
+}
+
+AIRCONV_API void
+DXMT12SM50GetArgumentsInfo(
+  dxmt12_airconv_shader_t pShader, DXMT12_MTL4_SHADER_ARGUMENT *pConstantBuffers,
+  DXMT12_MTL4_SHADER_ARGUMENT *pArguments
+) {
+  SM50GetArgumentsInfo(pShader, pConstantBuffers, pArguments);
+}
+
+AIRCONV_API int
+DXMT12DXILInitialize(
+    const void *pBytecode, size_t BytecodeSize, dxmt12_airconv_shader_t *ppShader,
+    DXMT12_MTL4_SHADER_REFLECTION *pRefl, dxmt12_airconv_error_t *ppError
 ) {
   struct sm50_initialize_params params;
   params.bytecode = pBytecode;
@@ -188,16 +277,16 @@ DXILInitialize(
 }
 
 AIRCONV_API void
-DXILDestroy(dxil_shader_t pShader) {
+DXMT12DXILDestroy(dxmt12_airconv_shader_t pShader) {
   struct sm50_destroy_params params;
   params.shader = pShader;
   UNIX_CALL(dxil_destroy, &params);
 }
 
 AIRCONV_API int
-DXILCompile(
-    dxil_shader_t pShader, struct SM50_SHADER_COMPILATION_ARGUMENT_DATA *pArgs, const char *FunctionName,
-    sm50_bitcode_t *ppBitcode, sm50_error_t *ppError
+DXMT12DXILCompile(
+    dxmt12_airconv_shader_t pShader, struct SM50_SHADER_COMPILATION_ARGUMENT_DATA *pArgs, const char *FunctionName,
+    dxmt12_airconv_bitcode_t *ppBitcode, dxmt12_airconv_error_t *ppError
 ) {
   struct sm50_compile_params params;
   params.shader = (sm50_shader_t)pShader;
@@ -212,9 +301,9 @@ DXILCompile(
   return params.ret;
 }
 
-AIRCONV_API void DXILGetArgumentsInfo(
-  dxil_shader_t pShader, struct MTL_SM50_SHADER_ARGUMENT *pConstantBuffers,
-  struct MTL_SM50_SHADER_ARGUMENT *pArguments
+AIRCONV_API void DXMT12DXILGetArgumentsInfo(
+  dxmt12_airconv_shader_t pShader, DXMT12_MTL4_SHADER_ARGUMENT *pConstantBuffers,
+  DXMT12_MTL4_SHADER_ARGUMENT *pArguments
 ) {
   struct sm50_get_arguments_info_params params;
   params.shader = (sm50_shader_t)pShader;
