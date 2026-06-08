@@ -14,6 +14,7 @@ d3d12_src = [
   'd3d12_fence.cpp',
   'd3d12_query.cpp',
   'd3d12_frame_interop.cpp',
+  'd3d12_dxgi_backend.cpp',
 ]
 
 d3d12core_src = [

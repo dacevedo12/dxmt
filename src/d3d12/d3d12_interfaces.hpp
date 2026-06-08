@@ -2,6 +2,7 @@
 
 #include "dxgi_interfaces.h"
 #include "com/com_guid.hpp"
+#include "Metal.hpp"
 #include <d3d12.h>
 
 namespace dxmt {
@@ -12,6 +13,7 @@ class Device;
 // swapchain/presenter code can recognize DXMT-backed D3D12 devices.
 DEFINE_COM_INTERFACE("7f7f9293-9c67-4c3f-865b-30c92e1a7d12", IMTLD3D12Device)
     : public IMTLDXGIDevice {
+  virtual WMT::Device STDMETHODCALLTYPE GetMTLDevice() = 0;
   virtual dxmt::Device &GetDXMTDevice() = 0;
   virtual void AddRefPrivate() = 0;
   virtual void ReleasePrivate() = 0;

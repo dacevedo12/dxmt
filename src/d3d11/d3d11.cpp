@@ -2,6 +2,7 @@
 #include "com/com_object.hpp"
 #include "com/com_pointer.hpp"
 #include "d3d11_device.hpp"
+#include "d3d11_dxgi_backend.hpp"
 #include "log/log.hpp"
 #include "util_fh4_bypass.hpp"
 #include "util_string.hpp"
@@ -37,8 +38,13 @@ D3D11CoreCreateDevice(IDXGIFactory *pFactory, IDXGIAdapter *pAdapter,
     FeatureLevels = defaultFeatureLevels.size();
   }
 
+  auto metal_device = GetD3D11AdapterDevice(dxgi_adapter.ptr());
+  if (!metal_device) {
+    ERR("D3D11CoreCreateDevice: DXGI adapter is not backed by the Metal backend");
+    return ERR_E_INVALIDARG(__func__);
+  }
   D3D_FEATURE_LEVEL maxFeatureLevel =
-      dxgi_adapter->GetMTLDevice().supportsFamily(WMTGPUFamilyApple7) ? D3D_FEATURE_LEVEL_11_1 : D3D_FEATURE_LEVEL_11_0;
+      metal_device.supportsFamily(WMTGPUFamilyApple7) ? D3D_FEATURE_LEVEL_11_1 : D3D_FEATURE_LEVEL_11_0;
   D3D_FEATURE_LEVEL minFeatureLevel = D3D_FEATURE_LEVEL();
   D3D_FEATURE_LEVEL devFeatureLevel = D3D_FEATURE_LEVEL();
 
@@ -64,7 +70,7 @@ D3D11CoreCreateDevice(IDXGIFactory *pFactory, IDXGIAdapter *pAdapter,
     Logger::info(str::format("Using feature level ", devFeatureLevel));
 
     auto device = CreateD3D11Device(
-        CreateDXMTDevice({.device = dxgi_adapter->GetMTLDevice()}),
+        CreateDXMTDevice({.device = metal_device}),
         dxgi_adapter.ptr(), devFeatureLevel, Flags);
 
     return device->QueryInterface(IID_PPV_ARGS(ppDevice));
@@ -200,6 +206,7 @@ BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, LPVOID reserved) {
 
   dxmt::fh4bypass::ApplyBadFiberDataBypass();
   DisableThreadLibraryCalls(instance);
+  dxmt::RegisterD3D11DxgiBackend();
   return TRUE;
 }
 

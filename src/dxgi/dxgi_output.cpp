@@ -6,8 +6,6 @@
 #include "dxgi_interfaces.h"
 #include "dxgi_output.hpp"
 #include "dxgi_options.hpp"
-#include "dxmt_format.hpp"
-#include "dxmt_presenter.hpp"
 #include "log/log.hpp"
 #include "util_fh4_bypass.hpp"
 #include "util_string.hpp"
@@ -140,10 +138,6 @@ class MTLDXGIOutputImpl : public MTLDXGIOutput {
 public:
   MTLDXGIOutputImpl(IMTLDXGIAdapter *adapter, HMONITOR monitor, DxgiOptions &options)
       : adapter_(adapter), monitor_(monitor), options_(options) {
-    WMTGetDisplayDescription(monitor_ == wsi::getDefaultMonitor()
-                                 ? WMTGetPrimaryDisplayId()
-                                 : WMTGetSecondaryDisplayId(),
-                             &native_desc_);
     for (uint32_t i = 0; i < DXMT_GAMMA_CP_COUNT; i++) {
       gamma_ramp_.red[i] = gamma_ramp_.green[i] = gamma_ramp_.blue[i] =
           float(i) / float(DXMT_GAMMA_CP_COUNT - 1);
@@ -391,9 +385,7 @@ public:
       fh4bypass::ApplyBadFiberDataBypass();
       return S_OK;
     }
-    MTL_DXGI_FORMAT_DESC formatDesc;
-    if (FAILED(MTLQueryDXGIFormat(this->adapter_->GetMTLDevice(), EnumFormat, formatDesc))
-      || !(formatDesc.Flag & MTL_DXGI_FORMAT_BACKBUFFER)) {
+    if (!this->adapter_->IsBackBufferFormatSupported(EnumFormat)) {
       *pNumModes = 0;
       fh4bypass::ApplyBadFiberDataBypass();
       return S_OK;
@@ -634,19 +626,19 @@ public:
       pDesc->BitsPerColor = 8;
       pDesc->ColorSpace = DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709;
     } else {
-      pDesc->BitsPerColor =
-          native_desc_.maximum_potential_edr_color_component_value > 1 ? 10 : 8;
-      pDesc->ColorSpace =
-          native_desc_.maximum_potential_edr_color_component_value > 1
-              ? DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020
-              : DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709;
+      pDesc->BitsPerColor = 8;
+      pDesc->ColorSpace = DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709;
     }
-    memcpy(pDesc->RedPrimary, native_desc_.red_primaries, 8);
-    memcpy(pDesc->GreenPrimary, native_desc_.green_primaries, 8);
-    memcpy(pDesc->BluePrimary, native_desc_.blue_primaries, 8);
-    memcpy(pDesc->WhitePoint, native_desc_.white_points, 8);
+    constexpr float red_primary[2] = {0.64f, 0.33f};
+    constexpr float green_primary[2] = {0.30f, 0.60f};
+    constexpr float blue_primary[2] = {0.15f, 0.06f};
+    constexpr float white_point[2] = {0.3127f, 0.3290f};
+    memcpy(pDesc->RedPrimary, red_primary, sizeof(red_primary));
+    memcpy(pDesc->GreenPrimary, green_primary, sizeof(green_primary));
+    memcpy(pDesc->BluePrimary, blue_primary, sizeof(blue_primary));
+    memcpy(pDesc->WhitePoint, white_point, sizeof(white_point));
     pDesc->MinLuminance = 0.0f;
-    pDesc->MaxLuminance = native_desc_.maximum_potential_edr_color_component_value * 100.0f;
+    pDesc->MaxLuminance = 100.0f;
     pDesc->MaxFullFrameLuminance = pDesc->MaxLuminance;
     fh4bypass::ApplyBadFiberDataBypass();
     return S_OK;
@@ -678,7 +670,6 @@ public:
 private:
   Com<IMTLDXGIAdapter> adapter_ = nullptr;
   HMONITOR monitor_ = nullptr;
-  WMTDisplayDescription native_desc_;
   DxgiOptions &options_;
   DXMTGammaRamp gamma_ramp_;
 };

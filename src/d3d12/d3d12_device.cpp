@@ -1,4 +1,5 @@
 #include "d3d12_device.hpp"
+#include "d3d12_dxgi_backend.hpp"
 
 #include "com/com_guid.hpp"
 #include "com/com_object.hpp"
@@ -1163,7 +1164,15 @@ public:
   void STDMETHODCALLTYPE Trim() override {}
 
   WMT::Device STDMETHODCALLTYPE GetMTLDevice() override {
-    return adapter_->GetMTLDevice();
+    return GetD3D12AdapterDevice(adapter_.ptr());
+  }
+
+  DxgiBackendKind STDMETHODCALLTYPE GetBackendKind() override {
+    return DxgiBackendKind::Metal4;
+  }
+
+  uint64_t STDMETHODCALLTYPE GetMetalDeviceHandle() override {
+    return adapter_->GetMetalDeviceHandle();
   }
 
   dxmt::Device &GetDXMTDevice() override {

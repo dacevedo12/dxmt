@@ -1,5 +1,6 @@
 #include "com/com_guid.hpp"
 #include "com/com_pointer.hpp"
+#include "dxgi_backend.hpp"
 #include "dxgi_options.hpp"
 #include "util_string.hpp"
 #include "log/log.hpp"
@@ -7,24 +8,31 @@
 #include "dxgi_interfaces.h"
 #include "dxgi_object.hpp"
 #include "d3d10_1.h"
-#include "Metal.hpp"
 #include "util_fh4_bypass.hpp"
+
+#include <cstring>
 
 namespace dxmt {
 
 Com<IDXGIOutput> CreateOutput(IMTLDXGIAdapter *pAadapter, HMONITOR monitor, DxgiOptions &options);
 
-LUID GetAdapterLuid(WMT::Device device) {
+LUID GetAdapterLuid(uint64_t registry_id) {
     // NOTE: use big-endian registryID, be consistent with MVK
-  return std::bit_cast<LUID>(__builtin_bswap64(device.registryID()));
+  return std::bit_cast<LUID>(__builtin_bswap64(registry_id));
 }
 
 class MTLDXGIAdapter : public MTLDXGIObject<IMTLDXGIAdapter> {
 public:
-  MTLDXGIAdapter(WMT::Device device, IDXGIFactory *factory, Config &config)
-      : device_(device), factory_(factory), options_(config) {
+  MTLDXGIAdapter(const DxgiBackendProvider &provider,
+                 const DxgiBackendAdapterInfo &info,
+                 IDXGIFactory *factory, Config &config)
+      : provider_(provider), info_(info), factory_(factory), options_(config) {
+    if (info_.device_handle && provider_.retain_device)
+      provider_.retain_device(info_.device_handle);
+    if (!info_.device_handle || !info_.registry_id)
+      return;
     D3DKMT_OPENADAPTERFROMLUID open = {};
-    open.AdapterLuid = GetAdapterLuid(device_);
+    open.AdapterLuid = GetAdapterLuid(info_.registry_id);
     if (D3DKMTOpenAdapterFromLuid(&open))
       WARN("Failed to open D3DKMT adapter");
     else
@@ -38,6 +46,8 @@ public:
       if (D3DKMTCloseAdapter(&close))
         WARN("Failed to close D3DKMT adapter");
     }
+    if (info_.device_handle && provider_.release_device)
+      provider_.release_device(info_.device_handle);
   }
 
   HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid,
@@ -148,7 +158,7 @@ public:
           sizeof(pDesc->Description) / sizeof(pDesc->Description[0]) - 1,
           options_.customDeviceDesc.c_str(), options_.customDeviceDesc.size());
     } else {
-      device_.name().getCString((char *)pDesc->Description, sizeof(pDesc->Description), WMTUTF16StringEncoding);
+      std::memcpy(pDesc->Description, info_.name, sizeof(pDesc->Description));
     }
 
     if (options_.customVendorId >= 0) {
@@ -168,13 +178,13 @@ public:
 
     pDesc->SubSysId = 0;
     pDesc->Revision = 0;
-    if (device_.hasUnifiedMemory())
-      pDesc->DedicatedVideoMemory = device_.recommendedMaxWorkingSetSize() / 2; // FIXME: use a more appropriate value
+    if (info_.has_unified_memory)
+      pDesc->DedicatedVideoMemory = info_.recommended_max_working_set_size / 2; // FIXME: use a more appropriate value
     else
-      pDesc->DedicatedVideoMemory = device_.recommendedMaxWorkingSetSize();
+      pDesc->DedicatedVideoMemory = info_.recommended_max_working_set_size;
     pDesc->DedicatedSystemMemory = 0;
     pDesc->SharedSystemMemory = 0;
-    pDesc->AdapterLuid = GetAdapterLuid(device_);
+    pDesc->AdapterLuid = GetAdapterLuid(info_.registry_id);
     pDesc->Flags = DXGI_ADAPTER_FLAG3_NONE;
     pDesc->GraphicsPreemptionGranularity = DXGI_GRAPHICS_PREEMPTION_DMA_BUFFER_BOUNDARY;
     pDesc->ComputePreemptionGranularity = DXGI_COMPUTE_PREEMPTION_DMA_BUFFER_BOUNDARY;
@@ -248,8 +258,8 @@ public:
       return ERR_E_INVALIDARG(__func__);
 
     // we don't actually care about MemorySegmentGroup
-    pVideoMemoryInfo->Budget = device_.recommendedMaxWorkingSetSize();
-    pVideoMemoryInfo->CurrentUsage = device_.currentAllocatedSize();
+    pVideoMemoryInfo->Budget = info_.recommended_max_working_set_size;
+    pVideoMemoryInfo->CurrentUsage = info_.current_allocated_size;
     pVideoMemoryInfo->AvailableForReservation = 0;
     pVideoMemoryInfo->CurrentReservation =
         mem_reserved_[uint32_t(MemorySegmentGroup)];
@@ -283,21 +293,88 @@ public:
     WARN("DXGIAdapter: video memory budget change notifications are unsupported");
   }
 
-  WMT::Device STDMETHODCALLTYPE GetMTLDevice() final { return device_; }
+  DxgiBackendKind STDMETHODCALLTYPE GetBackendKind() final {
+    return provider_.kind;
+  }
+
+  uint64_t STDMETHODCALLTYPE GetMetalDeviceHandle() final {
+    return info_.device_handle;
+  }
+
+  uint32_t STDMETHODCALLTYPE GetBackendAdapterIndex() final {
+    return info_.backend_index;
+  }
+
+  bool STDMETHODCALLTYPE
+  ResolveBackendAdapter(const DxgiBackendProvider *provider) final {
+    if (!provider || !provider->get_adapter_info) {
+      WARN("DXGIAdapter: backend resolve failed: provider unavailable");
+      return false;
+    }
+    if (provider_.kind != DxgiBackendKind::Unknown &&
+        provider->kind != provider_.kind) {
+      WARN("DXGIAdapter: backend resolve failed: kind mismatch current=",
+           uint32_t(provider_.kind), " requested=", uint32_t(provider->kind));
+      return false;
+    }
+    if (info_.device_handle)
+      return true;
+
+    DxgiBackendAdapterInfo resolved = {};
+    if (!provider->get_adapter_info(info_.backend_index, &resolved) ||
+        !resolved.device_handle) {
+      WARN("DXGIAdapter: backend resolve failed: no device for provider=",
+           provider->name ? provider->name : "<unnamed>",
+           " index=", info_.backend_index);
+      return false;
+    }
+    resolved.backend_index = info_.backend_index;
+
+    provider_ = *provider;
+    info_ = resolved;
+    if (provider_.retain_device)
+      provider_.retain_device(info_.device_handle);
+
+    if (info_.registry_id && !local_kmt_) {
+      D3DKMT_OPENADAPTERFROMLUID open = {};
+      open.AdapterLuid = GetAdapterLuid(info_.registry_id);
+      if (D3DKMTOpenAdapterFromLuid(&open))
+        WARN("Failed to open D3DKMT adapter");
+      else
+        local_kmt_ = open.hAdapter;
+    }
+
+    WARN("DXGIAdapter: resolved backend provider=",
+         provider_.name ? provider_.name : "<unnamed>",
+         " index=", info_.backend_index,
+         " registryID=", info_.registry_id);
+    return true;
+  }
+
   D3DKMT_HANDLE STDMETHODCALLTYPE GetLocalD3DKMT() final { return local_kmt_; }
 
+  bool STDMETHODCALLTYPE IsBackBufferFormatSupported(DXGI_FORMAT Format) final {
+    if (!info_.device_handle)
+      return true;
+    return provider_.is_backbuffer_format_supported
+               ? provider_.is_backbuffer_format_supported(info_.device_handle, Format)
+               : true;
+  }
+
 private:
-  WMT::Reference<WMT::Device> device_;
+  DxgiBackendProvider provider_;
+  DxgiBackendAdapterInfo info_;
   D3DKMT_HANDLE local_kmt_ = 0;
   Com<IDXGIFactory> factory_;
   DxgiOptions options_;
   uint64_t mem_reserved_[2] = {0, 0};
 };
 
-Com<IMTLDXGIAdapter> CreateAdapter(WMT::Device Device,
+Com<IMTLDXGIAdapter> CreateAdapter(const DxgiBackendProvider &provider,
+                                   const DxgiBackendAdapterInfo &info,
                                    IDXGIFactory2 *pFactory, Config &config) {
   return Com<IMTLDXGIAdapter>::transfer(
-      new MTLDXGIAdapter(Device, pFactory, config));
+      new MTLDXGIAdapter(provider, info, pFactory, config));
 }
 
 } // namespace dxmt

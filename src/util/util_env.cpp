@@ -161,7 +161,8 @@ std::string getUnixPath(const std::string &path) {
                                        path.data(), path.size());
 
     widePath[length] = L'\0';
-    return std::string(wine_get_unix_file_name(widePath.data()));
+    auto unix_path = wine_get_unix_file_name(widePath.data());
+    return unix_path ? std::string(unix_path) : std::string();
   }
   return "";
 #else

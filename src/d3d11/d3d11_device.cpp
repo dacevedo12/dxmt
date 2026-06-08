@@ -9,6 +9,7 @@
 #include "d3d11_context.hpp"
 #include "d3d11_context_state.hpp"
 #include "d3d11_device.hpp"
+#include "d3d11_dxgi_backend.hpp"
 #include "d3d11_pipeline_cache.hpp"
 #include "d3d11_private.h"
 #include "d3d11_query.hpp"
@@ -51,7 +52,7 @@ public:
       container_(container),
       feature_level_(FeatureLevel),
       feature_flags_(FeatureFlags),
-      features_(container->GetMTLDevice()),
+      features_(GetD3D11AdapterDevice(pAdapter)),
       sampler_states_(this),
       rasterizer_states_(this),
       depthstencil_states_(this),
@@ -1037,7 +1038,7 @@ public:
   }
 
   WMT::Device STDMETHODCALLTYPE GetMTLDevice() override {
-    return container_->GetMTLDevice();
+    return GetD3D11DeviceMetalDevice(container_);
   }
 
   D3DKMT_HANDLE STDMETHODCALLTYPE GetLocalD3DKMT() override {
@@ -1305,8 +1306,16 @@ public:
 
   void STDMETHODCALLTYPE Trim() override { WARN("DXGIDevice3::Trim: no-op"); };
 
-  WMT::Device STDMETHODCALLTYPE GetMTLDevice() override {
-    return adapter_->GetMTLDevice();
+  WMT::Device STDMETHODCALLTYPE GetMTLDevice() {
+    return GetD3D11AdapterDevice(adapter_.ptr());
+  }
+
+  DxgiBackendKind STDMETHODCALLTYPE GetBackendKind() override {
+    return DxgiBackendKind::Metal3;
+  }
+
+  uint64_t STDMETHODCALLTYPE GetMetalDeviceHandle() override {
+    return adapter_->GetMetalDeviceHandle();
   }
 
   HRESULT STDMETHODCALLTYPE CreateSwapChain(

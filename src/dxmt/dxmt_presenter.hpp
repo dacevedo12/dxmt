@@ -1,6 +1,7 @@
 #pragma once
 #include "Metal.hpp"
 #include "dxmt_command.hpp"
+#include "dxmt_gamma.hpp"
 #include "rc/util_rc.hpp"
 #include "util_cpu_fence.hpp"
 #include "winemetal.h"
@@ -15,15 +16,6 @@ struct DXMTPresentMetadata {
   float max_display_luminance;
   uint32_t alpha_mode;
   float background_color[4];
-};
-
-constexpr uint32_t DXMT_GAMMA_CP_COUNT = 1024;
-
-struct DXMTGammaRamp {
-  float red[DXMT_GAMMA_CP_COUNT];
-  float green[DXMT_GAMMA_CP_COUNT];
-  float blue[DXMT_GAMMA_CP_COUNT];
-  uint64_t version;
 };
 
 class Presenter : public RcObject {

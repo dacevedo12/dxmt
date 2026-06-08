@@ -1,4 +1,5 @@
 #include "d3d12_command_queue.hpp"
+#include "d3d12_dxgi_backend.hpp"
 
 #include "com/com_guid.hpp"
 #include "com/com_object.hpp"
@@ -3147,8 +3148,16 @@ public:
     device_->Trim();
   }
 
-  WMT::Device STDMETHODCALLTYPE GetMTLDevice() override {
-    return device_->GetMTLDevice();
+  WMT::Device STDMETHODCALLTYPE GetMTLDevice() {
+    return GetD3D12DeviceMetalDevice(device_.ptr());
+  }
+
+  DxgiBackendKind STDMETHODCALLTYPE GetBackendKind() override {
+    return DxgiBackendKind::Metal4;
+  }
+
+  uint64_t STDMETHODCALLTYPE GetMetalDeviceHandle() override {
+    return device_->GetMetalDeviceHandle();
   }
 
   D3DKMT_HANDLE STDMETHODCALLTYPE GetLocalD3DKMT() override {

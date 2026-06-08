@@ -1,4 +1,5 @@
 d3d11_res = wrc_generator.process('version.rc')
+d3d11_backend_res = wrc_generator.process('version.rc')
 
 d3d11_src = [
   'd3d11_class_linkage.cpp',
@@ -27,6 +28,7 @@ d3d11_src = [
   'd3d11_context_def.cpp',
   'd3d11_multithread.cpp',
   'd3d11_fence.cpp',
+  'd3d11_dxgi_backend.cpp',
 ]
 
 d3d10_src = [
@@ -38,10 +40,14 @@ d3d10_src = [
   '../d3d10/d3d10_view.cpp',
 ]
 
+d3d11_stub_src = [
+  'd3d11_stub.cpp',
+]
+
 d3d11_ld_args      = ['-L' + windows_native_install_dir] # a nice trick to force relink
 d3d11_link_depends = []
 
-d3d11_dll = shared_library('d3d11', d3d11_src, d3d10_src, d3d11_res,
+d3d11_backend_dll = shared_library('d3d11_dxmt', d3d11_src, d3d10_src, d3d11_backend_res,
   name_prefix         : '',
   dependencies        : [ 
     dxgi_dep, 
@@ -49,6 +55,18 @@ d3d11_dll = shared_library('d3d11', d3d11_src, d3d10_src, d3d11_res,
     airconv_forward_dep,
     dxmt_dep,
     winemetal_dep,
+    util_dep ],
+  include_directories : [ dxmt_include_path ],
+  install             : true,
+  install_dir         : windows_native_install_dir,
+  vs_module_defs      : 'd3d11_dxmt.def',
+  link_args           : d3d11_ld_args,
+  link_depends        : [ d3d11_link_depends ],
+)
+
+d3d11_dll = shared_library('d3d11', d3d11_stub_src, d3d11_res,
+  name_prefix         : '',
+  dependencies        : [
     util_dep ],
   include_directories : [ dxmt_include_path ],
   install             : true,
@@ -64,6 +82,14 @@ d3d11_dep = declare_dependency(
 )
 
 if wine_builtin_dll
+custom_target('postprocess_libd3d11_dxmt',
+  input : d3d11_backend_dll,
+  output: 'd3d11_dxmt.dll.postproc',
+  command : [ wine_build_path != '' ? winebuild.full_path() : winebuild, '--builtin', '@INPUT@' ],
+  depends : d3d11_backend_dll,
+  build_by_default : true
+)
+
 custom_target('postprocess_libd3d11',
   input : d3d11_dll,
   output: 'd3d11.dll.postproc',

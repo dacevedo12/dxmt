@@ -25,7 +25,7 @@ UpdateD3D12TemporalScalerSupport(ID3D12Device *device) {
     return;
 
   g_d3d12_temporal_scaler_supported =
-      dxmt_device->GetMTLDevice().supportsFXTemporalScaler();
+      dxmt_device->GetBackendKind() == DxgiBackendKind::Metal4;
 }
 
 bool
@@ -37,7 +37,7 @@ QueryD3D12TemporalScalerSupport(IDXGIAdapter *adapter) {
   if (FAILED(adapter->QueryInterface(IID_PPV_ARGS(&dxmt_adapter))))
     return false;
 
-  return dxmt_adapter->GetMTLDevice().supportsFXTemporalScaler();
+  return dxmt_adapter->GetBackendKind() == DxgiBackendKind::Metal4;
 }
 
 NVNGX_RESULT

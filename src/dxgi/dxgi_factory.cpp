@@ -1,24 +1,67 @@
 #include "com/com_pointer.hpp"
 #include "config/config.hpp"
+#include "dxgi_backend.hpp"
 #include "dxgi_interfaces.h"
 #include "dxgi_object.hpp"
 #include "com/com_guid.hpp"
-#include "dxmt_apitrace_d3d.hpp"
 #include "log/log.hpp"
 #include "util_env.hpp"
 #include "util_fh4_bypass.hpp"
 #include "util_string.hpp"
 #include "wsi_window.hpp"
-#include "Metal.hpp"
+
+#include <cstring>
 
 namespace dxmt {
 
-Com<IMTLDXGIAdapter> CreateAdapter(WMT::Device Device,
+Com<IMTLDXGIAdapter> CreateAdapter(const DxgiBackendProvider &provider,
+                                   const DxgiBackendAdapterInfo &info,
                                    IDXGIFactory2 *pFactory, Config &config);
-LUID GetAdapterLuid(WMT::Device device);
+LUID GetAdapterLuid(uint64_t registry_id);
 
 static bool IsEqualLuid(LUID a, LUID b) {
   return a.LowPart == b.LowPart && a.HighPart == b.HighPart;
+}
+
+struct DxgiAdapterCandidate {
+  DxgiBackendProvider provider = {};
+  DxgiBackendAdapterInfo info = {};
+};
+
+static constexpr uint64_t DeferredMetal4RegistryId = 0x44584d544d344445ull;
+
+static DxgiAdapterCandidate
+MakeDeferredAdapterCandidate() {
+  DxgiAdapterCandidate candidate = {};
+  candidate.provider.kind = DxgiBackendKind::Unknown;
+  candidate.provider.name = "deferred";
+  candidate.provider.priority = 100;
+  candidate.info.registry_id = DeferredMetal4RegistryId;
+  candidate.info.backend_index = 0;
+  candidate.info.has_unified_memory = true;
+  candidate.info.recommended_max_working_set_size = 8ull * 1024ull * 1024ull * 1024ull;
+  static constexpr WCHAR name[] = L"Apple Metal Deferred Adapter";
+  std::memcpy(candidate.info.name, name, sizeof(name));
+  return candidate;
+}
+
+static std::vector<DxgiAdapterCandidate>
+EnumerateAdapterCandidates() {
+  std::vector<DxgiAdapterCandidate> candidates;
+  for (const auto &provider : CopyRegisteredBackends()) {
+    const uint32_t count = provider.adapter_count ? provider.adapter_count() : 0;
+    for (uint32_t i = 0; i < count; ++i) {
+      DxgiBackendAdapterInfo info = {};
+      if (!provider.get_adapter_info || !provider.get_adapter_info(i, &info) ||
+          !info.device_handle)
+        continue;
+      info.backend_index = i;
+      candidates.push_back({provider, info});
+    }
+  }
+  if (candidates.empty())
+    candidates.push_back(MakeDeferredAdapterCandidate());
+  return candidates;
 }
 
 static constexpr UINT SupportedSwapChainFlags =
@@ -204,12 +247,8 @@ public:
       fsDesc.Windowed = TRUE;
     }
 
-    HRESULT hr = metal_dxgi_device->CreateSwapChain(this, hWnd, &desc, &fsDesc,
-                                                    ppSwapChain);
-    if (SUCCEEDED(hr) && ppSwapChain && *ppSwapChain) {
-      dxmt::apitrace::on_dxgi_create_swapchain(this, pDevice, *ppSwapChain);
-    }
-    return hr;
+    return metal_dxgi_device->CreateSwapChain(this, hWnd, &desc, &fsDesc,
+                                              ppSwapChain);
   }
 
   HRESULT STDMETHODCALLTYPE CreateSwapChainForCoreWindow(
@@ -250,8 +289,8 @@ public:
     fh4bypass::ApplyBadFiberDataBypass();
     InitReturnPtr(ppAdapter);
 
-    auto devices = WMT::CopyAllDevices();
-    UINT adapter_count = devices.count();
+    auto candidates = EnumerateAdapterCandidates();
+    UINT adapter_count = UINT(candidates.size());
 
     if (DxgiBootstrapDiagEnabled()) {
       WARN("DXGI bootstrap diagnostic: EnumAdapters1 request adapter=", Adapter,
@@ -272,7 +311,7 @@ public:
     if (adapter_count > 1) {
       UINT preferred_adapter = 0;
       for (unsigned i = 0; i < adapter_count; i++) {
-        if (!devices.object(i).hasUnifiedMemory())
+        if (!candidates[i].info.has_unified_memory)
           preferred_adapter = i;
       }
       if (Adapter == 0)
@@ -281,16 +320,18 @@ public:
         adjusted_adapter = Adapter <= preferred_adapter ? Adapter - 1 : Adapter;
     }
 
-    auto device = devices.object(adjusted_adapter);
-
     if (DxgiBootstrapDiagEnabled()) {
       WARN("DXGI bootstrap diagnostic: EnumAdapters1 selected adjustedAdapter=",
-           adjusted_adapter, " unifiedMemory=", device.hasUnifiedMemory(),
-           " registryID=", device.registryID());
+           adjusted_adapter, " backend=", candidates[adjusted_adapter].provider.name
+               ? candidates[adjusted_adapter].provider.name
+               : "<unnamed>",
+           " unifiedMemory=", candidates[adjusted_adapter].info.has_unified_memory,
+           " registryID=", candidates[adjusted_adapter].info.registry_id);
     }
 
-    *ppAdapter = CreateAdapter(device, this, Config::getInstance());
-    // devices->release(); // no you should not release it...
+    *ppAdapter = CreateAdapter(candidates[adjusted_adapter].provider,
+                               candidates[adjusted_adapter].info, this,
+                               Config::getInstance());
     fh4bypass::ApplyBadFiberDataBypass();
     return S_OK;
   }
@@ -363,13 +404,13 @@ public:
     if (!adapter)
       return DXGI_ERROR_INVALID_CALL;
 
-    auto devices = WMT::CopyAllDevices();
-    for (UINT i = 0; i < devices.count(); i++) {
-      auto device = devices.object(i);
-      if (!IsEqualLuid(GetAdapterLuid(device), luid))
+    auto candidates = EnumerateAdapterCandidates();
+    for (const auto &candidate : candidates) {
+      if (!IsEqualLuid(GetAdapterLuid(candidate.info.registry_id), luid))
         continue;
 
-      auto dxgi_adapter = CreateAdapter(device, this, Config::getInstance());
+      auto dxgi_adapter = CreateAdapter(candidate.provider, candidate.info,
+                                        this, Config::getInstance());
       return dxgi_adapter->QueryInterface(iid, adapter);
     }
 

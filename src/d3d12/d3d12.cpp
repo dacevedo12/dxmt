@@ -4,6 +4,7 @@
 #include "com/com_pointer.hpp"
 #include "d3d12_agility.hpp"
 #include "d3d12_device.hpp"
+#include "d3d12_dxgi_backend.hpp"
 #include "d3d12_root_signature.hpp"
 #include "dxgi_interfaces.h"
 #include "dxmt_apitrace_d3d.hpp"
@@ -185,6 +186,10 @@ CreateD3D12DeviceInstance(IUnknown *adapter, D3D_FEATURE_LEVEL minimum_feature_l
   dxmt::Com<IDXGIAdapter> dxgi_adapter = nullptr;
   dxmt::Com<IDXGIFactory1> dxgi_factory = nullptr;
 
+  HRESULT backend_hr = dxmt::d3d12::EnsureD3D12DxgiBackendRegistered();
+  if (FAILED(backend_hr))
+    return backend_hr;
+
   if (D3D12BootstrapDiagEnabled()) {
     dxmt::Logger::warn(dxmt::str::format(
         "D3D12 bootstrap diagnostic: CreateD3D12DeviceInstance adapter=",
@@ -238,7 +243,12 @@ CreateD3D12DeviceInstance(IUnknown *adapter, D3D_FEATURE_LEVEL minimum_feature_l
     return WARN_E_INVALIDARG(__func__);
   }
 
-  const auto gate = dxmt::d3d12::CheckSupportGate(metal_adapter->GetMTLDevice());
+  auto metal_device = dxmt::d3d12::GetD3D12AdapterDevice(metal_adapter.ptr());
+  if (!metal_device) {
+    dxmt::Logger::err("D3D12CreateDevice: DXGI adapter is not backed by the Metal4 backend");
+    return DXGI_ERROR_UNSUPPORTED;
+  }
+  const auto gate = dxmt::d3d12::CheckSupportGate(metal_device);
   if (D3D12BootstrapDiagEnabled()) {
     dxmt::Logger::warn(dxmt::str::format(
         "D3D12 bootstrap diagnostic: supportGate=",
@@ -288,7 +298,7 @@ CreateD3D12DeviceInstance(IUnknown *adapter, D3D_FEATURE_LEVEL minimum_feature_l
       }
 
       singleton_device = dxmt::d3d12::CreateD3D12Device(
-          dxmt::CreateDXMTDevice({.device = metal_adapter->GetMTLDevice()}),
+          dxmt::CreateDXMTDevice({.device = metal_device}),
           metal_adapter.ptr()).prvRef();
       HRESULT hr = singleton_device->QueryInterface(riid, device);
       if (D3D12BootstrapDiagEnabled()) {
@@ -301,7 +311,7 @@ CreateD3D12DeviceInstance(IUnknown *adapter, D3D_FEATURE_LEVEL minimum_feature_l
     }
 
     auto d3d12_device = dxmt::d3d12::CreateD3D12Device(
-        dxmt::CreateDXMTDevice({.device = metal_adapter->GetMTLDevice()}),
+        dxmt::CreateDXMTDevice({.device = metal_device}),
         metal_adapter.ptr());
 
     HRESULT hr = d3d12_device->QueryInterface(riid, device);

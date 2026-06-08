@@ -1,7 +1,7 @@
 #pragma once
+#include "dxmt_gamma.hpp"
 #include "dxgi_interfaces.h"
 #include "dxgi_object.hpp"
-#include "dxmt_presenter.hpp"
 
 namespace dxmt {
 

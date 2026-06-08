@@ -1,9 +1,7 @@
 #include "dxgi_interfaces.h"
-#include "dxmt_shader_cache.hpp"
 #include "log/log.hpp"
 #include "util_env.hpp"
 #include "util_fh4_bypass.hpp"
-#include "winemetal.h"
 #include <mutex>
 
 namespace dxmt {
@@ -51,16 +49,6 @@ static void InitializeVendorExtensionNV() {
   if (key3) RegCloseKey(key3);
 };
 
-static void InitializeMetalCachePath() {
-  if (env::getEnvVar("DXMT_USE_DEFAULT_METAL_CACHE") == "1")
-    return;
-  // This is the framework cache (mainly for PSOs), not managed by DXMT
-  auto metal_cache_path = GetDXMTShaderCacheDirectory() + "com.apple.metal";
-  if (!WMTSetMetalShaderCachePath(metal_cache_path.c_str())) {
-    Logger::info("Failed to set Metal cache path, fallback to system default");
-  }
-}
-
 extern "C" BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason,
                                LPVOID reserved) {
   if (reason != DLL_PROCESS_ATTACH)
@@ -69,7 +57,6 @@ extern "C" BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason,
   fh4bypass::ApplyBadFiberDataBypass();
   DisableThreadLibraryCalls(instance);
 
-  InitializeMetalCachePath();
   std::call_once(nvext_init, InitializeVendorExtensionNV);
 
   return TRUE;

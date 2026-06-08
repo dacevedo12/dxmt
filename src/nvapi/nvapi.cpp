@@ -5,6 +5,7 @@
 #include "nvapi_lite_common.h"
 #include "util_fh4_bypass.hpp"
 #include "util_string.hpp"
+#include "Metal.hpp"
 #include "winemetal.h"
 #include "wsi_monitor.hpp"
 #include <d3d12.h>
