@@ -21,6 +21,7 @@ runtime_files=(
   "x86_64-windows/d3d12.dll"
   "x86_64-windows/d3d12core.dll"
   "x86_64-windows/d3d11.dll"
+  "x86_64-windows/d3d11_dxmt.dll"
   "x86_64-windows/d3d10core.dll"
   "x86_64-windows/nvapi64.dll"
   "x86_64-windows/nvngx.dll"
@@ -35,6 +36,7 @@ windows_runtime_files=(
   "d3d12.dll"
   "d3d12core.dll"
   "d3d11.dll"
+  "d3d11_dxmt.dll"
   "d3d10core.dll"
   "nvapi64.dll"
   "nvngx.dll"
@@ -203,7 +205,8 @@ manifest = {
         "${COMPONENT_PATH}/wine/x86_64-windows",
     ],
     "environment_template": {
-        "WINEDLLOVERRIDES": "d3d10core,d3d11,d3d12,dxgi,winemetal,winemetal4,nvapi64,nvngx=n,b",
+        "DXMT_EXPERIMENT_DX12_SUPPORT": "1",
+        "WINEDLLOVERRIDES": "d3d10core,d3d11,d3d11_dxmt,d3d12,dxgi,winemetal,winemetal4,nvapi64,nvngx=n,b",
         "WINEDLLPATH": "${COMPONENT_PATH}/wine",
         "DYLD_FALLBACK_LIBRARY_PATH": "${COMPONENT_PATH}/wine/x86_64-unix:${WINE_INSTALL_PATH}/lib:${WINE_INSTALL_PATH}/lib/wine/x86_64-unix",
     },
