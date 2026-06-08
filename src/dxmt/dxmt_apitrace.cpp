@@ -18,6 +18,26 @@
 #include <windows.h>
 #endif
 
+#if DXMT_DX12_METAL4
+#define DXMT_WMT_APITRACE_SESSION_FLUSH WMT4ApitraceSessionFlush
+#define DXMT_WMT_APITRACE_SESSION_ENSURE_OPEN WMT4ApitraceSessionEnsureOpen
+#define DXMT_WMT_APITRACE_SESSION_SEAL_CHECKPOINT WMT4ApitraceSessionSealCheckpoint
+#define DXMT_WMT_APITRACE_SESSION_CLOSE WMT4ApitraceSessionClose
+#define DXMT_WMT_APITRACE_SET_CURRENT_D3D_SEQUENCE WMT4ApitraceSetCurrentD3DSequence
+#define DXMT_WMT_APITRACE_COMMAND_BUFFER_BEGIN WMT4ApitraceCommandBufferBegin
+#define DXMT_WMT_APITRACE_COMMAND_BUFFER_COMMIT WMT4ApitraceCommandBufferCommit
+#define DXMT_WMT_APITRACE_PRESENT_DRAWABLE WMT4ApitracePresentDrawable
+#else
+#define DXMT_WMT_APITRACE_SESSION_FLUSH WMTApitraceSessionFlush
+#define DXMT_WMT_APITRACE_SESSION_ENSURE_OPEN WMTApitraceSessionEnsureOpen
+#define DXMT_WMT_APITRACE_SESSION_SEAL_CHECKPOINT WMTApitraceSessionSealCheckpoint
+#define DXMT_WMT_APITRACE_SESSION_CLOSE WMTApitraceSessionClose
+#define DXMT_WMT_APITRACE_SET_CURRENT_D3D_SEQUENCE WMTApitraceSetCurrentD3DSequence
+#define DXMT_WMT_APITRACE_COMMAND_BUFFER_BEGIN WMTApitraceCommandBufferBegin
+#define DXMT_WMT_APITRACE_COMMAND_BUFFER_COMMIT WMTApitraceCommandBufferCommit
+#define DXMT_WMT_APITRACE_PRESENT_DRAWABLE WMTApitracePresentDrawable
+#endif
+
 namespace dxmt::apitrace {
 namespace {
 
@@ -226,7 +246,7 @@ flush_sessions_for_crash() {
 #ifdef DXMT_APITRACE_D3D
   ::apitrace::runtime::flush_process_trace_session();
 #endif
-  WMTApitraceSessionFlush();
+  DXMT_WMT_APITRACE_SESSION_FLUSH();
   log_verbose("session crash flush");
   crash_flush_running.store(false, std::memory_order_release);
 }
@@ -276,7 +296,7 @@ ensure_session_open() {
   install_crash_flush_handler();
 #endif
 
-  WMTApitraceSessionEnsureOpen();
+  DXMT_WMT_APITRACE_SESSION_ENSURE_OPEN();
   if (!session_open_logged.exchange(true, std::memory_order_relaxed) && verbose_enabled()) {
     INFO("DXMT apitrace: session open requested");
   }
@@ -290,7 +310,7 @@ seal_checkpoint() {
   if (shutdown_requested.load(std::memory_order_acquire))
     return;
 
-  WMTApitraceSessionSealCheckpoint();
+  DXMT_WMT_APITRACE_SESSION_SEAL_CHECKPOINT();
 #ifdef DXMT_APITRACE_D3D
   ::apitrace::runtime::seal_process_trace_session_checkpoint();
 #endif
@@ -305,7 +325,7 @@ seal_metal_checkpoint() {
   if (shutdown_requested.load(std::memory_order_acquire))
     return;
 
-  WMTApitraceSessionSealCheckpoint();
+  DXMT_WMT_APITRACE_SESSION_SEAL_CHECKPOINT();
   log_verbose("metal checkpoint sealed");
 }
 
@@ -331,7 +351,7 @@ shutdown() {
   if (shutdown_requested.exchange(true, std::memory_order_acq_rel))
     return;
 
-  WMTApitraceSessionClose();
+  DXMT_WMT_APITRACE_SESSION_CLOSE();
 #ifdef DXMT_APITRACE_D3D
   ::apitrace::runtime::shutdown_process_trace_session();
 #endif
@@ -343,7 +363,7 @@ set_current_d3d_sequence(uint64_t d3d_sequence) {
   if (!enabled())
     return;
 
-  WMTApitraceSetCurrentD3DSequence(d3d_sequence);
+  DXMT_WMT_APITRACE_SET_CURRENT_D3D_SEQUENCE(d3d_sequence);
 }
 
 void
@@ -352,7 +372,7 @@ on_command_buffer_begin(uint64_t command_buffer_id, uint64_t frame_id) {
     return;
 
   ensure_session_open();
-  WMTApitraceCommandBufferBegin(command_buffer_id, frame_id);
+  DXMT_WMT_APITRACE_COMMAND_BUFFER_BEGIN(command_buffer_id, frame_id);
   log_verbose("command buffer begin", command_buffer_id, frame_id);
 }
 
@@ -381,7 +401,7 @@ on_command_buffer_commit(uint64_t command_buffer_id) {
   if (!enabled())
     return;
 
-  WMTApitraceCommandBufferCommit(command_buffer_id);
+  DXMT_WMT_APITRACE_COMMAND_BUFFER_COMMIT(command_buffer_id);
   log_verbose("command buffer commit", command_buffer_id, 0);
 }
 
@@ -395,7 +415,7 @@ on_present_drawable(
   if (!enabled())
     return;
 
-  WMTApitracePresentDrawable(command_buffer_id, drawable_id, frame_index, sync_interval, flags);
+  DXMT_WMT_APITRACE_PRESENT_DRAWABLE(command_buffer_id, drawable_id, frame_index, sync_interval, flags);
   maybe_seal_metal_checkpoint_after_frame(frame_index);
   if (verbose_enabled()) {
     INFO("DXMT apitrace: present commandBuffer=", command_buffer_id,

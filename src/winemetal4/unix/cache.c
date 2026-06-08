@@ -182,7 +182,7 @@ resolve_cache_dir(NSString *path, bool path_is_file) {
 @end
 
 int
-_CacheReader_alloc_init(void *obj) {
+_WMT4CacheReader_alloc_init(void *obj) {
   struct unixcall_cache_alloc_init *params = obj;
   NSString *path = [[NSString alloc] initWithCString:params->path.ptr encoding:NSUTF8StringEncoding];
   params->ret_cache = (obj_handle_t)[[WMT4CacheReader alloc] initWithPath:path version:params->version];
@@ -191,7 +191,7 @@ _CacheReader_alloc_init(void *obj) {
 }
 
 int
-_CacheReader_get(void *obj) {
+_WMT4CacheReader_get(void *obj) {
   struct unixcall_cache_get *params = obj;
   NSData *key =
       [[NSData alloc] initWithBytesNoCopy:(void *)params->key.ptr length:params->key_length freeWhenDone:false];
@@ -202,7 +202,7 @@ _CacheReader_get(void *obj) {
 }
 
 int
-_CacheWriter_alloc_init(void *obj) {
+_WMT4CacheWriter_alloc_init(void *obj) {
   struct unixcall_cache_alloc_init *params = obj;
   NSString *path = [[NSString alloc] initWithCString:params->path.ptr encoding:NSUTF8StringEncoding];
   params->ret_cache = (obj_handle_t)[[WMT4CacheWriter alloc] initWithPath:path version:params->version];
@@ -211,7 +211,7 @@ _CacheWriter_alloc_init(void *obj) {
 }
 
 int
-_CacheWriter_set(void *obj) {
+_WMT4CacheWriter_set(void *obj) {
   struct unixcall_cache_set *params = obj;
   NSData *key =
       [[NSData alloc] initWithBytesNoCopy:(void *)params->key.ptr length:params->key_length freeWhenDone:false];
@@ -227,10 +227,15 @@ extern void MTLSetShaderCachePath(NSString* path);
 extern NSString* MTLGetShaderCachePath();
 
 int
-_WMTSetMetalShaderCachePath(void *obj) {
+_WMT4SetMetalShaderCachePath(void *obj) {
   struct unixcall_setmetalcachepath *params = obj;
   NSString *path = [[NSString alloc] initWithCString:params->path.ptr encoding:NSUTF8StringEncoding];
   NSString *resolved_path = resolve_cache_dir(path, false);
+  if (!resolved_path) {
+    params->ret_success = 0;
+    [path release];
+    return 0;
+  }
   MTLSetShaderCachePath(resolved_path);
   params->ret_success = [MTLGetShaderCachePath() isEqualToString:resolved_path];
   [path release];
@@ -240,7 +245,7 @@ _WMTSetMetalShaderCachePath(void *obj) {
 #else
 
 int
-WMTSetMetalShaderCachePath(void *obj) {
+WMT4SetMetalShaderCachePath(void *obj) {
   struct unixcall_setmetalcachepath *params = obj;
   params->ret_success = 0;
   return 0;

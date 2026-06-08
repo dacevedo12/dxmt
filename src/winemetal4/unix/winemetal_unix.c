@@ -5596,7 +5596,7 @@ _MTLDevice_newSharedTexture(void *obj) {
 extern kern_return_t bootstrap_register2(mach_port_t bp, name_t service_name, mach_port_t sp, int flags);
 
 static NTSTATUS
-_WMTBootstrapRegister(void *obj) {
+_WMT4BootstrapRegister(void *obj) {
   struct unixcall_bootstrap *params = obj;
   mach_port_t rp = params->mach_port;
   mach_port_t bp;
@@ -5609,7 +5609,7 @@ _WMTBootstrapRegister(void *obj) {
 }
 
 static NTSTATUS
-_WMTBootstrapLookUp(void *obj) {
+_WMT4BootstrapLookUp(void *obj) {
   struct unixcall_bootstrap *params = obj;
   mach_port_t rp = 0;
   mach_port_t bp;
@@ -5810,7 +5810,7 @@ _MTLDevice_newTileRenderPipelineState(void *obj) {
 
 #if DXMT_APITRACE_METAL
 static NTSTATUS
-_WMTApitraceSessionEnsureOpen(void *obj) {
+_WMT4ApitraceSessionEnsureOpen(void *obj) {
   (void)obj;
   if (!dxmt_apitrace_runtime_enabled())
     return STATUS_SUCCESS;
@@ -5821,7 +5821,7 @@ _WMTApitraceSessionEnsureOpen(void *obj) {
 }
 
 static NTSTATUS
-_WMTApitraceSessionClose(void *obj) {
+_WMT4ApitraceSessionClose(void *obj) {
   (void)obj;
   if (!dxmt_apitrace_runtime_enabled())
     return STATUS_SUCCESS;
@@ -5832,7 +5832,7 @@ _WMTApitraceSessionClose(void *obj) {
 }
 
 static NTSTATUS
-_WMTApitraceSessionFlush(void *obj) {
+_WMT4ApitraceSessionFlush(void *obj) {
   (void)obj;
   if (!dxmt_apitrace_runtime_enabled())
     return STATUS_SUCCESS;
@@ -5844,7 +5844,7 @@ _WMTApitraceSessionFlush(void *obj) {
 }
 
 static NTSTATUS
-_WMTApitraceSessionSealCheckpoint(void *obj) {
+_WMT4ApitraceSessionSealCheckpoint(void *obj) {
   (void)obj;
   if (!dxmt_apitrace_runtime_enabled())
     return STATUS_SUCCESS;
@@ -5856,7 +5856,7 @@ _WMTApitraceSessionSealCheckpoint(void *obj) {
 }
 
 static NTSTATUS
-_WMTApitraceSetCurrentD3DSequence(void *obj) {
+_WMT4ApitraceSetCurrentD3DSequence(void *obj) {
   struct unixcall_generic_obj_uint64_noret *params = obj;
   if (!dxmt_apitrace_runtime_enabled())
     return STATUS_SUCCESS;
@@ -5870,7 +5870,7 @@ _WMTApitraceSetCurrentD3DSequence(void *obj) {
 }
 
 static NTSTATUS
-_WMTApitraceCommandBufferBegin(void *obj) {
+_WMT4ApitraceCommandBufferBegin(void *obj) {
   struct unixcall_apitrace_command_buffer_begin *params = obj;
   if (!dxmt_apitrace_runtime_enabled())
     return STATUS_SUCCESS;
@@ -5888,7 +5888,7 @@ _WMTApitraceCommandBufferBegin(void *obj) {
 }
 
 static NTSTATUS
-_WMTApitraceCommandBufferCommit(void *obj) {
+_WMT4ApitraceCommandBufferCommit(void *obj) {
   struct unixcall_generic_obj_noret *params = obj;
   if (!dxmt_apitrace_runtime_enabled())
     return STATUS_SUCCESS;
@@ -5906,7 +5906,7 @@ _WMTApitraceCommandBufferCommit(void *obj) {
 }
 
 static NTSTATUS
-_WMTApitracePresentDrawable(void *obj) {
+_WMT4ApitracePresentDrawable(void *obj) {
   struct unixcall_apitrace_present *params = obj;
   if (!dxmt_apitrace_runtime_enabled())
     return STATUS_SUCCESS;
@@ -5931,25 +5931,25 @@ _WMTApitracePresentDrawable(void *obj) {
   return STATUS_SUCCESS;
 }
 #else
-static NTSTATUS _WMTApitraceSessionEnsureOpen(void *obj) { (void)obj; return STATUS_SUCCESS; }
-static NTSTATUS _WMTApitraceSessionClose(void *obj) { (void)obj; return STATUS_SUCCESS; }
-static NTSTATUS _WMTApitraceSessionFlush(void *obj) { (void)obj; return STATUS_SUCCESS; }
-static NTSTATUS _WMTApitraceSessionSealCheckpoint(void *obj) { (void)obj; return STATUS_SUCCESS; }
-static NTSTATUS _WMTApitraceSetCurrentD3DSequence(void *obj) { (void)obj; return STATUS_SUCCESS; }
-static NTSTATUS _WMTApitraceCommandBufferBegin(void *obj) { (void)obj; return STATUS_SUCCESS; }
-static NTSTATUS _WMTApitraceCommandBufferCommit(void *obj) { (void)obj; return STATUS_SUCCESS; }
-static NTSTATUS _WMTApitracePresentDrawable(void *obj) { (void)obj; return STATUS_SUCCESS; }
+static NTSTATUS _WMT4ApitraceSessionEnsureOpen(void *obj) { (void)obj; return STATUS_SUCCESS; }
+static NTSTATUS _WMT4ApitraceSessionClose(void *obj) { (void)obj; return STATUS_SUCCESS; }
+static NTSTATUS _WMT4ApitraceSessionFlush(void *obj) { (void)obj; return STATUS_SUCCESS; }
+static NTSTATUS _WMT4ApitraceSessionSealCheckpoint(void *obj) { (void)obj; return STATUS_SUCCESS; }
+static NTSTATUS _WMT4ApitraceSetCurrentD3DSequence(void *obj) { (void)obj; return STATUS_SUCCESS; }
+static NTSTATUS _WMT4ApitraceCommandBufferBegin(void *obj) { (void)obj; return STATUS_SUCCESS; }
+static NTSTATUS _WMT4ApitraceCommandBufferCommit(void *obj) { (void)obj; return STATUS_SUCCESS; }
+static NTSTATUS _WMT4ApitracePresentDrawable(void *obj) { (void)obj; return STATUS_SUCCESS; }
 #endif
 
 /*
  * Definition from cache.c
  */
 
-NTSTATUS _CacheReader_alloc_init(void *obj);
-NTSTATUS _CacheReader_get(void *obj);
-NTSTATUS _CacheWriter_alloc_init(void *obj);
-NTSTATUS _CacheWriter_set(void *obj);
-NTSTATUS _WMTSetMetalShaderCachePath(void *obj);
+NTSTATUS _WMT4CacheReader_alloc_init(void *obj);
+NTSTATUS _WMT4CacheReader_get(void *obj);
+NTSTATUS _WMT4CacheWriter_alloc_init(void *obj);
+NTSTATUS _WMT4CacheWriter_set(void *obj);
+NTSTATUS _WMT4SetMetalShaderCachePath(void *obj);
 NTSTATUS _MTL4CounterHeap_newTimestampHeap(void *obj);
 NTSTATUS _MTL4CounterHeap_resolveCounterRange(void *obj);
 NTSTATUS _MTL4TimestampContext_create(void *obj);
@@ -6077,14 +6077,14 @@ const void *__wine_unix_call_funcs[] = {
     &_MTLDevice_newBinaryArchive,
     &_MTLBinaryArchive_serialize,
     &_DispatchData_alloc_init,
-    &_CacheReader_alloc_init,
-    &_CacheReader_get,
-    &_CacheWriter_alloc_init,
-    &_CacheWriter_set,
-    &_WMTSetMetalShaderCachePath,
+    &_WMT4CacheReader_alloc_init,
+    &_WMT4CacheReader_get,
+    &_WMT4CacheWriter_alloc_init,
+    &_WMT4CacheWriter_set,
+    &_WMT4SetMetalShaderCachePath,
     &_MTLDevice_newSharedTexture,
-    &_WMTBootstrapRegister,
-    &_WMTBootstrapLookUp,
+    &_WMT4BootstrapRegister,
+    &_WMT4BootstrapLookUp,
     &_MTLSharedEvent_createMachPort,
     &_MTLDevice_newSharedEventWithMachPort,
     &_MTLDevice_registryID,
@@ -6094,18 +6094,18 @@ const void *__wine_unix_call_funcs[] = {
     &_MTLCommandBuffer_blitCommandEncoderWithSampleBuffers,
     &_MTLCommandBuffer_property,
     &_MTLDevice_newTileRenderPipelineState,
-    &_WMTApitraceSessionEnsureOpen,
-    &_WMTApitraceSessionClose,
-    &_WMTApitraceSetCurrentD3DSequence,
-    &_WMTApitraceCommandBufferBegin,
-    &_WMTApitraceCommandBufferCommit,
-    &_WMTApitracePresentDrawable,
-    &_WMTApitraceSessionSealCheckpoint,
+    &_WMT4ApitraceSessionEnsureOpen,
+    &_WMT4ApitraceSessionClose,
+    &_WMT4ApitraceSetCurrentD3DSequence,
+    &_WMT4ApitraceCommandBufferBegin,
+    &_WMT4ApitraceCommandBufferCommit,
+    &_WMT4ApitracePresentDrawable,
+    &_WMT4ApitraceSessionSealCheckpoint,
     &_MTLDevice_supportsPlacementSparse,
     &_MTLDevice_sparseTileSize,
     &_MTLDevice_newPlacementHeap,
     &_MTLDevice_updateSparseTextureMappings,
-    &_WMTApitraceSessionFlush,
+    &_WMT4ApitraceSessionFlush,
     &_MTL4CounterHeap_newTimestampHeap,
     &_MTL4CounterHeap_resolveCounterRange,
     &_MTL4TimestampContext_create,
@@ -6235,14 +6235,14 @@ const void *__wine_unix_call_wow64_funcs[] = {
     &_MTLDevice_newBinaryArchive,
     &_MTLBinaryArchive_serialize,
     &_DispatchData_alloc_init,
-    &_CacheReader_alloc_init,
-    &_CacheReader_get,
-    &_CacheWriter_alloc_init,
-    &_CacheWriter_set,
-    &_WMTSetMetalShaderCachePath,
+    &_WMT4CacheReader_alloc_init,
+    &_WMT4CacheReader_get,
+    &_WMT4CacheWriter_alloc_init,
+    &_WMT4CacheWriter_set,
+    &_WMT4SetMetalShaderCachePath,
     &_MTLDevice_newSharedTexture,
-    &_WMTBootstrapRegister,
-    &_WMTBootstrapLookUp,
+    &_WMT4BootstrapRegister,
+    &_WMT4BootstrapLookUp,
     &_MTLSharedEvent_createMachPort,
     &_MTLDevice_newSharedEventWithMachPort,
     &_MTLDevice_registryID,
@@ -6252,18 +6252,18 @@ const void *__wine_unix_call_wow64_funcs[] = {
     &_MTLCommandBuffer_blitCommandEncoderWithSampleBuffers,
     &_MTLCommandBuffer_property,
     &_MTLDevice_newTileRenderPipelineState,
-    &_WMTApitraceSessionEnsureOpen,
-    &_WMTApitraceSessionClose,
-    &_WMTApitraceSetCurrentD3DSequence,
-    &_WMTApitraceCommandBufferBegin,
-    &_WMTApitraceCommandBufferCommit,
-    &_WMTApitracePresentDrawable,
-    &_WMTApitraceSessionSealCheckpoint,
+    &_WMT4ApitraceSessionEnsureOpen,
+    &_WMT4ApitraceSessionClose,
+    &_WMT4ApitraceSetCurrentD3DSequence,
+    &_WMT4ApitraceCommandBufferBegin,
+    &_WMT4ApitraceCommandBufferCommit,
+    &_WMT4ApitracePresentDrawable,
+    &_WMT4ApitraceSessionSealCheckpoint,
     &_MTLDevice_supportsPlacementSparse,
     &_MTLDevice_sparseTileSize,
     &_MTLDevice_newPlacementHeap,
     &_MTLDevice_updateSparseTextureMappings,
-    &_WMTApitraceSessionFlush,
+    &_WMT4ApitraceSessionFlush,
     &_MTL4CounterHeap_newTimestampHeap,
     &_MTL4CounterHeap_resolveCounterRange,
     &_MTL4TimestampContext_create,

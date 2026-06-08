@@ -87,19 +87,19 @@ WINEMETAL_API obj_handle_t NSAutoreleasePool_alloc_init();
 
 WINEMETAL_API obj_handle_t MTLCommandQueue_commandBuffer(obj_handle_t queue);
 
-WINEMETAL_API void WMTApitraceSessionEnsureOpen(void);
+WINEMETAL_API void WMT4ApitraceSessionEnsureOpen(void);
 
-WINEMETAL_API void WMTApitraceSessionClose(void);
+WINEMETAL_API void WMT4ApitraceSessionClose(void);
 
-WINEMETAL_API void WMTApitraceSessionFlush(void);
+WINEMETAL_API void WMT4ApitraceSessionFlush(void);
 
-WINEMETAL_API void WMTApitraceSessionSealCheckpoint(void);
+WINEMETAL_API void WMT4ApitraceSessionSealCheckpoint(void);
 
-WINEMETAL_API void WMTApitraceSetCurrentD3DSequence(uint64_t d3d_sequence);
+WINEMETAL_API void WMT4ApitraceSetCurrentD3DSequence(uint64_t d3d_sequence);
 
-WINEMETAL_API void WMTApitraceCommandBufferBegin(obj_handle_t command_buffer, uint64_t frame_id);
+WINEMETAL_API void WMT4ApitraceCommandBufferBegin(obj_handle_t command_buffer, uint64_t frame_id);
 
-WINEMETAL_API void WMTApitraceCommandBufferCommit(obj_handle_t command_buffer);
+WINEMETAL_API void WMT4ApitraceCommandBufferCommit(obj_handle_t command_buffer);
 
 WINEMETAL_API void MTLCommandBuffer_commit(obj_handle_t cmdbuf);
 
@@ -1588,7 +1588,7 @@ WINEMETAL_API void MTLCommandBuffer_presentDrawable(obj_handle_t cmdbuf, obj_han
 WINEMETAL_API void
 MTLCommandBuffer_presentDrawableAfterMinimumDuration(obj_handle_t cmdbuf, obj_handle_t drawable, double after);
 
-WINEMETAL_API void WMTApitracePresentDrawable(
+WINEMETAL_API void WMT4ApitracePresentDrawable(
     obj_handle_t command_buffer,
     obj_handle_t drawable,
     uint64_t frame_index,
@@ -1927,21 +1927,21 @@ WINEMETAL_API void MTLBinaryArchive_serialize(obj_handle_t archive, const char *
 
 WINEMETAL_API obj_handle_t DispatchData_alloc_init(uint64_t native_ptr, uint64_t length);
 
-WINEMETAL_API obj_handle_t CacheReader_alloc_init(const char *path, uint64_t version);
+WINEMETAL_API obj_handle_t WMT4CacheReader_alloc_init(const char *path, uint64_t version);
 
-WINEMETAL_API obj_handle_t CacheReader_get(obj_handle_t reader, const void *key, uint64_t length);
+WINEMETAL_API obj_handle_t WMT4CacheReader_get(obj_handle_t reader, const void *key, uint64_t length);
 
-WINEMETAL_API obj_handle_t CacheWriter_alloc_init(const char *path, uint64_t version);
+WINEMETAL_API obj_handle_t WMT4CacheWriter_alloc_init(const char *path, uint64_t version);
 
-WINEMETAL_API void CacheWriter_set(obj_handle_t writer, const void *key, uint64_t key_length, obj_handle_t value);
+WINEMETAL_API void WMT4CacheWriter_set(obj_handle_t writer, const void *key, uint64_t key_length, obj_handle_t value);
 
-WINEMETAL_API bool WMTSetMetalShaderCachePath(const char *path);
+WINEMETAL_API bool WMT4SetMetalShaderCachePath(const char *path);
 
 WINEMETAL_API obj_handle_t MTLDevice_newSharedTexture(obj_handle_t device, struct WMTTextureInfo *info);
 
-WINEMETAL_API bool WMTBootstrapRegister(const char *name, mach_port_t mach_port);
+WINEMETAL_API bool WMT4BootstrapRegister(const char *name, mach_port_t mach_port);
 
-WINEMETAL_API bool WMTBootstrapLookUp(const char *name, mach_port_t *mach_port);
+WINEMETAL_API bool WMT4BootstrapLookUp(const char *name, mach_port_t *mach_port);
 
 WINEMETAL_API mach_port_t MTLSharedEvent_createMachPort(obj_handle_t event);
 

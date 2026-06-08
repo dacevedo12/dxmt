@@ -124,35 +124,35 @@ MTLCommandQueue_commandBuffer(obj_handle_t queue) {
 }
 
 WINEMETAL_API void
-WMTApitraceSessionEnsureOpen(void) {
+WMT4ApitraceSessionEnsureOpen(void) {
   struct unixcall_generic_obj_noret params;
   params.handle = 0;
   UNIX_CALL(136, &params);
 }
 
 WINEMETAL_API void
-WMTApitraceSessionClose(void) {
+WMT4ApitraceSessionClose(void) {
   struct unixcall_generic_obj_noret params;
   params.handle = 0;
   UNIX_CALL(137, &params);
 }
 
 WINEMETAL_API void
-WMTApitraceSessionFlush(void) {
+WMT4ApitraceSessionFlush(void) {
   struct unixcall_generic_obj_noret params;
   params.handle = 0;
   UNIX_CALL(147, &params);
 }
 
 WINEMETAL_API void
-WMTApitraceSessionSealCheckpoint(void) {
+WMT4ApitraceSessionSealCheckpoint(void) {
   struct unixcall_generic_obj_noret params;
   params.handle = 0;
   UNIX_CALL(142, &params);
 }
 
 WINEMETAL_API void
-WMTApitraceSetCurrentD3DSequence(uint64_t d3d_sequence) {
+WMT4ApitraceSetCurrentD3DSequence(uint64_t d3d_sequence) {
   struct unixcall_generic_obj_uint64_noret params;
   params.handle = 0;
   params.arg = d3d_sequence;
@@ -160,7 +160,7 @@ WMTApitraceSetCurrentD3DSequence(uint64_t d3d_sequence) {
 }
 
 WINEMETAL_API void
-WMTApitraceCommandBufferBegin(obj_handle_t command_buffer, uint64_t frame_id) {
+WMT4ApitraceCommandBufferBegin(obj_handle_t command_buffer, uint64_t frame_id) {
   struct unixcall_apitrace_command_buffer_begin params;
   params.command_buffer = command_buffer;
   params.frame_id = frame_id;
@@ -168,7 +168,7 @@ WMTApitraceCommandBufferBegin(obj_handle_t command_buffer, uint64_t frame_id) {
 }
 
 WINEMETAL_API void
-WMTApitraceCommandBufferCommit(obj_handle_t command_buffer) {
+WMT4ApitraceCommandBufferCommit(obj_handle_t command_buffer) {
   struct unixcall_generic_obj_noret params;
   params.handle = command_buffer;
   UNIX_CALL(140, &params);
@@ -553,7 +553,7 @@ MTLCommandBuffer_presentDrawableAfterMinimumDuration(obj_handle_t cmdbuf, obj_ha
 };
 
 WINEMETAL_API void
-WMTApitracePresentDrawable(
+WMT4ApitracePresentDrawable(
     obj_handle_t command_buffer,
     obj_handle_t drawable,
     uint64_t frame_index,
@@ -1085,7 +1085,7 @@ DispatchData_alloc_init(uint64_t native_ptr, uint64_t length) {
 }
 
 WINEMETAL_API obj_handle_t
-CacheReader_alloc_init(const char *path, uint64_t version) {
+WMT4CacheReader_alloc_init(const char *path, uint64_t version) {
   struct unixcall_cache_alloc_init params;
   WMT_MEMPTR_SET(params.path, path);
   params.version = version;
@@ -1094,7 +1094,7 @@ CacheReader_alloc_init(const char *path, uint64_t version) {
 }
 
 WINEMETAL_API obj_handle_t
-CacheReader_get(obj_handle_t reader, const void *key, uint64_t length) {
+WMT4CacheReader_get(obj_handle_t reader, const void *key, uint64_t length) {
   struct unixcall_cache_get params;
   params.cache = reader;
   WMT_MEMPTR_SET(params.key, key);
@@ -1104,7 +1104,7 @@ CacheReader_get(obj_handle_t reader, const void *key, uint64_t length) {
 }
 
 WINEMETAL_API obj_handle_t
-CacheWriter_alloc_init(const char *path, uint64_t version) {
+WMT4CacheWriter_alloc_init(const char *path, uint64_t version) {
   struct unixcall_cache_alloc_init params;
   WMT_MEMPTR_SET(params.path, path);
   params.version = version;
@@ -1113,7 +1113,7 @@ CacheWriter_alloc_init(const char *path, uint64_t version) {
 }
 
 WINEMETAL_API void
-CacheWriter_set(
+WMT4CacheWriter_set(
     obj_handle_t writer, const void *key, uint64_t key_length, obj_handle_t value
 ) {
   struct unixcall_cache_set params;
@@ -1125,7 +1125,7 @@ CacheWriter_set(
 }
 
 WINEMETAL_API bool
-WMTSetMetalShaderCachePath(const char *path) {
+WMT4SetMetalShaderCachePath(const char *path) {
   struct unixcall_setmetalcachepath params;
   WMT_MEMPTR_SET(params.path, path);
   params.ret_success = 0;
@@ -1143,7 +1143,7 @@ MTLDevice_newSharedTexture(obj_handle_t device, struct WMTTextureInfo *info) {
 }
 
 WINEMETAL_API bool
-WMTBootstrapRegister(const char *name, mach_port_t mach_port) {
+WMT4BootstrapRegister(const char *name, mach_port_t mach_port) {
   struct unixcall_bootstrap params;
   strncpy(params.name, name, sizeof(params.name) - 1);
   params.name[sizeof(params.name) - 1] = '\0';
@@ -1153,7 +1153,7 @@ WMTBootstrapRegister(const char *name, mach_port_t mach_port) {
 }
 
 WINEMETAL_API bool
-WMTBootstrapLookUp(const char *name, mach_port_t *mach_port) {
+WMT4BootstrapLookUp(const char *name, mach_port_t *mach_port) {
   struct unixcall_bootstrap params;
   strncpy(params.name, name, sizeof(params.name) - 1);
   params.name[sizeof(params.name) - 1] = '\0';

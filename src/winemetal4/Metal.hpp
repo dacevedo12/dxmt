@@ -1041,18 +1041,18 @@ class CacheReader : public Object {
 public:
   static Reference<CacheReader>
   alloc_init(const char *path, uint64_t version) {
-    return Reference<CacheReader>(CacheReader_alloc_init(path, version));
+    return Reference<CacheReader>(WMT4CacheReader_alloc_init(path, version));
   };
 
   Reference<DispatchData>
   get(const void *key, uint64_t length) {
-    return Reference<DispatchData>(CacheReader_get(handle, key, length));
+    return Reference<DispatchData>(WMT4CacheReader_get(handle, key, length));
   };
 
   template <typename K>
   Reference<DispatchData>
   get(const K &key) {
-    return Reference<DispatchData>(CacheReader_get(handle, reinterpret_cast<const void *>(&key), sizeof(key)));
+    return Reference<DispatchData>(WMT4CacheReader_get(handle, reinterpret_cast<const void *>(&key), sizeof(key)));
   };
 };
 
@@ -1060,12 +1060,12 @@ class CacheWriter : public Object {
 public:
   static Reference<CacheWriter>
   alloc_init(const char *path, uint64_t version) {
-    return Reference<CacheWriter>(CacheWriter_alloc_init(path, version));
+    return Reference<CacheWriter>(WMT4CacheWriter_alloc_init(path, version));
   };
 
   void
   set(const void *key, uint64_t key_length, DispatchData value) {
-    CacheWriter_set(handle, key, key_length, value);
+    WMT4CacheWriter_set(handle, key, key_length, value);
   };
 
   template <typename K>
