@@ -1860,6 +1860,17 @@ ArgumentEncodingContext::encodeConstantBuffers(
     switch (arg.Type) {
     case SM50BindingType::ConstantBuffer: {
       auto &cbuf = bindings[i];
+      if (cbuf.direct_buffer) {
+        encoded_buffer[arg.StructurePtrOffset] =
+            cbuf.direct_gpu_address + cbuf.offset;
+        DebugLogConstantBufferBinding<stage, kind>(
+            "", arg, cbuf, encoded_buffer[arg.StructurePtrOffset],
+            cbuf.direct_length > cbuf.offset ? cbuf.direct_length - cbuf.offset : 0,
+            encoder_id, false);
+        makeResident<stage, kind>(cbuf.direct_buffer,
+                                  GetResidencyMask<kind>(stage, true, false));
+        continue;
+      }
       if (!cbuf.buffer.ptr()) {
         encoded_buffer[arg.StructurePtrOffset] = dummy_cbuffer_info_.gpu_address;
         DebugLogConstantBufferBinding<stage, kind>(

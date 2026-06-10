@@ -294,15 +294,17 @@ public:
   }
 
   AllocatedArgumentBufferSlice
-  AllocateArgumentBuffer(uint64_t seq, size_t size) {
+  AllocateArgumentBuffer(uint64_t seq, size_t size, size_t alignment = 64) {
     if (!size)
       return {};
-    auto [block, offset] = argbuf_allocator.allocate(seq, cpu_coherent.signaledValue(), size, 64);
+    auto [block, offset] = argbuf_allocator.allocate(seq, cpu_coherent.signaledValue(), size, alignment);
     if constexpr (sizeof(void *) == 4) {
-      auto [shadow_block, shadow_offset] = argbuf_shadow_allocator.allocate(seq, cpu_coherent.signaledValue(), size, 64);
-      return {ptr_add(shadow_block.ptr, shadow_offset), block.buffer, offset, size, true};
+      auto [shadow_block, shadow_offset] = argbuf_shadow_allocator.allocate(seq, cpu_coherent.signaledValue(), size, alignment);
+      return {ptr_add(shadow_block.ptr, shadow_offset), block.buffer, offset,
+              block.gpu_address, size, true};
     } else {
-      return {ptr_add(block.mapped_address, offset), block.buffer, offset, size, false};
+      return {ptr_add(block.mapped_address, offset), block.buffer, offset,
+              block.gpu_address, size, false};
     }
   }
 

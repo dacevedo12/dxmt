@@ -7007,19 +7007,20 @@ resolve_cpu_fallback:
     if (!actual_count)
       return;
 
-    auto buffer = Rc<Buffer>(new Buffer(uint64_t(actual_count) * sizeof(UINT),
-                                        device_->GetMTLDevice()));
-    Flags<BufferAllocationFlag> flags;
-    flags.set(BufferAllocationFlag::GpuReadonly);
-    auto allocation = buffer->allocate(flags);
-    std::vector<UINT> packed(actual_count, 0);
-    std::copy(it->second.begin(),
-              it->second.begin() +
-                  std::min<size_t>(it->second.size(), packed.size()),
-              packed.begin());
-    allocation->updateContents(0, packed.data(),
-                               uint64_t(packed.size()) * sizeof(UINT));
-    buffer->rename(std::move(allocation));
+    const auto byte_length = uint64_t(actual_count) * sizeof(UINT);
+    auto constants = device_->GetDXMTDevice().queue().AllocateArgumentBuffer(
+        enc.currentSeqId(), byte_length,
+        D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT);
+    if (!constants.mapped || !constants.gpu_buffer)
+      return;
+    std::memset(constants.mapped, 0, constants.length);
+    std::memcpy(constants.mapped, it->second.data(),
+                std::min<uint64_t>(uint64_t(it->second.size()) * sizeof(UINT),
+                                   constants.length));
+    if (constants.needs_flush)
+      constants.gpu_buffer.updateContents(constants.offset, constants.mapped,
+                                          constants.length);
+    const auto gpu_address = constants.gpu_address + constants.offset;
 
     ForEachVisibleStage(parameter.visibility, compute, [&](PipelineStage stage) {
       auto slot = ResolveShaderBindingSlot(
@@ -7032,7 +7033,7 @@ resolve_cpu_fallback:
                           root_index, *slot,
                           parameter.constants.ShaderRegister,
                           parameter.constants.RegisterSpace,
-                          actual_count * sizeof(UINT),
+                          byte_length,
                           0);
       if (*slot >= 14) {
         WARN("D3D12CommandQueue: root constants target unsupported CBV slot b",
@@ -7041,29 +7042,29 @@ resolve_cpu_fallback:
       }
       switch (stage) {
       case PipelineStage::Compute:
-        enc.bindConstantBuffer<PipelineStage::Compute>(*slot, 0,
-                                                       Rc<Buffer>(buffer));
+        enc.bindConstantBufferDirect<PipelineStage::Compute>(
+            *slot, constants.gpu_buffer, gpu_address, byte_length);
         break;
       case PipelineStage::Pixel:
-        enc.bindConstantBuffer<PipelineStage::Pixel>(*slot, 0,
-                                                     Rc<Buffer>(buffer));
+        enc.bindConstantBufferDirect<PipelineStage::Pixel>(
+            *slot, constants.gpu_buffer, gpu_address, byte_length);
         break;
       case PipelineStage::Geometry:
-        enc.bindConstantBuffer<PipelineStage::Geometry>(*slot, 0,
-                                                        Rc<Buffer>(buffer));
+        enc.bindConstantBufferDirect<PipelineStage::Geometry>(
+            *slot, constants.gpu_buffer, gpu_address, byte_length);
         break;
       case PipelineStage::Hull:
-        enc.bindConstantBuffer<PipelineStage::Hull>(*slot, 0,
-                                                    Rc<Buffer>(buffer));
+        enc.bindConstantBufferDirect<PipelineStage::Hull>(
+            *slot, constants.gpu_buffer, gpu_address, byte_length);
         break;
       case PipelineStage::Domain:
-        enc.bindConstantBuffer<PipelineStage::Domain>(*slot, 0,
-                                                      Rc<Buffer>(buffer));
+        enc.bindConstantBufferDirect<PipelineStage::Domain>(
+            *slot, constants.gpu_buffer, gpu_address, byte_length);
         break;
       case PipelineStage::Vertex:
       default:
-        enc.bindConstantBuffer<PipelineStage::Vertex>(*slot, 0,
-                                                      Rc<Buffer>(buffer));
+        enc.bindConstantBufferDirect<PipelineStage::Vertex>(
+            *slot, constants.gpu_buffer, gpu_address, byte_length);
         break;
       }
     });

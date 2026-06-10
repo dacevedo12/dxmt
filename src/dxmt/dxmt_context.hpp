@@ -60,6 +60,9 @@ struct VertexBufferBinding {
 
 struct ConstantBufferBinding {
   Rc<Buffer> buffer;
+  WMT::Reference<WMT::Buffer> direct_buffer;
+  uint64_t direct_gpu_address = 0;
+  uint64_t direct_length = 0;
   unsigned offset;
 };
 
@@ -358,6 +361,7 @@ struct AllocatedArgumentBufferSlice {
   void *mapped;
   WMT::Buffer gpu_buffer;
   uint64_t offset;
+  uint64_t gpu_address;
   uint64_t length;
   bool needs_flush;
 };
@@ -462,6 +466,22 @@ public:
     auto &entry = cbuf_[idx];
     entry.offset = offset;
     entry.buffer = std::move(buffer);
+    entry.direct_buffer = {};
+    entry.direct_gpu_address = 0;
+    entry.direct_length = 0;
+  }
+
+  template <PipelineStage stage>
+  void
+  bindConstantBufferDirect(unsigned slot, WMT::Buffer buffer, uint64_t gpu_address,
+                           uint64_t length) {
+    unsigned idx = slot + 14 * unsigned(stage);
+    auto &entry = cbuf_[idx];
+    entry.buffer = {};
+    entry.direct_buffer = WMT::Reference<WMT::Buffer>(buffer);
+    entry.direct_gpu_address = gpu_address;
+    entry.direct_length = length;
+    entry.offset = 0;
   }
 
   template <PipelineStage stage>
