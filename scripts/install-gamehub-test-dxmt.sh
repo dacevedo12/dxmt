@@ -17,6 +17,7 @@ ENABLE_APITRACE="${DXMT_GAMEHUB_ENABLE_APITRACE:-0}"
 APITRACE_OUTPUT_DIR="${DXMT_GAMEHUB_APITRACE_OUTPUT_DIR:-${REPO_ROOT}/tmp/gamehub-apitrace}"
 APITRACE_VERBOSE="${DXMT_GAMEHUB_APITRACE_VERBOSE:-0}"
 APITRACE_SEAL_AFTER_FRAME="${DXMT_GAMEHUB_APITRACE_SEAL_AFTER_FRAME:-}"
+GAMEHUB_WINEDEBUG="${DXMT_GAMEHUB_WINEDEBUG:--all}"
 
 runtime_files=(
   "x86_64-windows/winemetal.dll"
@@ -198,7 +199,7 @@ write_manifest() {
 
   python3 - "$GAMEHUB_DXMT_ROOT/manifest.json" "$GAMEHUB_DXMT_PACKAGE" \
     "$ENABLE_APITRACE" "$APITRACE_OUTPUT_DIR" "$APITRACE_VERBOSE" \
-    "$APITRACE_SEAL_AFTER_FRAME" <<'PY'
+    "$APITRACE_SEAL_AFTER_FRAME" "$GAMEHUB_WINEDEBUG" <<'PY'
 import json
 import sys
 
@@ -208,12 +209,15 @@ enable_apitrace = sys.argv[3] == "1"
 apitrace_output_dir = sys.argv[4]
 apitrace_verbose = sys.argv[5] == "1"
 apitrace_seal_after_frame = sys.argv[6]
+winedebug = sys.argv[7]
 environment_template = {
     "DXMT_EXPERIMENT_DX12_SUPPORT": "1",
     "WINEDLLOVERRIDES": "d3d10core,d3d11,d3d11_dxmt,d3d12,dxgi,winemetal,winemetal4,nvapi64,nvngx=n,b",
     "WINEDLLPATH": "${COMPONENT_PATH}/wine",
     "DYLD_FALLBACK_LIBRARY_PATH": "${COMPONENT_PATH}/wine/x86_64-unix:${WINE_INSTALL_PATH}/lib:${WINE_INSTALL_PATH}/lib/wine/x86_64-unix",
 }
+if winedebug:
+    environment_template["WINEDEBUG"] = winedebug
 if enable_apitrace:
     environment_template["DXMT_APITRACE_ENABLED"] = "1"
     environment_template["APITRACE_TRACE_BUNDLE"] = apitrace_output_dir
