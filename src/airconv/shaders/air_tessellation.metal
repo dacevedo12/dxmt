@@ -150,11 +150,9 @@ struct TessMeshWorkload {
 
 int
 get_next_index(threadgroup int *out_count) {
-#ifdef __METAL_MEMORY_FLAGS_NONE__
-  return __metal_atomic_fetch_add_explicit(out_count, 1, int(memory_order_relaxed), __METAL_MEMORY_SCOPE_THREADGROUP__, __METAL_MEMORY_FLAGS_NONE__);
-#else
-  return __metal_atomic_fetch_add_explicit(out_count, 1, int(memory_order_relaxed), __METAL_MEMORY_SCOPE_THREADGROUP__);
-#endif
+  // The internal __metal_atomic_* intrinsics are gone from current
+  // Metal toolchains; the public atomic API is portable across all.
+  return atomic_fetch_add_explicit((threadgroup atomic_int *)out_count, 1, memory_order_relaxed);
 }
 
 template <partitioning partition>
