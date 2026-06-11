@@ -860,7 +860,12 @@ public:
 
   uint64_t deduplicateRenderArgumentTableSlice(WMTRenderStages stages, uint8_t index, uint64_t offset, uint64_t size);
 
+  uint64_t deduplicateRenderArgumentTableSliceBytes(
+      WMTRenderStages stages, uint8_t index, uint64_t offset, uint64_t size, const void *bytes);
+
   uint64_t deduplicateComputeArgumentTableSlice(uint8_t index, uint64_t offset, uint64_t size);
+
+  uint64_t deduplicateComputeArgumentTableSliceBytes(uint8_t index, uint64_t offset, uint64_t size, const void *bytes);
 
   std::pair<WMT::Buffer , size_t> allocateTempBuffer(size_t size, size_t alignment);
   

@@ -283,7 +283,7 @@ template void ArgumentEncodingContext::encodeConstantBuffers<PipelineStage::Pixe
 template <PipelineStage stage, PipelineKind kind>
 void
 ArgumentEncodingContext::encodeConstantBuffers(const MTL_SHADER_REFLECTION *reflection, const MTL_SM50_SHADER_ARGUMENT * constant_buffers, uint64_t offset) {
-  uint64_t *encoded_buffer = getMappedArgumentBuffer<uint64_t, stage == PipelineStage::Compute>(offset);
+  small_vector<uint64_t, 16> encoded_table(reflection->NumConstantBuffers, 0);
 
   for (unsigned i = 0; i < reflection->NumConstantBuffers; i++) {
     auto &arg = constant_buffers[i];
@@ -292,14 +292,14 @@ ArgumentEncodingContext::encodeConstantBuffers(const MTL_SHADER_REFLECTION *refl
     case SM50BindingType::ConstantBuffer: {
       auto &cbuf = cbuf_[slot];
       if (!cbuf.buffer.ptr()) {
-        encoded_buffer[arg.StructurePtrOffset] = dummy_cbuffer_info_.gpu_address;
+        encoded_table[arg.StructurePtrOffset] = dummy_cbuffer_info_.gpu_address;
         makeResident<stage, kind>(dummy_cbuffer_, GetResidencyMask<kind>(stage, true, false));
         continue;
       }
       auto argbuf = cbuf.buffer;
       auto valid_length = argbuf->length() > cbuf.offset ? argbuf->length() - cbuf.offset : 0;
       auto [argbuf_alloc, argbuf_offset] = access<stage>(argbuf, cbuf.offset, valid_length, ResourceAccess::Read);
-      encoded_buffer[arg.StructurePtrOffset] = argbuf_alloc->gpuAddress() + argbuf_offset + cbuf.offset;
+      encoded_table[arg.StructurePtrOffset] = argbuf_alloc->gpuAddress() + argbuf_offset + cbuf.offset;
       makeResident<stage, kind>(argbuf.ptr());
       break;
     }
@@ -311,7 +311,11 @@ ArgumentEncodingContext::encodeConstantBuffers(const MTL_SHADER_REFLECTION *refl
   /* kConstantBufferTableBinding = 29 */
   const auto table_size = uint64_t(reflection->NumConstantBuffers) << 3;
   if constexpr (stage == PipelineStage::Compute) {
-    const auto binding_offset = deduplicateComputeArgumentTableSlice(29, offset, table_size);
+    const auto binding_offset =
+        deduplicateComputeArgumentTableSliceBytes(29, offset, table_size, encoded_table.data());
+    if (binding_offset == offset)
+      std::memcpy(getMappedArgumentBuffer<uint64_t, true>(offset),
+                  encoded_table.data(), table_size);
     auto &cmd = encodeComputeCommand<wmtcmd_compute_setargumentbufferoffset>();
     cmd.type = WMTComputeCommandSetArgumentBufferOffset;
     cmd.offset = getFinalArgumentBufferOffset<true>(binding_offset);
@@ -339,7 +343,11 @@ ArgumentEncodingContext::encodeConstantBuffers(const MTL_SHADER_REFLECTION *refl
     } else {
       assert(0 && "Not implemented or unreachable");
     }
-    const auto binding_offset = deduplicateRenderArgumentTableSlice(cmd.stages, cmd.index, offset, table_size);
+    const auto binding_offset =
+        deduplicateRenderArgumentTableSliceBytes(cmd.stages, cmd.index, offset, table_size, encoded_table.data());
+    if (binding_offset == offset)
+      std::memcpy(getMappedArgumentBuffer<uint64_t>(offset),
+                  encoded_table.data(), table_size);
     cmd.offset = getFinalArgumentBufferOffset(binding_offset);
   }
 };
@@ -581,23 +589,38 @@ uint64_t
 ArgumentEncodingContext::deduplicateRenderArgumentTableSlice(
     WMTRenderStages stages, uint8_t index, uint64_t offset, uint64_t size
 ) {
+  auto *bytes = getMappedArgumentBuffer<uint8_t>(offset);
+  return deduplicateRenderArgumentTableSliceBytes(stages, index, offset, size, bytes);
+}
+
+uint64_t
+ArgumentEncodingContext::deduplicateRenderArgumentTableSliceBytes(
+    WMTRenderStages stages, uint8_t index, uint64_t offset, uint64_t size, const void *bytes
+) {
   auto *data = currentRenderEncoder();
   auto *cache = RenderArgumentTableSliceCache(data, stages);
   if (!cache)
     return offset;
   auto *base = getMappedArgumentBuffer<uint8_t>(0);
-  auto *bytes = getMappedArgumentBuffer<uint8_t>(offset);
-  return DeduplicateArgumentTableSlice(*cache, index, offset, size, base, bytes);
+  return DeduplicateArgumentTableSlice(*cache, index, offset, size, base, static_cast<const uint8_t *>(bytes));
 }
 
 uint64_t
 ArgumentEncodingContext::deduplicateComputeArgumentTableSlice(
     uint8_t index, uint64_t offset, uint64_t size
 ) {
+  auto *bytes = getMappedArgumentBuffer<uint8_t, true>(offset);
+  return deduplicateComputeArgumentTableSliceBytes(index, offset, size, bytes);
+}
+
+uint64_t
+ArgumentEncodingContext::deduplicateComputeArgumentTableSliceBytes(
+    uint8_t index, uint64_t offset, uint64_t size, const void *bytes
+) {
   auto *data = static_cast<ComputeEncoderData *>(currentEncoder());
   auto *base = getMappedArgumentBuffer<uint8_t, true>(0);
-  auto *bytes = getMappedArgumentBuffer<uint8_t, true>(offset);
-  return DeduplicateArgumentTableSlice(data->argument_table_cache, index, offset, size, base, bytes);
+  return DeduplicateArgumentTableSlice(
+      data->argument_table_cache, index, offset, size, base, static_cast<const uint8_t *>(bytes));
 }
 
 static void
@@ -1982,7 +2005,7 @@ ArgumentEncodingContext::encodeConstantBuffers(
     const MTL_SHADER_REFLECTION *reflection, const MTL_SM50_SHADER_ARGUMENT *constant_buffers, uint64_t offset,
     const ConstantBufferBinding *bindings
 ) {
-  uint64_t *encoded_buffer = getMappedArgumentBuffer<uint64_t, stage == PipelineStage::Compute>(offset);
+  small_vector<uint64_t, 16> encoded_table(reflection->NumConstantBuffers, 0);
   auto encoder_id = currentEncoderId();
 
   for (unsigned i = 0; i < reflection->NumConstantBuffers; i++) {
@@ -1991,10 +2014,10 @@ ArgumentEncodingContext::encodeConstantBuffers(
     case SM50BindingType::ConstantBuffer: {
       auto &cbuf = bindings[i];
       if (cbuf.direct_buffer) {
-        encoded_buffer[arg.StructurePtrOffset] =
+        encoded_table[arg.StructurePtrOffset] =
             cbuf.direct_gpu_address + cbuf.offset;
         DebugLogConstantBufferBinding<stage, kind>(
-            "", arg, cbuf, encoded_buffer[arg.StructurePtrOffset],
+            "", arg, cbuf, encoded_table[arg.StructurePtrOffset],
             cbuf.direct_length > cbuf.offset ? cbuf.direct_length - cbuf.offset : 0,
             encoder_id, false);
         makeResident<stage, kind>(cbuf.direct_buffer,
@@ -2002,7 +2025,7 @@ ArgumentEncodingContext::encodeConstantBuffers(
         continue;
       }
       if (!cbuf.buffer.ptr()) {
-        encoded_buffer[arg.StructurePtrOffset] = dummy_cbuffer_info_.gpu_address;
+        encoded_table[arg.StructurePtrOffset] = dummy_cbuffer_info_.gpu_address;
         DebugLogConstantBufferBinding<stage, kind>(
             "", arg, cbuf, dummy_cbuffer_info_.gpu_address, 0, encoder_id,
             true);
@@ -2012,9 +2035,9 @@ ArgumentEncodingContext::encodeConstantBuffers(
       auto argbuf = cbuf.buffer;
       auto valid_length = argbuf->length() > cbuf.offset ? argbuf->length() - cbuf.offset : 0;
       auto [argbuf_alloc, argbuf_offset] = access<stage>(argbuf, cbuf.offset, valid_length, ResourceAccess::Read);
-      encoded_buffer[arg.StructurePtrOffset] = argbuf_alloc->gpuAddress() + argbuf_offset + cbuf.offset;
+      encoded_table[arg.StructurePtrOffset] = argbuf_alloc->gpuAddress() + argbuf_offset + cbuf.offset;
       DebugLogConstantBufferBinding<stage, kind>(
-          "", arg, cbuf, encoded_buffer[arg.StructurePtrOffset],
+          "", arg, cbuf, encoded_table[arg.StructurePtrOffset],
           valid_length, encoder_id, false);
       makeResident<stage, kind>(argbuf.ptr());
       break;
@@ -2027,7 +2050,11 @@ ArgumentEncodingContext::encodeConstantBuffers(
   /* kConstantBufferTableBinding = 29 */
   const auto table_size = uint64_t(reflection->NumConstantBuffers) << 3;
   if constexpr (stage == PipelineStage::Compute) {
-    const auto binding_offset = deduplicateComputeArgumentTableSlice(29, offset, table_size);
+    const auto binding_offset =
+        deduplicateComputeArgumentTableSliceBytes(29, offset, table_size, encoded_table.data());
+    if (binding_offset == offset)
+      std::memcpy(getMappedArgumentBuffer<uint64_t, true>(offset),
+                  encoded_table.data(), table_size);
     auto &cmd = encodeComputeCommand<wmtcmd_compute_setargumentbufferoffset>();
     cmd.type = WMTComputeCommandSetArgumentBufferOffset;
     cmd.offset = getFinalArgumentBufferOffset<true>(binding_offset);
@@ -2055,7 +2082,11 @@ ArgumentEncodingContext::encodeConstantBuffers(
     } else {
       assert(0 && "Not implemented or unreachable");
     }
-    const auto binding_offset = deduplicateRenderArgumentTableSlice(cmd.stages, cmd.index, offset, table_size);
+    const auto binding_offset =
+        deduplicateRenderArgumentTableSliceBytes(cmd.stages, cmd.index, offset, table_size, encoded_table.data());
+    if (binding_offset == offset)
+      std::memcpy(getMappedArgumentBuffer<uint64_t>(offset),
+                  encoded_table.data(), table_size);
     cmd.offset = getFinalArgumentBufferOffset(binding_offset);
   }
 }
