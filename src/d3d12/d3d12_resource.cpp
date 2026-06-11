@@ -30,6 +30,7 @@ class ResourceImpl;
 
 struct ReservedTextureAsyncConfig {
   bool enabled = true;
+  bool prewarm_on_create = false;
   UINT workers = 1;
   UINT budget_us = 2000;
   UINT period_us = 16000;
@@ -64,6 +65,8 @@ ReservedTextureAsyncSettings() {
   static const ReservedTextureAsyncConfig config = [] {
     ReservedTextureAsyncConfig cfg = {};
     cfg.enabled = ParseEnvBool("DXMT_D3D12_RESERVED_TEXTURE_ASYNC", true);
+    cfg.prewarm_on_create =
+        ParseEnvBool("DXMT_D3D12_RESERVED_TEXTURE_PREWARM_ON_CREATE", false);
     cfg.workers = ParseEnvUint("DXMT_D3D12_RESERVED_TEXTURE_ASYNC_WORKERS",
                                1, 1, 4);
     cfg.budget_us = ParseEnvUint("DXMT_D3D12_RESERVED_TEXTURE_ASYNC_BUDGET_US",
@@ -1673,6 +1676,8 @@ private:
 
   bool QueueReservedTextureMaterializationLocked() {
     if (!ReservedTextureAsyncSettings().enabled)
+      return false;
+    if (!ReservedTextureAsyncSettings().prewarm_on_create)
       return false;
     if (materialization_state_ != MaterializationState::Unmaterialized)
       return false;
