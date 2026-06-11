@@ -5682,11 +5682,13 @@ private:
       return;
     }
 
-    if (resource.GetTexture()) {
+    if (resource.GetTextureAllocation()) {
       bool added = false;
       for (UINT i = 0; i < subresource_count; i++) {
         const UINT subresource = first_subresource + i;
         const UINT plane = GetSubresourcePlane(resource, subresource);
+        if (!resource.GetTextureAllocation(plane))
+          continue;
         Rc<Texture> texture = Rc<Texture>(resource.GetTexture(plane));
         if (!texture)
           continue;

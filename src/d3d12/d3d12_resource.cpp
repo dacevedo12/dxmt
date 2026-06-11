@@ -1702,6 +1702,8 @@ private:
         break;
       }
     }
+    if (success && !ReplayReservedTextureMappings())
+      success = false;
 
     {
       std::lock_guard lock(materialization_mutex_);
@@ -1723,6 +1725,93 @@ private:
            " height=", desc_.Height,
            " format=", uint32_t(desc_.Format));
     }
+  }
+
+  bool ReplayReservedTextureMappings() {
+    if (!has_tiling_ || tile_map_.empty() || !texture_allocation_)
+      return true;
+
+    struct MappingBatch {
+      ID3D12Heap *heap = nullptr;
+      std::vector<WMTSparseTextureMappingOperation> ops;
+    };
+    std::vector<MappingBatch> batches;
+
+    for (const auto &subresource : tiling_.subresources) {
+      if (!subresource.width_in_tiles || !subresource.height_in_tiles ||
+          !subresource.depth_in_tiles)
+        continue;
+
+      for (UINT z = 0; z < subresource.depth_in_tiles; ++z) {
+        for (UINT y = 0; y < subresource.height_in_tiles; ++y) {
+          for (UINT x = 0; x < subresource.width_in_tiles; ++x) {
+            const UINT index =
+                subresource.start_tile_index +
+                (z * subresource.height_in_tiles + y) *
+                    subresource.width_in_tiles +
+                x;
+            if (index >= tile_map_.size())
+              return false;
+
+            const auto &mapping = tile_map_[index];
+            if (!mapping.heap || mapping.heap_tile < 0)
+              continue;
+
+            auto *heap = mapping.heap.ptr();
+            auto it = std::find_if(
+                batches.begin(), batches.end(),
+                [heap](const MappingBatch &batch) { return batch.heap == heap; });
+            if (it == batches.end()) {
+              batches.push_back({heap, {}});
+              it = std::prev(batches.end());
+            }
+
+            WMTSparseTextureMappingOperation op = {};
+            op.mode = WMTSparseTextureMappingModeMap;
+            op.level = subresource.mip_level;
+            op.slice = subresource.array_slice;
+            op.x = x;
+            op.y = y;
+            op.z = z;
+            op.width = 1;
+            op.height = 1;
+            op.depth = 1;
+            op.heap_offset =
+                UINT64(mapping.heap_tile) *
+                D3D12_TILED_RESOURCE_TILE_SIZE_IN_BYTES;
+            it->ops.push_back(op);
+          }
+        }
+      }
+    }
+
+    if (batches.empty())
+      return true;
+
+    auto texture = texture_allocation_->texture();
+    if (!texture)
+      return false;
+
+    auto device = device_->GetDXMTDevice().device();
+    for (auto &batch : batches) {
+      auto *heap_object = dynamic_cast<d3d12::Heap *>(batch.heap);
+      WMT::Heap placement_heap =
+          heap_object ? heap_object->GetPlacementHeap() : WMT::Heap{};
+      if (!placement_heap)
+        return false;
+      if (!device.updateSparseTextureMappings(
+              texture, placement_heap, batch.ops.data(), batch.ops.size())) {
+        WARN("D3D12Resource: failed to replay reserved texture mappings"
+             " resource=", uint64_t(this),
+             " heap=", uint64_t(batch.heap),
+             " ops=", batch.ops.size(),
+             " width=", desc_.Width,
+             " height=", desc_.Height,
+             " format=", uint32_t(desc_.Format));
+        return false;
+      }
+    }
+    return true;
   }
 
   void WorkerMaterializeReservedTexture() {
