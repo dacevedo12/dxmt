@@ -147,44 +147,6 @@ ArgumentEncodingContext::~ArgumentEncodingContext() {
   wsi::aligned_free(dummy_cbuffer_host_);
 };
 
-static bool
-UpdateArgumentBufferOffsetState(std::array<uint64_t, 31> &offsets, uint32_t &valid_mask, uint8_t index, uint64_t offset) {
-  if (index >= offsets.size())
-    return false;
-  uint32_t bit = uint32_t(1) << index;
-  if ((valid_mask & bit) && offsets[index] == offset)
-    return false;
-  valid_mask |= bit;
-  offsets[index] = offset;
-  return true;
-}
-
-static bool
-ShouldEmitRenderArgumentBufferOffset(RenderEncoderData *data, WMTRenderStages stages, uint8_t index, uint64_t offset) {
-  bool changed = false;
-  if (stages & WMTRenderStageVertex)
-    changed |= UpdateArgumentBufferOffsetState(
-        data->argument_buffer_offsets_vertex, data->argument_buffer_offsets_valid_vertex, index, offset);
-  if (stages & WMTRenderStageFragment)
-    changed |= UpdateArgumentBufferOffsetState(
-        data->argument_buffer_offsets_fragment, data->argument_buffer_offsets_valid_fragment, index, offset);
-  if (stages & WMTRenderStageObject)
-    changed |= UpdateArgumentBufferOffsetState(
-        data->argument_buffer_offsets_object, data->argument_buffer_offsets_valid_object, index, offset);
-  if (stages & WMTRenderStageMesh)
-    changed |= UpdateArgumentBufferOffsetState(
-        data->argument_buffer_offsets_mesh, data->argument_buffer_offsets_valid_mesh, index, offset);
-  if (stages & WMTRenderStageTile)
-    changed |= UpdateArgumentBufferOffsetState(
-        data->argument_buffer_offsets_tile, data->argument_buffer_offsets_valid_tile, index, offset);
-  return changed;
-}
-
-static bool
-ShouldEmitComputeArgumentBufferOffset(ComputeEncoderData *data, uint8_t index, uint64_t offset) {
-  return UpdateArgumentBufferOffsetState(data->argument_buffer_offsets, data->argument_buffer_offsets_valid, index, offset);
-}
-
 template void ArgumentEncodingContext::encodeVertexBuffers<PipelineKind::Ordinary>(uint32_t slot_mask, uint64_t argument_buffer_offset);
 template void ArgumentEncodingContext::encodeVertexBuffers<PipelineKind::Tessellation>(uint32_t slot_mask, uint64_t argument_buffer_offset);
 template void ArgumentEncodingContext::encodeVertexBuffers<PipelineKind::Geometry>(uint32_t slot_mask, uint64_t argument_buffer_offset);
@@ -222,17 +184,14 @@ ArgumentEncodingContext::encodeVertexBuffers(uint32_t slot_mask, uint64_t offset
     makeResident<PipelineStage::Vertex, kind>(buffer.ptr());
   };
   {
-    uint64_t final_offset = getFinalArgumentBufferOffset(offset);
-    WMTRenderStages stages = WMTRenderStageVertex;
+    auto &cmd = encodeRenderCommand<wmtcmd_render_setargumentbufferoffset>();
+    cmd.offset = getFinalArgumentBufferOffset(offset);
+    cmd.index = 16;
+    cmd.type = WMTRenderCommandSetArgumentBufferOffset;
     if constexpr (kind == PipelineKind::Geometry || kind == PipelineKind::Tessellation)
-      stages = WMTRenderStageObject;
-    if (ShouldEmitRenderArgumentBufferOffset(currentRenderEncoder(), stages, 16, final_offset)) {
-      auto &cmd = encodeRenderCommand<wmtcmd_render_setargumentbufferoffset>();
-      cmd.type = WMTRenderCommandSetArgumentBufferOffset;
-      cmd.offset = final_offset;
-      cmd.index = 16;
-      cmd.stages = stages;
-    }
+      cmd.stages = WMTRenderStageObject;
+    else
+      cmd.stages = WMTRenderStageVertex;
   }
 }
 
@@ -348,42 +307,33 @@ ArgumentEncodingContext::encodeConstantBuffers(const MTL_SHADER_REFLECTION *refl
 
   /* kConstantBufferTableBinding = 29 */
   if constexpr (stage == PipelineStage::Compute) {
-    uint64_t final_offset = getFinalArgumentBufferOffset<true>(offset);
-    if (ShouldEmitComputeArgumentBufferOffset(static_cast<ComputeEncoderData *>(encoder_current), 29, final_offset)) {
-      auto &cmd = encodeComputeCommand<wmtcmd_compute_setargumentbufferoffset>();
-      cmd.type = WMTComputeCommandSetArgumentBufferOffset;
-      cmd.offset = final_offset;
-      cmd.index = 29;
-    }
+    auto &cmd = encodeComputeCommand<wmtcmd_compute_setargumentbufferoffset>();
+    cmd.type = WMTComputeCommandSetArgumentBufferOffset;
+    cmd.offset = getFinalArgumentBufferOffset<true>(offset);
+    cmd.index = 29;
   } else {
-    uint64_t final_offset = getFinalArgumentBufferOffset(offset);
-    uint8_t index = 29;
-    WMTRenderStages stages = WMTRenderStageVertex;
+    auto &cmd = encodeRenderCommand<wmtcmd_render_setargumentbufferoffset>();
+    cmd.type = WMTRenderCommandSetArgumentBufferOffset;
+    cmd.offset = getFinalArgumentBufferOffset(offset);
+    cmd.index = 29;
     if constexpr (stage == PipelineStage::Vertex) {
       if constexpr (kind == PipelineKind::Geometry)
-        stages = WMTRenderStageObject;
+        cmd.stages = WMTRenderStageObject;
       else if constexpr (kind == PipelineKind::Tessellation) {
-        stages = WMTRenderStageObject;
-        index = 27;
+        cmd.stages = WMTRenderStageObject;
+        cmd.index = 27;
       } else
-        stages = WMTRenderStageVertex;
+        cmd.stages = WMTRenderStageVertex;
     } else if constexpr (stage == PipelineStage::Pixel) {
-      stages = WMTRenderStageFragment;
+      cmd.stages = WMTRenderStageFragment;
     } else if constexpr (stage == PipelineStage::Hull) {
-      stages = WMTRenderStageObject;
+      cmd.stages = WMTRenderStageObject;
     } else if constexpr (stage == PipelineStage::Domain) {
-      stages = WMTRenderStageMesh;
+      cmd.stages = WMTRenderStageMesh;
     } else if constexpr (stage == PipelineStage::Geometry) {
-      stages = WMTRenderStageMesh;
+      cmd.stages = WMTRenderStageMesh;
     } else {
       assert(0 && "Not implemented or unreachable");
-    }
-    if (ShouldEmitRenderArgumentBufferOffset(currentRenderEncoder(), stages, index, final_offset)) {
-      auto &cmd = encodeRenderCommand<wmtcmd_render_setargumentbufferoffset>();
-      cmd.type = WMTRenderCommandSetArgumentBufferOffset;
-      cmd.offset = final_offset;
-      cmd.index = index;
-      cmd.stages = stages;
     }
   }
 };
@@ -1952,42 +1902,33 @@ ArgumentEncodingContext::encodeConstantBuffers(
 
   /* kConstantBufferTableBinding = 29 */
   if constexpr (stage == PipelineStage::Compute) {
-    uint64_t final_offset = getFinalArgumentBufferOffset<true>(offset);
-    if (ShouldEmitComputeArgumentBufferOffset(static_cast<ComputeEncoderData *>(encoder_current), 29, final_offset)) {
-      auto &cmd = encodeComputeCommand<wmtcmd_compute_setargumentbufferoffset>();
-      cmd.type = WMTComputeCommandSetArgumentBufferOffset;
-      cmd.offset = final_offset;
-      cmd.index = 29;
-    }
+    auto &cmd = encodeComputeCommand<wmtcmd_compute_setargumentbufferoffset>();
+    cmd.type = WMTComputeCommandSetArgumentBufferOffset;
+    cmd.offset = getFinalArgumentBufferOffset<true>(offset);
+    cmd.index = 29;
   } else {
-    uint64_t final_offset = getFinalArgumentBufferOffset(offset);
-    uint8_t index = 29;
-    WMTRenderStages stages = WMTRenderStageVertex;
+    auto &cmd = encodeRenderCommand<wmtcmd_render_setargumentbufferoffset>();
+    cmd.type = WMTRenderCommandSetArgumentBufferOffset;
+    cmd.offset = getFinalArgumentBufferOffset(offset);
+    cmd.index = 29;
     if constexpr (stage == PipelineStage::Vertex) {
       if constexpr (kind == PipelineKind::Geometry)
-        stages = WMTRenderStageObject;
+        cmd.stages = WMTRenderStageObject;
       else if constexpr (kind == PipelineKind::Tessellation) {
-        stages = WMTRenderStageObject;
-        index = 27;
+        cmd.stages = WMTRenderStageObject;
+        cmd.index = 27;
       } else
-        stages = WMTRenderStageVertex;
+        cmd.stages = WMTRenderStageVertex;
     } else if constexpr (stage == PipelineStage::Pixel) {
-      stages = WMTRenderStageFragment;
+      cmd.stages = WMTRenderStageFragment;
     } else if constexpr (stage == PipelineStage::Hull) {
-      stages = WMTRenderStageObject;
+      cmd.stages = WMTRenderStageObject;
     } else if constexpr (stage == PipelineStage::Domain) {
-      stages = WMTRenderStageMesh;
+      cmd.stages = WMTRenderStageMesh;
     } else if constexpr (stage == PipelineStage::Geometry) {
-      stages = WMTRenderStageMesh;
+      cmd.stages = WMTRenderStageMesh;
     } else {
       assert(0 && "Not implemented or unreachable");
-    }
-    if (ShouldEmitRenderArgumentBufferOffset(currentRenderEncoder(), stages, index, final_offset)) {
-      auto &cmd = encodeRenderCommand<wmtcmd_render_setargumentbufferoffset>();
-      cmd.type = WMTRenderCommandSetArgumentBufferOffset;
-      cmd.offset = final_offset;
-      cmd.index = index;
-      cmd.stages = stages;
     }
   }
 }
@@ -2358,42 +2299,33 @@ ArgumentEncodingContext::encodeShaderResources(
   }
 
   if constexpr (stage == PipelineStage::Compute) {
-    uint64_t final_offset = getFinalArgumentBufferOffset<true>(offset);
-    if (ShouldEmitComputeArgumentBufferOffset(static_cast<ComputeEncoderData *>(encoder_current), 30, final_offset)) {
-      auto &cmd = encodeComputeCommand<wmtcmd_compute_setargumentbufferoffset>();
-      cmd.type = WMTComputeCommandSetArgumentBufferOffset;
-      cmd.offset = final_offset;
-      cmd.index = 30;
-    }
+    auto &cmd = encodeComputeCommand<wmtcmd_compute_setargumentbufferoffset>();
+    cmd.type = WMTComputeCommandSetArgumentBufferOffset;
+    cmd.offset = getFinalArgumentBufferOffset<true>(offset);
+    cmd.index = 30;
   } else {
-    uint64_t final_offset = getFinalArgumentBufferOffset(offset);
-    uint8_t index = 30;
-    WMTRenderStages stages = WMTRenderStageVertex;
+    auto &cmd = encodeRenderCommand<wmtcmd_render_setargumentbufferoffset>();
+    cmd.type = WMTRenderCommandSetArgumentBufferOffset;
+    cmd.offset = getFinalArgumentBufferOffset(offset);
+    cmd.index = 30;
     if constexpr (stage == PipelineStage::Vertex) {
       if constexpr (kind == PipelineKind::Geometry)
-        stages = WMTRenderStageObject;
+        cmd.stages = WMTRenderStageObject;
       else if constexpr (kind == PipelineKind::Tessellation) {
-        stages = WMTRenderStageObject;
-        index = 28;
+        cmd.stages = WMTRenderStageObject;
+        cmd.index = 28;
       } else
-        stages = WMTRenderStageVertex;
+        cmd.stages = WMTRenderStageVertex;
     } else if constexpr (stage == PipelineStage::Pixel) {
-      stages = WMTRenderStageFragment;
+      cmd.stages = WMTRenderStageFragment;
     } else if constexpr (stage == PipelineStage::Hull) {
-      stages = WMTRenderStageObject;
+      cmd.stages = WMTRenderStageObject;
     } else if constexpr (stage == PipelineStage::Domain) {
-      stages = WMTRenderStageMesh;
+      cmd.stages = WMTRenderStageMesh;
     } else if constexpr (stage == PipelineStage::Geometry) {
-      stages = WMTRenderStageMesh;
+      cmd.stages = WMTRenderStageMesh;
     } else {
       assert(0 && "Not implemented or unreachable");
-    }
-    if (ShouldEmitRenderArgumentBufferOffset(currentRenderEncoder(), stages, index, final_offset)) {
-      auto &cmd = encodeRenderCommand<wmtcmd_render_setargumentbufferoffset>();
-      cmd.type = WMTRenderCommandSetArgumentBufferOffset;
-      cmd.offset = final_offset;
-      cmd.index = index;
-      cmd.stages = stages;
     }
   }
 }

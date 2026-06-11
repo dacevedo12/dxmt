@@ -208,16 +208,6 @@ struct RenderEncoderData : EncoderData {
   WMT::RenderPipelineState last_pso = {};
   uint64_t pixel_shader_demote_msaa_srv_mask_lo = 0;
   uint64_t pixel_shader_demote_msaa_srv_mask_hi = 0;
-  std::array<uint64_t, 31> argument_buffer_offsets_vertex = {};
-  std::array<uint64_t, 31> argument_buffer_offsets_fragment = {};
-  std::array<uint64_t, 31> argument_buffer_offsets_object = {};
-  std::array<uint64_t, 31> argument_buffer_offsets_mesh = {};
-  std::array<uint64_t, 31> argument_buffer_offsets_tile = {};
-  uint32_t argument_buffer_offsets_valid_vertex = 0;
-  uint32_t argument_buffer_offsets_valid_fragment = 0;
-  uint32_t argument_buffer_offsets_valid_object = 0;
-  uint32_t argument_buffer_offsets_valid_mesh = 0;
-  uint32_t argument_buffer_offsets_valid_tile = 0;
 };
 
 struct ComputeEncoderData : EncoderData {
@@ -228,8 +218,6 @@ struct ComputeEncoderData : EncoderData {
   uint64_t allocated_argbuf_size;
   void *allocated_argbuf_mapping;
   bool allocated_argbuf_needs_flush;
-  std::array<uint64_t, 31> argument_buffer_offsets = {};
-  uint32_t argument_buffer_offsets_valid = 0;
 };
 
 struct BlitEncoderData : EncoderData {
