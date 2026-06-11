@@ -2835,8 +2835,7 @@ public:
 
     auto *resource_object = dynamic_cast<d3d12::Resource *>(resource);
     const auto *tiling = resource_object ? resource_object->GetTiling() : nullptr;
-    if (!resource_object || !resource_object->IsReservedTexture() || !tiling ||
-        !resource_object->GetTextureAllocation()) {
+    if (!resource_object || !resource_object->IsReservedTexture() || !tiling) {
       if (ShouldLogTileMappingDiag()) {
         WARN("D3D12CommandQueue: TODO UpdateTileMappings requires reserved texture"
              " resource=", resource,
@@ -2894,6 +2893,14 @@ public:
 
     WMT::Heap placement_heap = {};
     if (has_map) {
+      if (!resource_object->EnsureTextureAllocation("UpdateTileMappings")) {
+        if (ShouldLogTileMappingDiag()) {
+          WARN("D3D12CommandQueue: TODO UpdateTileMappings failed to materialize reserved texture"
+               " resource=", resource,
+               " ops=", ops.size());
+        }
+        return;
+      }
       auto *heap_object = dynamic_cast<d3d12::Heap *>(heap);
       if (!heap_object) {
         if (ShouldLogTileMappingDiag())
@@ -2928,6 +2935,13 @@ public:
                " ops=", ops.size());
         return;
       }
+    }
+
+    if (!has_map && !resource_object->GetTextureAllocation()) {
+      auto tiling_copy = *tiling;
+      ApplySparseTileMappingOpsToResource(*resource_object, tiling_copy,
+                                          nullptr, ops);
+      return;
     }
 
     auto texture = resource_object->GetTextureAllocation()->texture();
@@ -2982,7 +2996,7 @@ public:
     const auto *dst_tiling = dst ? dst->GetTiling() : nullptr;
     const auto *src_tiling = src ? src->GetTiling() : nullptr;
     if (!dst || !src || !dst->IsReservedTexture() || !src->IsReservedTexture() ||
-        !dst_tiling || !src_tiling || !dst->GetTextureAllocation()) {
+        !dst_tiling || !src_tiling) {
       WARN("D3D12CommandQueue: TODO CopyTileMappings requires reserved textures"
            " dst=", dst_resource,
            " src=", src_resource,
@@ -3061,6 +3075,19 @@ public:
            " srcSubresource=", src_start->Subresource,
            " useBox=", region_size ? region_size->UseBox : 0,
            " numTiles=", region_size ? region_size->NumTiles : 1);
+      return;
+    }
+
+    if (!map_ops.empty() && !dst->EnsureTextureAllocation("CopyTileMappings")) {
+      WARN("D3D12CommandQueue: TODO CopyTileMappings failed to materialize destination"
+           " dst=", dst_resource,
+           " src=", src_resource);
+      return;
+    }
+    if (map_ops.empty() && !dst->GetTextureAllocation()) {
+      auto tiling_copy = *dst_tiling;
+      ApplySparseTileMappingOpsToResource(*dst, tiling_copy, nullptr,
+                                          unmap_ops);
       return;
     }
 
@@ -3703,6 +3730,8 @@ private:
 
       auto *resource = dynamic_cast<Resource *>(
           backbuffers_[current_backbuffer_].ptr());
+      if (resource && resource->IsReservedTexture())
+        resource->EnsureTextureAllocation("Present");
       if (!resource || !resource->GetTexture())
         return trace_present_return(E_FAIL);
       D3D12DiagLogSwapChainBackBuffer("Present1", current_backbuffer_,
@@ -5047,6 +5076,20 @@ private:
     if (!color_resource || !output_resource || !depth_resource ||
         !motion_resource) {
       WARN("D3D12CommandQueue: temporal upscale skipped foreign resource");
+      EmitPassSeparator(chunk);
+      return;
+    }
+    if ((color_resource->IsReservedTexture() &&
+         !color_resource->EnsureTextureAllocation("TemporalUpscale color")) ||
+        (output_resource->IsReservedTexture() &&
+         !output_resource->EnsureTextureAllocation("TemporalUpscale output")) ||
+        (depth_resource->IsReservedTexture() &&
+         !depth_resource->EnsureTextureAllocation("TemporalUpscale depth")) ||
+        (motion_resource->IsReservedTexture() &&
+         !motion_resource->EnsureTextureAllocation("TemporalUpscale motion")) ||
+        (exposure_resource && exposure_resource->IsReservedTexture() &&
+         !exposure_resource->EnsureTextureAllocation("TemporalUpscale exposure"))) {
+      WARN("D3D12CommandQueue: temporal upscale skipped unmaterialized reserved texture");
       EmitPassSeparator(chunk);
       return;
     }
@@ -7773,6 +7816,11 @@ resolve_cpu_fallback:
         ClearShaderResourceBinding(enc, stage, slot);
         return;
       }
+      if (resource->IsReservedTexture() &&
+          !resource->EnsureTextureAllocation("BindTextureSRV")) {
+        ClearShaderResourceBinding(enc, stage, slot);
+        return;
+      }
       const auto view =
           CreateShaderResourceTextureView(device_->GetMTLDevice(), *resource,
                                           descriptor);
@@ -8015,6 +8063,11 @@ resolve_cpu_fallback:
       if (descriptor.has_desc &&
           descriptor.desc.uav.ViewDimension == D3D12_UAV_DIMENSION_BUFFER) {
         WARN("D3D12CommandQueue: texture UAV cannot use BUFFER view dimension");
+        ClearUnorderedAccessBinding(enc, stage, slot);
+        return;
+      }
+      if (resource->IsReservedTexture() &&
+          !resource->EnsureTextureAllocation("BindTextureUAV")) {
         ClearUnorderedAccessBinding(enc, stage, slot);
         return;
       }
@@ -9150,6 +9203,8 @@ resolve_cpu_fallback:
     for (UINT i = 0; i < state.render_targets.size(); i++) {
       const auto &descriptor = state.render_targets[i];
       auto *resource = GetResource(descriptor.resource.ptr());
+      if (resource && resource->IsReservedTexture())
+        resource->EnsureTextureAllocation("RenderTarget");
       if (!resource || !resource->GetTexture())
         continue;
 
@@ -9170,6 +9225,8 @@ resolve_cpu_fallback:
 
     if (state.depth_stencil) {
       auto *resource = GetResource(state.depth_stencil->resource.ptr());
+      if (resource && resource->IsReservedTexture())
+        resource->EnsureTextureAllocation("DepthStencil");
       if (resource && resource->GetTexture()) {
         auto view = CreateDepthStencilView(device_->GetMTLDevice(), *resource,
                                            *state.depth_stencil);
@@ -10501,6 +10558,10 @@ resolve_cpu_fallback:
       return;
     }
 
+    if (dst->IsReservedTexture())
+      dst->EnsureTextureAllocation("CopyResource dst");
+    if (src->IsReservedTexture())
+      src->EnsureTextureAllocation("CopyResource src");
     if (dst->GetTextureAllocation() && src->GetTextureAllocation()) {
       CopyTextureRegionRecord copy = {};
       copy.dst.resource = record.dst;
@@ -10597,7 +10658,13 @@ resolve_cpu_fallback:
                                 const ResolveSubresourceRecord &record) {
     auto *dst = GetResource(record.dst.ptr());
     auto *src = GetResource(record.src.ptr());
-    if (!dst || !src || !dst->GetTexture() || !src->GetTexture())
+    if (!dst || !src)
+      return;
+    if (dst->IsReservedTexture())
+      dst->EnsureTextureAllocation("ResolveSubresource dst");
+    if (src->IsReservedTexture())
+      src->EnsureTextureAllocation("ResolveSubresource src");
+    if (!dst->GetTexture() || !src->GetTexture())
       return;
     dst->SetPresentSourceView({});
 
@@ -10705,6 +10772,10 @@ resolve_cpu_fallback:
             ? record.dst.subresource_index
             : 0;
 
+    if (dst->IsReservedTexture())
+      dst->EnsureTextureAllocation("CopyTextureRegion dst");
+    if (src->IsReservedTexture())
+      src->EnsureTextureAllocation("CopyTextureRegion src");
     if (dst->GetTextureAllocation() && src->GetTextureAllocation() &&
         dst->GetTexture() && src->GetTexture()) {
       dst->SetPresentSourceView({});
@@ -10836,6 +10907,9 @@ resolve_cpu_fallback:
 
     auto &buffer_resource = dst_is_buffer ? dst : src;
     auto &texture_resource = dst_is_buffer ? src : dst;
+    if (texture_resource.IsReservedTexture() &&
+        !texture_resource.EnsureTextureAllocation("BufferTextureCopy"))
+      return;
     if (!dst_is_buffer)
       texture_resource.SetPresentSourceView({});
     Rc<Buffer> buffer = buffer_resource.GetBuffer();
@@ -11097,6 +11171,8 @@ resolve_cpu_fallback:
       return;
     }
 
+    if (!tiled->EnsureTextureAllocation("CopyTiles"))
+      return;
     Rc<Texture> texture = Rc<Texture>(tiled->GetTexture(sub.plane));
     Rc<Buffer> buffer = buffer_resource->GetBuffer();
     if (!texture || !buffer)
@@ -11239,7 +11315,12 @@ resolve_cpu_fallback:
   void ReplayClearRenderTarget(CommandChunk *chunk,
                                const ClearRenderTargetRecord &record) {
     auto *resource = GetResource(record.descriptor.resource.ptr());
-    if (!resource || !resource->GetTexture() || !resource->GetTextureAllocation())
+    if (!resource)
+      return;
+    if (resource->IsReservedTexture() &&
+        !resource->EnsureTextureAllocation("ClearRenderTarget"))
+      return;
+    if (!resource->GetTexture() || !resource->GetTextureAllocation())
       return;
 
     Rc<Texture> texture = resource->GetTexture();
@@ -11258,7 +11339,12 @@ resolve_cpu_fallback:
   void ReplayClearDepthStencil(CommandChunk *chunk,
                                const ClearDepthStencilRecord &record) {
     auto *resource = GetResource(record.descriptor.resource.ptr());
-    if (!resource || !resource->GetTexture() || !resource->GetTextureAllocation())
+    if (!resource)
+      return;
+    if (resource->IsReservedTexture() &&
+        !resource->EnsureTextureAllocation("ClearDepthStencil"))
+      return;
+    if (!resource->GetTexture() || !resource->GetTextureAllocation())
       return;
 
     Rc<Texture> texture = resource->GetTexture();
@@ -11391,6 +11477,9 @@ resolve_cpu_fallback:
     }
 
     if (resource->GetTexture()) {
+      if (resource->IsReservedTexture() &&
+          !resource->EnsureTextureAllocation("ClearUnorderedAccessTexture"))
+        return;
       auto view = CreateUnorderedAccessTextureView(device_->GetMTLDevice(),
                                                    *resource, record.descriptor);
       if (!view)

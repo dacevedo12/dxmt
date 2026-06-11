@@ -2256,7 +2256,7 @@ public:
     auto *reserved = resource_object.ptr()
                          ? dynamic_cast<d3d12::Resource *>(resource_object.ptr())
                          : nullptr;
-    if (!reserved || !reserved->GetTextureAllocation() || !reserved->GetTiling()) {
+    if (!reserved || !reserved->GetTexture() || !reserved->GetTiling()) {
       WARN("D3D12Device: TODO CreateReservedResource(texture) unsupported"
            " format=", desc->Format,
            " dimension=", desc->Dimension,

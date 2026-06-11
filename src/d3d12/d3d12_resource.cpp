@@ -7,11 +7,17 @@
 #include "dxmt_format.hpp"
 #include "dxmt_apitrace_d3d.hpp"
 #include "log/log.hpp"
+#include "thread.hpp"
+#include "util_env.hpp"
 #include "util_string.hpp"
 #include <array>
 #include <algorithm>
+#include <chrono>
 #include <cstring>
+#include <cstdlib>
+#include <deque>
 #include <mutex>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -19,6 +25,157 @@ namespace dxmt::d3d12 {
 namespace {
 
 constexpr UINT kMaxTexturePlanes = 3;
+
+class ResourceImpl;
+
+struct ReservedTextureAsyncConfig {
+  bool enabled = true;
+  UINT workers = 1;
+  UINT budget_us = 2000;
+  UINT period_us = 16000;
+  UINT queue_limit = 32768;
+};
+
+static bool
+ParseEnvBool(const char *name, bool fallback) {
+  const auto value = env::getEnvVar(name);
+  if (value.empty())
+    return fallback;
+  if (value == "0" || value == "false" || value == "FALSE" ||
+      value == "off" || value == "OFF")
+    return false;
+  return true;
+}
+
+static UINT
+ParseEnvUint(const char *name, UINT fallback, UINT minimum, UINT maximum) {
+  const auto value = env::getEnvVar(name);
+  if (value.empty())
+    return fallback;
+  char *end = nullptr;
+  const unsigned long parsed = std::strtoul(value.c_str(), &end, 10);
+  if (!end || *end || parsed < minimum)
+    return fallback;
+  return static_cast<UINT>(std::min<unsigned long>(parsed, maximum));
+}
+
+static const ReservedTextureAsyncConfig &
+ReservedTextureAsyncSettings() {
+  static const ReservedTextureAsyncConfig config = [] {
+    ReservedTextureAsyncConfig cfg = {};
+    cfg.enabled = ParseEnvBool("DXMT_D3D12_RESERVED_TEXTURE_ASYNC", true);
+    cfg.workers = ParseEnvUint("DXMT_D3D12_RESERVED_TEXTURE_ASYNC_WORKERS",
+                               1, 1, 4);
+    cfg.budget_us = ParseEnvUint("DXMT_D3D12_RESERVED_TEXTURE_ASYNC_BUDGET_US",
+                                 2000, 0, 1000000);
+    cfg.period_us = ParseEnvUint("DXMT_D3D12_RESERVED_TEXTURE_ASYNC_PERIOD_US",
+                                 16000, 1000, 1000000);
+    cfg.queue_limit = ParseEnvUint("DXMT_D3D12_RESERVED_TEXTURE_ASYNC_QUEUE_LIMIT",
+                                   32768, 1, 1000000);
+    return cfg;
+  }();
+  return config;
+}
+
+struct ReservedTextureAsyncCounters {
+  std::atomic<uint64_t> queued = 0;
+  std::atomic<uint64_t> completed = 0;
+  std::atomic<uint64_t> stolen = 0;
+  std::atomic<uint64_t> awaited = 0;
+  std::atomic<uint64_t> failed = 0;
+  std::atomic<uint64_t> dropped = 0;
+  std::atomic<uint64_t> wait_us = 0;
+  std::atomic<uint64_t> max_wait_us = 0;
+};
+
+static ReservedTextureAsyncCounters &
+ReservedTextureCounters() {
+  static ReservedTextureAsyncCounters counters;
+  return counters;
+}
+
+static void
+RecordReservedTextureWait(uint64_t wait_us) {
+  auto &counters = ReservedTextureCounters();
+  counters.awaited.fetch_add(1, std::memory_order_relaxed);
+  counters.wait_us.fetch_add(wait_us, std::memory_order_relaxed);
+  uint64_t current = counters.max_wait_us.load(std::memory_order_relaxed);
+  while (wait_us > current &&
+         !counters.max_wait_us.compare_exchange_weak(
+             current, wait_us, std::memory_order_relaxed))
+    ;
+}
+
+static bool
+ShouldLogReservedTextureDiag() {
+  static std::atomic<uint32_t> count = 0;
+  const uint32_t value = count.fetch_add(1, std::memory_order_relaxed);
+  return value < 32 || (value & (value - 1)) == 0;
+}
+
+static void
+LogReservedTextureCounters(const char *event) {
+  if (!ShouldLogReservedTextureDiag())
+    return;
+  auto &counters = ReservedTextureCounters();
+  INFO("D3D12Resource: reserved texture async stats"
+       " event=", event ? event : "",
+       " queued=", counters.queued.load(std::memory_order_relaxed),
+       " completed=", counters.completed.load(std::memory_order_relaxed),
+       " stolen=", counters.stolen.load(std::memory_order_relaxed),
+       " awaited=", counters.awaited.load(std::memory_order_relaxed),
+       " failed=", counters.failed.load(std::memory_order_relaxed),
+       " dropped=", counters.dropped.load(std::memory_order_relaxed),
+       " wait_us=", counters.wait_us.load(std::memory_order_relaxed),
+       " max_wait_us=", counters.max_wait_us.load(std::memory_order_relaxed));
+}
+
+class ReservedTextureMaterializer {
+public:
+  static ReservedTextureMaterializer &Get() {
+    static ReservedTextureMaterializer materializer;
+    return materializer;
+  }
+
+  bool Enqueue(ResourceImpl *resource);
+
+  bool TryRemove(ResourceImpl *resource);
+
+  void Cancel(ResourceImpl *resource) {
+    TryRemove(resource);
+  }
+
+private:
+  ReservedTextureMaterializer() = default;
+
+  ~ReservedTextureMaterializer() {
+    {
+      std::lock_guard lock(mutex_);
+      stopping_ = true;
+      queue_.clear();
+    }
+    cond_.notify_all();
+    for (auto &worker : workers_) {
+      if (worker.joinable())
+        worker.join();
+    }
+  }
+
+  void StartWorkersLocked(UINT count) {
+    while (workers_.size() < count) {
+      workers_.emplace_back([this] { WorkerMain(); });
+      workers_.back().set_priority(dxmt::ThreadPriority::Lowest);
+    }
+  }
+
+  void WorkerMain();
+
+  dxmt::mutex mutex_;
+  dxmt::condition_variable cond_;
+  std::deque<Com<ID3D12Resource>> queue_;
+  std::vector<dxmt::thread> workers_;
+  bool stopping_ = false;
+};
 
 static UINT64
 Align(UINT64 value, UINT64 alignment) {
@@ -578,6 +735,7 @@ public:
   }
 
   ~ResourceImpl() {
+    CancelReservedTextureMaterialization();
     UnregisterBufferGpuVirtualAddress(this);
   }
 
@@ -914,6 +1072,60 @@ public:
                : nullptr;
   }
 
+  bool EnsureTextureAllocation(const char *reason) override {
+    if (kind_ != ResourceKind::ReservedTexture)
+      return texture_allocation_ != nullptr;
+
+    const auto start = std::chrono::steady_clock::now();
+    bool stole = false;
+    {
+      std::unique_lock<dxmt::mutex> lock(materialization_mutex_);
+      if (materialization_state_ == MaterializationState::Ready)
+        return texture_allocation_ != nullptr;
+      if (materialization_state_ == MaterializationState::Failed)
+        return false;
+      if (materialization_state_ == MaterializationState::Queued &&
+          ReservedTextureMaterializer::Get().TryRemove(this)) {
+        materialization_state_ = MaterializationState::Materializing;
+        stole = true;
+      } else if (materialization_state_ == MaterializationState::Unmaterialized) {
+        materialization_state_ = MaterializationState::Materializing;
+        stole = true;
+      }
+      if (!stole) {
+        materialization_cond_.wait(lock, [this] {
+          return materialization_state_ == MaterializationState::Ready ||
+                 materialization_state_ == MaterializationState::Failed;
+        });
+        const auto elapsed =
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - start).count();
+        if (elapsed > 0)
+          RecordReservedTextureWait(static_cast<uint64_t>(elapsed));
+        if (elapsed > 1000 && ShouldLogReservedTextureDiag()) {
+          INFO("D3D12Resource: waited for reserved texture materialization"
+               " reason=", reason ? reason : "",
+               " wait_us=", uint64_t(elapsed),
+               " resource=", uint64_t(this),
+               " width=", desc_.Width,
+               " height=", desc_.Height,
+               " format=", uint32_t(desc_.Format));
+        }
+        return texture_allocation_ != nullptr;
+      }
+    }
+
+    if (stole)
+      ReservedTextureCounters().stolen.fetch_add(1, std::memory_order_relaxed);
+    MaterializeReservedTexture(reason);
+    const auto elapsed =
+        std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - start).count();
+    if (elapsed > 0)
+      RecordReservedTextureWait(static_cast<uint64_t>(elapsed));
+    return texture_allocation_ != nullptr;
+  }
+
   void AddPendingTimestampResolve(UINT64 offset, UINT64 size,
                                   uint64_t seq) override {
     if (desc_.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER || !size)
@@ -944,6 +1156,16 @@ public:
   }
 
 private:
+  friend class ReservedTextureMaterializer;
+
+  enum class MaterializationState {
+    Unmaterialized,
+    Queued,
+    Materializing,
+    Ready,
+    Failed,
+  };
+
   Rc<dxmt::Texture> GetTextureRef(UINT plane) const {
     if (plane >= GetTextureLogicalPlaneCount(desc_))
       return nullptr;
@@ -1418,13 +1640,13 @@ private:
             new dxmt::Texture(info, device_->GetDXMTDevice().device());
       }
 
-      plane_allocations_[plane] = plane_textures_[plane]->allocate(flags);
-      plane_textures_[plane]->rename(
-          Rc<dxmt::TextureAllocation>(plane_allocations_[plane]));
+      if (kind_ != ResourceKind::ReservedTexture)
+        AllocateTexturePlane(plane, flags);
+      else
+        reserved_texture_allocation_flags_ = flags;
       if (!plane) {
         first_pixel_format = format.PixelFormat;
         texture_ = plane_textures_[plane];
-        texture_allocation_ = plane_allocations_[plane];
       }
     }
 
@@ -1432,6 +1654,89 @@ private:
         GetHeapType(heap_properties_) == D3D12_HEAP_TYPE_DEFAULT) {
       InitializeTextureContents(first_pixel_format);
     }
+    if (kind_ == ResourceKind::ReservedTexture) {
+      std::lock_guard lock(materialization_mutex_);
+      if (texture_ && has_tiling_ && QueueReservedTextureMaterializationLocked())
+        return;
+      materialization_state_ = MaterializationState::Unmaterialized;
+    }
+  }
+
+  void AllocateTexturePlane(UINT plane,
+                            Flags<dxmt::TextureAllocationFlag> flags) {
+    plane_allocations_[plane] = plane_textures_[plane]->allocate(flags);
+    plane_textures_[plane]->rename(
+        Rc<dxmt::TextureAllocation>(plane_allocations_[plane]));
+    if (!plane)
+      texture_allocation_ = plane_allocations_[plane];
+  }
+
+  bool QueueReservedTextureMaterializationLocked() {
+    if (!ReservedTextureAsyncSettings().enabled)
+      return false;
+    if (materialization_state_ != MaterializationState::Unmaterialized)
+      return false;
+    materialization_state_ = MaterializationState::Queued;
+    if (ReservedTextureMaterializer::Get().Enqueue(this))
+      return true;
+    materialization_state_ = MaterializationState::Unmaterialized;
+    return false;
+  }
+
+  void MaterializeReservedTexture(const char *reason) {
+    bool success = true;
+    for (UINT plane = 0; plane < GetTextureBackingPlaneCount(desc_); ++plane) {
+      if (!plane_textures_[plane]) {
+        success = false;
+        break;
+      }
+      if (!plane_allocations_[plane])
+        AllocateTexturePlane(plane, reserved_texture_allocation_flags_);
+      if (!plane_allocations_[plane]) {
+        success = false;
+        break;
+      }
+    }
+
+    {
+      std::lock_guard lock(materialization_mutex_);
+      materialization_state_ =
+          success ? MaterializationState::Ready : MaterializationState::Failed;
+    }
+    if (success)
+      ReservedTextureCounters().completed.fetch_add(1, std::memory_order_relaxed);
+    else
+      ReservedTextureCounters().failed.fetch_add(1, std::memory_order_relaxed);
+    LogReservedTextureCounters(success ? "complete" : "failed");
+    materialization_cond_.notify_all();
+
+    if (!success && ShouldLogReservedTextureDiag()) {
+      WARN("D3D12Resource: reserved texture materialization failed"
+           " reason=", reason ? reason : "",
+           " resource=", uint64_t(this),
+           " width=", desc_.Width,
+           " height=", desc_.Height,
+           " format=", uint32_t(desc_.Format));
+    }
+  }
+
+  void WorkerMaterializeReservedTexture() {
+    {
+      std::lock_guard lock(materialization_mutex_);
+      if (materialization_state_ != MaterializationState::Queued)
+        return;
+      materialization_state_ = MaterializationState::Materializing;
+    }
+    MaterializeReservedTexture("async-prewarm");
+  }
+
+  void CancelReservedTextureMaterialization() {
+    if (kind_ != ResourceKind::ReservedTexture)
+      return;
+    ReservedTextureMaterializer::Get().Cancel(this);
+    std::lock_guard lock(materialization_mutex_);
+    if (materialization_state_ == MaterializationState::Queued)
+      materialization_state_ = MaterializationState::Unmaterialized;
   }
 
   void BuildTilingMetadata(const WMTSparseTileSize &tile_size) {
@@ -1647,11 +1952,91 @@ private:
   Rc<dxmt::TextureAllocation> texture_allocation_;
   std::array<Rc<dxmt::Texture>, kMaxTexturePlanes> plane_textures_{};
   std::array<Rc<dxmt::TextureAllocation>, kMaxTexturePlanes> plane_allocations_{};
+  Flags<dxmt::TextureAllocationFlag> reserved_texture_allocation_flags_;
+  dxmt::mutex materialization_mutex_;
+  dxmt::condition_variable materialization_cond_;
+  MaterializationState materialization_state_ =
+      MaterializationState::Unmaterialized;
   dxmt::TextureViewKey present_source_view_ = {};
   std::string name_;
   std::mutex pending_timestamp_resolve_mutex_;
   std::vector<PendingTimestampResolveRange> pending_timestamp_resolves_;
 };
+
+bool
+ReservedTextureMaterializer::Enqueue(ResourceImpl *resource) {
+  const auto &config = ReservedTextureAsyncSettings();
+  if (!config.enabled)
+    return false;
+  Com<ID3D12Resource> resource_ref =
+      static_cast<ID3D12Resource *>(resource);
+
+  {
+    std::lock_guard lock(mutex_);
+    StartWorkersLocked(config.workers);
+    if (stopping_ || queue_.size() >= config.queue_limit) {
+      ReservedTextureCounters().dropped.fetch_add(1, std::memory_order_relaxed);
+      return false;
+    }
+    queue_.push_back(std::move(resource_ref));
+  }
+  ReservedTextureCounters().queued.fetch_add(1, std::memory_order_relaxed);
+  LogReservedTextureCounters("queue");
+  cond_.notify_one();
+  return true;
+}
+
+bool
+ReservedTextureMaterializer::TryRemove(ResourceImpl *resource) {
+  auto *resource_ptr = static_cast<ID3D12Resource *>(resource);
+  std::lock_guard lock(mutex_);
+  for (auto it = queue_.begin(); it != queue_.end(); ++it) {
+    if (it->ptr() == resource_ptr) {
+      queue_.erase(it);
+      return true;
+    }
+  }
+  return false;
+}
+
+void
+ReservedTextureMaterializer::WorkerMain() {
+  env::setThreadName("dxmt-resvtex");
+  const auto &config = ReservedTextureAsyncSettings();
+  using clock = std::chrono::steady_clock;
+  auto period_begin = clock::now();
+  uint64_t spent_us = 0;
+
+  while (true) {
+    Com<ID3D12Resource> resource_ref;
+    {
+      std::unique_lock<dxmt::mutex> lock(mutex_);
+      cond_.wait(lock, [this] { return stopping_ || !queue_.empty(); });
+      if (stopping_ && queue_.empty())
+        return;
+      resource_ref = std::move(queue_.front());
+      queue_.pop_front();
+    }
+
+    if (config.budget_us && spent_us >= config.budget_us) {
+      const auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
+          clock::now() - period_begin);
+      if (elapsed.count() < config.period_us) {
+        std::this_thread::sleep_for(
+            std::chrono::microseconds(config.period_us - elapsed.count()));
+      }
+      period_begin = clock::now();
+      spent_us = 0;
+    }
+
+    const auto start = clock::now();
+    if (auto *resource = dynamic_cast<ResourceImpl *>(resource_ref.ptr()))
+      resource->WorkerMaterializeReservedTexture();
+    spent_us += static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::microseconds>(
+            clock::now() - start).count());
+  }
+}
 
 } // namespace
 
