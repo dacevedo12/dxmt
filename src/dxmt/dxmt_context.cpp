@@ -184,14 +184,17 @@ ArgumentEncodingContext::encodeVertexBuffers(uint32_t slot_mask, uint64_t offset
     makeResident<PipelineStage::Vertex, kind>(buffer.ptr());
   };
   {
+    const WMTRenderStages stages =
+        (kind == PipelineKind::Geometry || kind == PipelineKind::Tessellation)
+            ? WMTRenderStageObject
+            : WMTRenderStageVertex;
+    const auto table_size = uint64_t(__builtin_popcount(slot_mask)) * sizeof(VERTEX_BUFFER_ENTRY);
+    const auto binding_offset = deduplicateRenderArgumentTableSlice(stages, 16, offset, table_size);
     auto &cmd = encodeRenderCommand<wmtcmd_render_setargumentbufferoffset>();
-    cmd.offset = getFinalArgumentBufferOffset(offset);
+    cmd.offset = getFinalArgumentBufferOffset(binding_offset);
     cmd.index = 16;
     cmd.type = WMTRenderCommandSetArgumentBufferOffset;
-    if constexpr (kind == PipelineKind::Geometry || kind == PipelineKind::Tessellation)
-      cmd.stages = WMTRenderStageObject;
-    else
-      cmd.stages = WMTRenderStageVertex;
+    cmd.stages = stages;
   }
 }
 
@@ -306,15 +309,16 @@ ArgumentEncodingContext::encodeConstantBuffers(const MTL_SHADER_REFLECTION *refl
   }
 
   /* kConstantBufferTableBinding = 29 */
+  const auto table_size = uint64_t(reflection->NumConstantBuffers) << 3;
   if constexpr (stage == PipelineStage::Compute) {
+    const auto binding_offset = deduplicateComputeArgumentTableSlice(29, offset, table_size);
     auto &cmd = encodeComputeCommand<wmtcmd_compute_setargumentbufferoffset>();
     cmd.type = WMTComputeCommandSetArgumentBufferOffset;
-    cmd.offset = getFinalArgumentBufferOffset<true>(offset);
+    cmd.offset = getFinalArgumentBufferOffset<true>(binding_offset);
     cmd.index = 29;
   } else {
     auto &cmd = encodeRenderCommand<wmtcmd_render_setargumentbufferoffset>();
     cmd.type = WMTRenderCommandSetArgumentBufferOffset;
-    cmd.offset = getFinalArgumentBufferOffset(offset);
     cmd.index = 29;
     if constexpr (stage == PipelineStage::Vertex) {
       if constexpr (kind == PipelineKind::Geometry)
@@ -335,6 +339,8 @@ ArgumentEncodingContext::encodeConstantBuffers(const MTL_SHADER_REFLECTION *refl
     } else {
       assert(0 && "Not implemented or unreachable");
     }
+    const auto binding_offset = deduplicateRenderArgumentTableSlice(cmd.stages, cmd.index, offset, table_size);
+    cmd.offset = getFinalArgumentBufferOffset(binding_offset);
   }
 };
 
@@ -474,6 +480,124 @@ static bool
 DebugEnabledEnv(const char *name) {
   auto value = env::getEnvVar(name);
   return value == "1" || value == "true" || value == "yes" || value == "trace";
+}
+
+static bool
+DebugShouldLogArgumentTableSliceCache() {
+  static const bool enabled = DebugEnabledEnv("DXMT_DIAG_ARGUMENT_TABLE_CACHE");
+  return enabled;
+}
+
+static uint64_t
+HashArgumentTableSlice(const uint8_t *bytes, uint64_t size) {
+  constexpr uint64_t kFnvOffset = 14695981039346656037ull;
+  constexpr uint64_t kFnvPrime = 1099511628211ull;
+  uint64_t hash = kFnvOffset;
+  for (uint64_t i = 0; i < size; i++) {
+    hash ^= bytes[i];
+    hash *= kFnvPrime;
+  }
+  return hash;
+}
+
+static ArgumentTableSliceCache *
+RenderArgumentTableSliceCache(RenderEncoderData *data, WMTRenderStages stages) {
+  switch (stages) {
+  case WMTRenderStageVertex:
+    return &data->argument_table_cache_vertex;
+  case WMTRenderStageFragment:
+    return &data->argument_table_cache_fragment;
+  case WMTRenderStageObject:
+    return &data->argument_table_cache_object;
+  case WMTRenderStageMesh:
+    return &data->argument_table_cache_mesh;
+  default:
+    return nullptr;
+  }
+}
+
+static uint64_t
+DeduplicateArgumentTableSlice(
+    ArgumentTableSliceCache &cache, uint8_t index, uint64_t offset, uint64_t size,
+    const uint8_t *base, const uint8_t *bytes
+) {
+  if (!size || index >= cache.entries.size())
+    return offset;
+
+  cache.lookups++;
+  const auto hash = HashArgumentTableSlice(bytes, size);
+  auto &entry = cache.entries[index];
+  if (entry.valid && entry.size == size && entry.hash == hash &&
+      !std::memcmp(base + entry.offset, bytes, size)) {
+    cache.hits++;
+    cache.bytes_avoided += size;
+    cache.hits_by_index[index]++;
+    return entry.offset;
+  }
+
+  cache.misses++;
+  entry.valid = true;
+  entry.hash = hash;
+  entry.offset = offset;
+  entry.size = static_cast<uint32_t>(size);
+  return offset;
+}
+
+static void
+DebugLogArgumentTableSliceCache(
+    const char *kind, const char *stage, uint64_t frame_id, uint64_t seq_id,
+    uint64_t encoder_id, const ArgumentTableSliceCache &cache
+) {
+  if (!DebugShouldLogArgumentTableSliceCache() || !cache.lookups)
+    return;
+
+  std::stringstream hit_distribution;
+  bool first = true;
+  for (unsigned i = 0; i < cache.hits_by_index.size(); i++) {
+    if (!cache.hits_by_index[i])
+      continue;
+    if (!first)
+      hit_distribution << ",";
+    hit_distribution << i << ":" << cache.hits_by_index[i];
+    first = false;
+  }
+
+  INFO(
+      "DXMT diagnostic: argument table slice cache",
+      " kind=", kind,
+      " stage=", stage,
+      " frame=", frame_id,
+      " seq=", seq_id,
+      " encoder=", encoder_id,
+      " lookups=", cache.lookups,
+      " hits=", cache.hits,
+      " misses=", cache.misses,
+      " bytesAvoided=", cache.bytes_avoided,
+      " hitByIndex=", first ? "-" : hit_distribution.str()
+  );
+}
+
+uint64_t
+ArgumentEncodingContext::deduplicateRenderArgumentTableSlice(
+    WMTRenderStages stages, uint8_t index, uint64_t offset, uint64_t size
+) {
+  auto *data = currentRenderEncoder();
+  auto *cache = RenderArgumentTableSliceCache(data, stages);
+  if (!cache)
+    return offset;
+  auto *base = getMappedArgumentBuffer<uint8_t>(0);
+  auto *bytes = getMappedArgumentBuffer<uint8_t>(offset);
+  return DeduplicateArgumentTableSlice(*cache, index, offset, size, base, bytes);
+}
+
+uint64_t
+ArgumentEncodingContext::deduplicateComputeArgumentTableSlice(
+    uint8_t index, uint64_t offset, uint64_t size
+) {
+  auto *data = static_cast<ComputeEncoderData *>(currentEncoder());
+  auto *base = getMappedArgumentBuffer<uint8_t, true>(0);
+  auto *bytes = getMappedArgumentBuffer<uint8_t, true>(offset);
+  return DeduplicateArgumentTableSlice(data->argument_table_cache, index, offset, size, base, bytes);
 }
 
 static void
@@ -1901,15 +2025,16 @@ ArgumentEncodingContext::encodeConstantBuffers(
   }
 
   /* kConstantBufferTableBinding = 29 */
+  const auto table_size = uint64_t(reflection->NumConstantBuffers) << 3;
   if constexpr (stage == PipelineStage::Compute) {
+    const auto binding_offset = deduplicateComputeArgumentTableSlice(29, offset, table_size);
     auto &cmd = encodeComputeCommand<wmtcmd_compute_setargumentbufferoffset>();
     cmd.type = WMTComputeCommandSetArgumentBufferOffset;
-    cmd.offset = getFinalArgumentBufferOffset<true>(offset);
+    cmd.offset = getFinalArgumentBufferOffset<true>(binding_offset);
     cmd.index = 29;
   } else {
     auto &cmd = encodeRenderCommand<wmtcmd_render_setargumentbufferoffset>();
     cmd.type = WMTRenderCommandSetArgumentBufferOffset;
-    cmd.offset = getFinalArgumentBufferOffset(offset);
     cmd.index = 29;
     if constexpr (stage == PipelineStage::Vertex) {
       if constexpr (kind == PipelineKind::Geometry)
@@ -1930,6 +2055,8 @@ ArgumentEncodingContext::encodeConstantBuffers(
     } else {
       assert(0 && "Not implemented or unreachable");
     }
+    const auto binding_offset = deduplicateRenderArgumentTableSlice(cmd.stages, cmd.index, offset, table_size);
+    cmd.offset = getFinalArgumentBufferOffset(binding_offset);
   }
 }
 
@@ -2299,14 +2426,16 @@ ArgumentEncodingContext::encodeShaderResources(
   }
 
   if constexpr (stage == PipelineStage::Compute) {
+    const auto table_size = uint64_t(reflection->ArgumentTableQwords) << 3;
+    const auto binding_offset = deduplicateComputeArgumentTableSlice(30, offset, table_size);
     auto &cmd = encodeComputeCommand<wmtcmd_compute_setargumentbufferoffset>();
     cmd.type = WMTComputeCommandSetArgumentBufferOffset;
-    cmd.offset = getFinalArgumentBufferOffset<true>(offset);
+    cmd.offset = getFinalArgumentBufferOffset<true>(binding_offset);
     cmd.index = 30;
   } else {
+    const auto table_size = uint64_t(reflection->ArgumentTableQwords) << 3;
     auto &cmd = encodeRenderCommand<wmtcmd_render_setargumentbufferoffset>();
     cmd.type = WMTRenderCommandSetArgumentBufferOffset;
-    cmd.offset = getFinalArgumentBufferOffset(offset);
     cmd.index = 30;
     if constexpr (stage == PipelineStage::Vertex) {
       if constexpr (kind == PipelineKind::Geometry)
@@ -2327,6 +2456,8 @@ ArgumentEncodingContext::encodeShaderResources(
     } else {
       assert(0 && "Not implemented or unreachable");
     }
+    const auto binding_offset = deduplicateRenderArgumentTableSlice(cmd.stages, cmd.index, offset, table_size);
+    cmd.offset = getFinalArgumentBufferOffset(binding_offset);
   }
 }
 
@@ -3241,6 +3372,18 @@ ArgumentEncodingContext::flushCommands(WMT::CommandBuffer cmdbuf, uint64_t seqId
       auto command_summary = DebugSummarizeRenderCommands(&data->cmd_head);
       DebugAccumulateRenderCommands(currentFrameStatistics(), &data->cmd_head);
       DebugLogRenderPassInfo(frame_id_, seqId, data->id, data, command_summary);
+      DebugLogArgumentTableSliceCache(
+          "render", "vertex", frame_id_, seqId, data->id,
+          data->argument_table_cache_vertex);
+      DebugLogArgumentTableSliceCache(
+          "render", "fragment", frame_id_, seqId, data->id,
+          data->argument_table_cache_fragment);
+      DebugLogArgumentTableSliceCache(
+          "render", "object", frame_id_, seqId, data->id,
+          data->argument_table_cache_object);
+      DebugLogArgumentTableSliceCache(
+          "render", "mesh", frame_id_, seqId, data->id,
+          data->argument_table_cache_mesh);
       encoder.setLabel(DebugEncoderLabel(
           "RenderPass id=" + std::to_string(data->id) +
           " draw=" + std::to_string(command_summary.draws + command_summary.indexed_draws) +
@@ -3266,6 +3409,9 @@ ArgumentEncodingContext::flushCommands(WMT::CommandBuffer cmdbuf, uint64_t seqId
       auto command_summary = DebugSummarizeComputeCommands(&data->cmd_head);
       auto first_pso_diag = LookupComputePipelineDiagInfo(command_summary.first_pso);
       auto last_pso_diag = LookupComputePipelineDiagInfo(command_summary.last_pso);
+      DebugLogArgumentTableSliceCache(
+          "compute", "compute", frame_id_, seqId, data->id,
+          data->argument_table_cache);
       if (data->allocated_argbuf_needs_flush) {
         data->allocated_argbuf.updateContents(data->allocated_argbuf_offset, data->allocated_argbuf_mapping,
                                               data->allocated_argbuf_size);

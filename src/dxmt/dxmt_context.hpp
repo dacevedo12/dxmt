@@ -14,6 +14,7 @@
 #include "log/log.hpp"
 #include "rc/util_rc_ptr.hpp"
 #include "airconv_public.h"
+#include <array>
 #include <cassert>
 #include <optional>
 #include <string>
@@ -178,6 +179,22 @@ struct RenderEncoderStencilAttachmentData {
   uint8_t clear_stencil;
 };
 
+struct ArgumentTableSliceCacheEntry {
+  uint64_t hash = 0;
+  uint64_t offset = 0;
+  uint32_t size = 0;
+  bool valid = false;
+};
+
+struct ArgumentTableSliceCache {
+  std::array<ArgumentTableSliceCacheEntry, 31> entries = {};
+  std::array<uint64_t, 31> hits_by_index = {};
+  uint64_t lookups = 0;
+  uint64_t hits = 0;
+  uint64_t misses = 0;
+  uint64_t bytes_avoided = 0;
+};
+
 struct RenderEncoderData : EncoderData {
   std::array<RenderEncoderColorAttachmentData, 8> colors;
   RenderEncoderDepthAttachmentData depth;
@@ -208,6 +225,10 @@ struct RenderEncoderData : EncoderData {
   WMT::RenderPipelineState last_pso = {};
   uint64_t pixel_shader_demote_msaa_srv_mask_lo = 0;
   uint64_t pixel_shader_demote_msaa_srv_mask_hi = 0;
+  ArgumentTableSliceCache argument_table_cache_vertex;
+  ArgumentTableSliceCache argument_table_cache_fragment;
+  ArgumentTableSliceCache argument_table_cache_object;
+  ArgumentTableSliceCache argument_table_cache_mesh;
 };
 
 struct ComputeEncoderData : EncoderData {
@@ -218,6 +239,7 @@ struct ComputeEncoderData : EncoderData {
   uint64_t allocated_argbuf_size;
   void *allocated_argbuf_mapping;
   bool allocated_argbuf_needs_flush;
+  ArgumentTableSliceCache argument_table_cache;
 };
 
 struct BlitEncoderData : EncoderData {
@@ -835,6 +857,10 @@ public:
       return static_cast<ComputeEncoderData *>(encoder_current)->allocated_argbuf;
     return static_cast<RenderEncoderData *>(encoder_current)->allocated_argbuf;
   }
+
+  uint64_t deduplicateRenderArgumentTableSlice(WMTRenderStages stages, uint8_t index, uint64_t offset, uint64_t size);
+
+  uint64_t deduplicateComputeArgumentTableSlice(uint8_t index, uint64_t offset, uint64_t size);
 
   std::pair<WMT::Buffer , size_t> allocateTempBuffer(size_t size, size_t alignment);
   
