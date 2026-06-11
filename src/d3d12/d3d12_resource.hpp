@@ -6,6 +6,7 @@
 #include "dxmt_texture.hpp"
 #include "rc/util_rc_ptr.hpp"
 #include <d3d12.h>
+#include <functional>
 #include <vector>
 
 namespace dxmt::d3d12 {
@@ -40,6 +41,8 @@ struct ResourceTileMapping {
 
 class Resource {
 public:
+  using PendingCpuQueryResolveFn = std::function<void(Resource *)>;
+
   virtual ~Resource() = default;
 
   virtual ResourceKind GetKind() const = 0;
@@ -65,6 +68,13 @@ public:
   virtual bool EnsureTextureAllocation(const char *reason) = 0;
   virtual void AddPendingTimestampResolve(UINT64 offset, UINT64 size,
                                           uint64_t seq) = 0;
+  virtual bool CanDeferCpuQueryResolve() const = 0;
+  virtual void AddPendingCpuQueryResolve(UINT64 offset, UINT64 size,
+                                         uint64_t seq,
+                                         PendingCpuQueryResolveFn resolve) = 0;
+  virtual bool HasPendingCpuQueryResolves(UINT64 offset, UINT64 size) = 0;
+  virtual bool MaterializePendingCpuQueryResolves(UINT64 offset, UINT64 size,
+                                                  const char *context) = 0;
   virtual void SetPresentSourceView(dxmt::TextureViewKey view) = 0;
   virtual dxmt::TextureViewKey GetPresentSourceView() const = 0;
   virtual ID3D12Resource *GetD3D12Resource() = 0;

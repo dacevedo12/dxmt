@@ -427,11 +427,32 @@ D3D12TimestampGpuResolveEnabled() {
   return enabled;
 }
 
+static bool
+D3D12QueryCpuFallbackDeferEnabled() {
+  static const bool enabled =
+      D3D12EnabledEnvDefaultOn("DXMT_D3D12_QUERY_CPU_FALLBACK_DEFER");
+  return enabled;
+}
+
+static bool
+D3D12QueryFallbackStatsEnabled() {
+  static const bool enabled =
+      D3D12DiagEnabledEnv("DXMT_D3D12_QUERY_FALLBACK_STATS") ||
+      D3D12DiagEnabledEnv("DXMT_DIAG_D3D12_QUERY") ||
+      D3D12DiagEnabledEnv("DXMT_DIAG_COMMAND_QUEUE");
+  return enabled;
+}
+
 static std::atomic<uint64_t> g_timestamp_gpu_resolve_runs = {0};
 static std::atomic<uint64_t> g_timestamp_gpu_resolve_queries = {0};
 static std::atomic<uint64_t> g_timestamp_cpu_fallbacks = {0};
 static std::atomic<uint64_t> g_timestamp_cpu_fallback_queries = {0};
 static std::atomic<uint64_t> g_timestamp_cpu_wait_us = {0};
+static std::atomic<uint64_t> g_timestamp_cpu_deferred_fallbacks = {0};
+static std::atomic<uint64_t> g_timestamp_cpu_deferred_queries = {0};
+static std::atomic<uint64_t> g_timestamp_cpu_map_materialized_fallbacks = {0};
+static std::atomic<uint64_t> g_timestamp_cpu_immediate_fallbacks = {0};
+static std::atomic<uint64_t> g_timestamp_cpu_unsafe_fallbacks = {0};
 
 static bool
 D3D12DeferredTimestampMarkersEnabled() {
@@ -927,6 +948,56 @@ ValidateBufferRange(Resource *resource, UINT64 offset, UINT64 size,
     return false;
   }
   return true;
+}
+
+static void
+ResolveQueryDataToCpuBufferStatic(ID3D12GraphicsCommandList *command_list,
+                                  ID3D12QueryHeap *query_heap,
+                                  D3D12_QUERY_TYPE type, UINT start_index,
+                                  UINT query_count, Resource *dst,
+                                  ID3D12Resource *dst_identity,
+                                  UINT64 dst_buffer_offset,
+                                  const char *context,
+                                  uintptr_t queue_id) {
+  auto *heap = dynamic_cast<QueryHeap *>(query_heap);
+  if (!heap || !dst)
+    return;
+
+  std::vector<uint8_t> data;
+  if (!heap->Resolve(type, start_index, query_count, data)) {
+    WARN_FILE_ONLY("D3D12 queue diagnostic: ResolveQueryData final failed"
+         " context=", context,
+         " queue=", queue_id,
+         " queryType=", type,
+         " start=", start_index,
+         " count=", query_count);
+    return;
+  }
+  if (!ValidateBufferRange(dst, dst_buffer_offset, data.size(),
+                           "query resolve"))
+    return;
+  if (!data.empty())
+    dst->GetBufferAllocation()->updateContents(
+        dst->GetHeapOffset() + dst_buffer_offset, data.data(),
+        data.size());
+  dxmt::apitrace::record_resolve_query_data_result(
+      command_list, query_heap, static_cast<uint32_t>(type), start_index,
+      query_count, dst_identity, dst_buffer_offset,
+      data.data(), data.size());
+  WARN_FILE_ONLY("D3D12 queue diagnostic: ResolveQueryData leave"
+       " context=", context,
+       " queue=", queue_id,
+       " bytes=", data.size());
+}
+
+static void
+ResolveQueryDataToCpuBufferStatic(const ResolveQueryDataRecord &record,
+                                  const char *context,
+                                  uintptr_t queue_id) {
+  ResolveQueryDataToCpuBufferStatic(
+      record.command_list.ptr(), record.heap.ptr(), record.type,
+      record.start_index, record.query_count, GetResource(record.dst_buffer.ptr()),
+      record.dst_buffer.ptr(), record.dst_buffer_offset, context, queue_id);
 }
 
 enum class DirectIndirectOperation {
@@ -4132,7 +4203,7 @@ private:
     ReplayComputePassBatch compute_pass_batch;
     std::vector<PendingTimestampMarker> pending_timestamp_markers;
     std::vector<PendingTimestampResolve> pending_timestamp_resolves;
-    std::vector<ResolveQueryDataRecord> pending_cpu_query_resolves;
+    std::vector<ResolveQueryDataRecord> pending_immediate_cpu_query_resolves;
   };
 
   static ReplayState
@@ -4449,60 +4520,140 @@ private:
 
   void ResolveQueryDataToCpuBuffer(const ResolveQueryDataRecord &record,
                                    const char *context) {
-    auto *heap = dynamic_cast<QueryHeap *>(record.heap.ptr());
-    auto *dst = GetResource(record.dst_buffer.ptr());
-    if (!heap || !dst)
-      return;
+    ResolveQueryDataToCpuBufferStatic(record, context,
+                                      reinterpret_cast<uintptr_t>(this));
+  }
 
-    std::vector<uint8_t> data;
-    if (!heap->Resolve(record.type, record.start_index, record.query_count,
-                       data)) {
-      WARN_FILE_ONLY("D3D12 queue diagnostic: ResolveQueryData final failed"
-           " context=", context,
-           " queue=", reinterpret_cast<uintptr_t>(this),
-           " queryType=", record.type,
-           " start=", record.start_index,
-           " count=", record.query_count);
+  bool CanGpuResolveTimestampSample(const PendingTimestampResolve::Sample &sample,
+                                    uint64_t sequence,
+                                    uint64_t current_sequence) const {
+    if (sample.index == ~0ull)
+      return false;
+#if DXMT_DX12_METAL4
+    return (sample.heap && sample.heap_entry_size) ||
+           sequence == current_sequence;
+#else
+    return sequence == current_sequence;
+#endif
+  }
+
+  ResolveQueryDataRecord SliceResolveRecord(const ResolveQueryDataRecord &record,
+                                            UINT start_index,
+                                            UINT query_count) const {
+    auto slice = record;
+    slice.start_index = start_index;
+    slice.query_count = query_count;
+    slice.dst_buffer_offset +=
+        UINT64(start_index - record.start_index) * QueryResultStride(record.type);
+    return slice;
+  }
+
+  bool DeferCpuQueryResolveToResource(const ResolveQueryDataRecord &record,
+                                      UINT64 byte_count) {
+    if (!D3D12QueryCpuFallbackDeferEnabled())
+      return false;
+    if (record.type != D3D12_QUERY_TYPE_TIMESTAMP)
+      return false;
+
+    auto *dst = GetResource(record.dst_buffer.ptr());
+    if (!dst || !dst->CanDeferCpuQueryResolve())
+      return false;
+
+    const auto seq = device_->GetDXMTDevice().queue().CurrentSeqId();
+    const auto queue_id = reinterpret_cast<uintptr_t>(this);
+    Com<ID3D12GraphicsCommandList> command_list = record.command_list;
+    Com<ID3D12QueryHeap> query_heap = record.heap;
+    ID3D12Resource *dst_identity = record.dst_buffer.ptr();
+    const auto type = record.type;
+    const auto start_index = record.start_index;
+    const auto query_count = record.query_count;
+    const auto dst_buffer_offset = record.dst_buffer_offset;
+    dst->AddPendingCpuQueryResolve(
+        record.dst_buffer_offset, byte_count, seq,
+        [command_list = std::move(command_list),
+         query_heap = std::move(query_heap), type, start_index, query_count,
+         dst_identity, dst_buffer_offset, queue_id](Resource *resource) mutable {
+          g_timestamp_cpu_map_materialized_fallbacks.fetch_add(
+              1, std::memory_order_relaxed);
+          ResolveQueryDataToCpuBufferStatic(
+              command_list.ptr(), query_heap.ptr(), type, start_index,
+              query_count, resource, dst_identity, dst_buffer_offset,
+              "cpu-deferred-map", queue_id);
+        });
+    g_timestamp_cpu_deferred_fallbacks.fetch_add(1,
+                                                std::memory_order_relaxed);
+    g_timestamp_cpu_deferred_queries.fetch_add(record.query_count,
+                                              std::memory_order_relaxed);
+    return true;
+  }
+
+  void QueueCpuQueryFallback(ReplayState &state,
+                             const ResolveQueryDataRecord &record,
+                             UINT64 byte_count, const char *reason) {
+    if (record.type == D3D12_QUERY_TYPE_TIMESTAMP) {
+      g_timestamp_cpu_fallbacks.fetch_add(1, std::memory_order_relaxed);
+      g_timestamp_cpu_fallback_queries.fetch_add(record.query_count,
+                                                std::memory_order_relaxed);
+    }
+
+    if (DeferCpuQueryResolveToResource(record, byte_count)) {
+      static std::atomic<uint32_t> defer_log_count = 0;
+      if (D3D12DiagShouldLog(defer_log_count, D3D12QueryFallbackStatsEnabled())) {
+        WARN_FILE_ONLY("D3D12 queue diagnostic: ResolveQueryData CPU fallback deferred"
+             " queue=", reinterpret_cast<uintptr_t>(this),
+             " reason=", reason ? reason : "",
+             " start=", record.start_index,
+             " count=", record.query_count,
+             " bytes=", byte_count,
+             " tsCpuDeferredFallbacks=",
+             g_timestamp_cpu_deferred_fallbacks.load(std::memory_order_relaxed),
+             " tsCpuDeferredQueries=",
+             g_timestamp_cpu_deferred_queries.load(std::memory_order_relaxed));
+      }
       return;
     }
-    if (!ValidateBufferRange(dst, record.dst_buffer_offset, data.size(),
-                             "query resolve"))
-      return;
-    if (!data.empty())
-      dst->GetBufferAllocation()->updateContents(
-          dst->GetHeapOffset() + record.dst_buffer_offset, data.data(),
-          data.size());
-    dxmt::apitrace::record_resolve_query_data_result(
-        record.command_list.ptr(), record.heap.ptr(),
-        static_cast<uint32_t>(record.type), record.start_index,
-        record.query_count, record.dst_buffer.ptr(), record.dst_buffer_offset,
-        data.data(), data.size());
-    WARN_FILE_ONLY("D3D12 queue diagnostic: ResolveQueryData leave"
-         " context=", context,
-         " queue=", reinterpret_cast<uintptr_t>(this),
-         " bytes=", data.size());
+
+    if (record.type == D3D12_QUERY_TYPE_TIMESTAMP) {
+      g_timestamp_cpu_immediate_fallbacks.fetch_add(1,
+                                                   std::memory_order_relaxed);
+      g_timestamp_cpu_unsafe_fallbacks.fetch_add(1, std::memory_order_relaxed);
+    }
+    state.pending_immediate_cpu_query_resolves.push_back(record);
+    static std::atomic<uint32_t> immediate_log_count = 0;
+    if (D3D12DiagShouldLog(immediate_log_count, D3D12QueryFallbackStatsEnabled())) {
+      WARN_FILE_ONLY("D3D12 queue diagnostic: ResolveQueryData CPU fallback immediate"
+           " queue=", reinterpret_cast<uintptr_t>(this),
+           " reason=", reason ? reason : "",
+           " start=", record.start_index,
+           " count=", record.query_count,
+           " bytes=", byte_count,
+           " tsCpuImmediateFallbacks=",
+           g_timestamp_cpu_immediate_fallbacks.load(std::memory_order_relaxed),
+           " tsCpuUnsafeFallbacks=",
+           g_timestamp_cpu_unsafe_fallbacks.load(std::memory_order_relaxed));
+    }
   }
 
   bool MaterializeCpuQueryResolves(CommandChunk *&chunk, ReplayState &state,
                                    ID3D12Resource *resource = nullptr,
                                    UINT64 offset = 0,
                                    UINT64 size = UINT64_MAX) {
-    if (state.pending_cpu_query_resolves.empty())
+    if (state.pending_immediate_cpu_query_resolves.empty())
       return false;
 
     std::vector<ResolveQueryDataRecord> selected;
     std::vector<ResolveQueryDataRecord> remaining;
-    selected.reserve(state.pending_cpu_query_resolves.size());
-    remaining.reserve(state.pending_cpu_query_resolves.size());
+    selected.reserve(state.pending_immediate_cpu_query_resolves.size());
+    remaining.reserve(state.pending_immediate_cpu_query_resolves.size());
 
-    for (auto &resolve : state.pending_cpu_query_resolves) {
+    for (auto &resolve : state.pending_immediate_cpu_query_resolves) {
       if (ResolveRecordTouchesRange(resolve, resource, offset, size))
         selected.push_back(std::move(resolve));
       else
         remaining.push_back(std::move(resolve));
     }
 
-    state.pending_cpu_query_resolves = std::move(remaining);
+    state.pending_immediate_cpu_query_resolves = std::move(remaining);
     if (selected.empty())
       return false;
 
@@ -4579,13 +4730,43 @@ private:
         MaterializeTimestampResolves(chunk, state, resource, offset, size);
     const bool emitted_cpu =
         MaterializeCpuQueryResolves(chunk, state, resource, offset, size);
-    if (emitted_gpu && !emitted_cpu) {
+    auto *d3d_resource = GetResource(resource);
+    bool materialized_deferred_cpu = false;
+    if (d3d_resource &&
+        d3d_resource->HasPendingCpuQueryResolves(offset, size)) {
+      FlushPassBatches(chunk, state);
+      auto &queue = device_->GetDXMTDevice().queue();
+      queue.CommitCurrentChunk();
+      materialized_deferred_cpu =
+          d3d_resource->MaterializePendingCpuQueryResolves(offset, size,
+                                                           "cpu-read");
+      chunk = queue.CurrentChunk();
+    }
+    if (emitted_gpu && !emitted_cpu && !materialized_deferred_cpu) {
       auto &queue = device_->GetDXMTDevice().queue();
       const auto seq = queue.CurrentSeqId();
       queue.CommitCurrentChunk();
       queue.WaitCPUFence(seq);
       chunk = queue.CurrentChunk();
     }
+  }
+
+  void MaterializeDeferredCpuQueryResolvesForGpuAccess(CommandChunk *&chunk,
+                                                       ReplayState &state,
+                                                       ID3D12Resource *resource,
+                                                       UINT64 offset,
+                                                       UINT64 size) {
+    auto *d3d_resource = GetResource(resource);
+    if (!d3d_resource ||
+        !d3d_resource->HasPendingCpuQueryResolves(offset, size))
+      return;
+
+    FlushPassBatches(chunk, state);
+    auto &queue = device_->GetDXMTDevice().queue();
+    queue.CommitCurrentChunk();
+    d3d_resource->MaterializePendingCpuQueryResolves(offset, size,
+                                                     "gpu-access");
+    chunk = queue.CurrentChunk();
   }
 
   template <typename Fn>
@@ -5423,6 +5604,9 @@ private:
     if (materialize_query_resolves && resource->GetBufferAllocation())
       MaterializeCpuQueryResolves(chunk, state, d3d_resource, 0,
                                   resource->GetResourceDesc().Width);
+    if (materialize_query_resolves && resource->GetBufferAllocation())
+      MaterializeDeferredCpuQueryResolvesForGpuAccess(
+          chunk, state, d3d_resource, 0, resource->GetResourceDesc().Width);
     if (materialize_timestamp_resolves)
       MaterializeTimestampResolvesForAccess(chunk, state, d3d_resource, desired);
     WarnUnsupportedResourceState(desired, context);
@@ -5969,80 +6153,76 @@ private:
         record.type == D3D12_QUERY_TYPE_TIMESTAMP &&
         dst->GetBufferAllocation() &&
         sizing_data.size() == UINT64(record.query_count) * sizeof(uint64_t)) {
-      bool gpu_samples = record.query_count != 0;
       std::vector<PendingTimestampResolve::Sample> samples;
       samples.reserve(record.query_count);
-      UINT first_bad_index = 0;
-      uint64_t first_bad_sample = ~0ull;
-      uint64_t first_bad_sequence = ~0ull;
+      std::vector<bool> can_gpu_resolve;
+      can_gpu_resolve.reserve(record.query_count);
       const auto current_sequence =
           device_->GetDXMTDevice().queue().CurrentSeqId();
       for (UINT i = 0; i < record.query_count; i++) {
         auto query = heap->TimestampQueryAt(record.type, record.start_index + i);
         PendingTimestampResolve::Sample sample = {};
+        uint64_t sequence = ~0ull;
         if (query) {
           sample.index = query->sampleIndex();
+          sequence = query->sampleSequence();
 #if DXMT_DX12_METAL4
           sample.heap = query->resolveHeap();
           sample.heap_entry_size = query->resolveHeapEntrySize();
 #endif
         }
-        samples.push_back(sample);
-        const auto sequence = query ? query->sampleSequence() : ~0ull;
-        if (gpu_samples && (sample.index == ~0ull
-#if DXMT_DX12_METAL4
-            || ((!sample.heap || !sample.heap_entry_size) &&
-                sequence != current_sequence)
-#else
-            || sequence != current_sequence
-#endif
-            )) {
-          gpu_samples = false;
-          first_bad_index = record.start_index + i;
-          first_bad_sample = sample.index;
-          first_bad_sequence = sequence;
-        }
+        can_gpu_resolve.push_back(
+            CanGpuResolveTimestampSample(sample, sequence, current_sequence));
+        samples.push_back(std::move(sample));
       }
 
-      if (!gpu_samples) {
-        if (D3D12DiagShouldLog(query_log_count, query_diag_enabled)) {
-          WARN_FILE_ONLY("D3D12 queue diagnostic: ResolveQueryData timestamp fallback"
-               " queue=", reinterpret_cast<uintptr_t>(this),
-               " start=", record.start_index,
-               " count=", record.query_count,
-               " badIndex=", first_bad_index,
-               " badSample=", first_bad_sample,
-               " badSeq=", first_bad_sequence
-#if !DXMT_DX12_METAL4
-               , " currentSeq=", current_sequence
-#endif
-          );
+      bool emitted_any_run = false;
+      for (UINT i = 0; i < record.query_count;) {
+        const bool gpu_run = can_gpu_resolve[i];
+        UINT run_count = 1;
+        while (i + run_count < record.query_count &&
+               can_gpu_resolve[i + run_count] == gpu_run)
+          run_count++;
+
+        const UINT run_start = record.start_index + i;
+        auto run_record = SliceResolveRecord(record, run_start, run_count);
+        const UINT64 run_bytes = UINT64(run_count) * sizeof(uint64_t);
+        if (gpu_run) {
+          std::vector<PendingTimestampResolve::Sample> run_samples;
+          run_samples.reserve(run_count);
+          for (UINT j = 0; j < run_count; j++)
+            run_samples.push_back(samples[i + j]);
+          state.pending_timestamp_resolves.push_back(PendingTimestampResolve{
+              record.command_list, record.heap, record.dst_buffer,
+              std::move(run_samples), run_start, run_count,
+              run_record.dst_buffer_offset, run_bytes});
+          emitted_any_run = true;
+        } else {
+          QueueCpuQueryFallback(state, run_record, run_bytes,
+                                "timestamp-missing-gpu-resolve-source");
         }
-        goto resolve_cpu_fallback;
+        i += run_count;
       }
 
-      state.pending_timestamp_resolves.push_back(PendingTimestampResolve{
-          record.command_list, record.heap, record.dst_buffer,
-          std::move(samples), record.start_index, record.query_count,
-          record.dst_buffer_offset,
-          static_cast<UINT64>(sizing_data.size())});
-      if (D3D12DiagShouldLog(query_log_count, query_diag_enabled)) {
-        WARN_FILE_ONLY("D3D12 queue diagnostic: ResolveQueryData deferred timestamp"
+      if (emitted_any_run &&
+          D3D12DiagShouldLog(query_log_count, query_diag_enabled)) {
+        WARN_FILE_ONLY("D3D12 queue diagnostic: ResolveQueryData split timestamp"
              " queue=", reinterpret_cast<uintptr_t>(this),
              " start=", record.start_index,
              " count=", record.query_count,
-             " bytes=", sizing_data.size());
+             " bytes=", sizing_data.size(),
+             " tsGpuRuns=", g_timestamp_gpu_resolve_runs.load(std::memory_order_relaxed),
+             " tsCpuFallbacks=",
+             g_timestamp_cpu_fallbacks.load(std::memory_order_relaxed),
+             " tsCpuDeferredFallbacks=",
+             g_timestamp_cpu_deferred_fallbacks.load(std::memory_order_relaxed),
+             " tsCpuImmediateFallbacks=",
+             g_timestamp_cpu_immediate_fallbacks.load(std::memory_order_relaxed));
       }
       return;
     }
 
-resolve_cpu_fallback:
-    if (record.type == D3D12_QUERY_TYPE_TIMESTAMP) {
-      g_timestamp_cpu_fallbacks.fetch_add(1, std::memory_order_relaxed);
-      g_timestamp_cpu_fallback_queries.fetch_add(record.query_count,
-                                                std::memory_order_relaxed);
-    }
-    state.pending_cpu_query_resolves.push_back(record);
+    QueueCpuQueryFallback(state, record, sizing_data.size(), "non-gpu-query");
     if (D3D12DiagShouldLog(query_log_count, query_diag_enabled)) {
       WARN_FILE_ONLY("D3D12 queue diagnostic: ResolveQueryData deferred CPU fallback"
            " queue=", reinterpret_cast<uintptr_t>(this),

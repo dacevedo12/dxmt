@@ -328,6 +328,9 @@ CommandQueue::PresentBoundary() {
 
 void
 CommandQueue::WaitCPUFence(uint64_t seq) {
+  if (cpu_coherent.signaledValue() >= seq)
+    return;
+
   const auto t0 = clock::now();
   cpu_coherent.wait(seq);
   const auto t1 = clock::now();

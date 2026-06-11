@@ -1146,6 +1146,103 @@ public:
     pending_timestamp_resolves_.push_back(range);
   }
 
+  bool CanDeferCpuQueryResolve() const override {
+    return desc_.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER &&
+           buffer_allocation_ && buffer_allocation_->mappedMemory(0) &&
+           heap_properties_.Type == D3D12_HEAP_TYPE_READBACK;
+  }
+
+  void AddPendingCpuQueryResolve(UINT64 offset, UINT64 size, uint64_t seq,
+                                 PendingCpuQueryResolveFn resolve) override {
+    if (!CanDeferCpuQueryResolve() || !size || !resolve)
+      return;
+
+    PendingCpuQueryResolveRange range = {};
+    range.offset = std::min<UINT64>(offset, desc_.Width);
+    const UINT64 end = std::min<UINT64>(offset + size, desc_.Width);
+    if (end <= range.offset)
+      return;
+    range.size = end - range.offset;
+    range.seq = seq;
+    range.resolve = std::move(resolve);
+
+    std::lock_guard lock(pending_cpu_query_resolve_mutex_);
+    pending_cpu_query_resolves_.push_back(std::move(range));
+  }
+
+  bool HasPendingCpuQueryResolves(UINT64 offset, UINT64 size) override {
+    if (desc_.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER || !size)
+      return false;
+
+    const UINT64 read_begin = std::min<UINT64>(offset, desc_.Width);
+    const UINT64 read_end = std::min<UINT64>(offset + size, desc_.Width);
+    if (read_end <= read_begin)
+      return false;
+
+    std::lock_guard lock(pending_cpu_query_resolve_mutex_);
+    for (const auto &range : pending_cpu_query_resolves_) {
+      if (BufferRangesOverlap(range.offset, range.size, read_begin,
+                              read_end - read_begin))
+        return true;
+    }
+    return false;
+  }
+
+  bool MaterializePendingCpuQueryResolves(UINT64 offset, UINT64 size,
+                                          const char *context) override {
+    if (desc_.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER || !size)
+      return false;
+
+    const UINT64 read_begin = std::min<UINT64>(offset, desc_.Width);
+    const UINT64 read_end = std::min<UINT64>(offset + size, desc_.Width);
+    if (read_end <= read_begin)
+      return false;
+
+    std::vector<PendingCpuQueryResolveRange> selected;
+    {
+      std::lock_guard lock(pending_cpu_query_resolve_mutex_);
+      std::vector<PendingCpuQueryResolveRange> remaining;
+      remaining.reserve(pending_cpu_query_resolves_.size());
+      selected.reserve(pending_cpu_query_resolves_.size());
+      for (auto &range : pending_cpu_query_resolves_) {
+        if (BufferRangesOverlap(range.offset, range.size, read_begin,
+                                read_end - read_begin))
+          selected.push_back(std::move(range));
+        else
+          remaining.push_back(std::move(range));
+      }
+      pending_cpu_query_resolves_ = std::move(remaining);
+    }
+
+    if (selected.empty())
+      return false;
+
+    uint64_t wait_seq = 0;
+    for (const auto &range : selected)
+      wait_seq = std::max(wait_seq, range.seq);
+
+    const auto wait_begin = std::chrono::steady_clock::now();
+    if (wait_seq)
+      device_->GetDXMTDevice().queue().WaitCPUFence(wait_seq);
+    const auto wait_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                             std::chrono::steady_clock::now() - wait_begin)
+                             .count();
+    if (wait_us > 1000) {
+      INFO("D3D12Resource: materialized deferred query resolves"
+           " context=", context ? context : "",
+           " resource=", uint64_t(this),
+           " count=", selected.size(),
+           " seq=", wait_seq,
+           " wait_us=", uint64_t(wait_us));
+    }
+
+    for (auto &range : selected) {
+      if (range.resolve)
+        range.resolve(this);
+    }
+    return true;
+  }
+
   void SetPresentSourceView(dxmt::TextureViewKey view) override {
     present_source_view_ = view;
   }
@@ -1988,6 +2085,13 @@ private:
     uint64_t seq = 0;
   };
 
+  struct PendingCpuQueryResolveRange {
+    UINT64 offset = 0;
+    UINT64 size = 0;
+    uint64_t seq = 0;
+    PendingCpuQueryResolveFn resolve;
+  };
+
   static bool BufferRangesOverlap(UINT64 a_offset, UINT64 a_size,
                                   UINT64 b_offset, UINT64 b_size) {
     if (!a_size || !b_size)
@@ -2023,6 +2127,12 @@ private:
 
     if (wait_seq)
       device_->GetDXMTDevice().queue().WaitCPUFence(wait_seq);
+
+    // Deferred CPU query resolves are registered after their producer chunk has
+    // been committed by the command queue. Map only realizes completed pending
+    // work; intra-replay CPU reads are handled by the queue before this point.
+    MaterializePendingCpuQueryResolves(read_begin, read_end - read_begin,
+                                       "map-read");
   }
 
   Com<IMTLD3D12Device> device_;
@@ -2055,6 +2165,8 @@ private:
   std::string name_;
   std::mutex pending_timestamp_resolve_mutex_;
   std::vector<PendingTimestampResolveRange> pending_timestamp_resolves_;
+  std::mutex pending_cpu_query_resolve_mutex_;
+  std::vector<PendingCpuQueryResolveRange> pending_cpu_query_resolves_;
 };
 
 bool
