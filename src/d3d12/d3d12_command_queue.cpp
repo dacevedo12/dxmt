@@ -985,10 +985,12 @@ ResolveQueryDataToCpuBufferStatic(ID3D12GraphicsCommandList *command_list,
       command_list, query_heap, static_cast<uint32_t>(type), start_index,
       query_count, dst_identity, dst_buffer_offset,
       data.data(), data.size());
-  WARN_FILE_ONLY("D3D12 queue diagnostic: ResolveQueryData leave"
-       " context=", context,
-       " queue=", queue_id,
-       " bytes=", data.size());
+  static std::atomic<uint32_t> log_count = 0;
+  if (D3D12DiagShouldLog(log_count, D3D12QueryFallbackStatsEnabled()))
+    WARN_FILE_ONLY("D3D12 queue diagnostic: ResolveQueryData leave"
+         " context=", context,
+         " queue=", queue_id,
+         " bytes=", data.size());
 }
 
 static void

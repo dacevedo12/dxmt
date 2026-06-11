@@ -30,6 +30,14 @@ struct Counters {
   std::atomic<uint64_t> query_batch_wait_queries = {0};
   std::atomic<uint64_t> query_batch_wait_us = {0};
   std::atomic<uint64_t> query_batch_wait_max_us = {0};
+  std::atomic<uint64_t> graphics_pso_creates = {0};
+  std::atomic<uint64_t> graphics_pso_create_us = {0};
+  std::atomic<uint64_t> graphics_pso_create_max_us = {0};
+  std::atomic<uint64_t> graphics_pso_create_failures = {0};
+  std::atomic<uint64_t> compute_pso_creates = {0};
+  std::atomic<uint64_t> compute_pso_create_us = {0};
+  std::atomic<uint64_t> compute_pso_create_max_us = {0};
+  std::atomic<uint64_t> compute_pso_create_failures = {0};
 };
 
 Counters g_counters;
@@ -109,7 +117,23 @@ void maybeFlush(uint64_t frame) {
                   sample(g_counters.query_batch_wait_queries),
                   " queryBatchWaitUs=", sample(g_counters.query_batch_wait_us),
                   " queryBatchWaitMaxUs=",
-                  sample(g_counters.query_batch_wait_max_us)));
+                  sample(g_counters.query_batch_wait_max_us),
+                  " graphicsPsoCreates=",
+                  sample(g_counters.graphics_pso_creates),
+                  " graphicsPsoCreateUs=",
+                  sample(g_counters.graphics_pso_create_us),
+                  " graphicsPsoCreateMaxUs=",
+                  sample(g_counters.graphics_pso_create_max_us),
+                  " graphicsPsoCreateFailures=",
+                  sample(g_counters.graphics_pso_create_failures),
+                  " computePsoCreates=",
+                  sample(g_counters.compute_pso_creates),
+                  " computePsoCreateUs=",
+                  sample(g_counters.compute_pso_create_us),
+                  " computePsoCreateMaxUs=",
+                  sample(g_counters.compute_pso_create_max_us),
+                  " computePsoCreateFailures=",
+                  sample(g_counters.compute_pso_create_failures)));
 }
 
 } // namespace
@@ -190,6 +214,30 @@ void recordQueryBatchWait(uint64_t batches, uint64_t queries,
                                                std::memory_order_relaxed);
   g_counters.query_batch_wait_us.fetch_add(wait_us, std::memory_order_relaxed);
   updateMax(g_counters.query_batch_wait_max_us, wait_us);
+}
+
+void recordGraphicsPipelineCreate(uint64_t duration_us, bool success) {
+  if (!enabled())
+    return;
+  g_counters.graphics_pso_creates.fetch_add(1, std::memory_order_relaxed);
+  g_counters.graphics_pso_create_us.fetch_add(duration_us,
+                                             std::memory_order_relaxed);
+  updateMax(g_counters.graphics_pso_create_max_us, duration_us);
+  if (!success)
+    g_counters.graphics_pso_create_failures.fetch_add(
+        1, std::memory_order_relaxed);
+}
+
+void recordComputePipelineCreate(uint64_t duration_us, bool success) {
+  if (!enabled())
+    return;
+  g_counters.compute_pso_creates.fetch_add(1, std::memory_order_relaxed);
+  g_counters.compute_pso_create_us.fetch_add(duration_us,
+                                            std::memory_order_relaxed);
+  updateMax(g_counters.compute_pso_create_max_us, duration_us);
+  if (!success)
+    g_counters.compute_pso_create_failures.fetch_add(
+        1, std::memory_order_relaxed);
 }
 
 } // namespace dxmt::perf

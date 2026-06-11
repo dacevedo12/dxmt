@@ -5,12 +5,14 @@
 #include "com/com_private_data.hpp"
 #include "dxmt_format.hpp"
 #include "dxmt_pipeline_diag.hpp"
+#include "dxmt_perf_stats.hpp"
 #include "log/log.hpp"
 #include "sha1/sha1_util.hpp"
 #include "util_env.hpp"
 #include "util_string.hpp"
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cctype>
 #include <cstddef>
 #include <cstring>
@@ -3095,20 +3097,33 @@ StoreStatus(HRESULT *status, HRESULT value) {
 void
 LogGraphicsPipelineDesc(const char *where,
                         const D3D12_GRAPHICS_PIPELINE_STATE_DESC &desc) {
-  INFO("D3D12 diagnostic: graphics pipeline create",
-       " where=", where,
-       " hasVS=", HasBytecode(desc.VS),
-       " hasPS=", HasBytecode(desc.PS),
-       " hasGS=", HasBytecode(desc.GS),
-       " hasHS=", HasBytecode(desc.HS),
-       " hasDS=", HasBytecode(desc.DS),
-       " topologyType=", uint32_t(desc.PrimitiveTopologyType),
-       " numRT=", uint32_t(desc.NumRenderTargets),
-       " sampleCount=", uint32_t(desc.SampleDesc.Count),
-       " sampleQuality=", uint32_t(desc.SampleDesc.Quality),
-       " streamOutputEntries=", uint32_t(desc.StreamOutput.NumEntries),
-       " streamOutputStrides=", uint32_t(desc.StreamOutput.NumStrides),
-       " cachedPsoBytes=", uint64_t(desc.CachedPSO.CachedBlobSizeInBytes));
+  if (!D3D12PipelineDiagShouldLog())
+    return;
+
+  Logger::logFileOnly(
+      LogLevel::Info,
+      str::format("D3D12 diagnostic: graphics pipeline create",
+                  " where=", where,
+                  " hasVS=", HasBytecode(desc.VS),
+                  " hasPS=", HasBytecode(desc.PS),
+                  " hasGS=", HasBytecode(desc.GS),
+                  " hasHS=", HasBytecode(desc.HS),
+                  " hasDS=", HasBytecode(desc.DS),
+                  " topologyType=", uint32_t(desc.PrimitiveTopologyType),
+                  " numRT=", uint32_t(desc.NumRenderTargets),
+                  " sampleCount=", uint32_t(desc.SampleDesc.Count),
+                  " sampleQuality=", uint32_t(desc.SampleDesc.Quality),
+                  " streamOutputEntries=", uint32_t(desc.StreamOutput.NumEntries),
+                  " streamOutputStrides=", uint32_t(desc.StreamOutput.NumStrides),
+                  " cachedPsoBytes=",
+                  uint64_t(desc.CachedPSO.CachedBlobSizeInBytes)));
+}
+
+uint64_t
+ElapsedUs(std::chrono::steady_clock::time_point start) {
+  return std::chrono::duration_cast<std::chrono::microseconds>(
+             std::chrono::steady_clock::now() - start)
+      .count();
 }
 
 } // namespace
@@ -3121,11 +3136,13 @@ CreateGraphicsPipelineState(IMTLD3D12Device *device,
     StoreStatus(status, E_INVALIDARG);
     return nullptr;
   }
+  const auto create_start = std::chrono::steady_clock::now();
   LogGraphicsPipelineDesc("CreateGraphicsPipelineState", *desc);
 
   PipelineGraphicsState graphics_state = {};
   HRESULT hr = CloneGraphicsState(*desc, graphics_state);
   if (FAILED(hr)) {
+    dxmt::perf::recordGraphicsPipelineCreate(ElapsedUs(create_start), false);
     StoreStatus(status, hr);
     return nullptr;
   }
@@ -3136,35 +3153,41 @@ CreateGraphicsPipelineState(IMTLD3D12Device *device,
   hr = AppendPipelineShader(PipelineShaderStage::Vertex, device, desc->VS, shaders);
   if (FAILED(hr)) {
     DestroyPipelineShaders(shaders);
+    dxmt::perf::recordGraphicsPipelineCreate(ElapsedUs(create_start), false);
     StoreStatus(status, hr);
     return nullptr;
   }
   hr = AppendPipelineShader(PipelineShaderStage::Pixel, device, desc->PS, shaders);
   if (FAILED(hr)) {
     DestroyPipelineShaders(shaders);
+    dxmt::perf::recordGraphicsPipelineCreate(ElapsedUs(create_start), false);
     StoreStatus(status, hr);
     return nullptr;
   }
   hr = AppendPipelineShader(PipelineShaderStage::Geometry, device, desc->GS, shaders);
   if (FAILED(hr)) {
     DestroyPipelineShaders(shaders);
+    dxmt::perf::recordGraphicsPipelineCreate(ElapsedUs(create_start), false);
     StoreStatus(status, hr);
     return nullptr;
   }
   hr = AppendPipelineShader(PipelineShaderStage::Hull, device, desc->HS, shaders);
   if (FAILED(hr)) {
     DestroyPipelineShaders(shaders);
+    dxmt::perf::recordGraphicsPipelineCreate(ElapsedUs(create_start), false);
     StoreStatus(status, hr);
     return nullptr;
   }
   hr = AppendPipelineShader(PipelineShaderStage::Domain, device, desc->DS, shaders);
   if (FAILED(hr)) {
     DestroyPipelineShaders(shaders);
+    dxmt::perf::recordGraphicsPipelineCreate(ElapsedUs(create_start), false);
     StoreStatus(status, hr);
     return nullptr;
   }
   if (shaders.empty()) {
     DestroyPipelineShaders(shaders);
+    dxmt::perf::recordGraphicsPipelineCreate(ElapsedUs(create_start), false);
     StoreStatus(status, E_INVALIDARG);
     return nullptr;
   }
@@ -3174,6 +3197,7 @@ CreateGraphicsPipelineState(IMTLD3D12Device *device,
       device, PipelineStateType::Graphics, desc->pRootSignature,
       std::move(shaders), std::move(graphics_state),
       std::move(compute_state));
+  dxmt::perf::recordGraphicsPipelineCreate(ElapsedUs(create_start), bool(pso));
   StoreStatus(status, pso ? S_OK : E_OUTOFMEMORY);
   return pso;
 }
@@ -3186,10 +3210,12 @@ CreateComputePipelineState(IMTLD3D12Device *device,
     StoreStatus(status, E_INVALIDARG);
     return nullptr;
   }
+  const auto create_start = std::chrono::steady_clock::now();
 
   PipelineComputeState compute_state = {};
   HRESULT hr = CloneComputeState(*desc, compute_state);
   if (FAILED(hr)) {
+    dxmt::perf::recordComputePipelineCreate(ElapsedUs(create_start), false);
     StoreStatus(status, hr);
     return nullptr;
   }
@@ -3199,11 +3225,13 @@ CreateComputePipelineState(IMTLD3D12Device *device,
   hr = AppendPipelineShader(PipelineShaderStage::Compute, device, desc->CS, shaders);
   if (FAILED(hr)) {
     DestroyPipelineShaders(shaders);
+    dxmt::perf::recordComputePipelineCreate(ElapsedUs(create_start), false);
     StoreStatus(status, hr);
     return nullptr;
   }
   if (shaders.empty()) {
     DestroyPipelineShaders(shaders);
+    dxmt::perf::recordComputePipelineCreate(ElapsedUs(create_start), false);
     StoreStatus(status, E_INVALIDARG);
     return nullptr;
   }
@@ -3213,6 +3241,7 @@ CreateComputePipelineState(IMTLD3D12Device *device,
       device, PipelineStateType::Compute, desc->pRootSignature,
       std::move(shaders), std::move(graphics_state),
       std::move(compute_state));
+  dxmt::perf::recordComputePipelineCreate(ElapsedUs(create_start), bool(pso));
   StoreStatus(status, pso ? S_OK : E_OUTOFMEMORY);
   return pso;
 }
@@ -3236,9 +3265,6 @@ CreatePipelineStateFromStream(IMTLD3D12Device *device,
     StoreStatus(status, hr);
     return nullptr;
   }
-
-  if (!has_compute_shader)
-    LogGraphicsPipelineDesc("CreatePipelineStateFromStream", graphics);
 
   if (has_compute_shader)
     return CreateComputePipelineState(device, &compute, status);

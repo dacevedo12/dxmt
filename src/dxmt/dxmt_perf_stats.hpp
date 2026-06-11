@@ -18,4 +18,7 @@ void recordTimestampCpuWait(uint64_t wait_us);
 void recordQueryBatchWait(uint64_t batches, uint64_t queries,
                           uint64_t wait_us);
 
+void recordGraphicsPipelineCreate(uint64_t duration_us, bool success);
+void recordComputePipelineCreate(uint64_t duration_us, bool success);
+
 } // namespace dxmt::perf
