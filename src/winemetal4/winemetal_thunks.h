@@ -367,6 +367,13 @@ struct unixcall_cache_set {
   obj_handle_t value_data;
 };
 
+struct unixcall_dispatch_data_copy {
+  obj_handle_t data;
+  struct WMTMemoryPointer bytes;
+  uint64_t capacity;
+  uint64_t ret_length;
+};
+
 struct unixcall_setmetalcachepath {
   struct WMTConstMemoryPointer path;
   uint64_t ret_success;

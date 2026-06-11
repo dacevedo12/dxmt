@@ -178,6 +178,10 @@ public:
 
 class DispatchData : public Object {
 public:
+  uint64_t
+  copy(void *bytes, uint64_t capacity) {
+    return DispatchData_copy(handle, bytes, capacity);
+  }
 };
 
 class Event : public Object {

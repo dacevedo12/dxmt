@@ -6652,6 +6652,20 @@ _DispatchData_alloc_init(void *obj) {
   return STATUS_SUCCESS;
 }
 
+static NTSTATUS
+_DispatchData_copy(void *obj) {
+  struct unixcall_dispatch_data_copy *params = obj;
+  const void *bytes = NULL;
+  size_t length = 0;
+  dispatch_data_t mapped = dispatch_data_create_map((dispatch_data_t)params->data, &bytes, &length);
+  params->ret_length = length;
+  void *dst = params->bytes.ptr;
+  if (dst && params->capacity >= length && length)
+    memcpy(dst, bytes, length);
+  dispatch_release(mapped);
+  return STATUS_SUCCESS;
+}
+
 @interface MTLSharedTextureHandle ()
 
 - (MTLSharedTextureHandle *)initWithMachPort:(mach_port_t)port;
@@ -7055,6 +7069,7 @@ NTSTATUS _MTL4TimestampContext_create(void *obj);
 NTSTATUS _MTL4TimestampContext_destroy(void *obj);
 NTSTATUS _MTL4TimestampContext_writeTimestamp(void *obj);
 NTSTATUS _MTLDevice_sizeOfTimestampHeapEntry(void *obj);
+static NTSTATUS _DispatchData_copy(void *obj);
 
 const void *__wine_unix_call_funcs[] = {
     &_NSObject_retain,
@@ -7371,5 +7386,6 @@ const void *__wine_unix_call_wow64_funcs[] = {
     &_MTL4TimestampContext_writeTimestamp,
     &_MTLDevice_sizeOfTimestampHeapEntry,
     &_MTL4CommandBuffer_resolveCounterHeap,
+    &_DispatchData_copy,
 };
 #endif

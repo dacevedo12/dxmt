@@ -17,7 +17,9 @@
 #include "dxmt_info.hpp"
 #include "dxmt_presenter.hpp"
 #include "dxmt_sampler.hpp"
+#include "dxmt_shader_cache.hpp"
 #include "log/log.hpp"
+#include "sha1/sha1_util.hpp"
 #include "util_env.hpp"
 #include "util_string.hpp"
 #include "util_win32_compat.h"
@@ -25,6 +27,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cstddef>
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
@@ -37,6 +40,7 @@
 #include <deque>
 #include <tuple>
 #include <sstream>
+#include <string_view>
 #include <type_traits>
 #include <typeinfo>
 #include <unordered_map>
@@ -8143,6 +8147,110 @@ resolve_cpu_fallback:
     return WMTSamplerBorderColorOpaqueWhite;
   }
 
+  struct DescriptorTableBindingRecipeEntry {
+    uint16_t root_index = 0;
+    uint16_t range_index = 0;
+    uint16_t stage = 0;
+    uint16_t slot = 0;
+    uint32_t range_offset = 0;
+    uint32_t descriptor_index = 0;
+    uint32_t descriptor_count = 0;
+    uint32_t range_type = 0;
+    DXMT12_MTL4_SHADER_ARGUMENT argument = {};
+  };
+
+  struct DescriptorTableBindingRecipe {
+    std::vector<DescriptorTableBindingRecipeEntry> entries;
+  };
+
+  struct DescriptorTableBindingRecipeBlobHeader {
+    uint32_t magic = 0x42524344; // DCRB
+    uint32_t version = 1;
+    uint32_t entry_size = sizeof(DescriptorTableBindingRecipeEntry);
+    uint32_t entry_count = 0;
+  };
+
+  static constexpr uint64_t kD3D12BindingRecipeCacheVersion = 1;
+
+  static std::string BuildDescriptorTableBindingRecipeCachePath() {
+    return dxmt::GetDXMTShaderCacheDirectory() + "d3d12_binding_recipes.db";
+  }
+
+  static Sha1Digest
+  BuildDescriptorTableBindingRecipeKey(const PipelineState &pipeline,
+                                       const RootSignature &root,
+                                       bool compute) {
+    Sha1HashState hash;
+    static constexpr std::string_view prefix = "dxmt.d3d12.binding-recipe.v1";
+    const auto &shader_key = pipeline.GetShaderCacheKey();
+    const auto root_blob = root.GetSerializedBlob();
+    hash.update(prefix.data(), prefix.size());
+    hash.update(&compute, sizeof(compute));
+    hash.update(shader_key.data(), shader_key.size());
+    if (!root_blob.empty())
+      hash.update(root_blob.data(), root_blob.size());
+    return hash.final();
+  }
+
+  static std::optional<DescriptorTableBindingRecipe>
+  LoadDescriptorTableBindingRecipe(const Sha1Digest &key) {
+    if (env::getEnvVar("DXMT_SHADER_CACHE") == "0")
+      return std::nullopt;
+    auto reader = WMT::CacheReader::alloc_init(
+        BuildDescriptorTableBindingRecipeCachePath().c_str(),
+        kD3D12BindingRecipeCacheVersion);
+    if (!reader)
+      return std::nullopt;
+    auto data = reader.get(key);
+    if (!data)
+      return std::nullopt;
+
+    DescriptorTableBindingRecipeBlobHeader header = {};
+    const auto header_size = uint64_t(sizeof(header));
+    if (data.copy(&header, header_size) != header_size)
+      return std::nullopt;
+    if (header.magic != DescriptorTableBindingRecipeBlobHeader().magic ||
+        header.version != DescriptorTableBindingRecipeBlobHeader().version ||
+        header.entry_size != sizeof(DescriptorTableBindingRecipeEntry))
+      return std::nullopt;
+
+    const uint64_t total_size =
+        header_size + uint64_t(header.entry_count) * header.entry_size;
+    std::vector<uint8_t> bytes(total_size);
+    if (data.copy(bytes.data(), bytes.size()) != total_size)
+      return std::nullopt;
+
+    DescriptorTableBindingRecipe recipe = {};
+    recipe.entries.resize(header.entry_count);
+    if (header.entry_count)
+      std::memcpy(recipe.entries.data(), bytes.data() + header_size,
+                  recipe.entries.size() * sizeof(recipe.entries[0]));
+    return recipe;
+  }
+
+  static void
+  StoreDescriptorTableBindingRecipe(const Sha1Digest &key,
+                                    const DescriptorTableBindingRecipe &recipe) {
+    if (env::getEnvVar("DXMT_SHADER_CACHE") == "0")
+      return;
+    auto writer = WMT::CacheWriter::alloc_init(
+        BuildDescriptorTableBindingRecipeCachePath().c_str(),
+        kD3D12BindingRecipeCacheVersion);
+    if (!writer)
+      return;
+
+    DescriptorTableBindingRecipeBlobHeader header = {};
+    header.entry_count = recipe.entries.size();
+    std::vector<uint8_t> bytes(
+        sizeof(header) + recipe.entries.size() * sizeof(recipe.entries[0]));
+    std::memcpy(bytes.data(), &header, sizeof(header));
+    if (!recipe.entries.empty())
+      std::memcpy(bytes.data() + sizeof(header), recipe.entries.data(),
+                  recipe.entries.size() * sizeof(recipe.entries[0]));
+    auto data = WMT::MakeDispatchData(bytes.data(), bytes.size());
+    writer.set(key, data);
+  }
+
   UINT ReflectedDescriptorRangeCount(const PipelineState &pipeline,
                                      const RootSignatureRange &range,
                                      D3D12_SHADER_VISIBILITY visibility,
@@ -8227,6 +8335,155 @@ resolve_cpu_fallback:
     }
   }
 
+  DescriptorTableBindingRecipe
+  BuildDescriptorTableBindingRecipe(const PipelineState &pipeline,
+                                    const RootSignature &root, bool compute) {
+    DescriptorTableBindingRecipe recipe = {};
+    const auto parameters = root.GetParameters();
+    for (UINT root_index = 0; root_index < parameters.size(); root_index++) {
+      const auto &parameter = parameters[root_index];
+      if (parameter.parameter_type != D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE)
+        continue;
+
+      UINT running_offset = 0;
+      for (UINT range_index = 0; range_index < parameter.ranges.size();
+           range_index++) {
+        const auto &range = parameter.ranges[range_index];
+        const auto range_offset = DescriptorRangeOffset(range, running_offset);
+        const auto count =
+            range.descriptor_count == UINT_MAX
+                ? ReflectedDescriptorRangeCount(
+                      pipeline, range, parameter.visibility, compute)
+                : range.descriptor_count;
+        ForEachVisibleStage(
+            parameter.visibility, compute, [&](PipelineStage stage) {
+              const auto binding_type = BindingTypeForRange(range.range_type);
+              const auto *shader = FindShaderForStage(pipeline, stage);
+              if (!shader)
+                return;
+              const auto *arguments =
+                  binding_type == SM50BindingType::ConstantBuffer
+                      ? shader->constantBufferInfo()
+                      : shader->resourceArgumentInfo();
+              const auto argument_count =
+                  binding_type == SM50BindingType::ConstantBuffer
+                      ? shader->reflection().NumConstantBuffers
+                      : shader->reflection().NumArguments;
+              if (!arguments)
+                return;
+
+              for (UINT arg_index = 0; arg_index < argument_count;
+                   arg_index++) {
+                const auto &argument = arguments[arg_index];
+                if (argument.Type != binding_type)
+                  continue;
+                const auto space =
+                    argument.RegisterCount ? argument.RegisterSpace : 0;
+                const auto lower =
+                    argument.RegisterCount ? argument.RegisterLowerBound
+                                           : argument.SM50BindingSlot;
+                const auto arg_count =
+                    argument.RegisterCount ? argument.RegisterCount : 1;
+                const auto resolved_count =
+                    arg_count == UINT_MAX ? 1u : std::max<UINT>(arg_count, 1u);
+                if (space != range.register_space ||
+                    lower + resolved_count < lower)
+                  continue;
+
+                for (UINT i = 0; i < resolved_count; i++) {
+                  const auto shader_register = lower + i;
+                  if (shader_register < range.base_shader_register)
+                    continue;
+                  const auto descriptor_index =
+                      shader_register - range.base_shader_register;
+                  if (descriptor_index >= count)
+                    continue;
+
+                  DescriptorTableBindingRecipeEntry entry = {};
+                  entry.root_index = root_index;
+                  entry.range_index = range_index;
+                  entry.stage = uint16_t(stage);
+                  entry.slot = argument.SM50BindingSlot + i;
+                  entry.range_offset = range_offset;
+                  entry.descriptor_index = descriptor_index;
+                  entry.descriptor_count = count;
+                  entry.range_type = range.range_type;
+                  entry.argument = argument;
+                  recipe.entries.push_back(entry);
+                }
+              }
+            });
+        if (range.descriptor_count != UINT_MAX)
+          running_offset = range_offset + range.descriptor_count;
+      }
+    }
+    return recipe;
+  }
+
+  const DescriptorTableBindingRecipe &
+  GetDescriptorTableBindingRecipe(const PipelineState &pipeline,
+                                  const RootSignature &root, bool compute) {
+    struct CacheKey {
+      Sha1Digest digest = {};
+      bool operator==(const CacheKey &other) const {
+        return digest == other.digest;
+      }
+    };
+    struct CacheKeyHash {
+      size_t operator()(const CacheKey &key) const {
+        return std::hash<Sha1Digest>()(key.digest);
+      }
+    };
+
+    static std::mutex mutex;
+    static std::unordered_map<CacheKey, DescriptorTableBindingRecipe,
+                              CacheKeyHash>
+        cache;
+
+    CacheKey key = {
+        BuildDescriptorTableBindingRecipeKey(pipeline, root, compute)};
+    std::lock_guard lock(mutex);
+    auto it = cache.find(key);
+    if (it != cache.end())
+      return it->second;
+
+    auto loaded = LoadDescriptorTableBindingRecipe(key.digest);
+    DescriptorTableBindingRecipe recipe =
+        loaded ? std::move(*loaded)
+               : BuildDescriptorTableBindingRecipe(pipeline, root, compute);
+    if (!loaded)
+      StoreDescriptorTableBindingRecipe(key.digest, recipe);
+    auto inserted = cache.insert({key, std::move(recipe)});
+    return inserted.first->second;
+  }
+
+  void ApplyDescriptorTableBindingRecipe(
+      ArgumentEncodingContext &enc, const ReplayState &state,
+      const PipelineState &pipeline, bool compute,
+      const DescriptorTableBindingRecipe &recipe) {
+    for (const auto &entry : recipe.entries) {
+      const auto base = GetTableHandle(state, compute, entry.root_index);
+      if (!base.ptr)
+        continue;
+      const auto range_type =
+          static_cast<D3D12_DESCRIPTOR_RANGE_TYPE>(entry.range_type);
+      const auto *descriptor = GetBoundDescriptorRecordInRange(
+          state, base, entry.range_offset, entry.descriptor_index,
+          entry.descriptor_count, DescriptorHeapTypeForRange(range_type));
+      const auto stage = static_cast<PipelineStage>(entry.stage);
+      if (!descriptor) {
+        ClearDescriptorBinding(enc, stage, range_type, entry.slot);
+        continue;
+      }
+      DebugLogRootBinding(
+          DescriptorRangeTypeName(range_type), pipeline, compute, stage,
+          entry.root_index, entry.slot, 0, 0,
+          DescriptorRecordSizeBytes(*descriptor), 0);
+      BindDescriptor(enc, stage, range_type, entry.slot, *descriptor,
+                     &entry.argument);
+    }
+  }
+
   void ApplyRootDescriptorTables(ArgumentEncodingContext &enc,
                                  const ReplayState &state,
                                  const PipelineState &pipeline, bool compute) {
@@ -8236,87 +8493,15 @@ resolve_cpu_fallback:
       return;
 
     ApplyStaticSamplers(enc, pipeline, *root, compute);
+    ApplyDescriptorTableBindingRecipe(
+        enc, state, pipeline, compute,
+        GetDescriptorTableBindingRecipe(pipeline, *root, compute));
 
     const auto parameters = root->GetParameters();
     for (UINT root_index = 0; root_index < parameters.size(); root_index++) {
       const auto &parameter = parameters[root_index];
       if (parameter.parameter_type == D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE) {
-        const auto base = GetTableHandle(state, compute, root_index);
-        if (!base.ptr)
-          continue;
-        UINT running_offset = 0;
-        for (const auto &range : parameter.ranges) {
-          const auto range_offset = DescriptorRangeOffset(range, running_offset);
-          const auto count =
-              range.descriptor_count == UINT_MAX
-                  ? ReflectedDescriptorRangeCount(
-                        pipeline, range, parameter.visibility, compute)
-                  : range.descriptor_count;
-          ForEachVisibleStage(
-              parameter.visibility, compute, [&](PipelineStage stage) {
-                const auto binding_type = BindingTypeForRange(range.range_type);
-                const auto *shader = FindShaderForStage(pipeline, stage);
-                if (!shader)
-                  return;
-                const auto *arguments =
-                    binding_type == SM50BindingType::ConstantBuffer
-                        ? shader->constantBufferInfo()
-                        : shader->resourceArgumentInfo();
-                const auto argument_count =
-                    binding_type == SM50BindingType::ConstantBuffer
-                        ? shader->reflection().NumConstantBuffers
-                        : shader->reflection().NumArguments;
-                if (!arguments)
-                  return;
-
-                for (UINT arg_index = 0; arg_index < argument_count;
-                     arg_index++) {
-                  const auto &argument = arguments[arg_index];
-                  if (argument.Type != binding_type)
-                    continue;
-                  const auto space = argument.RegisterCount
-                                         ? argument.RegisterSpace
-                                         : 0;
-                  const auto lower = argument.RegisterCount
-                                         ? argument.RegisterLowerBound
-                                         : argument.SM50BindingSlot;
-                  const auto arg_count =
-                      argument.RegisterCount ? argument.RegisterCount : 1;
-                  const auto resolved_count =
-                      arg_count == UINT_MAX ? 1u : std::max<UINT>(arg_count, 1u);
-                  if (space != range.register_space ||
-                      lower + resolved_count < lower)
-                    continue;
-
-                  for (UINT i = 0; i < resolved_count; i++) {
-                    const auto shader_register = lower + i;
-                    if (shader_register < range.base_shader_register)
-                      continue;
-                    const auto descriptor_index =
-                        shader_register - range.base_shader_register;
-                    if (descriptor_index >= count)
-                      continue;
-                    const auto slot = argument.SM50BindingSlot + i;
-                    const auto *descriptor = GetBoundDescriptorRecordInRange(
-                        state, base, range_offset, descriptor_index, count,
-                        DescriptorHeapTypeForRange(range.range_type));
-                    if (!descriptor) {
-                      ClearDescriptorBinding(enc, stage, range.range_type, slot);
-                      continue;
-                    }
-                    DebugLogRootBinding(
-                        DescriptorRangeTypeName(range.range_type), pipeline,
-                        compute, stage, root_index, slot, shader_register,
-                        range.register_space,
-                        DescriptorRecordSizeBytes(*descriptor), 0);
-                    BindDescriptor(enc, stage, range.range_type, slot,
-                                   *descriptor, &argument);
-                  }
-                }
-              });
-          if (range.descriptor_count != UINT_MAX)
-            running_offset = range_offset + range.descriptor_count;
-        }
+        continue;
       } else if (parameter.parameter_type ==
                  D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS) {
         BindRootConstants(enc, state, pipeline, compute, root_index, parameter);
