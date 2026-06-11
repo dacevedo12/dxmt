@@ -485,6 +485,14 @@ D3D12DiagBindingsEnabled() {
 }
 
 static bool
+D3D12DiagBindingRecipeCacheEnabled() {
+  static const bool enabled =
+      D3D12DiagEnabledEnv("DXMT_DIAG_BINDING_RECIPE_CACHE") ||
+      D3D12DiagEnabledEnv("DXMT_DIAG_COMMAND_QUEUE");
+  return enabled;
+}
+
+static bool
 D3D12DiagDrawVisibilityEnabled() {
   static const bool enabled =
       D3D12DiagEnabledEnv("DXMT_DIAG_DRAW_VISIBILITY") ||
@@ -2710,6 +2718,10 @@ public:
            " flags=", desc_.Flags,
            " nodeMask=", desc_.NodeMask);
     }
+  }
+
+  ~CommandQueueImpl() {
+    LogBindingRecipeDiagSummary("command-queue-destroy");
   }
 
   HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void **ppvObject) override {
@@ -8163,6 +8175,137 @@ resolve_cpu_fallback:
     std::vector<DescriptorTableBindingRecipeEntry> entries;
   };
 
+  struct DescriptorTableBindingRecipeDiagStats {
+    std::atomic<uint64_t> get_calls = 0;
+    std::atomic<uint64_t> get_ns = 0;
+    std::atomic<uint64_t> process_hits = 0;
+    std::atomic<uint64_t> process_hit_ns = 0;
+    std::atomic<uint64_t> process_misses = 0;
+    std::atomic<uint64_t> process_miss_ns = 0;
+    std::atomic<uint64_t> db_load_calls = 0;
+    std::atomic<uint64_t> db_load_hits = 0;
+    std::atomic<uint64_t> db_load_misses = 0;
+    std::atomic<uint64_t> db_load_ns = 0;
+    std::atomic<uint64_t> build_calls = 0;
+    std::atomic<uint64_t> build_entries = 0;
+    std::atomic<uint64_t> build_ns = 0;
+    std::atomic<uint64_t> store_calls = 0;
+    std::atomic<uint64_t> store_entries = 0;
+    std::atomic<uint64_t> store_bytes = 0;
+    std::atomic<uint64_t> store_ns = 0;
+    std::atomic<uint64_t> apply_calls = 0;
+    std::atomic<uint64_t> apply_entries = 0;
+    std::atomic<uint64_t> apply_bound = 0;
+    std::atomic<uint64_t> apply_cleared = 0;
+    std::atomic<uint64_t> apply_missing_table = 0;
+    std::atomic<uint64_t> apply_ns = 0;
+  };
+
+  static DescriptorTableBindingRecipeDiagStats &
+  BindingRecipeDiagStats() {
+    static DescriptorTableBindingRecipeDiagStats stats;
+    return stats;
+  }
+
+  static uint64_t BindingRecipeDiagNowNs() {
+    const auto now = std::chrono::steady_clock::now().time_since_epoch();
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(now).count();
+  }
+
+  static double BindingRecipeDiagNsToMs(uint64_t ns) {
+    return static_cast<double>(ns) / 1000000.0;
+  }
+
+  static double BindingRecipeDiagAvgNs(uint64_t ns, uint64_t count) {
+    return count ? static_cast<double>(ns) / static_cast<double>(count) : 0.0;
+  }
+
+  static void LogBindingRecipeDiagSummary(const char *reason) {
+    if (!D3D12DiagBindingRecipeCacheEnabled())
+      return;
+
+    auto &stats = BindingRecipeDiagStats();
+    const auto get_calls = stats.get_calls.load(std::memory_order_relaxed);
+    const auto apply_calls = stats.apply_calls.load(std::memory_order_relaxed);
+    if (!get_calls && !apply_calls)
+      return;
+
+    const auto get_ns = stats.get_ns.load(std::memory_order_relaxed);
+    const auto process_hits = stats.process_hits.load(std::memory_order_relaxed);
+    const auto process_hit_ns =
+        stats.process_hit_ns.load(std::memory_order_relaxed);
+    const auto process_misses =
+        stats.process_misses.load(std::memory_order_relaxed);
+    const auto process_miss_ns =
+        stats.process_miss_ns.load(std::memory_order_relaxed);
+    const auto db_load_calls =
+        stats.db_load_calls.load(std::memory_order_relaxed);
+    const auto db_load_hits =
+        stats.db_load_hits.load(std::memory_order_relaxed);
+    const auto db_load_misses =
+        stats.db_load_misses.load(std::memory_order_relaxed);
+    const auto db_load_ns = stats.db_load_ns.load(std::memory_order_relaxed);
+    const auto build_calls = stats.build_calls.load(std::memory_order_relaxed);
+    const auto build_entries =
+        stats.build_entries.load(std::memory_order_relaxed);
+    const auto build_ns = stats.build_ns.load(std::memory_order_relaxed);
+    const auto store_calls = stats.store_calls.load(std::memory_order_relaxed);
+    const auto store_entries =
+        stats.store_entries.load(std::memory_order_relaxed);
+    const auto store_bytes = stats.store_bytes.load(std::memory_order_relaxed);
+    const auto store_ns = stats.store_ns.load(std::memory_order_relaxed);
+    const auto apply_entries =
+        stats.apply_entries.load(std::memory_order_relaxed);
+    const auto apply_bound = stats.apply_bound.load(std::memory_order_relaxed);
+    const auto apply_cleared =
+        stats.apply_cleared.load(std::memory_order_relaxed);
+    const auto apply_missing_table =
+        stats.apply_missing_table.load(std::memory_order_relaxed);
+    const auto apply_ns = stats.apply_ns.load(std::memory_order_relaxed);
+
+    INFO("D3D12 binding recipe diagnostic: summary"
+         " reason=", reason,
+         " getCalls=", get_calls,
+         " getMs=", BindingRecipeDiagNsToMs(get_ns),
+         " getAvgNs=", BindingRecipeDiagAvgNs(get_ns, get_calls),
+         " processHits=", process_hits,
+         " processHitMs=", BindingRecipeDiagNsToMs(process_hit_ns),
+         " processHitAvgNs=", BindingRecipeDiagAvgNs(process_hit_ns, process_hits),
+         " processMisses=", process_misses,
+         " processMissMs=", BindingRecipeDiagNsToMs(process_miss_ns),
+         " processMissAvgNs=", BindingRecipeDiagAvgNs(process_miss_ns, process_misses),
+         " dbLoadCalls=", db_load_calls,
+         " dbLoadHits=", db_load_hits,
+         " dbLoadMisses=", db_load_misses,
+         " dbLoadMs=", BindingRecipeDiagNsToMs(db_load_ns),
+         " dbLoadAvgNs=", BindingRecipeDiagAvgNs(db_load_ns, db_load_calls),
+         " buildCalls=", build_calls,
+         " buildEntries=", build_entries,
+         " buildMs=", BindingRecipeDiagNsToMs(build_ns),
+         " buildAvgNs=", BindingRecipeDiagAvgNs(build_ns, build_calls),
+         " storeCalls=", store_calls,
+         " storeEntries=", store_entries,
+         " storeBytes=", store_bytes,
+         " storeMs=", BindingRecipeDiagNsToMs(store_ns),
+         " storeAvgNs=", BindingRecipeDiagAvgNs(store_ns, store_calls),
+         " applyCalls=", apply_calls,
+         " applyEntries=", apply_entries,
+         " applyBound=", apply_bound,
+         " applyCleared=", apply_cleared,
+         " applyMissingTable=", apply_missing_table,
+         " applyMs=", BindingRecipeDiagNsToMs(apply_ns),
+         " applyAvgNs=", BindingRecipeDiagAvgNs(apply_ns, apply_calls),
+         " applyAvgEntryNs=", BindingRecipeDiagAvgNs(apply_ns, apply_entries));
+  }
+
+  static void MaybeLogBindingRecipeDiagSummary(uint64_t calls,
+                                               const char *reason) {
+    if (!D3D12DiagBindingRecipeCacheEnabled())
+      return;
+    if (calls <= 16 || (calls % 65536) == 0)
+      LogBindingRecipeDiagSummary(reason);
+  }
+
   struct DescriptorTableBindingRecipeBlobHeader {
     uint32_t magic = 0x42524344; // DCRB
     uint32_t version = 1;
@@ -8423,6 +8566,9 @@ resolve_cpu_fallback:
   const DescriptorTableBindingRecipe &
   GetDescriptorTableBindingRecipe(const PipelineState &pipeline,
                                   const RootSignature &root, bool compute) {
+    const bool diag_enabled = D3D12DiagBindingRecipeCacheEnabled();
+    const uint64_t get_start_ns =
+        diag_enabled ? BindingRecipeDiagNowNs() : 0;
     struct CacheKey {
       Sha1Digest digest = {};
       bool operator==(const CacheKey &other) const {
@@ -8444,16 +8590,77 @@ resolve_cpu_fallback:
         BuildDescriptorTableBindingRecipeKey(pipeline, root, compute)};
     std::lock_guard lock(mutex);
     auto it = cache.find(key);
-    if (it != cache.end())
+    if (it != cache.end()) {
+      if (diag_enabled) {
+        auto &stats = BindingRecipeDiagStats();
+        const uint64_t elapsed = BindingRecipeDiagNowNs() - get_start_ns;
+        const auto calls =
+            stats.get_calls.fetch_add(1, std::memory_order_relaxed) + 1;
+        stats.get_ns.fetch_add(elapsed, std::memory_order_relaxed);
+        stats.process_hits.fetch_add(1, std::memory_order_relaxed);
+        stats.process_hit_ns.fetch_add(elapsed, std::memory_order_relaxed);
+        MaybeLogBindingRecipeDiagSummary(calls, "get-process-hit");
+      }
       return it->second;
+    }
 
+    const uint64_t load_start_ns =
+        diag_enabled ? BindingRecipeDiagNowNs() : 0;
     auto loaded = LoadDescriptorTableBindingRecipe(key.digest);
+    if (diag_enabled) {
+      auto &stats = BindingRecipeDiagStats();
+      stats.db_load_calls.fetch_add(1, std::memory_order_relaxed);
+      if (loaded)
+        stats.db_load_hits.fetch_add(1, std::memory_order_relaxed);
+      else
+        stats.db_load_misses.fetch_add(1, std::memory_order_relaxed);
+      stats.db_load_ns.fetch_add(BindingRecipeDiagNowNs() - load_start_ns,
+                                 std::memory_order_relaxed);
+    }
+
+    uint64_t build_start_ns = 0;
+    if (diag_enabled && !loaded)
+      build_start_ns = BindingRecipeDiagNowNs();
     DescriptorTableBindingRecipe recipe =
         loaded ? std::move(*loaded)
                : BuildDescriptorTableBindingRecipe(pipeline, root, compute);
-    if (!loaded)
+    if (diag_enabled && !loaded) {
+      auto &stats = BindingRecipeDiagStats();
+      stats.build_calls.fetch_add(1, std::memory_order_relaxed);
+      stats.build_entries.fetch_add(recipe.entries.size(),
+                                    std::memory_order_relaxed);
+      stats.build_ns.fetch_add(BindingRecipeDiagNowNs() - build_start_ns,
+                               std::memory_order_relaxed);
+    }
+    if (!loaded) {
+      const uint64_t store_start_ns =
+          diag_enabled ? BindingRecipeDiagNowNs() : 0;
       StoreDescriptorTableBindingRecipe(key.digest, recipe);
+      if (diag_enabled) {
+        auto &stats = BindingRecipeDiagStats();
+        const auto bytes =
+            sizeof(DescriptorTableBindingRecipeBlobHeader) +
+            recipe.entries.size() * sizeof(DescriptorTableBindingRecipeEntry);
+        stats.store_calls.fetch_add(1, std::memory_order_relaxed);
+        stats.store_entries.fetch_add(recipe.entries.size(),
+                                      std::memory_order_relaxed);
+        stats.store_bytes.fetch_add(bytes, std::memory_order_relaxed);
+        stats.store_ns.fetch_add(BindingRecipeDiagNowNs() - store_start_ns,
+                                 std::memory_order_relaxed);
+      }
+    }
     auto inserted = cache.insert({key, std::move(recipe)});
+    if (diag_enabled) {
+      auto &stats = BindingRecipeDiagStats();
+      const uint64_t elapsed = BindingRecipeDiagNowNs() - get_start_ns;
+      const auto calls =
+          stats.get_calls.fetch_add(1, std::memory_order_relaxed) + 1;
+      stats.get_ns.fetch_add(elapsed, std::memory_order_relaxed);
+      stats.process_misses.fetch_add(1, std::memory_order_relaxed);
+      stats.process_miss_ns.fetch_add(elapsed, std::memory_order_relaxed);
+      MaybeLogBindingRecipeDiagSummary(calls,
+                                       loaded ? "get-db-hit" : "get-build");
+    }
     return inserted.first->second;
   }
 
@@ -8461,10 +8668,18 @@ resolve_cpu_fallback:
       ArgumentEncodingContext &enc, const ReplayState &state,
       const PipelineState &pipeline, bool compute,
       const DescriptorTableBindingRecipe &recipe) {
+    const bool diag_enabled = D3D12DiagBindingRecipeCacheEnabled();
+    const uint64_t apply_start_ns =
+        diag_enabled ? BindingRecipeDiagNowNs() : 0;
+    uint64_t missing_tables = 0;
+    uint64_t cleared = 0;
+    uint64_t bound = 0;
     for (const auto &entry : recipe.entries) {
       const auto base = GetTableHandle(state, compute, entry.root_index);
-      if (!base.ptr)
+      if (!base.ptr) {
+        missing_tables++;
         continue;
+      }
       const auto range_type =
           static_cast<D3D12_DESCRIPTOR_RANGE_TYPE>(entry.range_type);
       const auto *descriptor = GetBoundDescriptorRecordInRange(
@@ -8473,6 +8688,7 @@ resolve_cpu_fallback:
       const auto stage = static_cast<PipelineStage>(entry.stage);
       if (!descriptor) {
         ClearDescriptorBinding(enc, stage, range_type, entry.slot);
+        cleared++;
         continue;
       }
       DebugLogRootBinding(
@@ -8481,6 +8697,21 @@ resolve_cpu_fallback:
           DescriptorRecordSizeBytes(*descriptor), 0);
       BindDescriptor(enc, stage, range_type, entry.slot, *descriptor,
                      &entry.argument);
+      bound++;
+    }
+    if (diag_enabled) {
+      auto &stats = BindingRecipeDiagStats();
+      const auto calls =
+          stats.apply_calls.fetch_add(1, std::memory_order_relaxed) + 1;
+      stats.apply_entries.fetch_add(recipe.entries.size(),
+                                    std::memory_order_relaxed);
+      stats.apply_missing_table.fetch_add(missing_tables,
+                                          std::memory_order_relaxed);
+      stats.apply_cleared.fetch_add(cleared, std::memory_order_relaxed);
+      stats.apply_bound.fetch_add(bound, std::memory_order_relaxed);
+      stats.apply_ns.fetch_add(BindingRecipeDiagNowNs() - apply_start_ns,
+                               std::memory_order_relaxed);
+      MaybeLogBindingRecipeDiagSummary(calls, "apply");
     }
   }
 
