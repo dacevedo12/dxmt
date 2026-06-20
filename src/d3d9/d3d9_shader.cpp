@@ -420,6 +420,10 @@ MTLD3D9VertexShader::AddRef() {
 
 ULONG STDMETHODCALLTYPE
 MTLD3D9VertexShader::Release() {
+  // D3D9 Release-at-0 clamp: handed out at public 0 while self-pinned / bound
+  // (DXVK clamps every device child); guard the underflow before the decrement.
+  if (m_refCount.load() == 0)
+    return 0;
   ULONG ref = ComObject::Release();
   if (ref == 0) {
     m_device->Release();
@@ -619,6 +623,9 @@ MTLD3D9PixelShader::AddRef() {
 
 ULONG STDMETHODCALLTYPE
 MTLD3D9PixelShader::Release() {
+  // D3D9 Release-at-0 clamp (see MTLD3D9VertexShader::Release).
+  if (m_refCount.load() == 0)
+    return 0;
   ULONG ref = ComObject::Release();
   if (ref == 0) {
     m_device->Release();

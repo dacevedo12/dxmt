@@ -109,7 +109,9 @@ buildLevelsAndMirror(
         // not standalone, not swapchain). Surfaces vended via
         // GetSurfaceLevel route the second Unlock into D3D_OK; the
         // INVALIDCALL elsewhere still catches genuine bookkeeping bugs.
-        /*textureMipSurface=*/true
+        /*textureMipSurface=*/true,
+        // Sub-resource: the level shares this texture's public refcount.
+        /*baseTexture=*/static_cast<IDirect3DBaseTexture9 *>(self)
     );
     if (needs_mirror)
       level->setLazyMirrorParent(self);
@@ -259,6 +261,13 @@ MTLD3D9Texture::AddRef() {
 
 ULONG STDMETHODCALLTYPE
 MTLD3D9Texture::Release() {
+  // D3D9 clamps Release-at-0 (a quirk apps rely on; com/com_object.hpp
+  // ComObjectClamp). This class multiply-inherits (ComObject +
+  // MTLD3D9CommonTexture) so ComObjectClamp cannot wrap it; fold the guard by
+  // hand. It also keeps a level's delegated Release from underflowing the
+  // shared counter.
+  if (m_refCount.load() == 0)
+    return 0;
   ULONG ref = ComObject::Release();
   if (ref == 0) {
     if (m_isLosable) {

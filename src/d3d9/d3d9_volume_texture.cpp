@@ -102,6 +102,11 @@ MTLD3D9VolumeTexture::AddRef() {
 
 ULONG STDMETHODCALLTYPE
 MTLD3D9VolumeTexture::Release() {
+  // D3D9 Release-at-0 clamp (hand-folded: multiply-inherits, so
+  // ComObjectClamp cannot wrap it). Also bounds a volume's delegated Release
+  // against the shared counter.
+  if (m_refCount.load() == 0)
+    return 0;
   ULONG ref = ComObject::Release();
   if (ref == 0) {
     if (m_isLosable) {

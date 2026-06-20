@@ -1749,6 +1749,18 @@ MTLD3D9Device::readbackSurfaceMirror(MTLD3D9Surface *surface) {
   std::memcpy(surface->cpuPtr(), static_cast<const char *>(block.mapped_address) + offset, total_bytes);
 }
 
+ULONG STDMETHODCALLTYPE
+MTLD3D9Device::Release() {
+  // D3D9 clamps Release-at-0 (a quirk apps rely on; com/com_object.hpp
+  // ComObjectClamp). The device multiply-inherits, so ComObjectClamp cannot
+  // wrap it; fold the same guard by hand. The implicit resources that pin the
+  // device unpin it on their own public 1->0, so this only ever guards a
+  // genuine over-release at 0.
+  if (m_refCount.load() == 0)
+    return 0;
+  return ComObject<IDirect3DDevice9Ex>::Release();
+}
+
 HRESULT STDMETHODCALLTYPE
 MTLD3D9Device::QueryInterface(REFIID riid, void **ppvObject) {
   if (!ppvObject)

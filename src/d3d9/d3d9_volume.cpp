@@ -28,21 +28,17 @@ MTLD3D9Volume::~MTLD3D9Volume() = default;
 
 ULONG STDMETHODCALLTYPE
 MTLD3D9Volume::AddRef() {
-  ULONG ref = ComObject::AddRef();
-  // Pub-AddRef pins the container, same shape as MTLD3D9Surface: the
-  // container's pub-AddRef in turn pins the device, so the chain
-  // volume → texture → device stays correct through GetVolumeLevel.
-  if (ref == 1)
-    static_cast<IDirect3DVolumeTexture9 *>(m_container)->AddRef();
-  return ref;
+  // A volume is always a sub-resource of its volume texture (never
+  // standalone), so it shares the parent's public counter:
+  // get_refcount(volume) == get_refcount(volume texture), per the D3D9
+  // sub-resource contract (DXVK D3D9Subresource). The parent owns this
+  // volume, so the whole body delegates and never touches `this` afterwards.
+  return static_cast<IDirect3DVolumeTexture9 *>(m_container)->AddRef();
 }
 
 ULONG STDMETHODCALLTYPE
 MTLD3D9Volume::Release() {
-  ULONG ref = ComObject::Release();
-  if (ref == 0)
-    static_cast<IDirect3DVolumeTexture9 *>(m_container)->Release();
-  return ref;
+  return static_cast<IDirect3DVolumeTexture9 *>(m_container)->Release();
 }
 
 HRESULT STDMETHODCALLTYPE

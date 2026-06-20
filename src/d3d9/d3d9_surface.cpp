@@ -15,10 +15,12 @@ namespace dxmt {
 MTLD3D9Surface::MTLD3D9Surface(
     MTLD3D9Device *device, const D3DSURFACE_DESC &desc, IUnknown *container, WMT::Reference<WMT::Texture> texture,
     uint32_t mipLevel, bool selfPin, WMTTextureType parentTextureType, WMT::Reference<WMT::Buffer> buffer, void *cpuPtr,
-    uint32_t pitch, uint32_t arraySlice, void *ownedBacking, Rc<dxmt::Texture> dxmtTexture, bool textureMipSurface
+    uint32_t pitch, uint32_t arraySlice, void *ownedBacking, Rc<dxmt::Texture> dxmtTexture, bool textureMipSurface,
+    IDirect3DBaseTexture9 *baseTexture
 ) :
     m_device(device),
     m_container(container),
+    m_baseTexture(baseTexture),
     m_desc(desc),
     m_buffer(std::move(buffer)),
     m_texture(std::move(texture)),
@@ -73,38 +75,57 @@ MTLD3D9Surface::markLosable() {
 
 ULONG STDMETHODCALLTYPE
 MTLD3D9Surface::AddRef() {
+  // Texture / cube mip-level surface: share the parent texture's public
+  // counter so get_refcount(level) == get_refcount(parent), per the D3D9
+  // sub-resource contract (DXVK D3D9Subresource). The parent owns this level,
+  // so the whole body delegates and never touches `this` afterwards.
+  if (m_baseTexture)
+    return m_baseTexture->AddRef();
+  // Standalone surface (CreateRenderTarget / DepthStencil / Offscreen, the
+  // auto-DS) and the implicit backbuffer pin the DEVICE on their public 0->1
+  // edge, like every DXVK D3D9DeviceChild. m_container is GetContainer
+  // identity only: the backbuffer's container is the swapchain, but its ref
+  // pins the device.
   ULONG ref = ComObject::AddRef();
-  // Pin the container, not the device, so the chain
-  // surface→container→device stays correct for sub-resource surfaces
-  // (mip level of a texture, swapchain backbuffer). For standalone
-  // surfaces container == device, so the behaviour matches the prior
-  // pattern.
   if (ref == 1)
-    m_container->AddRef();
+    m_device->AddRef();
   return ref;
 }
 
 ULONG STDMETHODCALLTYPE
 MTLD3D9Surface::Release() {
+  // Sub-resource: delegate the whole public Release to the parent texture.
+  // The parent can destruct synchronously inside this call (its m_levels
+  // clears and deletes `this`), so the result must come from the delegated
+  // call and `this` must not be read afterwards.
+  if (m_baseTexture)
+    return m_baseTexture->Release();
+  // Standalone / implicit surface: D3D9 clamps Release-at-0. These are handed
+  // out at public refcount 0 and kept alive by a private ref, and an app may
+  // Release a surface that lives with the device; guard the underflow before
+  // the decrement so a redundant Release-at-0 neither wraps the counter nor
+  // re-runs the device unpin.
+  if (m_refCount.load() == 0)
+    return 0;
   ULONG ref = ComObject::Release();
   if (ref == 0) {
-    // Losable counter: decrement on pub→0 BEFORE container release.
-    // Reset checks counter BEFORE unbinding, so it must track app
-    // public-ref presence, not full destruct (per D3D9 spec).
+    // Losable counter: decrement on pub->0 BEFORE the device unpin. Reset
+    // checks the counter before unbinding, so it must track app public-ref
+    // presence, not full destruct (per D3D9 spec).
     if (m_isLosable) {
       m_isLosable = false;
-      m_device->onLosableResourceDestroyed();
+      m_device->onLosableResourceDestroyed(m_losableBytes);
     }
-    // Snapshot the self-pin state before releasing the container.
-    // m_container->Release() can synchronously destruct the container,
-    // whose Com<Surface,false> member release drops our priv ref. If we
-    // were holding the last priv ref via something other than this
-    // self-pin (we usually aren't, but the surface's full priv chain is
-    // not enumerable here) reading m_self_pinned afterwards would be a
-    // UAF.
+    // device->Release() can synchronously destruct the device. A standalone
+    // self-pinned surface survives that teardown via its self-pin (dropped just
+    // below); the implicit backbuffer (no self-pin) is instead deleted inside
+    // this call via its private drop, so nothing afterwards reads `this`, only
+    // the captured device and the local ref. Capture the device first since the
+    // call may free `this`.
+    MTLD3D9Device *device = m_device;
     bool dropSelfPin = m_self_pinned;
     m_self_pinned = false;
-    m_container->Release();
+    device->Release();
     if (dropSelfPin)
       ReleasePrivate();
   }

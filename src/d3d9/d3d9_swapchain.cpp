@@ -410,6 +410,12 @@ MTLD3D9SwapChain::Release() {
   // it. The chain's own pin keeps the device alive across the destructor;
   // dropping it last balances the pin taken in AddRef.
   MTLD3D9Device *device = m_device;
+  // D3D9 clamps Release-at-0: the implicit chain is handed out at public
+  // refcount 0 (the device holds it via a private ref), so an app that
+  // Releases a GetSwapChain(0) result past 0 must see 0, not an underflow,
+  // and must not re-unpin the device.
+  if (m_refCount.load() == 0)
+    return 0;
   ULONG ref = ComObject::Release();
   if (ref == 0)
     device->Release();

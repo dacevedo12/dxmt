@@ -335,6 +335,10 @@ public:
   ~MTLD3D9Device();
 
   HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void **ppvObject) override;
+  // D3D9 clamps Release-at-0. The device multiply-inherits (ComObject +
+  // IDxmtDiag9) so ComObjectClamp cannot wrap it; the override hand-folds the
+  // guard. AddRef inherits ComObject (no underflow to clamp).
+  ULONG STDMETHODCALLTYPE Release() override;
 
   // Internal accessors: used by surfaces / textures / buffers when
   // they need the underlying Metal device for resource allocation.

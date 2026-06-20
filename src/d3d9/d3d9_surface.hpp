@@ -30,7 +30,8 @@ public:
       MTLD3D9Device *device, const D3DSURFACE_DESC &desc, IUnknown *container, WMT::Reference<WMT::Texture> texture,
       uint32_t mipLevel, bool selfPin, WMTTextureType parentTextureType, WMT::Reference<WMT::Buffer> buffer = {},
       void *cpuPtr = nullptr, uint32_t pitch = 0, uint32_t arraySlice = 0, void *ownedBacking = nullptr,
-      Rc<dxmt::Texture> dxmtTexture = nullptr, bool textureMipSurface = false
+      Rc<dxmt::Texture> dxmtTexture = nullptr, bool textureMipSurface = false,
+      IDirect3DBaseTexture9 *baseTexture = nullptr
   );
   ~MTLD3D9Surface();
 
@@ -218,6 +219,14 @@ private:
   // null; we never construct a surface with null container, but the
   // GetContainer path defensively handles it.
   IUnknown *m_container;
+  // The parent base texture when this surface is a texture / cube mip-level
+  // sub-resource, else null. When set, AddRef/Release delegate entirely to it
+  // so the level shares the parent's public refcount (the D3D9 sub-resource
+  // contract, DXVK D3D9Subresource); when null the surface is standalone or
+  // the implicit backbuffer and pins the device on its own 0<->1 edge.
+  // Separate from m_container (GetContainer identity) so the backbuffer can
+  // report the swapchain while pinning the device.
+  IDirect3DBaseTexture9 *m_baseTexture;
   D3DSURFACE_DESC m_desc;
   // Lockable-only backing buffer; the texture below is a view into it.
   // Declared before m_texture so the buffer outlives the view at

@@ -246,6 +246,11 @@ MTLD3D9VertexBuffer::AddRef() {
 
 ULONG STDMETHODCALLTYPE
 MTLD3D9VertexBuffer::Release() {
+  // D3D9 Release-at-0 clamp: handed out at public 0 while self-pinned / bound,
+  // so guard the underflow before the decrement (DXVK clamps every device
+  // child; same shape as the surface/swapchain/texture clamps).
+  if (m_refCount.load() == 0)
+    return 0;
   ULONG ref = ComObject::Release();
   if (ref == 0) {
     // Losable counter: decrement on pub→0, BEFORE m_device->Release
@@ -475,6 +480,9 @@ MTLD3D9IndexBuffer::AddRef() {
 
 ULONG STDMETHODCALLTYPE
 MTLD3D9IndexBuffer::Release() {
+  // D3D9 Release-at-0 clamp (see MTLD3D9VertexBuffer::Release).
+  if (m_refCount.load() == 0)
+    return 0;
   ULONG ref = ComObject::Release();
   if (ref == 0) {
     if (m_isLosable) {
