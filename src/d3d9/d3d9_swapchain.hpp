@@ -14,6 +14,7 @@ namespace dxmt {
 class Presenter;
 class MTLD3D9Device;
 class MTLD3D9Surface;
+class Texture;
 
 class MTLD3D9SwapChain final : public ComObject<IDirect3DSwapChain9Ex> {
 public:
@@ -99,6 +100,12 @@ private:
   // i>0 exist only so GetBackBuffer(i) returns distinct objects and are
   // never presented. Surfaces are Com<,false> (priv ref only).
   std::vector<Com<MTLD3D9Surface, false>> m_backBuffers;
+  // Single-sample present source for an MSAA backbuffer. D3D9 lets the app
+  // render the scene straight to an MSAA backbuffer and auto-resolves it at
+  // Present; the CAMetalLayer drawable is single-sample, so Present resolves
+  // m_backBuffers[0] into this and presents it (the DXVK/wined3d shape). Null
+  // for a single-sample chain, where Present blits the backbuffer directly.
+  Rc<dxmt::Texture> m_resolveTarget;
   // CAMetalLayer the chain blits to at Present, plus the NSView wrapper
   // returned by CreateMetalViewFromHWND that owns its lifetime. Null
   // when no HWND was provided (smokes and headless test harnesses);

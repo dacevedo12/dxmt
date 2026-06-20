@@ -48,16 +48,16 @@ namespace dxmt {
 // MSAA backbuffers (sample_count from params.MultiSampleType) lands
 // in one shape, not two.
 static void
-backBufferDescriptors(const D3DPRESENT_PARAMETERS &params, WMTTextureInfo &info, D3DSURFACE_DESC &desc) {
+backBufferDescriptors(const D3DPRESENT_PARAMETERS &params, uint32_t sampleCount, WMTTextureInfo &info, D3DSURFACE_DESC &desc) {
   info = {};
   info.pixel_format = D3DFormatToMetal(params.BackBufferFormat, D3D9FormatUsage::RenderTarget);
   info.width = params.BackBufferWidth;
   info.height = params.BackBufferHeight;
   info.depth = 1;
   info.array_length = 1;
-  info.type = WMTTextureType2D;
+  info.type = sampleCount > 1 ? WMTTextureType2DMultisample : WMTTextureType2D;
   info.mipmap_level_count = 1;
-  info.sample_count = 1;
+  info.sample_count = sampleCount;
   info.usage = static_cast<WMTTextureUsage>(WMTTextureUsageRenderTarget | WMTTextureUsageShaderRead);
   // PixelFormatView for D3DRS_SRGBWRITEENABLE: the back buffer is the
   // most common RT and games often toggle sRGB-write per draw on it.
@@ -70,15 +70,32 @@ backBufferDescriptors(const D3DPRESENT_PARAMETERS &params, WMTTextureInfo &info,
   desc.Type = D3DRTYPE_SURFACE;
   desc.Usage = D3DUSAGE_RENDERTARGET;
   desc.Pool = D3DPOOL_DEFAULT;
-  // The backbuffer is forced to single-sample (sample_count=1 above);
-  // reflect that in the desc so GetDesc reads back the actual storage,
-  // not the requested-but-not-honored MSAA. Real MSAA backbuffer
-  // support would lift both the sample_count and these two fields
-  // off params in lockstep.
-  desc.MultiSampleType = D3DMULTISAMPLE_NONE;
-  desc.MultiSampleQuality = 0;
+  // GetDesc reads back the realized MSAA mode; a single-sample chain (or a
+  // fallback to 1 on an unsupported request) reads back as NONE. The MSAA
+  // backbuffer is the app's render target; Present resolves it to a
+  // single-sample drawable (see m_resolveTarget).
+  desc.MultiSampleType = sampleCount > 1 ? params.MultiSampleType : D3DMULTISAMPLE_NONE;
+  desc.MultiSampleQuality = sampleCount > 1 ? params.MultiSampleQuality : 0;
   desc.Width = params.BackBufferWidth;
   desc.Height = params.BackBufferHeight;
+}
+
+// Single-sample present source for an MSAA backbuffer (DXVK shape): same
+// format/extent/usage as the MSAA backbuffer but one sample, so Present can
+// resolve into it and blit it to the single-sample drawable. Null on failure.
+static Rc<dxmt::Texture>
+buildResolveTarget(MTLD3D9Device *device, const WMTTextureInfo &bbInfo) {
+  WMTTextureInfo info = bbInfo;
+  info.type = WMTTextureType2D;
+  info.sample_count = 1;
+  Rc<dxmt::Texture> tex = new dxmt::Texture(info, device->metalDevice());
+  dxmt::Flags<dxmt::TextureAllocationFlag> flags;
+  flags.set(dxmt::TextureAllocationFlag::CpuInvisible);
+  auto allocation = tex->allocate(flags);
+  if (!allocation || !allocation->texture())
+    return nullptr;
+  tex->rename(std::move(allocation));
+  return tex;
 }
 
 // Drawable extent = live window client size (not stale layer drawable).
@@ -223,11 +240,18 @@ MTLD3D9SwapChain::MTLD3D9SwapChain(
 bool
 MTLD3D9SwapChain::buildBackBuffer() {
   m_backBuffers.clear();
+  m_resolveTarget = nullptr;
   const UINT count = std::max<UINT>(1u, m_params.BackBufferCount);
 
+  const uint32_t sampleCount = m_device->metalSampleCount(m_params.MultiSampleType, m_params.MultiSampleQuality);
   WMTTextureInfo info;
   D3DSURFACE_DESC desc;
-  backBufferDescriptors(m_params, info, desc);
+  backBufferDescriptors(m_params, sampleCount, info, desc);
+  if (sampleCount > 1) {
+    m_resolveTarget = buildResolveTarget(m_device, info);
+    if (!m_resolveTarget)
+      return false;
+  }
 
   // Allocate BackBufferCount surfaces, each over its own dxmt::Texture
   // allocation. Slot 0 is the one the device auto-binds to RT0 and the
@@ -270,9 +294,16 @@ MTLD3D9SwapChain::ResetForDeviceReset(const D3DPRESENT_PARAMETERS &params, HWND 
   // backing so app-held IDirect3DSurface9* refs point to new content after Reset.
   // Allocate textures first; only swap on success to keep chain coherent on OOM.
   const UINT new_count = std::max<UINT>(1u, params.BackBufferCount);
+  const uint32_t sampleCount = m_device->metalSampleCount(params.MultiSampleType, params.MultiSampleQuality);
   WMTTextureInfo info;
   D3DSURFACE_DESC desc;
-  backBufferDescriptors(params, info, desc);
+  backBufferDescriptors(params, sampleCount, info, desc);
+  Rc<dxmt::Texture> new_resolve_target;
+  if (sampleCount > 1) {
+    new_resolve_target = buildResolveTarget(m_device, info);
+    if (!new_resolve_target)
+      return D3DERR_DEVICELOST;
+  }
 
   std::vector<Rc<dxmt::Texture>> new_dxmt_textures;
   std::vector<WMT::Texture> new_raw_textures;
@@ -290,8 +321,12 @@ MTLD3D9SwapChain::ResetForDeviceReset(const D3DPRESENT_PARAMETERS &params, HWND 
     new_dxmt_textures.push_back(std::move(dxmt_bb));
   }
 
-  // All allocations succeeded; commit the new params and rebind.
+  // All allocations succeeded; commit the new params and rebind. Report the
+  // resolved device window (focus window when the app passed a null
+  // hDeviceWindow), matching the ctor and what GetPresentParameters returns.
   m_params = params;
+  m_params.hDeviceWindow = hEffectiveWindow;
+  m_resolveTarget = std::move(new_resolve_target);
 
   // BackBufferCount shrunk: trim trailing slots. Surfaces with an
   // outstanding app-held public ref get destroyed when the app drops
@@ -553,10 +588,32 @@ MTLD3D9SwapChain::Present(
     vsync_duration = static_cast<double>(multiplier) / m_refreshRateHz;
   }
   auto bb_dxmt = m_backBuffers[0]->dxmtTexture();
+  Rc<dxmt::Texture> resolve_target = m_resolveTarget;
+  const uint32_t bb_w = m_params.BackBufferWidth;
+  const uint32_t bb_h = m_params.BackBufferHeight;
   Rc<Presenter> presenter = m_presenter;
-  chunk->emitcc([backbuffer = std::move(bb_dxmt), presenter = std::move(presenter), vsync_duration,
+  chunk->emitcc([backbuffer = std::move(bb_dxmt), resolve_target = std::move(resolve_target),
+                 presenter = std::move(presenter), vsync_duration, bb_w, bb_h,
                  state = std::move(state)](ArgumentEncodingContext &ctx) mutable {
-    ctx.present(backbuffer, presenter, vsync_duration, state.metadata);
+    // D3D9 auto-resolves an MSAA backbuffer at Present; the CAMetalLayer
+    // drawable is single-sample, so average-resolve into the resolve target
+    // and present that (the DXVK/wined3d shape). A single-sample chain
+    // presents the backbuffer directly.
+    if (backbuffer->sampleCount() > 1 && resolve_target) {
+      // Resolve through the full views: the resolve binds its source as a
+      // color attachment (needs RenderTarget), but a custom createView on a
+      // texture that also carries PixelFormatView usage (for sRGB-write)
+      // comes back without the RenderTarget bit, so the encode-side guard
+      // would skip the pass. The full view keeps the texture's whole usage.
+      ctx.resolve_texture_cmd.resolve(
+          backbuffer, backbuffer->fullView, resolve_target, resolve_target->fullView,
+          ResolveTextureMode::Average, WMTScissorRect{0, 0, bb_w, bb_h}, WMTOrigin{0, 0, 0},
+          WMTSize{bb_w, bb_h, 1}
+      );
+      ctx.present(resolve_target, presenter, vsync_duration, state.metadata);
+    } else {
+      ctx.present(backbuffer, presenter, vsync_duration, state.metadata);
+    }
   });
   // No backbuffer rotation. Slot 0 is the persistent draw + present buffer; the
   // CAMetalLayer drawable pool supplies the in-flight buffering that the GL and

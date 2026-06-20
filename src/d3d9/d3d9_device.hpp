@@ -343,6 +343,12 @@ public:
   metalDevice() const {
     return m_metalDevice;
   }
+  // Realized Metal sample count for a D3D9 multisample request (1 on an
+  // unsupported type). Device-exposed accessor for the same file-local
+  // mapping CreateRenderTarget and CreateDepthStencilSurface use, so the
+  // swapchain backbuffer derives its count from one place and every
+  // attachment a render pass binds agrees.
+  uint32_t metalSampleCount(D3DMULTISAMPLE_TYPE type, DWORD quality) const;
   // Public accessor to the underlying dxmt::CommandQueue. The swapchain's
   // Present routes its present-blit through a chunk on this queue
   // (chunk->emitcc + ctx.present + PresentBoundary). Returned by reference

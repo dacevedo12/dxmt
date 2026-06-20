@@ -654,60 +654,62 @@ wmt_scissor_from_d3d9(const RECT &sr, const D3DVIEWPORT9 &vp, bool scissor_enabl
   return out;
 }
 
-// D3DMULTISAMPLE_TYPE (+ quality) → Metal sampleCount + accept/reject
-// HRESULT. Keeps CreateRenderTarget / CreateDepthStencilSurface in
-// lock-step with MTLD3D9Interface::CheckDeviceMultiSampleType: the same
-// supportsTextureSampleCount probe runs at probe time and at create
-// time, so apps that see the probe accept 8x on M2+/M3 GPUs don't then
-// get NOTAVAILABLE from the create call. D3DMULTISAMPLE_NONMASKABLE
-// reads the quality level as a sample-count selector (1 << quality),
-// the same mapping DXVK uses in GetSampleCount (d3d9_util.cpp), rather
-// than rejecting it. Returns (sample_count=1, INVALIDCALL) on
-// out-of-enum, (1, NOTAVAILABLE) on in-enum-but-unsupported,
-// (N, S_OK) on success.
+// D3DMULTISAMPLE_TYPE (+ quality) → Metal sampleCount + create-path
+// accept/reject HRESULT, for CreateRenderTarget / CreateDepthStencilSurface.
+// The create path validates the way wined3d texture.c does: every invalid or
+// device-unsupported request is D3DERR_INVALIDCALL. NOTAVAILABLE is a
+// CheckDeviceMultiSampleType-only result and never comes back from a create.
+// The per-count supportsTextureSampleCount probe is the same one
+// CheckDeviceMultiSampleType reports from, so a count the app saw accepted at
+// probe time is accepted here too. D3DMULTISAMPLE_NONMASKABLE reads the
+// quality level as a sample-count selector (1 << quality), the DXVK
+// GetSampleCount mapping. Returns sample_count 1 on rejection so the callers
+// that ignore the HRESULT (the implicit-DS and metalSampleCount paths) still
+// fall back to single-sample.
 inline std::pair<uint32_t, HRESULT>
 multisample_type_to_metal_sample_count(D3DMULTISAMPLE_TYPE ms, DWORD quality, WMT::Device device) {
-  auto check = [&](uint32_t n) -> std::pair<uint32_t, HRESULT> {
-    if (n == 1)
-      return {1u, D3D_OK};
-    return device.supportsTextureSampleCount(static_cast<uint8_t>(n))
-               ? std::make_pair(n, static_cast<HRESULT>(S_OK))
-               : std::make_pair(1u, static_cast<HRESULT>(D3DERR_NOTAVAILABLE));
-  };
   switch (ms) {
   case D3DMULTISAMPLE_NONE:
     return {1u, D3D_OK};
+  // A masked type names an exact sample count: it must be device-supported,
+  // and the quality level must be 0 (only NONMASKABLE carries a quality).
   case D3DMULTISAMPLE_2_SAMPLES:
   case D3DMULTISAMPLE_4_SAMPLES:
   case D3DMULTISAMPLE_8_SAMPLES:
   case D3DMULTISAMPLE_16_SAMPLES:
-    return check(static_cast<uint32_t>(ms));
-  // NONMASKABLE picks the sample count from the quality level: quality N
-  // selects 1 << N samples. Out-of-range quality (count > 16) is the
-  // app's error, so reject with INVALIDCALL like DXVK's GetSampleCount.
+    if (quality != 0 || !device.supportsTextureSampleCount(static_cast<uint8_t>(ms)))
+      return {1u, static_cast<HRESULT>(D3DERR_INVALIDCALL)};
+    return {static_cast<uint32_t>(ms), D3D_OK};
+  // NONMASKABLE quality level N selects 1 << N samples: level 0 is the
+  // always-present single-sample level, levels above it must name a
+  // device-supported power-of-two count. Sample-count support is monotonic on
+  // Apple GPUs, so a level the device backs here is exactly a level inside the
+  // count CheckDeviceMultiSampleType reports.
   case D3DMULTISAMPLE_NONMASKABLE: {
+    if (quality == 0)
+      return {1u, D3D_OK};
     if (quality > 4)
       return {1u, static_cast<HRESULT>(D3DERR_INVALIDCALL)};
-    return check(1u << quality);
+    uint32_t samples = 1u << quality;
+    if (!device.supportsTextureSampleCount(static_cast<uint8_t>(samples)))
+      return {1u, static_cast<HRESULT>(D3DERR_INVALIDCALL)};
+    return {samples, D3D_OK};
   }
-  case D3DMULTISAMPLE_3_SAMPLES:
-  case D3DMULTISAMPLE_5_SAMPLES:
-  case D3DMULTISAMPLE_6_SAMPLES:
-  case D3DMULTISAMPLE_7_SAMPLES:
-  case D3DMULTISAMPLE_9_SAMPLES:
-  case D3DMULTISAMPLE_10_SAMPLES:
-  case D3DMULTISAMPLE_11_SAMPLES:
-  case D3DMULTISAMPLE_12_SAMPLES:
-  case D3DMULTISAMPLE_13_SAMPLES:
-  case D3DMULTISAMPLE_14_SAMPLES:
-  case D3DMULTISAMPLE_15_SAMPLES:
-    return {1u, static_cast<HRESULT>(D3DERR_NOTAVAILABLE)};
+  // Non-power-of-two counts (3, 5, 6, 7, 9..15) and any out-of-enum value are
+  // invalid input.
   default:
     return {1u, static_cast<HRESULT>(D3DERR_INVALIDCALL)};
   }
 }
 
 } // namespace
+
+uint32_t
+MTLD3D9Device::metalSampleCount(D3DMULTISAMPLE_TYPE type, DWORD quality) const {
+  auto [count, hr] = multisample_type_to_metal_sample_count(type, quality, m_metalDevice);
+  (void)hr;
+  return count;
+}
 
 // Async PSO compile: mirrors d3d11 MTLCompiledGraphicsPipelineImpl.
 // Calls newRenderPipelineState off-thread; signals ready bit when done.
@@ -2188,15 +2190,23 @@ MTLD3D9Device::createAutoDepthStencil(const D3DPRESENT_PARAMETERS &params) {
   WMTPixelFormat fmt = D3DFormatToMetal(params.AutoDepthStencilFormat, D3D9FormatUsage::DepthStencil);
   if (fmt == WMTPixelFormatInvalid)
     return;
+  // The implicit DS must carry the same sample count the app's MSAA render
+  // targets do, or a render pass that binds both hits a Metal color/depth
+  // sample-count mismatch (an AGX command-buffer hang). Mirror
+  // CreateDepthStencilSurface; an unsupported request falls back to 1.
+  auto [sampleCount, msHr] = multisample_type_to_metal_sample_count(
+      params.MultiSampleType, params.MultiSampleQuality, m_metalDevice
+  );
+  (void)msHr;
   WMTTextureInfo info{};
   info.pixel_format = fmt;
   info.width = params.BackBufferWidth;
   info.height = params.BackBufferHeight;
   info.depth = 1;
   info.array_length = 1;
-  info.type = WMTTextureType2D;
+  info.type = sampleCount > 1 ? WMTTextureType2DMultisample : WMTTextureType2D;
   info.mipmap_level_count = 1;
-  info.sample_count = 1;
+  info.sample_count = sampleCount;
   info.usage = WMTTextureUsageRenderTarget;
   info.options = WMTResourceStorageModePrivate;
   Rc<dxmt::Texture> dxmt_ds_texture = new dxmt::Texture(info, m_metalDevice);
@@ -2212,13 +2222,10 @@ MTLD3D9Device::createAutoDepthStencil(const D3DPRESENT_PARAMETERS &params) {
   dsDesc.Type = D3DRTYPE_SURFACE;
   dsDesc.Usage = D3DUSAGE_DEPTHSTENCIL;
   dsDesc.Pool = D3DPOOL_DEFAULT;
-  // sample_count=1 above forces single-sample storage; mirror that
-  // here so GetDesc reads back the actual MSAA mode, not the
-  // requested-but-not-honored one. Matches the swapchain backbuffer's
-  // descriptor coercion in backBufferDescriptors. Real MSAA auto-DS
-  // support would lift both at once.
-  dsDesc.MultiSampleType = D3DMULTISAMPLE_NONE;
-  dsDesc.MultiSampleQuality = 0;
+  // Reflect the realized sample count so GetDesc reads back the actual MSAA
+  // mode; a fallback to 1 on an unsupported request reads back as NONE.
+  dsDesc.MultiSampleType = sampleCount > 1 ? params.MultiSampleType : D3DMULTISAMPLE_NONE;
+  dsDesc.MultiSampleQuality = sampleCount > 1 ? params.MultiSampleQuality : 0;
   dsDesc.Width = params.BackBufferWidth;
   dsDesc.Height = params.BackBufferHeight;
   // Identity-preserving Reset path; if the auto-DS already exists
@@ -6845,20 +6852,43 @@ MTLD3D9Device::ResolveBatchedDrawForChunk(
 
     // ---- PSO descriptor build ----
     MTLD3D9Surface *ds = refs.depth_stencil_surface.ptr();
+    // Sample count flows from the realized Metal texture, NOT
+    // desc().MultiSampleType: NONMASKABLE (and any path that allocates more
+    // samples than the enum encodes) stores an enum that maps to 1 while the
+    // texture carries the real count, and Metal hard-errors (hangs AGX) when
+    // the pipeline rasterSampleCount differs from an attachment. Mirrors
+    // d3d11's OM-bind, which reads the count off the bound view.
+    uint8_t raster_sample_count = 1;
+    if (rt0 && !IsNullFormat(rt0->desc().Format) && rt0->dxmtTexture()) {
+      raster_sample_count = static_cast<uint8_t>(rt0->dxmtTexture()->sampleCount());
+    } else if (ds && ds->dxmtTexture()) {
+      raster_sample_count = static_cast<uint8_t>(ds->dxmtTexture()->sampleCount());
+    }
+    // Every render-pass attachment + the pipeline must share one sample count.
+    // A bound DS whose sample count disagrees with the color target (an app
+    // pairing an MSAA depth surface with a single-sample render target, or the
+    // reverse) is dropped here, before the PSO bakes a depth format, rather than
+    // faulting the GPU. The mismatch is an app error, so warn once instead of
+    // once per draw.
+    if (ds && ds->dxmtTexture() && rt0 && !IsNullFormat(rt0->desc().Format) &&
+        ds->dxmtTexture()->sampleCount() != raster_sample_count) {
+      // Encode thread is the sole toucher; a plain static needs no guard.
+      static bool warned = false;
+      if (!warned) {
+        warned = true;
+        Logger::warn(str::format(
+            "d3d9: depth-stencil sample count ", ds->dxmtTexture()->sampleCount(), " != render target ",
+            (unsigned)raster_sample_count, "; dropping the DS (a render target and depth-stencil must match multisample)"
+        ));
+      }
+      ds = nullptr;
+      bd.resolved_ds_dxmt = nullptr;
+    }
     WMTPixelFormat ds_pixel_format = WMTPixelFormatInvalid;
     bool ds_has_stencil = false;
     if (ds) {
       ds_pixel_format = D3DFormatToMetal(ds->desc().Format, D3D9FormatUsage::DepthStencil);
       ds_has_stencil = HasStencilAspect(ds->desc().Format);
-    }
-    auto multisample_to_count = [](D3DMULTISAMPLE_TYPE mst) -> uint8_t {
-      return mst >= D3DMULTISAMPLE_2_SAMPLES ? static_cast<uint8_t>(mst) : 1u;
-    };
-    uint8_t raster_sample_count = 1;
-    if (rt0 && !IsNullFormat(rt0->desc().Format)) {
-      raster_sample_count = multisample_to_count(rt0->desc().MultiSampleType);
-    } else if (ds) {
-      raster_sample_count = multisample_to_count(ds->desc().MultiSampleType);
     }
     // Plumb the sample count through to the chunk lambda so its
     // startRenderPass(default_raster_sample_count=N) matches the PSO's
