@@ -866,6 +866,14 @@ MTLD3D9Device::MTLD3D9Device(
   // private. Released in our destructor.
   m_implicitSwapChain->AddRefPrivate();
 
+  // A device created fullscreen resizes its device window to the borderless
+  // backbuffer rect up front, the same as a windowed->fullscreen Reset; wined3d
+  // does this in swapchain_init when the implicit chain is not windowed.
+  if (!validatedParams.Windowed) {
+    enterFullscreenWindow(effectiveWindow, validatedParams.BackBufferWidth, validatedParams.BackBufferHeight);
+    hookFocusWindowProc(effectiveWindow);
+  }
+
   // Seed the device-wide queue latency from the primary (implicit) chain.
   // The clamp is min(frameLatency, BackBufferCount + 1) per DXVK
   // d3d9_swapchain.cpp GetActualFrameLatency; without it the queue runs at
@@ -1081,6 +1089,12 @@ MTLD3D9Device::acquireOrAllocateBufferBacking(
 }
 
 MTLD3D9Device::~MTLD3D9Device() {
+  // Restore the device window to its windowed style/rect so a fullscreen
+  // game leaving does not strand a borderless, topmost window. No-op unless
+  // a fullscreen window is currently held. unhook restores the focus window's
+  // wndproc so our forwarding proc never outlives the device.
+  leaveFullscreenWindow();
+  unhookFocusWindowProc();
   // Drain the encoder + cmdbuf before anything else; they hold Metal
   // handles whose dispose path needs the queue and device alive. The
   // local autorelease pool is required because flushOpenWork's
@@ -2029,6 +2043,159 @@ UINT STDMETHODCALLTYPE
 MTLD3D9Device::GetNumberOfSwapChains() {
   return 1;
 }
+// Port of wined3d_swapchain_state_setup_fullscreen (dlls/wined3d/swapchain.c):
+// resize + restyle the device window to a borderless fullscreen rect. On first
+// entry the pre-fullscreen style/exstyle/rect are saved for restore; a later
+// call on the same window (a resolution-change Reset) only repositions. Pure
+// window geometry: the monitor query is read-only and the display mode is never
+// touched.
+void
+MTLD3D9Device::enterFullscreenWindow(HWND window, UINT width, UINT height) {
+  if (!window)
+    return;
+  // The app asked dxmt not to touch its window; leave it exactly as is.
+  if (m_creationParams.BehaviorFlags & D3DCREATE_NOWINDOWCHANGES)
+    return;
+
+  // Fullscreen rect: the window's monitor origin plus the backbuffer extent.
+  // Single-monitor desktops sit at (0, 0); a read-only MonitorFromWindow keeps
+  // multi-monitor correct without a display-mode switch.
+  LONG x = 0, y = 0;
+  HMONITOR monitor = MonitorFromWindow(window, MONITOR_DEFAULTTOPRIMARY);
+  MONITORINFO mi{};
+  mi.cbSize = sizeof(mi);
+  if (monitor && GetMonitorInfoW(monitor, &mi)) {
+    x = mi.rcMonitor.left;
+    y = mi.rcMonitor.top;
+  }
+
+  if (m_fullscreenWindow != window) {
+    // First entry (or a newly designated device window). Save the windowed
+    // style/exstyle/rect, then restyle to a borderless popup: wined3d
+    // fullscreen_style / fullscreen_exstyle.
+    m_fullscreenWindow = window;
+    m_savedWindowStyle = GetWindowLongW(window, GWL_STYLE);
+    m_savedWindowExStyle = GetWindowLongW(window, GWL_EXSTYLE);
+    GetWindowRect(window, &m_savedWindowRect);
+    LONG style = (m_savedWindowStyle | WS_POPUP | WS_SYSMENU) & ~(WS_CAPTION | WS_THICKFRAME);
+    LONG exStyle = m_savedWindowExStyle & ~(WS_EX_WINDOWEDGE | WS_EX_CLIENTEDGE);
+    SetWindowLongW(window, GWL_STYLE, style);
+    SetWindowLongW(window, GWL_EXSTYLE, exStyle);
+  }
+  // wined3d uses HWND_TOPMOST + SWP_FRAMECHANGED | SWP_NOACTIVATE | SWP_SHOWWINDOW.
+  SetWindowPos(
+      window, HWND_TOPMOST, x, y, static_cast<int>(width), static_cast<int>(height),
+      SWP_FRAMECHANGED | SWP_NOACTIVATE | SWP_SHOWWINDOW
+  );
+}
+
+// Port of wined3d_swapchain_state_restore_from_fullscreen. Restores the saved
+// style (preserving the live WS_VISIBLE / WS_EX_TOPMOST bits, as wined3d does so
+// it never hides or un-tops a window the app is driving). Non-Ex d3d9 is
+// style-only (it does not set RESTORE_WINDOW_RECT); Ex also restores the saved
+// window rect.
+void
+MTLD3D9Device::leaveFullscreenWindow() {
+  HWND window = m_fullscreenWindow;
+  if (!window)
+    return;
+  m_fullscreenWindow = nullptr;
+
+  LONG liveStyle = GetWindowLongW(window, GWL_STYLE);
+  LONG liveExStyle = GetWindowLongW(window, GWL_EXSTYLE);
+  LONG style = (m_savedWindowStyle & ~WS_VISIBLE) | (liveStyle & WS_VISIBLE);
+  LONG exStyle = (m_savedWindowExStyle & ~WS_EX_TOPMOST) | (liveExStyle & WS_EX_TOPMOST);
+  SetWindowLongW(window, GWL_STYLE, style);
+  SetWindowLongW(window, GWL_EXSTYLE, exStyle);
+  if (m_isEx)
+    SetWindowPos(
+        window, HWND_NOTOPMOST, m_savedWindowRect.left, m_savedWindowRect.top,
+        m_savedWindowRect.right - m_savedWindowRect.left, m_savedWindowRect.bottom - m_savedWindowRect.top,
+        SWP_FRAMECHANGED | SWP_NOACTIVATE
+    );
+  else
+    SetWindowPos(window, nullptr, 0, 0, 0, 0, SWP_FRAMECHANGED | SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE);
+
+  m_savedWindowStyle = 0;
+  m_savedWindowExStyle = 0;
+  m_savedWindowRect = RECT{};
+}
+
+namespace {
+// Window property holding the focus window's original wndproc while dxmt holds
+// it subclassed. The forwarding proc reads it per message; hook/unhook own it.
+constexpr const wchar_t *kFocusProcProp = L"DXMTD3D9FocusOrigProc";
+
+LRESULT CALLBACK
+focusWindowProc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam) {
+  auto orig = reinterpret_cast<WNDPROC>(GetPropW(hwnd, kFocusProcProp));
+  BOOL unicode = IsWindowUnicode(hwnd);
+  // The focus window is being torn down while still subclassed: drop our proc
+  // so neither the property nor our function pointer outlives it.
+  if (message == WM_NCDESTROY && orig) {
+    SetWindowLongPtrW(hwnd, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(orig));
+    RemovePropW(hwnd, kFocusProcProp);
+  }
+  if (!orig)
+    return unicode ? DefWindowProcW(hwnd, message, wparam, lparam) : DefWindowProcA(hwnd, message, wparam, lparam);
+  return unicode ? CallWindowProcW(orig, hwnd, message, wparam, lparam)
+                 : CallWindowProcA(orig, hwnd, message, wparam, lparam);
+}
+} // namespace
+
+void
+MTLD3D9Device::hookFocusWindowProc(HWND fallbackWindow) {
+  if (m_focusProcHooked)
+    return;
+  // wined3d installs the subclass unconditionally on the fullscreen transition;
+  // D3DCREATE_NOWINDOWCHANGES suppresses only the window restyle, not the proc
+  // hook. The focus window defaults to the device window when none was given.
+  HWND focus = m_creationParams.hFocusWindow;
+  if (!focus)
+    focus = fallbackWindow;
+  if (!focus || !IsWindow(focus))
+    return;
+  // Match the window's existing ANSI/Unicode flavour so the forwarding path
+  // stays consistent with the app's own proc. Cache it so the unhook restores
+  // through the same slot even if the window's flavour is queried later.
+  m_focusProcUnicode = IsWindowUnicode(focus);
+  LONG_PTR orig = m_focusProcUnicode
+                      ? SetWindowLongPtrW(focus, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(focusWindowProc))
+                      : SetWindowLongPtrA(focus, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(focusWindowProc));
+  SetPropW(focus, kFocusProcProp, reinterpret_cast<HANDLE>(orig));
+  m_focusWindow = focus;
+  m_focusProcHooked = true;
+}
+
+void
+MTLD3D9Device::unhookFocusWindowProc() {
+  if (!m_focusProcHooked)
+    return;
+  HWND focus = m_focusWindow;
+  m_focusProcHooked = false;
+  m_focusWindow = nullptr;
+  if (!focus || !IsWindow(focus))
+    return;
+  auto orig = reinterpret_cast<WNDPROC>(GetPropW(focus, kFocusProcProp));
+  if (!orig)
+    return;
+  // Restore only while our proc is still the installed one; an app that
+  // re-subclassed on top of us keeps its proc (wined3d guards the same way).
+  // Use the slot we hooked through, not a fresh IsWindowUnicode query. Leave
+  // the property in place if someone else owns the proc: its WM_NCDESTROY
+  // self-heal still needs it to find the original.
+  auto current = reinterpret_cast<WNDPROC>(
+      m_focusProcUnicode ? GetWindowLongPtrW(focus, GWLP_WNDPROC) : GetWindowLongPtrA(focus, GWLP_WNDPROC)
+  );
+  if (current == focusWindowProc) {
+    if (m_focusProcUnicode)
+      SetWindowLongPtrW(focus, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(orig));
+    else
+      SetWindowLongPtrA(focus, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(orig));
+    RemovePropW(focus, kFocusProcProp);
+  }
+}
+
 HRESULT STDMETHODCALLTYPE
 MTLD3D9Device::Reset(D3DPRESENT_PARAMETERS *pPresentationParameters) {
   // Wine's main thread has no outer NSAutoreleasePool. Reset tears
@@ -2126,6 +2293,20 @@ MTLD3D9Device::Reset(D3DPRESENT_PARAMETERS *pPresentationParameters) {
   //    the swapchain ctor path's defaults; the swapchain already has
   //    its own copy via ResetForDeviceReset.
   std::memcpy(&m_presentParams, pPresentationParameters, sizeof(D3DPRESENT_PARAMETERS));
+
+  // Drive the device window to match the new mode, the windowed<->fullscreen
+  // handling wined3d's reset path runs via the swapchain state. enter/leave are
+  // idempotent on m_fullscreenWindow: a fullscreen->fullscreen Reset just
+  // repositions, a windowed->windowed Reset is a no-op.
+  {
+    if (!m_presentParams.Windowed) {
+      enterFullscreenWindow(effectiveWindow, m_presentParams.BackBufferWidth, m_presentParams.BackBufferHeight);
+      hookFocusWindowProc(effectiveWindow);
+    } else {
+      leaveFullscreenWindow();
+      unhookFocusWindowProc();
+    }
+  }
 
   // 5. Reset every category of device state to D3D9 defaults; non-Ex
   //    only. DXVK d3d9_device.cpp skips full state-reset on Ex
