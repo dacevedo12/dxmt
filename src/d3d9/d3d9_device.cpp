@@ -4314,14 +4314,16 @@ MTLD3D9Device::StretchRect(
   const D3DSURFACE_DESC &dd = dst->desc();
   if (sd.Pool != D3DPOOL_DEFAULT || dd.Pool != D3DPOOL_DEFAULT)
     return D3DERR_INVALIDCALL;
-  // Destination must be either a standalone surface (CreateRenderTarget /
-  // CreateDepthStencilSurface / CreateOffscreenPlainSurface) OR a sub-
-  // resource backed by a texture with RENDERTARGET / DEPTHSTENCIL usage.
-  // StretchRect-ing into a plain SetTexture-bound DEFAULT texture is
-  // INVALIDCALL per DXVK d3d9_device.cpp. Without this gate
-  // dxmt accepts the blit and silently succeeds; apps relying on the
-  // error code to fall back to a different copy path miss it.
-  if (dd.Type != D3DRTYPE_SURFACE && !(dd.Usage & (D3DUSAGE_RENDERTARGET | D3DUSAGE_DEPTHSTENCIL)))
+  // A texture sub-resource is a valid destination only when its texture was
+  // created RENDERTARGET / DEPTHSTENCIL; StretchRect into a plain texture is
+  // INVALIDCALL (wined3d d3d9 device.c rejects when dst->texture && the
+  // sub-resource has no RENDER_TARGET/DEPTH_STENCIL bind; DXVK matches). The
+  // container check is isTextureSubresource(): a standalone surface
+  // (CreateRenderTarget / CreateDepthStencilSurface /
+  // CreateOffscreenPlainSurface, swapchain backbuffer) has no parent texture
+  // and is always a legal destination. A D3DRTYPE check is useless here, every
+  // surface reports D3DRTYPE_SURFACE whether or not it backs a texture.
+  if (dst->isTextureSubresource() && !(dd.Usage & (D3DUSAGE_RENDERTARGET | D3DUSAGE_DEPTHSTENCIL)))
     return D3DERR_INVALIDCALL;
   // DS-to-DS: both surfaces must be DS, same lowered Metal format,
   // and the call must be outside an active scene (DXVK
@@ -4482,6 +4484,11 @@ MTLD3D9Device::ColorFill(IDirect3DSurface9 *pSurface, const RECT *pRect, D3DCOLO
   // with the documented INVALIDCALL so the app sees a clean fallback
   // path instead.
   if (IsCompressedFormat(dd.Format))
+    return D3DERR_INVALIDCALL;
+  // ColorFill targets render targets and standalone offscreen-plain
+  // surfaces; a plain or DYNAMIC texture sub-resource (not a render target)
+  // is rejected (wined3d device.c; the test's resource_types matrix).
+  if (dst->isTextureSubresource() && !(dd.Usage & D3DUSAGE_RENDERTARGET))
     return D3DERR_INVALIDCALL;
   // Resolve the fill rect. NULL means full surface; otherwise validate
   // against the surface bounds (wined3d/DXVK both INVALIDCALL on an

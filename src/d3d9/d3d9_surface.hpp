@@ -74,6 +74,14 @@ public:
   desc() const {
     return m_desc;
   }
+  // True when this surface is a sub-resource of a texture (GetSurfaceLevel
+  // or a cube face), false for standalone surfaces (CreateRenderTarget,
+  // CreateDepthStencilSurface, CreateOffscreenPlainSurface, swapchain
+  // backbuffer). ColorFill rejects a non-render-target texture sub-resource.
+  bool
+  isTextureSubresource() const {
+    return m_baseTexture != nullptr;
+  }
   // Mip level this surface views into m_texture. 0 for standalone
   // surfaces (CreateRenderTarget, CreateDepthStencilSurface,
   // CreateOffscreenPlainSurface: m_texture is itself a single-level

@@ -314,13 +314,18 @@ MTLD3D9Surface::LockRect(D3DLOCKED_RECT *pLockedRect, const RECT *pRect, DWORD F
                  static_cast<UINT>(pRect->bottom) >= m_desc.Height);
   if (!full_resource || m_desc.Pool != D3DPOOL_DEFAULT)
     Flags &= ~D3DLOCK_DISCARD;
-  // Lockable render target: the GPU is the writer, so the mirror is
-  // refreshed before the pointer goes out unless the caller discards.
-  // Tested after the DISCARD normalization above so a partial-rect
-  // DISCARD still reads back, matching DXVK's lock order; wined3d maps
-  // render targets through the same sysmem download. Only
-  // CreateRenderTarget surfaces carry both the usage bit and a mirror.
-  if ((m_desc.Usage & D3DUSAGE_RENDERTARGET) && m_texture != nullptr && !(Flags & D3DLOCK_DISCARD))
+  // GPU-authoritative mirror surfaces: the contents live in the Metal
+  // texture (a render pass, ColorFill, StretchRect or UpdateSurface is the
+  // writer), so the host mirror is refreshed before the pointer goes out
+  // unless the caller discards. This covers lockable render targets AND
+  // DEFAULT-pool offscreen-plain surfaces (Usage 0): both are DEFAULT-pool
+  // and buffer-less (the texture is the truth, not an aliased backing
+  // buffer). DYNAMIC textures stream CPU->GPU and keep the mirror
+  // authoritative, so they skip the download. Tested after the DISCARD
+  // normalization above so a partial-rect DISCARD still reads back, matching
+  // DXVK's lock order; wined3d maps the same sysmem download.
+  if (m_buffer == nullptr && m_texture != nullptr && m_desc.Pool == D3DPOOL_DEFAULT &&
+      !(m_desc.Usage & D3DUSAGE_DYNAMIC) && !(Flags & D3DLOCK_DISCARD))
     m_device->readbackSurfaceMirror(this);
 
   // Row-byte offset: y_in_blocks * pitch. For uncompressed, blocks
