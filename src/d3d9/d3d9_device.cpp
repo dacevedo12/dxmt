@@ -2356,6 +2356,12 @@ MTLD3D9Device::Reset(D3DPRESENT_PARAMETERS *pPresentationParameters) {
   // 7. Re-bind the new backbuffer to RT0 (matches the ctor's auto-bind
   //    shape: SetRenderTarget(0, …) also resets viewport/scissor to
   //    the new RT extents, which is what apps expect post-Reset).
+  // A D3D9Ex device preserves the app's viewport Z range (MinZ/MaxZ)
+  // across Reset, unlike a non-Ex device which resets it to 0..1;
+  // SetRenderTarget(0) zeroes it either way, so snapshot and restore it on
+  // the Ex path (DXVK d3d9_device.cpp restores MinZ/MaxZ only on extended).
+  const float savedMinZ = m_viewport.MinZ;
+  const float savedMaxZ = m_viewport.MaxZ;
   if (auto *bb = m_implicitSwapChain->backBuffer()) {
     SetRenderTarget(0, static_cast<IDirect3DSurface9 *>(bb));
   }
@@ -2365,6 +2371,11 @@ MTLD3D9Device::Reset(D3DPRESENT_PARAMETERS *pPresentationParameters) {
     // pointer is the priv-pinned mirror; surface-side public refcount
     // unchanged.
     SetDepthStencilSurface(static_cast<IDirect3DSurface9 *>(m_depthStencilSurface.ptr()));
+  }
+  if (m_isEx) {
+    m_viewport.MinZ = savedMinZ;
+    m_viewport.MaxZ = savedMaxZ;
+    m_encShadowDirty |= dxmt::D9ES_DIRTY_VIEWPORT;
   }
   m_deviceState.store(DeviceState::Ok, std::memory_order_relaxed);
   return D3D_OK;
