@@ -940,8 +940,29 @@ walk_dxso_shader(const uint32_t *byte_code, uint32_t dword_count, const DxsoHead
     md.instruction_count += 1;
     if (ins.has_dcl && ins.has_dst)
       md.dcls.push_back({ins.dcl, ins.dst.base});
-    if (ins.has_def && ins.has_dst)
+    if (ins.has_def && ins.has_dst) {
+      // Reject a constant-register index past the shader-model limit; wine
+      // d3d9 fails Create{Vertex,Pixel}Shader for these and the host
+      // validation maps nullopt to D3DERR_INVALIDCALL. Float consts: 256 on
+      // VS, 8 / 32 / 224 on PS SM1 / SM2 / SM3. Integer and boolean consts:
+      // 16 on VS SM2+ and PS SM3, absent before that.
+      const bool is_vs = header.kind == DxsoShaderKind::Vertex;
+      uint32_t const_cap;
+      if (ins.def.kind == DxsoDefKind::Float32) {
+        const_cap = is_vs ? 256u : ((header.major >= 3) ? 224u : (header.major >= 2) ? 32u : 8u);
+      } else {
+        // Integer/boolean consts (16 each where present): VS gained them in
+        // SM2, PS in ps_2_1 (the ps_2_x / ps_2_b static-flow-control profiles,
+        // minor >= 1) and SM3.
+        const bool has_int_bool =
+            is_vs ? (header.major >= 2)
+                  : (header.major >= 3 || (header.major == 2 && header.minor >= 1));
+        const_cap = has_int_bool ? 16u : 0u;
+      }
+      if (ins.dst.base.num >= const_cap)
+        return std::nullopt;
       md.consts.push_back({ins.def, ins.dst.base});
+    }
     if (ins.opcode == DxsoOpcode::TexKill)
       md.uses_kill = true;
     if (dxso_opcode_uses_derivatives(ins.opcode))
