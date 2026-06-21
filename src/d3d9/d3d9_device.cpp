@@ -2405,15 +2405,21 @@ MTLD3D9Device::CreateTexture(
       return D3DERR_INVALIDCALL;
   }
 
-  // pSharedHandle doubles as an initial-data pointer for single-level
+  // pSharedHandle doubles as a user-memory pointer for single-level
   // SYSTEMMEM textures (the Vista-era user-memory path; the rows are
-  // tightly packed). DXVK accepts it on any device and copies at
-  // create time; wined3d additionally gates it on Ex. Cross-process
+  // tightly packed). wined3d aliases the app pointer in place: LockRect
+  // hands it back and the GPU upload sources from it, with no copy. The
+  // app owns the storage for the texture's lifetime. Cross-process
   // sharing (DEFAULT pool) stays unimplemented.
-  const void *initial_data = nullptr;
+  void *user_memory = nullptr;
   if (pSharedHandle) {
+    // wined3d device.c gates the whole shared-handle block on the device:
+    // a non-extended device rejects any handle with E_NOTIMPL before the
+    // user-memory branch is reached. The overload is D3D9Ex-only.
+    if (!m_isEx)
+      return E_NOTIMPL;
     if (Pool == D3DPOOL_SYSTEMMEM && Levels == 1) {
-      initial_data = *reinterpret_cast<void **>(pSharedHandle);
+      user_memory = *reinterpret_cast<void **>(pSharedHandle);
       pSharedHandle = nullptr;
     } else if (Pool != D3DPOOL_DEFAULT) {
       return D3DERR_INVALIDCALL;
@@ -2616,30 +2622,14 @@ MTLD3D9Device::CreateTexture(
     dxmt_texture->rename(std::move(allocation));
   }
 
-  auto *tex =
-      new MTLD3D9Texture(this, Width, Height, app_levels, Usage, Format, Pool, std::move(dxmt_texture), backingPitch);
+  // user_memory: level 0 aliases the app pointer (see the ctor). The
+  // texture starts fully dirty, so the app's create-time contents reach
+  // a DEFAULT mirror through the first UpdateTexture with no copy here.
+  auto *tex = new MTLD3D9Texture(
+      this, Width, Height, app_levels, Usage, Format, Pool, std::move(dxmt_texture), backingPitch, user_memory
+  );
   if (Pool == D3DPOOL_DEFAULT)
     tex->markLosable();
-  if (initial_data) {
-    // The lock path absorbs every backing variant; at create time a
-    // SYSTEMMEM lock is a plain host copy. A lock failure here means
-    // the mirror allocation failed; fail the create rather than hand
-    // back a texture that silently dropped its data.
-    D3DLOCKED_RECT lr{};
-    if (FAILED(tex->LockRect(0, &lr, nullptr, 0))) {
-      tex->AddRef();
-      tex->Release();
-      return D3DERR_OUTOFVIDEOMEMORY;
-    }
-    const uint32_t src_pitch = D3DFormatRowPitch(Format, Width);
-    const uint32_t rows = D3DFormatRowCount(Format, Height);
-    const uint8_t *src = static_cast<const uint8_t *>(initial_data);
-    uint8_t *dst = static_cast<uint8_t *>(lr.pBits);
-    const uint32_t copy_pitch = std::min<uint32_t>(src_pitch, lr.Pitch);
-    for (uint32_t r = 0; r < rows; ++r)
-      std::memcpy(dst + static_cast<size_t>(r) * lr.Pitch, src + static_cast<size_t>(r) * src_pitch, copy_pitch);
-    tex->UnlockRect(0);
-  }
   tex->AddRef();
   *ppTexture = tex;
   return D3D_OK;
@@ -2652,8 +2642,18 @@ MTLD3D9Device::CreateVolumeTexture(
   if (!ppVolumeTexture)
     return D3DERR_INVALIDCALL;
   *ppVolumeTexture = nullptr;
-  if (pSharedHandle)
+  if (pSharedHandle) {
+    // Non-extended devices reject any handle with E_NOTIMPL (wined3d
+    // device.c). On an extended device the user-memory overload is only
+    // defined for single-subresource 2D resources; a volume texture with a
+    // non-DEFAULT-pool handle is INVALIDCALL. DEFAULT pool is the
+    // cross-process share path.
+    if (!m_isEx)
+      return E_NOTIMPL;
+    if (Pool != D3DPOOL_DEFAULT)
+      return D3DERR_INVALIDCALL;
     return E_NOTIMPL; // cross-process shared 3D textures deferred
+  }
   if (Width == 0 || Height == 0 || Depth == 0)
     return D3DERR_INVALIDCALL;
   // Mirror GetDeviceCaps's MaxVolumeExtent (2048). The 2D/cube/RT/DS
@@ -2784,8 +2784,18 @@ MTLD3D9Device::CreateCubeTexture(
       return D3DERR_INVALIDCALL;
   }
 
-  if (pSharedHandle)
+  if (pSharedHandle) {
+    // Non-extended devices reject any handle with E_NOTIMPL (wined3d
+    // device.c). On an extended device the user-memory overload is only
+    // defined for single-subresource 2D resources; a cube texture (six
+    // faces) with a non-DEFAULT-pool handle is INVALIDCALL. DEFAULT pool is
+    // the cross-process share path.
+    if (!m_isEx)
+      return E_NOTIMPL;
+    if (Pool != D3DPOOL_DEFAULT)
+      return D3DERR_INVALIDCALL;
     return E_NOTIMPL;
+  }
 
   // Attachment usage on a format Metal cannot attach is rejected at
   // create; see CreateTexture.
@@ -3491,8 +3501,10 @@ MTLD3D9Device::UpdateTexture(IDirect3DBaseTexture9 *pSourceTexture, IDirect3DBas
       return D3DERR_INVALIDCALL;
     if (src_tail.Width != dst0.Width || src_tail.Height != dst0.Height)
       return D3DERR_INVALIDCALL;
-    WMT::Buffer src_mirror = src->mirrorBuffer();
-    if (src_mirror == nullptr)
+    // Source from the CPU mirror base, not the Metal mirror buffer: the
+    // copy below stages through the upload ring from mirrorBase(), and a
+    // user-memory source aliases the app pointer with no mirror buffer.
+    if (src->mirrorBase() == nullptr)
       return D3DERR_INVALIDCALL;
     WMT::Texture dst_tex = dst->metalTexture();
     if (dst_tex == nullptr)
@@ -4404,14 +4416,27 @@ MTLD3D9Device::CreateOffscreenPlainSurface(
   if (Pool == D3DPOOL_MANAGED)
     return D3DERR_INVALIDCALL;
 
-  // pSharedHandle: non-Ex always E_NOTIMPL; Ex+SYSTEMMEM/DEFAULT not yet.
-  // Collapse implementable branches to E_NOTIMPL; illegal to INVALIDCALL.
+  // pSharedHandle on SYSTEMMEM is the user-memory overload: the app
+  // pointer is the packed CPU storage, aliased in place the same way the
+  // texture path does it (offscreen plain surfaces are single level, so
+  // there is no level gate). DEFAULT pool is the cross-process shared
+  // handle (unimplemented); any other pool with a handle is illegal.
+  void *user_memory = nullptr;
   if (pSharedHandle) {
+    // Non-extended devices reject any handle with E_NOTIMPL up front, the
+    // same gate the texture path uses; the user-memory overload is
+    // D3D9Ex-only (wined3d device.c).
     if (!m_isEx)
       return E_NOTIMPL;
-    if (Pool != D3DPOOL_SYSTEMMEM && Pool != D3DPOOL_DEFAULT)
+    if (Pool == D3DPOOL_SYSTEMMEM) {
+      user_memory = *reinterpret_cast<void **>(pSharedHandle);
+      pSharedHandle = nullptr;
+    } else if (Pool != D3DPOOL_DEFAULT) {
       return D3DERR_INVALIDCALL;
-    return E_NOTIMPL;
+    } else {
+      // TODO: cross-process resource share.
+      return E_NOTIMPL;
+    }
   }
 
   // A depth-stencil offscreen-plain surface has no GPU attachment role here
@@ -4534,6 +4559,26 @@ MTLD3D9Device::CreateOffscreenPlainSurface(
     cpuPtr = ownedBacking;
     // buffer stays null → UnlockRect takes the mirror-upload path, not the
     // zero-copy buffer-backed path SYSTEMMEM/SCRATCH use.
+  } else if (user_memory) {
+    // D3D9Ex user-memory: the app pointer is the lock storage, tightly
+    // packed. The Metal texture is a plain CPU-visible allocation; the
+    // surface stays a valid UpdateSurface source because that path stages
+    // from cpuPtr(). No buffer wrap (the app pointer is neither page-
+    // aligned nor dxmt-owned) and no owned backing (the app frees it).
+    uint32_t bpp = D3DFormatBytesPerPixel(Format);
+    if (bpp == 0)
+      return D3DERR_INVALIDCALL;
+    pitch = D3DFormatRowPitch(Format, Width);
+    if (pitch == 0)
+      return D3DERR_INVALIDCALL;
+    dxmt_texture = new dxmt::Texture(info, m_metalDevice);
+    dxmt::Flags<dxmt::TextureAllocationFlag> alloc_flags;
+    auto allocation = dxmt_texture->allocate(alloc_flags);
+    if (!allocation || !allocation->texture())
+      return D3DERR_OUTOFVIDEOMEMORY;
+    texture = WMT::Reference<WMT::Texture>(allocation->texture());
+    dxmt_texture->rename(std::move(allocation));
+    cpuPtr = user_memory;
   } else {
     // Lockable pools: back the texture with an MTLBuffer so LockRect
     // can hand out a CPU pointer without a getBytes copy. Pitch is
@@ -8963,6 +9008,12 @@ MTLD3D9Device::CreateOffscreenPlainSurfaceEx(
     return D3DERR_INVALIDCALL;
   if (HRESULT hr = validateCreateExUsage(Usage, pSharedHandle); hr != D3D_OK)
     return hr;
+  // The Ex entry's pSharedHandle is a cross-process shared handle, not the
+  // SYSTEMMEM user-memory overload the non-Ex method accepts. That path is
+  // unimplemented (wined3d's CreateOffscreenPlainSurfaceEx is a stub), so
+  // reject it here rather than forward into the non-Ex user-memory branch.
+  if (pSharedHandle)
+    return E_NOTIMPL;
   return CreateOffscreenPlainSurface(Width, Height, Format, Pool, ppSurface, pSharedHandle);
 }
 HRESULT STDMETHODCALLTYPE

@@ -23,11 +23,17 @@ buildLevelsAndMirror(
     D3DPOOL pool, WMT::Texture parentTex, WMT::Buffer backingBuffer, void *backingPtr, uint32_t bufferPitch,
     const Rc<dxmt::Texture> &dxmtTexture, WMT::Reference<WMT::Buffer> &mirrorBufferOut, void *&mirrorBackingOut,
     std::vector<size_t> &mirrorOffsets, std::vector<Com<MTLD3D9Surface, false>> &levelsOut,
-    WMTPixelFormat &metalFormatOut
+    WMTPixelFormat &metalFormatOut, void *userMemory
 ) {
   metalFormatOut = parentTex.pixelFormat();
 
   const bool buffer_backed = (backingBuffer != nullptr);
+  // D3D9Ex user-memory (single level): the app pointer is the packed CPU
+  // master. Seed it as the mirror base so mirrorBase() / UpdateTexture
+  // source from it directly and ensureMirror early-outs; level 0 aliases
+  // it for LockRect below. No mirror buffer, no copy.
+  if (userMemory)
+    mirrorBackingOut = userMemory;
   // D3DUSAGE_DYNAMIC DEFAULT textures (video planes, dynamic normal maps)
   // are LockRect'd every frame to stream data; per MSDN a DYNAMIC texture
   // is lockable regardless of pool. Give them the same sysmem mirror +
@@ -78,6 +84,7 @@ buildLevelsAndMirror(
     void *cpu_ptr = nullptr;
     uint32_t pitch = 0;
     WMT::Reference<WMT::Buffer> level_buffer;
+    const bool user_mem_level = (userMemory != nullptr) && (i == 0);
     if (buffer_backed && i == 0) {
       // buffer-backed level-0: surface aliases the backing buffer's
       // bytes; Lock returns the wsi::aligned_malloc'd pointer +
@@ -86,6 +93,13 @@ buildLevelsAndMirror(
       cpu_ptr = backingPtr;
       pitch = bufferPitch;
       level_buffer = WMT::Reference<WMT::Buffer>(backingBuffer);
+    } else if (user_mem_level) {
+      // D3D9Ex user-memory level-0: alias the app pointer with a tightly
+      // packed pitch (the runtime expects packed data, never padded).
+      // m_buffer stays null so a write Unlock takes the dirty-record
+      // path; the GPU side is fed by UpdateTexture from mirrorBase().
+      cpu_ptr = userMemory;
+      pitch = D3DFormatRowPitch(format, level_w);
     }
     // For needs_mirror surfaces (MANAGED/SYSTEMMEM/SCRATCH non-buffer-
     // backed), cpu_ptr/mirror_src/pitch stay null until ensureMirror
@@ -113,7 +127,7 @@ buildLevelsAndMirror(
         // Sub-resource: the level shares this texture's public refcount.
         /*baseTexture=*/static_cast<IDirect3DBaseTexture9 *>(self)
     );
-    if (needs_mirror)
+    if (needs_mirror && !user_mem_level)
       level->setLazyMirrorParent(self);
     levelsOut.emplace_back(level);
   }
@@ -121,11 +135,12 @@ buildLevelsAndMirror(
 
 MTLD3D9Texture::MTLD3D9Texture(
     MTLD3D9Device *device, UINT width, UINT height, UINT levels, DWORD usage, D3DFORMAT format, D3DPOOL pool,
-    Rc<dxmt::Texture> texture, uint32_t bufferPitch
+    Rc<dxmt::Texture> texture, uint32_t bufferPitch, void *userMemory
 ) :
     m_device(device),
     m_textureRaw(WMT::Reference<WMT::Texture>(texture->current()->texture())),
     m_dxmtTexture(std::move(texture)),
+    m_userMemory(userMemory != nullptr),
     m_usage(usage),
     m_pool(pool),
     m_format(format),
@@ -152,7 +167,7 @@ MTLD3D9Texture::MTLD3D9Texture(
   }
   buildLevelsAndMirror(
       this, m_device, width, height, levels, usage, format, pool, m_textureRaw, levelBackingBuffer, levelBackingPtr,
-      bufferPitch, m_dxmtTexture, m_mirrorBuffer, m_mirrorBacking, m_mirrorOffsets, m_levels, m_metalFormat
+      bufferPitch, m_dxmtTexture, m_mirrorBuffer, m_mirrorBacking, m_mirrorOffsets, m_levels, m_metalFormat, userMemory
   );
 }
 
@@ -230,7 +245,9 @@ MTLD3D9Texture::~MTLD3D9Texture() {
   // when last Rc<TextureAllocation> drops. Donating from dtor would race
   // in-flight chunks: UAF. Use post-completion hook instead. Mirror donation
   // safe: UnlockRect's blit retains buffer before dtor.
-  if (m_mirrorBacking || m_mirrorBuffer != nullptr) {
+  // User-memory textures alias the app's pointer as the mirror base; the
+  // app owns that storage, so the texture must not pool or free it.
+  if (!m_userMemory && (m_mirrorBacking || m_mirrorBuffer != nullptr)) {
     const size_t mirror_bytes = m_mirrorOffsets.empty() ? 0u : m_mirrorOffsets.back();
     m_device->releaseBufferBacking(std::move(m_mirrorBuffer), m_mirrorBacking, /*gpu_address=*/0, mirror_bytes);
     m_mirrorBacking = nullptr;

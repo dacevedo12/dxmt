@@ -28,9 +28,12 @@ public:
   // ref_tracker. Two flavours: regular (bufferPitch==0, Metal texture direct) and
   // buffer-backed (bufferPitch>0, wsi::aligned_malloc wrapped in Metal buffer).
   // Buffer path: ref_tracker keeps buffer alive to GPU completion, closing prior UAF.
+  // userMemory: D3D9Ex SYSTEMMEM user-memory (single level). The app pointer is the
+  // packed CPU master: level-0 LockRect aliases it and UpdateTexture stages from it,
+  // matching wined3d (no copy). The texture must not free it.
   MTLD3D9Texture(
       MTLD3D9Device *device, UINT width, UINT height, UINT levels, DWORD usage, D3DFORMAT format, D3DPOOL pool,
-      Rc<dxmt::Texture> texture, uint32_t bufferPitch = 0
+      Rc<dxmt::Texture> texture, uint32_t bufferPitch = 0, void *userMemory = nullptr
   );
   ~MTLD3D9Texture();
 
@@ -220,6 +223,10 @@ private:
   WMT::Reference<WMT::Buffer> m_mirrorBuffer;
   void *m_mirrorBacking = nullptr;
   std::vector<size_t> m_mirrorOffsets;
+  // D3D9Ex user-memory: m_mirrorBacking points at the app-owned packed
+  // pixel storage rather than a dxmt allocation (no m_mirrorBuffer). The
+  // dtor must not pool or free it; the app owns the lifetime.
+  bool m_userMemory = false;
   DWORD m_usage;
   D3DPOOL m_pool;
   D3DFORMAT m_format;
