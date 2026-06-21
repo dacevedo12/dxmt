@@ -309,6 +309,16 @@ private:
 
 public:
   void markLosable();
+  // D3D9Ex CreateRenderTargetEx / CreateDepthStencilSurfaceEx carry extra
+  // informational Usage bits (RESTRICTED_CONTENT, the shared-resource
+  // restrictions) that the fixed non-Ex create signature cannot thread in.
+  // The Ex method ORs them onto the base RT/DS usage before the surface
+  // reaches the app; only GetDesc reads them (dxmt does not enforce content
+  // protection).
+  void
+  addDescUsage(DWORD usage) {
+    m_desc.Usage |= usage;
+  }
 };
 
 } // namespace dxmt

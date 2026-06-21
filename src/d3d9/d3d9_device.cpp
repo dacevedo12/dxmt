@@ -8994,10 +8994,15 @@ MTLD3D9Device::CreateRenderTargetEx(
     return D3DERR_INVALIDCALL;
   if (HRESULT hr = validateCreateExUsage(Usage, pSharedHandle); hr != D3D_OK)
     return hr;
-  // dxmt doesn't yet support cross-process resource sharing, so the
-  // RESTRICT_* Usage bits are accepted but effectively ignored. The
-  // validation above is the spec-faithful part apps hr-check.
-  return CreateRenderTarget(Width, Height, Format, MultiSample, MultisampleQuality, Lockable, ppSurface, pSharedHandle);
+  // The RESTRICT_* / RESTRICTED_CONTENT bits are not enforced (no
+  // cross-process sharing or content protection yet), but D3D9Ex requires
+  // GetDesc to report the requested Usage alongside the implicit
+  // RENDERTARGET bit, so thread it onto the surface after the base create.
+  HRESULT hr =
+      CreateRenderTarget(Width, Height, Format, MultiSample, MultisampleQuality, Lockable, ppSurface, pSharedHandle);
+  if (SUCCEEDED(hr) && Usage)
+    static_cast<MTLD3D9Surface *>(*ppSurface)->addDescUsage(Usage);
+  return hr;
 }
 HRESULT STDMETHODCALLTYPE
 MTLD3D9Device::CreateOffscreenPlainSurfaceEx(
@@ -9025,9 +9030,15 @@ MTLD3D9Device::CreateDepthStencilSurfaceEx(
     return D3DERR_INVALIDCALL;
   if (HRESULT hr = validateCreateExUsage(Usage, pSharedHandle); hr != D3D_OK)
     return hr;
-  return CreateDepthStencilSurface(
+  // GetDesc must report the requested Usage alongside the implicit
+  // DEPTHSTENCIL bit (the RESTRICTED_CONTENT restriction is informational,
+  // not enforced); thread it onto the surface after the base create.
+  HRESULT hr = CreateDepthStencilSurface(
       Width, Height, Format, MultiSample, MultisampleQuality, Discard, ppSurface, pSharedHandle
   );
+  if (SUCCEEDED(hr) && Usage)
+    static_cast<MTLD3D9Surface *>(*ppSurface)->addDescUsage(Usage);
+  return hr;
 }
 HRESULT STDMETHODCALLTYPE
 MTLD3D9Device::ResetEx(D3DPRESENT_PARAMETERS *pPresentationParameters, D3DDISPLAYMODEEX *pFullscreenDisplayMode) {
