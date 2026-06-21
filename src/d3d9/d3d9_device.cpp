@@ -4361,17 +4361,30 @@ MTLD3D9Device::StretchRect(
     // emit a color-RT render pass on a DS texture.
     if (sd.Width != dd.Width || sd.Height != dd.Height)
       return D3DERR_INVALIDCALL;
+    // A multisampled depth source would need a true depth resolve: Metal
+    // does that through a render pass whose depth attachment carries a
+    // resolveTexture and a depth resolve filter (DXVK routes it through
+    // vkResolveImage's depth mode). The color resolve path below instead
+    // builds a draw-based average-resolve PSO keyed on the dst format,
+    // which is not color renderable for a depth texture and trips Metal
+    // pipeline validation. Reject until a depth-resolve encode path lands
+    // rather than crash on the invalid pipeline.
+    if (sd.MultiSampleType != D3DMULTISAMPLE_NONE) {
+      Logger::warn("d3d9: StretchRect: multisampled depth-stencil resolve is not implemented; rejecting");
+      return D3DERR_INVALIDCALL;
+    }
   }
   // Format compatibility: two cases, (1) Metal formats match (fast Blit), (2) differ but sample-compatible (render-pass
   // stretch). Also taken when extents differ regardless of format.
   bool format_mismatch = src->metalPixelFormat() != dst->metalPixelFormat();
-  // MSAA: src multisampled → dst single-sampled resolves (inverse rejected).
-  // Resolve target format must match MS source (format_mismatch=false).
+  // MSAA: a multisampled src resolves to a single-sampled dst (the inverse
+  // is rejected below). The resolve runs a fragment-average pass whose PSO
+  // is keyed on the dst format, so a format-converting resolve (e.g.
+  // multisampled A8R8G8B8 -> single R5G6B5) is allowed; the DS branch above
+  // already required matching formats for a depth resolve.
   bool needs_resolve = sd.MultiSampleType != D3DMULTISAMPLE_NONE;
   if (needs_resolve) {
     if (dd.MultiSampleType != D3DMULTISAMPLE_NONE)
-      return D3DERR_INVALIDCALL;
-    if (format_mismatch)
       return D3DERR_INVALIDCALL;
   } else if (dd.MultiSampleType != D3DMULTISAMPLE_NONE) {
     // Single-sample → multisample has no D3D9 semantics.
