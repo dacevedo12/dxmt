@@ -309,6 +309,10 @@ layout_fingerprint(const DXSO_SHADER_IA_INPUT_LAYOUT_DATA &layout) {
   mix(layout.slot_mask);
   mix(layout.num_elements);
   mix(static_cast<uint32_t>(layout.index_buffer_format));
+  // Pre-transformed draws inject the screen->clip remap into the VS
+  // epilogue, so they are a distinct variant from the same layout drawn
+  // untransformed.
+  mix(layout.position_transformed);
   for (uint32_t i = 0; i < layout.num_elements; ++i) {
     const auto &e = layout.elements[i];
     mix(e.reg);

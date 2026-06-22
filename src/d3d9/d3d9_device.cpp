@@ -6547,6 +6547,10 @@ EmitCommonRenderSetup_d9(
   enc_setbuffer(WMTRenderCommandSetVertexBuffer, cu[2].buffer, cu[2].offset, 2);
   enc_setbuffer(WMTRenderCommandSetVertexBuffer, cu[6].buffer, cu[6].offset, 3);
   enc_setbuffer(WMTRenderCommandSetVertexBuffer, cu[7].buffer, cu[7].offset, 4);
+  // Pre-transform viewport remap at VS buffer 5: only the POSITIONT VS variant
+  // declares this binding, so only bind it for those draws.
+  if (bd.resolved_position_transformed)
+    enc_setbuffer(WMTRenderCommandSetVertexBuffer, cu[8].buffer, cu[8].offset, 5);
   enc_setbuffer(WMTRenderCommandSetVertexBuffer, bd.resolved_vbuf_table_buffer, bd.resolved_vbuf_table_offset, 16);
   enc_setbuffer(WMTRenderCommandSetFragmentBuffer, cu[3].buffer, cu[3].offset, 0);
   enc_setbuffer(WMTRenderCommandSetFragmentBuffer, cu[4].buffer, cu[4].offset, 1);
@@ -6933,6 +6937,7 @@ MTLD3D9Device::ResolveBatchedDrawForChunk(
     bd.resolved_ds_level = resolve_cache.resolved_ds_level;
     bd.resolved_ds_slice = resolve_cache.resolved_ds_slice;
     bd.resolved_viewport = resolve_cache.resolved_viewport;
+    bd.resolved_position_transformed = resolve_cache.resolved_position_transformed;
     bd.resolved_scissor = resolve_cache.resolved_scissor;
     std::memcpy(bd.resolved_rt_handles, resolve_cache.resolved_rt_handles, sizeof(bd.resolved_rt_handles));
     std::memcpy(bd.resolved_rt_view, resolve_cache.resolved_rt_view, sizeof(bd.resolved_rt_view));
@@ -6962,13 +6967,26 @@ MTLD3D9Device::ResolveBatchedDrawForChunk(
     DXSO_IA_INPUT_ELEMENT elements[64];
     uint32_t element_count = 0;
     uint32_t slot_mask = 0;
+    bool decl_position_transformed = false;
     for (UINT i = 0; i < decl->elementCount(); ++i) {
       const D3DVERTEXELEMENT9 &e = decl->elements()[i];
       if (e.Stream == 0xFF)
         continue;
+      // A pre-transformed position element (D3DDECLUSAGE_POSITIONT) carries
+      // window-space coordinates. D3D9 routes such a draw through the fixed-
+      // function pre-transform (the bound vertex shader is, per spec, ignored).
+      // dxmt has no fixed-function VS generator yet, so it instead matches the
+      // POSITIONT element to the bound VS dcl_position input and appends the
+      // screen->clip remap to that VS epilogue. This is exact for the common
+      // case of a passthrough VS (mov oPos, v0); a POSITIONT draw whose VS does
+      // its own transform would be double-transformed and is the case the
+      // synthesized fixed-function VS path (not yet implemented) would cover.
+      uint32_t match_usage = e.Usage;
+      if (e.Usage == D3DDECLUSAGE_POSITIONT)
+        match_usage = D3DDECLUSAGE_POSITION;
       int vs_reg = -1;
       for (const auto &d : vs->metadata().dcls) {
-        if (d.bound_to.type == DxsoRegisterType::Input && static_cast<uint32_t>(d.dcl.usage) == e.Usage &&
+        if (d.bound_to.type == DxsoRegisterType::Input && static_cast<uint32_t>(d.dcl.usage) == match_usage &&
             d.dcl.usage_index == e.UsageIndex) {
           vs_reg = static_cast<int>(d.bound_to.num);
           break;
@@ -6976,6 +6994,10 @@ MTLD3D9Device::ResolveBatchedDrawForChunk(
       }
       if (vs_reg < 0)
         continue;
+      // Flag the draw only once the POSITIONT element actually feeds a VS input,
+      // so a declared-but-unconsumed position doesn't force the transformed variant.
+      if (e.Usage == D3DDECLUSAGE_POSITIONT)
+        decl_position_transformed = true;
       if (element_count >= 64)
         break;
       DXSO_IA_INPUT_ELEMENT &elem = elements[element_count++];
@@ -7023,6 +7045,8 @@ MTLD3D9Device::ResolveBatchedDrawForChunk(
     layout.num_elements = element_count;
     layout.elements = elements;
     layout.index_buffer_format = ib_fmt;
+    layout.position_transformed = decl_position_transformed ? 1u : 0u;
+    bd.resolved_position_transformed = decl_position_transformed;
 
     // D3DRS_POINTSIZE auto-injection: when the bound VS doesn't write
     // oPts (per metadata.writes_point_size) AND the draw is a point list
@@ -7555,6 +7579,7 @@ MTLD3D9Device::ResolveBatchedDrawForChunk(
     resolve_cache.resolved_ds_level = bd.resolved_ds_level;
     resolve_cache.resolved_ds_slice = bd.resolved_ds_slice;
     resolve_cache.resolved_viewport = bd.resolved_viewport;
+    resolve_cache.resolved_position_transformed = bd.resolved_position_transformed;
     resolve_cache.resolved_scissor = bd.resolved_scissor;
     std::memcpy(resolve_cache.resolved_rt_handles, bd.resolved_rt_handles, sizeof(resolve_cache.resolved_rt_handles));
     std::memcpy(resolve_cache.resolved_rt_view, bd.resolved_rt_view, sizeof(resolve_cache.resolved_rt_view));
@@ -7842,13 +7867,42 @@ MTLD3D9Device::ResolveBatchedDrawForChunk(
       ps_f_regs = std::min(std::max(ps_f_regs, max_def_float(ps->metadata())), D3D9_MAX_PS_CONST_F);
     const size_t vs_const_f_bytes = vs_f_regs ? static_cast<size_t>(vs_f_regs) * 16u : 16u;
     const size_t ps_const_f_bytes = ps_f_regs ? static_cast<size_t>(ps_f_regs) * 16u : 16u;
-    const size_t sz[8] = {
+    // Pre-transform viewport remap: two float4 (invExtent, invOffset) packed
+    // from the live D3D9 viewport, matching DXVK's HasPositionT constants. The
+    // POSITIONT VS variant reads this at loc 5 and applies
+    // pos = pos*invExtent + invOffset then the rhw divide. Computed for every
+    // draw (it depends only on viewport + ztest, both on the pod the const
+    // cache keys on) so a cache entry shared by a non-transformed and a
+    // transformed draw still carries the right remap; only POSITIONT draws bind
+    // it (the emit gates on resolved_position_transformed).
+    float vp_remap[8] = {};
+    {
+      const float vpW = static_cast<float>(pod.viewport.Width ? pod.viewport.Width : 1u);
+      const float vpH = static_cast<float>(pod.viewport.Height ? pod.viewport.Height : 1u);
+      const float vpX = static_cast<float>(pod.viewport.X);
+      const float vpY = static_cast<float>(pod.viewport.Y);
+      // Z passes through to clip space only when depth test is actually live (a
+      // DS is bound AND D3DRS_ZENABLE), matching DXVK IsZTestEnabled and dxmt's
+      // own depth_stencil_info gate; otherwise pre-transformed Z is forced to 0
+      // so untested UI is never depth-clipped.
+      const float zt = (bd.resolved_ds_handle != 0 && rs[D3DRS_ZENABLE] != D3DZB_FALSE) ? 1.0f : 0.0f;
+      vp_remap[0] = 2.0f / vpW;  // invExtent
+      vp_remap[1] = -2.0f / vpH;
+      vp_remap[2] = zt;
+      vp_remap[3] = 1.0f;
+      vp_remap[4] = -2.0f * vpX / vpW - 1.0f;  // invOffset = (-X,-Y,0,0)*invExtent + (-1,1,0,0)
+      vp_remap[5] = 2.0f * vpY / vpH + 1.0f;
+      vp_remap[6] = 0.0f;
+      vp_remap[7] = 0.0f;
+    }
+    const size_t sz[9] = {
         vs_const_f_bytes,       sizeof(pod.vs_const_I), sizeof(uint32_t),           ps_const_f_bytes,
         sizeof(pod.ps_const_I), sizeof(ps_b_blob),      sizeof(packed_clip_planes), sizeof(uint32_t),
+        sizeof(vp_remap),
     };
-    size_t sub_off[8];
+    size_t sub_off[9];
     size_t total = 0;
-    for (uint32_t i = 0; i < 8; ++i) {
+    for (uint32_t i = 0; i < 9; ++i) {
       sub_off[i] = total;
       total = align_up(total + sz[i], kSubAlign);
     }
@@ -7862,6 +7916,7 @@ MTLD3D9Device::ResolveBatchedDrawForChunk(
     std::memcpy(base + sub_off[5], ps_b_blob, sz[5]);
     std::memcpy(base + sub_off[6], packed_clip_planes, sz[6]);
     std::memcpy(base + sub_off[7], &clip_count, sz[7]);
+    std::memcpy(base + sub_off[8], vp_remap, sz[8]);
     // Stamp def'd float constants over the app state (see vs_needs_defs
     // above for the relative-addressing contract).
     auto apply_defs = [](char *dst, const DxsoShaderMetadata &md, uint32_t reg_count) {
@@ -7878,7 +7933,7 @@ MTLD3D9Device::ResolveBatchedDrawForChunk(
     if (ps_needs_defs)
       apply_defs(base + sub_off[3], ps->metadata(), ps_f_regs);
     const obj_handle_t buf = block.buffer.handle;
-    for (uint32_t i = 0; i < 8; ++i) {
+    for (uint32_t i = 0; i < 9; ++i) {
       bd.resolved_const_uploads[i].buffer = buf;
       bd.resolved_const_uploads[i].offset = base_off + sub_off[i];
     }

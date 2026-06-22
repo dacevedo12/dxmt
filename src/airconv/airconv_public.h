@@ -408,6 +408,13 @@ struct DXSO_SHADER_IA_INPUT_LAYOUT_DATA {
   uint32_t slot_mask;
   uint32_t num_elements;
   struct DXSO_IA_INPUT_ELEMENT *elements;
+  /* Pre-transformed (D3DDECLUSAGE_POSITIONT / D3DFVF_XYZRHW) draw: the
+     position stream is already in window space, so the VS must remap it
+     to clip space (screen->NDC + rhw divide) instead of passing it
+     through. The host packs invExtent/invOffset into a VS uniform at
+     location 5 (see compile_dxso). Matches wined3d position_transformed /
+     DXVK HasPositionT. */
+  uint32_t position_transformed;
 };
 
 /* PS-only specialisation: bake the D3D9 alpha test

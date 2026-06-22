@@ -4227,6 +4227,7 @@ struct DXSO_SHADER_IA_INPUT_LAYOUT_DATA32 {
   uint32_t slot_mask;
   uint32_t num_elements;
   uint32_t elements;
+  uint32_t position_transformed;
 };
 
 struct DXSO_SHADER_PSO_PIXEL_SHADER_DATA32 {
@@ -4291,6 +4292,7 @@ dxso_compilation_argument32_convert(
       data->slot_mask = src->slot_mask;
       data->num_elements = src->num_elements;
       data->elements = UInt32ToPtr(src->elements);
+      data->position_transformed = src->position_transformed;
       break;
     }
     case DXSO_SHADER_PSO_PIXEL_SHADER: {

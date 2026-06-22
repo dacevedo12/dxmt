@@ -51,6 +51,11 @@ compile_dxso(
   // Manual fetch is VS-only; even if the host hands a layout for a PS
   // (it shouldn't), the lowering below would have nothing to do.
   const bool manual_fetch = is_vertex && ia_layout != nullptr;
+  // Pre-transformed (POSITIONT / XYZRHW) draw: the host marks the layout so
+  // the VS epilogue remaps the window-space position to clip space instead
+  // of passing it through. wined3d/DXVK run a fixed-function pre-transform
+  // path for these; dxmt injects the same remap into the VS position write.
+  const bool position_transformed = is_vertex && ia_layout != nullptr && ia_layout->position_transformed;
   // Alpha test is PS-only and only relevant when the host explicitly
   // opts in; passing nullptr (or D3DCMP_ALWAYS) means no test snippet
   // is emitted, so the unspecialised PS keeps its current shape.
@@ -421,6 +426,25 @@ compile_dxso(
             .address_space = air::AddressSpace::constant,
             .type = air::msl_uint,
             .arg_name = "clip_count",
+            .raster_order_group = {},
+        }
+    );
+  }
+
+  // Pre-transform viewport remap: two float4 (invExtent, invOffset) packed by
+  // the host from the live D3D9 viewport. Only present for POSITIONT draws so
+  // ordinary VSes keep their current binding layout.
+  uint32_t vp_remap_arg_idx = ~0u;
+  if (position_transformed) {
+    vp_remap_arg_idx = sig.DefineInput(
+        air::ArgumentBindingBuffer{
+            .buffer_size = {},
+            .location_index = 5,
+            .array_size = 1,
+            .memory_access = air::MemoryAccess::read,
+            .address_space = air::AddressSpace::constant,
+            .type = air::msl_float4,
+            .arg_name = "vp_remap",
             .raster_order_group = {},
         }
     );
@@ -3442,7 +3466,27 @@ compile_dxso(
   } else {
     Value *retval = UndefValue::get(retTy);
     if (is_vertex) {
-      auto *pos = builder.CreateLoad(float4Ty, out_slot);
+      Value *pos = builder.CreateLoad(float4Ty, out_slot);
+      if (position_transformed) {
+        // Window-space (POSITIONT/XYZRHW) -> clip space, then the perspective
+        // rhw setup, matching wined3d/DXVK's fixed-function pre-transform path.
+        // invExtent/invOffset are the host-packed viewport remap (location 5);
+        // the rhw = 1/w divide (guarding w==0) scales xyz and replaces w so the
+        // GPU's perspective divide lands xy at the screen position.
+        auto *posFTy = Type::getFloatTy(context);
+        auto *vpPtr = fn->getArg(vp_remap_arg_idx);
+        auto *invExtent = builder.CreateLoad(float4Ty, vpPtr);
+        auto *invOffGep = builder.CreateGEP(float4Ty, vpPtr, builder.getInt32(1));
+        auto *invOffset = builder.CreateLoad(float4Ty, invOffGep);
+        pos = builder.CreateFAdd(builder.CreateFMul(pos, invExtent), invOffset);
+        Value *w = builder.CreateExtractElement(pos, builder.getInt32(3));
+        Value *isZero = builder.CreateFCmpOEQ(w, ConstantFP::get(posFTy, 0.0));
+        Value *rhw = builder.CreateSelect(
+            isZero, ConstantFP::get(posFTy, 1.0), builder.CreateFDiv(ConstantFP::get(posFTy, 1.0), w)
+        );
+        pos = builder.CreateFMul(pos, builder.CreateVectorSplat(4, rhw));
+        pos = builder.CreateInsertElement(pos, rhw, builder.getInt32(3));
+      }
       retval = builder.CreateInsertValue(retval, pos, {0});
       // User clip planes: emit clip_distance[i] = (i < clip_count)
       //   ? dot(planes[i], pos) : 0.0

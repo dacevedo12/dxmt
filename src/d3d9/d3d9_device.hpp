@@ -902,7 +902,12 @@ public:
       obj_handle_t buffer = 0;
       uint64_t offset = 0;
     };
-    std::array<ResolvedConstUpload, 8> resolved_const_uploads = {};
+    // Index 8 carries the pre-transform viewport remap (invExtent/invOffset)
+    // bound to VS buffer 5; only populated when resolved_position_transformed.
+    std::array<ResolvedConstUpload, 9> resolved_const_uploads = {};
+    // Pre-transformed (POSITIONT/XYZRHW) draw: the VS variant injects the
+    // screen->clip remap and reads the viewport uniform at VS buffer 5.
+    bool resolved_position_transformed = false;
     // Viewport / scissor pre-converted to Metal shape by Resolve (from
     // D9EncodingState's D3D9-shape fields + D3DRS_SCISSORTESTENABLE).
     // Cheap to store per-draw (one cache-line); avoids re-running the
@@ -1106,7 +1111,7 @@ private:
     // shader switches for the common case.
     const void *vs_defs_key = nullptr;
     const void *ps_defs_key = nullptr;
-    std::array<BatchedDraw::ResolvedConstUpload, 8> uploads = {};
+    std::array<BatchedDraw::ResolvedConstUpload, 9> uploads = {};
   };
   // Cluster cache for the cluster-stable resolved bundle (PSO, DSSO,
   // sampler+texture views, RT/DS resolve, viewport/scissor, IA layout
@@ -1138,6 +1143,9 @@ private:
     uint8_t resolved_raster_sample_count = 1;
     float resolved_depth_bias_scale = 1.0f;
     bool resolved_ds_has_stencil = false;
+    // Pre-transformed (POSITIONT) draw: cluster-cached so back-to-back same-state
+    // draws still bind the loc-5 viewport-remap uniform (the cached PSO declares it).
+    bool resolved_position_transformed = false;
     uint8_t resolved_rt_count = 0;
     uint32_t resolved_rt_width = 0;
     uint32_t resolved_rt_height = 0;
