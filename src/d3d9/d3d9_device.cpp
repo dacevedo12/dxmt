@@ -91,6 +91,20 @@ commonTextureFromBound(IDirect3DBaseTexture9 *iface) {
   return nullptr;
 }
 
+// D3D9 rejects a block-compressed (DXTn) resource whose requested top-level
+// (mip 0) width or height is not a whole number of 4x4 blocks, returning
+// INVALIDCALL on every pool. Lower mip levels may be sub-block (a legal 4x4
+// two-level texture has a 2x2 mip 1), so only the requested dimensions are
+// gated. Volume depth is unconstrained (block depth is always 1). wined3d
+// resource.c enforces this once at resource init; shared here by all four
+// texture/surface create entry points.
+bool
+isBlockAlignedCreate(D3DFORMAT format, UINT width, UINT height) {
+  if (!IsCompressedFormat(format))
+    return true;
+  return (width & 3u) == 0u && (height & 3u) == 0u;
+}
+
 // D3DDECLTYPE → MTLAttributeFormat (dxbc_signature.cpp mirrors the table).
 // D3DCOLOR legacy 0xAARRGGBB layout matches Metal's UChar4Normalized_BGRA.
 // UDEC3 / DEC3N packed formats need custom unpack; not covered.
@@ -2590,6 +2604,8 @@ MTLD3D9Device::CreateTexture(
     return D3DERR_INVALIDCALL;
   if (Width > 16384 || Height > 16384)
     return D3DERR_INVALIDCALL;
+  if (!isBlockAlignedCreate(Format, Width, Height))
+    return D3DERR_INVALIDCALL;
 
   // wined3d texture.c; D3DPOOL_MANAGED is invalid on d3d9ex
   // devices. (Non-Ex devices honour MANAGED; we currently downgrade
@@ -2891,6 +2907,10 @@ MTLD3D9Device::CreateVolumeTexture(
   // forwarding them to the allocator to fail as OUTOFVIDEOMEMORY.
   if (Width > 2048 || Height > 2048 || Depth > 2048)
     return D3DERR_INVALIDCALL;
+  // Block-compressed (DXTn) volumes gate width/height on the 4x4 block the
+  // same way the 2D paths do; depth is unconstrained (block depth is 1).
+  if (!isBlockAlignedCreate(Format, Width, Height))
+    return D3DERR_INVALIDCALL;
   // wined3d texture.c; D3DUSAGE_WRITEONLY is buffer-only.
   if (Usage & D3DUSAGE_WRITEONLY)
     return D3DERR_INVALIDCALL;
@@ -2903,6 +2923,10 @@ MTLD3D9Device::CreateVolumeTexture(
   default:
     return D3DERR_INVALIDCALL;
   }
+  // wined3d texture.c; D3DPOOL_MANAGED is invalid on d3d9ex. The 2D and
+  // cube create paths reject it already; this is the missing sibling.
+  if (Pool == D3DPOOL_MANAGED && m_isEx)
+    return D3DERR_INVALIDCALL;
   // D3D9 spec: volume textures can't be render targets or depth-stencil.
   if (Usage & (D3DUSAGE_RENDERTARGET | D3DUSAGE_DEPTHSTENCIL))
     return D3DERR_INVALIDCALL;
@@ -2919,14 +2943,6 @@ MTLD3D9Device::CreateVolumeTexture(
   // test asserts it), unlike the 2D and cube paths which permit SCRATCH+DYNAMIC.
   if ((Usage & D3DUSAGE_DYNAMIC) && (Pool == D3DPOOL_MANAGED || Pool == D3DPOOL_SCRATCH))
     return D3DERR_INVALIDCALL;
-  // Lower the format. Volume textures are sampled-only on Apple Silicon
-  // (no 3D RT), so use the SampleableTexture path. Compressed formats
-  // (DXT*) are NOT legal on 3D textures per D3D9 spec; D3DFormatToMetal
-  // returns WMTPixelFormatInvalid for them on the sampleable path.
-  WMTPixelFormat pixelFormat = D3DFormatToMetal(Format, D3D9FormatUsage::SampleableTexture);
-  if (pixelFormat == WMTPixelFormatInvalid)
-    return D3DERR_INVALIDCALL;
-
   UINT real_levels = Levels;
   if (real_levels == 0) {
     real_levels = 1;
@@ -2943,6 +2959,32 @@ MTLD3D9Device::CreateVolumeTexture(
     if (real_levels > max_levels)
       return D3DERR_INVALIDCALL;
   }
+
+  // Block-compressed (DXTn) volumes: Metal has no 3D block-compressed pixel
+  // format, so there is no GPU-side texture to allocate. D3D9 still permits a
+  // SCRATCH copy, a pure system-memory staging blob that is never bound or
+  // sampled; the other pools imply a GPU binding we cannot honour, and
+  // CheckDeviceFormat reports DXT volumes unsupported so the runtime makes them
+  // INVALIDCALL there. The volume is created mirror-only (no backing
+  // dxmt::Texture): LockBox serves the host mirror and the GPU push no-ops on
+  // the absent texture.
+  if (IsCompressedFormat(Format)) {
+    if (Pool != D3DPOOL_SCRATCH)
+      return D3DERR_INVALIDCALL;
+    auto *tex = new MTLD3D9VolumeTexture(
+        this, Width, Height, Depth, real_levels, Usage, Format, Pool, /*texture=*/nullptr
+    );
+    captureTextureLeafVtable(tex, kLeafVolume);
+    tex->AddRef();
+    *ppVolumeTexture = tex;
+    return D3D_OK;
+  }
+
+  // Lower the format. Volume textures are sampled-only on Apple Silicon (no 3D
+  // RT), so use the SampleableTexture path.
+  WMTPixelFormat pixelFormat = D3DFormatToMetal(Format, D3D9FormatUsage::SampleableTexture);
+  if (pixelFormat == WMTPixelFormatInvalid)
+    return D3DERR_INVALIDCALL;
 
   WMTTextureInfo info{};
   info.pixel_format = pixelFormat;
@@ -2993,6 +3035,8 @@ MTLD3D9Device::CreateCubeTexture(
   if (EdgeLength == 0)
     return D3DERR_INVALIDCALL;
   if (EdgeLength > 16384)
+    return D3DERR_INVALIDCALL;
+  if (!isBlockAlignedCreate(Format, EdgeLength, EdgeLength))
     return D3DERR_INVALIDCALL;
 
   if (Pool == D3DPOOL_MANAGED && m_isEx)
@@ -4665,6 +4709,8 @@ MTLD3D9Device::CreateOffscreenPlainSurface(
     return D3DERR_INVALIDCALL;
   if (Width > 16384 || Height > 16384)
     return D3DERR_INVALIDCALL;
+  if (!isBlockAlignedCreate(Format, Width, Height))
+    return D3DERR_INVALIDCALL;
 
   // wined3d device.c; D3DPOOL_MANAGED on offscreen plain is
   // contract-illegal (managed pool implies a GPU mirror, but offscreen
@@ -4803,11 +4849,10 @@ MTLD3D9Device::CreateOffscreenPlainSurface(
     dxmt_texture->rename(std::move(allocation));
     // DEFAULT surfaces always lockable (MSDN). Private texture can't carry CPU pointer; buffer-backed loses
     // RenderTarget (Apple Silicon disallows RT on linear textures). Solution: host-side mirror (MANAGED pattern).
-    const uint32_t block_h = IsCompressedFormat(Format) ? 4u : 1u;
     pitch = D3DFormatRowPitch(Format, Width);
     if (pitch == 0)
       return D3DERR_INVALIDCALL;
-    const uint64_t mirror_bytes = static_cast<uint64_t>(pitch) * ((Height + block_h - 1) / block_h);
+    const uint64_t mirror_bytes = static_cast<uint64_t>(pitch) * D3DFormatRowCount(Format, Height);
     ownedBacking = wsi::aligned_malloc(mirror_bytes, DXMT_PAGE_SIZE);
     if (!ownedBacking)
       return D3DERR_OUTOFVIDEOMEMORY;
@@ -4821,9 +4866,6 @@ MTLD3D9Device::CreateOffscreenPlainSurface(
     // surface stays a valid UpdateSurface source because that path stages
     // from cpuPtr(). No buffer wrap (the app pointer is neither page-
     // aligned nor dxmt-owned) and no owned backing (the app frees it).
-    uint32_t bpp = D3DFormatBytesPerPixel(Format);
-    if (bpp == 0)
-      return D3DERR_INVALIDCALL;
     pitch = D3DFormatRowPitch(Format, Width);
     if (pitch == 0)
       return D3DERR_INVALIDCALL;
@@ -4835,6 +4877,32 @@ MTLD3D9Device::CreateOffscreenPlainSurface(
     texture = WMT::Reference<WMT::Texture>(allocation->texture());
     dxmt_texture->rename(std::move(allocation));
     cpuPtr = user_memory;
+  } else if (IsCompressedFormat(Format)) {
+    // SYSTEMMEM/SCRATCH block-compressed: Metal has no buffer-backed compressed
+    // textures, so use a private Metal texture for the handle plus a host mirror
+    // for the lock pointer, the same shape as the DEFAULT branch. The handle is
+    // a CpuInvisible placeholder (never sampled; UpdateSurface/lock work off the
+    // mirror), so it carries Private storage like the DEFAULT branch rather than
+    // the Shared mode the CPU pools use for their buffer-backed textures. Pitch
+    // and backing height are counted in 4x4 blocks.
+    info.options = WMTResourceStorageModePrivate;
+    dxmt_texture = new dxmt::Texture(info, m_metalDevice);
+    dxmt::Flags<dxmt::TextureAllocationFlag> alloc_flags;
+    alloc_flags.set(dxmt::TextureAllocationFlag::CpuInvisible);
+    auto allocation = dxmt_texture->allocate(alloc_flags);
+    if (!allocation || !allocation->texture())
+      return D3DERR_OUTOFVIDEOMEMORY;
+    texture = WMT::Reference<WMT::Texture>(allocation->texture());
+    dxmt_texture->rename(std::move(allocation));
+    pitch = D3DFormatRowPitch(Format, Width);
+    if (pitch == 0)
+      return D3DERR_INVALIDCALL;
+    const uint64_t mirror_bytes = static_cast<uint64_t>(pitch) * D3DFormatRowCount(Format, Height);
+    ownedBacking = wsi::aligned_malloc(mirror_bytes, DXMT_PAGE_SIZE);
+    if (!ownedBacking)
+      return D3DERR_OUTOFVIDEOMEMORY;
+    std::memset(ownedBacking, 0, mirror_bytes);
+    cpuPtr = ownedBacking;
   } else {
     // Lockable pools: back the texture with an MTLBuffer so LockRect
     // can hand out a CPU pointer without a getBytes copy. Pitch is

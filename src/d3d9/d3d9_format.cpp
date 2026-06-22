@@ -243,6 +243,8 @@ D3DFormatRowPitch(D3DFORMAT format, uint32_t width) {
   case D3DFMT_DXT3:
   case D3DFMT_DXT4:
   case D3DFMT_DXT5:
+  // ATI2N (two BC-style channels) is also 16 bytes per 4×4 block.
+  case D3DFMT_ATI2:
     // 16 bytes per 4×4 block.
     return ((width + 3u) / 4u) * 16u;
   default: {
@@ -303,6 +305,13 @@ IsCompressedFormat(D3DFORMAT format) {
   case D3DFMT_DXT3:
   case D3DFMT_DXT4:
   case D3DFMT_DXT5:
+  // ATI2N is 4x4 block compression like the DXTn family. dxmt does not lower
+  // it to Metal BC5 yet, so D3DFormatToMetal returns Invalid. Only the volume
+  // create path realizes it (as a system-memory SCRATCH blob, the same shape
+  // as a DXTn SCRATCH volume, with the block geometry below); the 2D and cube
+  // paths gate scratchability on IsScratchableUnsupportedFormat, which omits
+  // ATI2, so they return INVALIDCALL for it.
+  case D3DFMT_ATI2:
     return true;
   default:
     return false;

@@ -122,6 +122,16 @@ MTLD3D9Volume::LockBox(D3DLOCKED_BOX *pLockedVolume, const D3DBOX *pBox, DWORD F
     if (pBox->Right <= pBox->Left || pBox->Bottom <= pBox->Top || pBox->Back <= pBox->Front ||
         pBox->Right > m_desc.Width || pBox->Bottom > m_desc.Height || pBox->Back > m_desc.Depth)
       return D3DERR_INVALIDCALL;
+    // Block-compressed (DXTn) volumes require block-aligned box edges. Unlike
+    // 2D surfaces, volumes enforce this on EVERY pool (wined3d forgives a
+    // misaligned box only for buffers and 2D textures; a 3D texture never gets
+    // that escape), so the gate is unconditional. Depth (Front/Back) is not
+    // block compressed. right/bottom may sit at the volume extent.
+    if (IsCompressedFormat(m_desc.Format) &&
+        ((pBox->Left & 3) || (pBox->Top & 3) ||
+         ((pBox->Right & 3) && pBox->Right != m_desc.Width) ||
+         ((pBox->Bottom & 3) && pBox->Bottom != m_desc.Height)))
+      return D3DERR_INVALIDCALL;
     x0 = pBox->Left;
     y0 = pBox->Top;
     z0 = pBox->Front;
@@ -129,18 +139,21 @@ MTLD3D9Volume::LockBox(D3DLOCKED_BOX *pLockedVolume, const D3DBOX *pBox, DWORD F
     h = pBox->Bottom - pBox->Top;
     d = pBox->Back - pBox->Front;
   }
-  // Compute the byte offset of the locked box's first byte into the
-  // mirror. Uncompressed only; volume textures are never block-
-  // compressed in D3D9 (DXT* are 2D-only). Column-step is bytes-per-
-  // pixel; the prior `slice_pitch / width` shape evaluated to
-  // bpp*height (since slice_pitch = row_pitch * height = bpp * width *
-  // height), so a partial LockBox with x0 > 0 wrote/read y0*height
-  // bytes past the row origin: memory smash. Match the bpp shape
-  // pushLevelToGpu uses at d3d9_volume_texture.cpp.
-  uint32_t bpp = D3DFormatBytesPerPixel(m_desc.Format);
+  // Byte offset of the locked box's first byte into the mirror. Block-
+  // compressed volumes are addressed in 4x4 blocks: the row offset steps by
+  // block rows and the column offset by bytes-per-block-column. Depth carries
+  // no block compression (block depth is 1), so z0 indexes whole slices.
+  // D3DFormatRowPitch(format, block_w) yields the bytes per block column for
+  // DXTn and the bytes-per-pixel for plain formats, so both share one path.
+  // The block gate above keeps x0/y0 block-aligned for DXTn, so the divisions
+  // are exact.
+  const uint32_t block_w = IsCompressedFormat(m_desc.Format) ? 4u : 1u;
+  const uint32_t block_h = IsCompressedFormat(m_desc.Format) ? 4u : 1u;
+  const uint32_t col_step = D3DFormatRowPitch(m_desc.Format, block_w);
   uint8_t *base = static_cast<uint8_t *>(m_cpu_ptr);
-  size_t offset =
-      static_cast<size_t>(z0) * m_slice_pitch + static_cast<size_t>(y0) * m_row_pitch + static_cast<size_t>(x0) * bpp;
+  size_t offset = static_cast<size_t>(z0) * m_slice_pitch +
+                  (static_cast<size_t>(y0) / block_h) * m_row_pitch +
+                  (static_cast<size_t>(x0) / block_w) * col_step;
   pLockedVolume->RowPitch = static_cast<INT>(m_row_pitch);
   pLockedVolume->SlicePitch = static_cast<INT>(m_slice_pitch);
   pLockedVolume->pBits = base + offset;

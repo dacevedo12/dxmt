@@ -20,7 +20,9 @@ class MTLD3D9Device;
 // IDirect3DVolumeTexture9: 3D texture used for color-grading LUTs,
 // volume rendering, and fluid-sim tables. WMTTextureType3D + per-level
 // MTLD3D9Volume, CPU mirror as std::vector (no Metal-buffer wrapper).
-// Compressed formats unsupported; mirror is pure linear (rowPitch×H×D).
+// Block-compressed (DXTn) volumes have no Metal 3D texture, so they exist
+// only as a mirror-backed SCRATCH staging copy with a null m_texture; the
+// mirror is sized in block rows (rowPitch × RowCount × depth).
 class MTLD3D9VolumeTexture final : public ComObject<IDirect3DVolumeTexture9>, public MTLD3D9CommonTexture {
 public:
   MTLD3D9VolumeTexture(
@@ -69,7 +71,9 @@ public:
   // MTLD3D9Texture / MTLD3D9CubeTexture.
   WMT::Texture
   metalTexture() const override {
-    return m_texture->current()->texture();
+    // Null for a mirror-only (block-compressed SCRATCH) volume: it has no Metal
+    // 3D texture. Such a resource is never bound, so the bind path never asks.
+    return m_texture != nullptr ? m_texture->current()->texture() : WMT::Texture{};
   }
   const Rc<dxmt::Texture> &
   dxmtTexture() const override {

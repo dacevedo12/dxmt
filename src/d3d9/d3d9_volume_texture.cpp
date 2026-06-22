@@ -26,12 +26,24 @@ MTLD3D9VolumeTexture::MTLD3D9VolumeTexture(
   m_depth_l0 = depth;
   m_dirty_box = D3DBOX{0, 0, width, height, 0, depth};
 
-  WMT::Texture parentTex = m_texture->current()->texture();
-  m_metalFormat = parentTex.pixelFormat();
+  // Block-compressed (DXTn) volumes have no Metal 3D texture (Apple Silicon has
+  // no 3D BC pixel format); they are mirror-only SCRATCH staging. m_texture is
+  // null there and m_metalFormat stays Invalid, which is fine: the resource is
+  // never sampled, and LockBox/UnlockBox work off the host mirror alone.
+  if (m_texture != nullptr) {
+    WMT::Texture parentTex = m_texture->current()->texture();
+    m_metalFormat = parentTex.pixelFormat();
+  }
 
-  // Per-level mirror sizing. Volumes can't be block-compressed in
-  // D3D9, so pitch math is plain (bpp × width × height × depth).
-  const bool needs_mirror = (pool == D3DPOOL_MANAGED || pool == D3DPOOL_SYSTEMMEM || pool == D3DPOOL_SCRATCH);
+  // Per-level mirror sizing in block rows: a slice is RowPitch x RowCount
+  // bytes, where RowCount is ceil(height/4) for the block-compressed (DXTn)
+  // volume formats D3D9 allows and plain height otherwise.
+  // DEFAULT volumes are GPU-only and unlockable, except DYNAMIC ones: per MSDN
+  // a DYNAMIC texture is lockable regardless of pool, so it gets the same
+  // sysmem mirror + upload-on-unlock as the CPU pools (matches the 2D path in
+  // buildLevelsAndMirror). Volumes are never RT/DS, so no usage guard is needed.
+  const bool needs_mirror = (pool == D3DPOOL_MANAGED || pool == D3DPOOL_SYSTEMMEM || pool == D3DPOOL_SCRATCH ||
+                             (pool == D3DPOOL_DEFAULT && (usage & D3DUSAGE_DYNAMIC)));
   m_mirrorOffsets.resize(levels + 1u);
   size_t total_bytes = 0;
   for (UINT lvl = 0; lvl < levels; ++lvl) {
@@ -39,8 +51,8 @@ MTLD3D9VolumeTexture::MTLD3D9VolumeTexture(
     UINT lh = std::max<UINT>(1u, height >> lvl);
     UINT ld = std::max<UINT>(1u, depth >> lvl);
     m_mirrorOffsets[lvl] = total_bytes;
-    total_bytes +=
-        static_cast<size_t>(D3DFormatRowPitch(format, lw)) * static_cast<size_t>(lh) * static_cast<size_t>(ld);
+    total_bytes += static_cast<size_t>(D3DFormatRowPitch(format, lw)) *
+                   static_cast<size_t>(D3DFormatRowCount(format, lh)) * static_cast<size_t>(ld);
   }
   m_mirrorOffsets[levels] = total_bytes;
   if (needs_mirror && total_bytes > 0)
@@ -67,7 +79,7 @@ MTLD3D9VolumeTexture::MTLD3D9VolumeTexture(
     if (!m_mirror.empty()) {
       cpu_ptr = m_mirror.data() + m_mirrorOffsets[lvl];
       row_pitch = D3DFormatRowPitch(format, lw);
-      slice_pitch = row_pitch * lh;
+      slice_pitch = row_pitch * D3DFormatRowCount(format, lh);
     }
     auto *vol = new MTLD3D9Volume(m_device, this, desc, lvl, cpu_ptr, row_pitch, slice_pitch);
     m_levels.emplace_back(vol);
@@ -324,6 +336,11 @@ void
 MTLD3D9VolumeTexture::pushLevelToGpu(uint32_t level, const MTLD3D9Volume *vol) {
   if (m_mirror.empty())
     return;
+  // Mirror-only block-compressed SCRATCH volumes have no GPU texture; there is
+  // nothing to push. The only current caller gates on MANAGED so this is never
+  // reached for them, but guard locally so the safety is not caller-dependent.
+  if (m_texture == nullptr)
+    return;
   WMT::Texture tex = m_texture->current()->texture();
   if (tex == nullptr)
     return;
@@ -334,15 +351,16 @@ MTLD3D9VolumeTexture::pushLevelToGpu(uint32_t level, const MTLD3D9Volume *vol) {
   if (row_pitch == 0)
     return;
 
-  // Push only the locked box, not the whole level. Source pointer
-  // walks from the mirror base + level offset + per-row/slice offset
-  // (skip src_z slices × slice_pitch, then skip src_y rows × row_pitch,
-  // then add the x pixel offset). Uncompressed only; volumes never
-  // carry block-compressed pixels in D3D9.
+  // Push only the locked box, not the whole level. Source pointer walks
+  // from the mirror base + level offset + per-row/slice offset (skip src_z
+  // slices x slice_pitch, then skip src_y rows x row_pitch, then add the x
+  // pixel offset). The per-slice stride is block rows to match the mirror
+  // sizing; the row/column offsets stay pixel-based (block-aligned partial-box
+  // uploads of DXTn volumes are a separate gap, not reached by full-box uploads).
   uint32_t bpp = D3DFormatBytesPerPixel(m_format);
   const uint8_t *base = m_mirror.data() + m_mirrorOffsets[level];
   size_t row_off = static_cast<size_t>(vol->lockedY()) * row_pitch;
-  size_t slice_off = static_cast<size_t>(vol->lockedZ()) * row_pitch * d.Height;
+  size_t slice_off = static_cast<size_t>(vol->lockedZ()) * row_pitch * D3DFormatRowCount(m_format, d.Height);
   size_t col_off = static_cast<size_t>(vol->lockedX()) * bpp;
   const uint8_t *src = base + slice_off + row_off + col_off;
 
@@ -354,9 +372,9 @@ MTLD3D9VolumeTexture::pushLevelToGpu(uint32_t level, const MTLD3D9Volume *vol) {
   size.width = vol->lockedW();
   size.height = vol->lockedH();
   size.depth = vol->lockedD();
-  // Source slices are spaced by the full mip's slice pitch (row_pitch x
-  // mip height), which exceeds the staged box height for a sub-box upload.
-  uint32_t src_slice_pitch = row_pitch * d.Height;
+  // Source slices are spaced by the full mip's slice pitch (row_pitch x the
+  // mip's block-row count), which exceeds the staged box height for a sub-box upload.
+  uint32_t src_slice_pitch = row_pitch * D3DFormatRowCount(m_format, d.Height);
   m_device->stageTextureUpload(
       tex, m_texture, level, /*slice=*/0, origin, size, src, row_pitch, /*compressed=*/false, src_slice_pitch
   );

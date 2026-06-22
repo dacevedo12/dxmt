@@ -275,12 +275,11 @@ MTLD3D9Surface::LockRect(D3DLOCKED_RECT *pLockedRect, const RECT *pRect, DWORD F
   // DISCARD + NOOVERWRITE: NOOVERWRITE wins.
   if ((Flags & (D3DLOCK_DISCARD | D3DLOCK_NOOVERWRITE)) == (D3DLOCK_DISCARD | D3DLOCK_NOOVERWRITE))
     Flags &= ~D3DLOCK_DISCARD;
-  // Per-pixel offset math for partial-rect LockRects. Compressed
-  // formats are addressed by 4×4 blocks; pRect's left/top must be
-  // block-aligned (D3D9 contract); wined3d texture.c d3d9_texture_2d
-  // _lock_rect:142 enforces. We compute the row-byte and column-byte
-  // skip from the format's row-pitch helpers instead of a flat bpp so
-  // both DXT and uncompressed share the same math.
+  // Partial-rect LockRects derive the row-byte and column-byte skip from the
+  // format's row-pitch helpers instead of a flat bpp, so both DXT (addressed in
+  // 4x4 blocks) and uncompressed share the same offset math. The rect's
+  // left/top reaching that math are block-aligned: the validation below either
+  // accepted a block-aligned rect or nulled pRect (whole-surface lock).
   const uint32_t row_pitch = D3DFormatRowPitch(m_desc.Format, m_desc.Width);
   if (row_pitch == 0 || m_pitch == 0)
     return D3DERR_INVALIDCALL;
@@ -288,21 +287,41 @@ MTLD3D9Surface::LockRect(D3DLOCKED_RECT *pLockedRect, const RECT *pRect, DWORD F
   LONG x0 = 0;
   LONG y0 = 0;
   if (pRect) {
-    if (pRect->left < 0 || pRect->top < 0 || pRect->right > static_cast<LONG>(m_desc.Width) ||
-        pRect->bottom > static_cast<LONG>(m_desc.Height) || pRect->left >= pRect->right || pRect->top >= pRect->bottom)
-      return D3DERR_INVALIDCALL;
-    // Compressed-format block alignment: DXT/BCn surfaces are addressed
-    // in 4x4 blocks, so pRect's left/top must be multiples of 4. The
-    // byte-offset math below uses `x0 / block_h` rounding which would
-    // silently truncate an unaligned rect to the previous block start
-    // (apps would Lock at a different rect than they asked for and write
-    // out-of-bounds rows). wined3d texture.c::d3d9_texture_2d_lock_rect
-    // enforces the same gate. right/bottom may be at the surface extent
-    // (which IS block-aligned by D3D9 contract on the create).
-    if (IsCompressedFormat(m_desc.Format) && ((pRect->left & 3) || (pRect->top & 3)))
-      return D3DERR_INVALIDCALL;
-    x0 = pRect->left;
-    y0 = pRect->top;
+    if (IsCompressedFormat(m_desc.Format)) {
+      // Compressed surfaces are addressed in 4x4 blocks. The box must be in
+      // bounds, non-degenerate, and block-aligned (left/top block multiples,
+      // right/bottom block multiples or the surface extent); the byte-offset
+      // math below floors x0/y0 to the block, so an out-of-bounds or unaligned
+      // rect would otherwise point past the mirror or truncate to the previous
+      // block. The UINT casts mirror wined3d_box_set: a negative edge wraps
+      // large and trips the bounds test, matching wined3d's check_box_dimensions.
+      const UINT bl = static_cast<UINT>(pRect->left), bt = static_cast<UINT>(pRect->top);
+      const UINT br = static_cast<UINT>(pRect->right), bb = static_cast<UINT>(pRect->bottom);
+      const bool box_ok =
+          !(bl >= br || br > m_desc.Width || bt >= bb || bb > m_desc.Height) &&
+          !((bl & 3) || (bt & 3) || ((br & 3) && br != m_desc.Width) || ((bb & 3) && bb != m_desc.Height));
+      if (!box_ok) {
+        // A GPU-only (DEFAULT) DXTn surface rejects the invalid box; a CPU-pool
+        // one degrades to a whole-surface lock so the following Unlock pushes a
+        // block-aligned, in-bounds region rather than a wild sub-block. wined3d
+        // forgives the box only for CPU-resident textures (device.c map: a
+        // BLOCKS format with no CPU access fails, otherwise it proceeds).
+        if (m_desc.Pool == D3DPOOL_DEFAULT)
+          return D3DERR_INVALIDCALL;
+        pRect = nullptr;
+      } else {
+        x0 = pRect->left;
+        y0 = pRect->top;
+      }
+    } else {
+      // Uncompressed CPU-resident surfaces accept any rect, including out-of-
+      // bounds, inverted, or negative ones: D3D9 hands back a pointer whose byte
+      // offset wraps in unsigned arithmetic. wined3d's map path does no box
+      // validation; DXVK block-checks compressed formats only. The Unlock upload
+      // region is clamped to the surface extent so the GPU blit stays in bounds.
+      x0 = pRect->left;
+      y0 = pRect->top;
+    }
   }
   // DXVK d3d9_device.cpp: DISCARD is only meaningful on full-
   // extent DEFAULT-pool locks; drop it on partial-rect or non-DEFAULT.
@@ -330,6 +349,7 @@ MTLD3D9Surface::LockRect(D3DLOCKED_RECT *pLockedRect, const RECT *pRect, DWORD F
 
   // Row-byte offset: y_in_blocks * pitch. For uncompressed, blocks
   // are 1×1 so this is just y * pitch. For DXT, y must be /4 first.
+  const uint32_t block_w = IsCompressedFormat(m_desc.Format) ? 4u : 1u;
   const uint32_t block_h = IsCompressedFormat(m_desc.Format) ? 4u : 1u;
   const uint32_t row_offset = (static_cast<uint32_t>(y0) / block_h) * m_pitch;
   // Column-byte offset: same idea: bytes-per-block-column for
@@ -337,7 +357,7 @@ MTLD3D9Surface::LockRect(D3DLOCKED_RECT *pLockedRect, const RECT *pRect, DWORD F
   // row pitch and texel-per-row count to avoid a parallel switch.
   const uint32_t cols_per_row = IsCompressedFormat(m_desc.Format) ? (m_desc.Width + 3u) / 4u : m_desc.Width;
   const uint32_t col_bytes = cols_per_row > 0 ? row_pitch / cols_per_row : 0u;
-  const uint32_t col_offset = (static_cast<uint32_t>(x0) / block_h) * col_bytes;
+  const uint32_t col_offset = (static_cast<uint32_t>(x0) / block_w) * col_bytes;
 
   pLockedRect->Pitch = static_cast<INT>(m_pitch);
   pLockedRect->pBits = static_cast<uint8_t *>(m_cpu_ptr) + row_offset + col_offset;
@@ -406,11 +426,12 @@ MTLD3D9Surface::UnlockRect() {
     // through the block size to stay aligned (D3D9 contract).
     const bool compressed = IsCompressedFormat(m_desc.Format);
     const uint32_t row_pitch = D3DFormatRowPitch(m_desc.Format, m_desc.Width);
+    const uint32_t block_w = compressed ? 4u : 1u;
     const uint32_t block_h = compressed ? 4u : 1u;
     const uint32_t cols_per_row = compressed ? (m_desc.Width + 3u) / 4u : m_desc.Width;
     const uint32_t col_bytes = cols_per_row > 0 ? row_pitch / cols_per_row : 0u;
     const uint32_t src_row_off = (m_locked_y / block_h) * m_pitch;
-    const uint32_t src_col_off = (m_locked_x / block_h) * col_bytes;
+    const uint32_t src_col_off = (m_locked_x / block_w) * col_bytes;
     WMTOrigin origin{};
     origin.x = m_locked_x;
     origin.y = m_locked_y;

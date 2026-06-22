@@ -13,6 +13,12 @@ namespace dxmt {
 constexpr D3DFORMAT D3DFMT_INTZ = static_cast<D3DFORMAT>(MAKEFOURCC('I', 'N', 'T', 'Z'));
 constexpr D3DFORMAT D3DFMT_DF24 = static_cast<D3DFORMAT>(MAKEFOURCC('D', 'F', '2', '4'));
 constexpr D3DFORMAT D3DFMT_DF16 = static_cast<D3DFORMAT>(MAKEFOURCC('D', 'F', '1', '6'));
+// ATI2N (3Dc) two-channel 4x4 block compression, the same FOURCC games probe
+// inline. Metal could realize it as BC5_RGUnorm, but dxmt does not wire that
+// mapping yet, so it lowers to Invalid. The volume create path realizes it as
+// a system-memory SCRATCH blob (block geometry in IsCompressedFormat); the 2D
+// and cube create paths reject it (it is not in IsScratchableUnsupportedFormat).
+constexpr D3DFORMAT D3DFMT_ATI2 = static_cast<D3DFORMAT>(MAKEFOURCC('A', 'T', 'I', '2'));
 
 // D3DFORMAT → MTLPixelFormat lowering. Returns WMTPixelFormatInvalid for
 // unsupported formats. Usage argument selects alias for ambiguous formats
