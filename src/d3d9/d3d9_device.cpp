@@ -54,6 +54,43 @@ static_assert(D9ES_MAX_PS_CONST_B == D3D9_MAX_PS_CONST_B, "");
 
 namespace {
 
+// SetTexture and UpdateTexture receive an app-owned IDirect3DBaseTexture9 and must
+// not call through its vtable to identify it: a wrapped or hostile vtable (some
+// overlays install one, and the conformance path for this deliberately corrupts it)
+// would divert the call to garbage. Capture each texture leaf's real vtable pointer
+// when it is created and match an incoming pointer against them, the way wined3d's
+// unsafe_impl_from_IDirect3DBaseTexture9 reads the vtable pointer instead of calling
+// it. A matched leaf's MTLD3D9CommonTexture sub-object carries its own, untouched
+// vtable, so reading its type afterwards is safe.
+enum { kLeaf2D = 0, kLeafCube = 1, kLeafVolume = 2 };
+std::atomic<const void *> g_textureLeafVtable[3] = {};
+
+void
+captureTextureLeafVtable(IDirect3DBaseTexture9 *leaf, unsigned index) {
+  g_textureLeafVtable[index].store(*reinterpret_cast<const void *const *>(leaf), std::memory_order_relaxed);
+}
+
+// Returns the common texture for a recognised dxmt texture, or null for a null,
+// foreign, or hostile-vtable pointer (the caller treats that as "no texture",
+// matching wined3d). Never dereferences the app vtable.
+MTLD3D9CommonTexture *
+commonTextureFromBound(IDirect3DBaseTexture9 *iface) {
+  if (!iface)
+    return nullptr;
+  const void *vtable = *reinterpret_cast<const void *const *>(iface);
+  // A null vtable is never one of ours, and this guards the degenerate match
+  // against a capture slot that no texture of that type has populated yet.
+  if (!vtable)
+    return nullptr;
+  if (vtable == g_textureLeafVtable[kLeaf2D].load(std::memory_order_relaxed))
+    return static_cast<MTLD3D9Texture *>(static_cast<IDirect3DTexture9 *>(iface));
+  if (vtable == g_textureLeafVtable[kLeafCube].load(std::memory_order_relaxed))
+    return static_cast<MTLD3D9CubeTexture *>(static_cast<IDirect3DCubeTexture9 *>(iface));
+  if (vtable == g_textureLeafVtable[kLeafVolume].load(std::memory_order_relaxed))
+    return static_cast<MTLD3D9VolumeTexture *>(static_cast<IDirect3DVolumeTexture9 *>(iface));
+  return nullptr;
+}
+
 // D3DDECLTYPE → MTLAttributeFormat (dxbc_signature.cpp mirrors the table).
 // D3DCOLOR legacy 0xAARRGGBB layout matches Metal's UChar4Normalized_BGRA.
 // UDEC3 / DEC3N packed formats need custom unpack; not covered.
@@ -2820,6 +2857,7 @@ MTLD3D9Device::CreateTexture(
   auto *tex = new MTLD3D9Texture(
       this, Width, Height, app_levels, Usage, Format, Pool, std::move(dxmt_texture), backingPitch, user_memory
   );
+  captureTextureLeafVtable(tex, kLeaf2D);
   if (Pool == D3DPOOL_DEFAULT)
     tex->markLosable();
   tex->AddRef();
@@ -2934,6 +2972,7 @@ MTLD3D9Device::CreateVolumeTexture(
 
   auto *tex =
       new MTLD3D9VolumeTexture(this, Width, Height, Depth, real_levels, Usage, Format, Pool, std::move(dxmt_texture));
+  captureTextureLeafVtable(tex, kLeafVolume);
   if (Pool == D3DPOOL_DEFAULT)
     tex->markLosable();
   tex->AddRef();
@@ -3085,6 +3124,7 @@ MTLD3D9Device::CreateCubeTexture(
   dxmt_texture->rename(std::move(allocation));
 
   auto *tex = new MTLD3D9CubeTexture(this, EdgeLength, app_levels, Usage, Format, Pool, std::move(dxmt_texture));
+  captureTextureLeafVtable(tex, kLeafCube);
   if (Pool == D3DPOOL_DEFAULT)
     tex->markLosable();
   tex->AddRef();
@@ -3647,12 +3687,16 @@ MTLD3D9Device::UpdateTexture(IDirect3DBaseTexture9 *pSourceTexture, IDirect3DBas
     return D3DERR_INVALIDCALL;
   if (pSourceTexture == pDestinationTexture)
     return D3DERR_INVALIDCALL;
-  D3DRESOURCETYPE src_type = pSourceTexture->GetType();
-  D3DRESOURCETYPE dst_type = pDestinationTexture->GetType();
+  // Identify both textures without calling through their app-visible vtables (see
+  // SetTexture); read each type from its own internal common-texture vtable.
+  MTLD3D9CommonTexture *src_common = commonTextureFromBound(pSourceTexture);
+  MTLD3D9CommonTexture *dst_common = commonTextureFromBound(pDestinationTexture);
+  if (!src_common || !dst_common)
+    return D3DERR_INVALIDCALL;
+  D3DRESOURCETYPE src_type = src_common->commonTextureType();
+  D3DRESOURCETYPE dst_type = dst_common->commonTextureType();
   if (src_type != dst_type)
     return D3DERR_INVALIDCALL;
-  if (src_type != D3DRTYPE_TEXTURE && src_type != D3DRTYPE_CUBETEXTURE && src_type != D3DRTYPE_VOLUMETEXTURE)
-    return D3DERR_NOTAVAILABLE;
 
   // UpdateTexture requires a SYSTEMMEM source and a DEFAULT destination. wined3d
   // rejects a MANAGED source or destination outright (d3d9 device.c gates on the
@@ -5737,26 +5781,11 @@ MTLD3D9Device::SetTexture(DWORD Stage, IDirect3DBaseTexture9 *pTexture) {
   if (slot == UINT32_MAX)
     return D3D_OK;
 
-  MTLD3D9CommonTexture *common = nullptr;
-  if (pTexture) {
-    // Dispatch to the leaf based on the D3D9 type tag, then cross-cast
-    // to MTLD3D9CommonTexture. Two static_casts because the leaf is
-    // multi-inherited (ComObject<IDirect3D*Texture9> + MTLD3D9CommonTexture);
-    // going via the leaf is the only way the C++ object model can
-    // resolve which CommonTexture sub-object to land on.
-    switch (pTexture->GetType()) {
-    case D3DRTYPE_TEXTURE:
-      common = static_cast<MTLD3D9Texture *>(static_cast<IDirect3DTexture9 *>(pTexture));
-      break;
-    case D3DRTYPE_CUBETEXTURE:
-      common = static_cast<MTLD3D9CubeTexture *>(static_cast<IDirect3DCubeTexture9 *>(pTexture));
-      break;
-    case D3DRTYPE_VOLUMETEXTURE:
-      common = static_cast<MTLD3D9VolumeTexture *>(static_cast<IDirect3DVolumeTexture9 *>(pTexture));
-      break;
-    default:
-      return D3DERR_INVALIDCALL;
-    }
+  // Identify the texture without calling through its app-visible vtable (which an
+  // overlay may have wrapped, or an app deliberately corrupted): an unrecognised
+  // non-null pointer is treated as "no texture", matching wined3d.
+  MTLD3D9CommonTexture *common = commonTextureFromBound(pTexture);
+  if (common) {
     // Cross-device check matches Set(RT|DepthStencilSurface). Same
     // reasoning: deviceRaw() avoids an AddRef/Release cycle that
     // GetDevice would force on a hot path.
