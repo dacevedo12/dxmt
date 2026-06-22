@@ -52,11 +52,16 @@ MTLD3D9StateBlock::Release() {
     return 0;
   ULONG ref = ComObject::Release();
   if (ref == 0) {
-    m_device->Release();
+    // The destructor deregisters from the device's StateBlock registry, so the
+    // device has to outlive it. Drop the device pin LAST: capture it locally
+    // (ReleasePrivate frees `this`), let the destructor run while the pin still
+    // keeps the device alive, then release the pin, which may now free it.
+    auto *device = m_device;
     if (m_self_pinned) {
       m_self_pinned = false;
       ReleasePrivate();
     }
+    device->Release();
   }
   return ref;
 }

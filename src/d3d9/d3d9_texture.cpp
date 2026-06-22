@@ -289,9 +289,13 @@ MTLD3D9Texture::Release() {
   if (ref == 0) {
     if (m_isLosable) {
       m_isLosable = false;
-      m_device->onLosableResourceDestroyed();
+      m_device->onLosableResourceDestroyed(m_losableBytes);
     }
-    m_device->Release();
+    // The destructor returns the mirror buffer backing to the device pool, so
+    // the device has to outlive it. Drop the device pin LAST: capture it
+    // (ReleasePrivate frees `this`), let the destructor run while the pin still
+    // keeps the device alive, then release the pin, which may now free it.
+    MTLD3D9Device *device = m_device;
     // Drop the ctor self-pin exactly once, matching MTLD3D9Surface.
     // Subsequent pub Get→Release cycles must NOT call ReleasePrivate
     // again; m_textures[N] / m_levels surface containers etc. may
@@ -301,6 +305,7 @@ MTLD3D9Texture::Release() {
       m_self_pinned = false;
       ReleasePrivate();
     }
+    device->Release();
   }
   return ref;
 }
