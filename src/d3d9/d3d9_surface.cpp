@@ -348,7 +348,10 @@ MTLD3D9Surface::LockRect(D3DLOCKED_RECT *pLockedRect, const RECT *pRect, DWORD F
   // 4x4 blocks) and uncompressed share the same offset math. The rect's
   // left/top reaching that math are block-aligned: the validation below either
   // accepted a block-aligned rect or nulled pRect (whole-surface lock).
-  const uint32_t row_pitch = D3DFormatRowPitch(m_desc.Format, m_desc.Width);
+  // The 'NULL' FOURCC placeholder has no real layout; CreateRenderTarget backs
+  // a lockable one with a 4-bpp (BGRA8 dummy) mirror, so report the same pitch.
+  const uint32_t row_pitch =
+      IsNullFormat(m_desc.Format) ? (m_desc.Width * 4u) : D3DFormatRowPitch(m_desc.Format, m_desc.Width);
   if (row_pitch == 0 || m_pitch == 0)
     return D3DERR_INVALIDCALL;
 
@@ -419,8 +422,11 @@ MTLD3D9Surface::LockRect(D3DLOCKED_RECT *pLockedRect, const RECT *pRect, DWORD F
   // authoritative, so they skip the download. Tested after the DISCARD
   // normalization above so a partial-rect DISCARD still reads back, matching
   // DXVK's lock order; wined3d maps the same sysmem download.
+  // A 'NULL' placeholder keeps a 1x1 dummy Metal texture behind a desc-sized
+  // mirror; its bytes are never GPU-meaningful (the slot is write-skipped), and
+  // a readback would copy the desc extent out of the 1x1 texture's bounds.
   if (m_buffer == nullptr && m_texture != nullptr && m_desc.Pool == D3DPOOL_DEFAULT &&
-      !(m_desc.Usage & D3DUSAGE_DYNAMIC) && !(Flags & D3DLOCK_DISCARD))
+      !(m_desc.Usage & D3DUSAGE_DYNAMIC) && !(Flags & D3DLOCK_DISCARD) && !IsNullFormat(m_desc.Format))
     m_device->readbackSurfaceMirror(this);
 
   // Row-byte offset: y_in_blocks * pitch. For uncompressed, blocks
@@ -497,8 +503,11 @@ MTLD3D9Surface::UnlockRect() {
   // visible, no upload step. Mirror-backed surfaces (MANAGED, DEFAULT
   // plain, DYNAMIC textures, lockable RTs): explicit upload to the
   // Metal texture via m_uploadRing.
+  // 'NULL' placeholder: no upload (see LockRect; the 1x1 dummy texture can't
+  // take a desc-sized region and the bytes are never read by the GPU).
   if (m_buffer == nullptr && m_cpu_ptr != nullptr && m_texture != nullptr &&
-      (m_desc.Pool == D3DPOOL_MANAGED || m_desc.Pool == D3DPOOL_DEFAULT) && !m_locked_readonly) {
+      (m_desc.Pool == D3DPOOL_MANAGED || m_desc.Pool == D3DPOOL_DEFAULT) && !m_locked_readonly &&
+      !IsNullFormat(m_desc.Format) && m_locked_w > 0 && m_locked_h > 0) {
     // Push only the dirty rect to GPU. wined3d does the same; copying
     // the full level extent on every Unlock burns wine syscall RTT for
     // games that lock 100s of textures during loading. The src pointer

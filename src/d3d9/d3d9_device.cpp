@@ -2696,6 +2696,18 @@ MTLD3D9Device::CreateTexture(
   else if (Usage & D3DUSAGE_DEPTHSTENCIL)
     formatUsage = D3D9FormatUsage::DepthStencil;
   WMTPixelFormat pixelFormat = D3DFormatToMetal(Format, formatUsage);
+  // 'NULL' FOURCC render-target texture: the write-skipped placeholder
+  // CreateRenderTarget already builds for standalone surfaces. There is no
+  // real Metal format, so back it with BGRA8; the desc keeps D3DFMT_NULL and
+  // the render path drops the slot. NULL is render-target only, so a NULL
+  // without RT usage stays unsupported and falls through to the reject below.
+  // Unlike the standalone surface (1x1 dummy) and DXVK (no image at all), this
+  // allocates the full-size BGRA8 chain: the texture level/mirror machinery
+  // ties the level descs to the Metal texture dimensions, so a 1x1 split would
+  // be invasive. The backing is inert (never written, sampled, or read back),
+  // so it is correctness-neutral; shrinking it is a deferred memory tidy.
+  if (IsNullFormat(Format) && (Usage & D3DUSAGE_RENDERTARGET))
+    pixelFormat = WMTPixelFormatBGRA8Unorm;
   if (pixelFormat == WMTPixelFormatInvalid) {
     Logger::warn(str::format("d3d9: CreateTexture: unsupported format ", (unsigned)Format, " usage ", (unsigned)Usage));
     return D3DERR_INVALIDCALL;
@@ -3089,6 +3101,11 @@ MTLD3D9Device::CreateCubeTexture(
   else if (Usage & D3DUSAGE_DEPTHSTENCIL)
     formatUsage = D3D9FormatUsage::DepthStencil;
   WMTPixelFormat pixelFormat = D3DFormatToMetal(Format, formatUsage);
+  // 'NULL' FOURCC render-target cube: CheckDeviceFormat advertises NULL for
+  // cube RTs (the TEXTURE/CUBETEXTURE branch), so back it with BGRA8 like the
+  // 2D path to keep caps and create consistent. The desc keeps D3DFMT_NULL.
+  if (IsNullFormat(Format) && (Usage & D3DUSAGE_RENDERTARGET))
+    pixelFormat = WMTPixelFormatBGRA8Unorm;
   if (pixelFormat == WMTPixelFormatInvalid) {
     Logger::warn(str::format("d3d9: CreateCubeTexture: unsupported format ", (unsigned)Format, " usage ", (unsigned)Usage));
     return D3DERR_INVALIDCALL;
@@ -3420,8 +3437,11 @@ MTLD3D9Device::CreateRenderTarget(
   void *ownedBacking = nullptr;
   void *cpuPtr = nullptr;
   uint32_t pitch = 0;
-  if (Lockable && !isNullRT) {
-    pitch = D3DFormatRowPitch(Format, Width);
+  if (Lockable) {
+    // 'NULL' has no real pixel layout; treat it as the BGRA8 dummy (4 bpp) so
+    // a lockable NULL RT hands back a defined, desc-sized region. The bytes
+    // are never read by the GPU (the slot is write-skipped).
+    pitch = isNullRT ? (Width * 4u) : D3DFormatRowPitch(Format, Width);
     if (pitch == 0)
       return D3DERR_INVALIDCALL;
     const uint64_t mirror_bytes = static_cast<uint64_t>(pitch) * Height;
