@@ -231,6 +231,9 @@ private:
   // across calls, and pre-creating sidesteps a lock on the lookup
   // path.
   std::vector<Com<MTLD3D9Surface, false>> m_levels;
+  // Texture-wide Lock/GetDC coordination shared by every level surface (wined3d
+  // resource.map_count). setSharedLockState points each level at this.
+  D3D9SurfaceLockState m_shared_lock_state;
   // Per-level sysmem mirror for SYSTEMMEM/MANAGED/SCRATCH pools:
   // wsi::aligned_malloc wrapped in MTLBuffer, direct buffer→texture blit on Unlock
   // (avoids memcpy to staging ring on every Unlock: upload-heavy workloads benefit).

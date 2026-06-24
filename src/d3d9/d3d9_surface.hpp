@@ -12,6 +12,13 @@
 
 namespace dxmt {
 
+// Shared Lock/GetDC bookkeeping for all surfaces of one texture (wined3d's
+// resource.map_count + per-texture DC exclusion). See MTLD3D9Surface.
+struct D3D9SurfaceLockState {
+  uint32_t map_count = 0;
+  bool dc_open = false;
+};
+
 class MTLD3D9Device;
 class MTLD3D9Texture;
 
@@ -199,6 +206,14 @@ public:
   setLazyMirrorParent(MTLD3D9Texture *parent) {
     m_lazyMirrorParent = parent;
   }
+  // Point this surface at its parent texture's shared Lock/GetDC state so all
+  // sibling surfaces coordinate texture-wide (see D3D9SurfaceLockState). Called
+  // by the owning texture for each level/face surface it creates.
+  void
+  setSharedLockState(D3D9SurfaceLockState *state) {
+    if (state)
+      m_lock_state = state;
+  }
   void
   patchMirror(void *cpu_ptr, obj_handle_t buffer_handle, uint32_t level_offset, uint32_t pitch) {
     m_cpu_ptr = cpu_ptr;
@@ -227,6 +242,10 @@ public:
     m_dxmtTexture = std::move(dxmtTexture);
     m_metalFormat = m_texture.pixelFormat();
   }
+  // Swap the lockable host mirror across a swapchain Reset: free the old backing
+  // and adopt the new one (or null to make a no-longer-lockable backbuffer
+  // GPU-only). Defined out-of-line to keep wsi out of this header.
+  void resetLockableMirror(void *cpuPtr, uint32_t pitch, void *ownedBacking);
 
 private:
   // Lifetime: device held by surface; first public AddRef→device AddRef, last Release→device Release.
@@ -270,6 +289,15 @@ private:
   void *m_cpu_ptr = nullptr;
   uint32_t m_pitch = 0;
   bool m_locked = false;
+  // Texture-wide Lock/GetDC coordination (wined3d resource.map_count model).
+  // map_count counts every active Lock and GetDC across ALL sibling surfaces of
+  // a texture; dc_open marks that one of them holds a GDI DC. GetDC requires
+  // map_count == 0 (nothing mapped anywhere on the texture); LockRect on a
+  // sibling is allowed while another is locked but not while a DC is open. A
+  // standalone surface points at its own m_own_lock_state; 2D-texture and cube
+  // surfaces are pointed at the parent's shared instance via setSharedLockState.
+  D3D9SurfaceLockState m_own_lock_state;
+  D3D9SurfaceLockState *m_lock_state = &m_own_lock_state;
 #ifdef _WIN32
   // GDI text composition (GetDC/ReleaseDC): apps rasterize UI text into a
   // sampled texture via GDI. GetDC locks the surface and hands GDI a DC created

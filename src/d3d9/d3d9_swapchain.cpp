@@ -18,6 +18,7 @@
 #include "dxmt_presenter.hpp"
 #include "util_env.hpp"
 #include "wsi_monitor.hpp"
+#include "wsi_platform.hpp"
 #include "wsi_window.hpp"
 
 // D3DPRESENT_FORCEIMMEDIATE is a spec-defined Present dwFlags bit
@@ -40,6 +41,32 @@
 #endif
 
 namespace dxmt {
+
+// A lockable backbuffer (D3DPRESENTFLAG_LOCKABLE_BACKBUFFER) is given a host
+// mirror like a DEFAULT offscreen-plain surface: LockRect/GetDC read it back
+// from the Metal texture and upload on unlock. Non-lockable backbuffers stay
+// GPU-only (cpuPtr null, LockRect/GetDC correctly fail).
+static void
+allocLockableBackBufferMirror(
+    bool lockable, const D3DSURFACE_DESC &desc, void *&cpuPtr, uint32_t &pitch, void *&ownedBacking
+) {
+  cpuPtr = nullptr;
+  ownedBacking = nullptr;
+  pitch = 0;
+  if (!lockable)
+    return;
+  const uint32_t p = D3DFormatRowPitch(desc.Format, desc.Width);
+  if (p == 0)
+    return;
+  const uint64_t bytes = static_cast<uint64_t>(p) * D3DFormatRowCount(desc.Format, desc.Height);
+  void *mirror = wsi::aligned_malloc(bytes, DXMT_PAGE_SIZE);
+  if (!mirror)
+    return;
+  std::memset(mirror, 0, bytes);
+  cpuPtr = mirror;
+  ownedBacking = mirror;
+  pitch = p;
+}
 
 // Backbuffer texture descriptor + D3DSURFACE_DESC derived from a
 // PRESENT_PARAMETERS. Used identically by buildBackBuffer (ctor
@@ -260,6 +287,7 @@ MTLD3D9SwapChain::buildBackBuffer() {
   // their own pipelining, even though Metal's CAMetalLayer is what
   // does the actual in-flight buffering on this backend.
   m_backBuffers.reserve(count);
+  const bool lockable = (m_params.Flags & D3DPRESENTFLAG_LOCKABLE_BACKBUFFER) != 0;
   for (UINT i = 0; i < count; ++i) {
     Rc<dxmt::Texture> dxmt_bb_texture = new dxmt::Texture(info, m_device->metalDevice());
     dxmt::Flags<dxmt::TextureAllocationFlag> alloc_flags;
@@ -271,16 +299,19 @@ MTLD3D9SwapChain::buildBackBuffer() {
     }
     WMT::Texture rawTex = allocation->texture();
     dxmt_bb_texture->rename(std::move(allocation));
+    void *bbCpu = nullptr, *bbOwned = nullptr;
+    uint32_t bbPitch = 0;
+    allocLockableBackBufferMirror(lockable, desc, bbCpu, bbPitch, bbOwned);
     auto *bb = new MTLD3D9Surface(
         m_device, desc, static_cast<IDirect3DSwapChain9 *>(this), WMT::Reference<WMT::Texture>(rawTex),
         /*mipLevel=*/0,
         /*selfPin=*/false,
         /*parentTextureType=*/WMTTextureType2D,
         /*buffer=*/{},
-        /*cpuPtr=*/nullptr,
-        /*pitch=*/0,
+        /*cpuPtr=*/bbCpu,
+        /*pitch=*/bbPitch,
         /*arraySlice=*/0,
-        /*ownedBacking=*/nullptr,
+        /*ownedBacking=*/bbOwned,
         /*dxmtTexture=*/std::move(dxmt_bb_texture)
     );
     m_backBuffers.emplace_back(bb);
@@ -337,24 +368,34 @@ MTLD3D9SwapChain::ResetForDeviceReset(const D3DPRESENT_PARAMETERS &params, HWND 
 
   // Slots 0..min(old, new)-1: keep the same MTLD3D9Surface object and
   // swap its inner texture/format/desc in place.
+  const bool lockable = (params.Flags & D3DPRESENTFLAG_LOCKABLE_BACKBUFFER) != 0;
   const UINT keep = std::min<UINT>(static_cast<UINT>(m_backBuffers.size()), new_count);
   for (UINT i = 0; i < keep; ++i) {
     m_backBuffers[i]->resetBacking(
         desc, WMT::Reference<WMT::Texture>(new_raw_textures[i]), std::move(new_dxmt_textures[i])
     );
+    // Re-fit the lockable host mirror to the new extent/format (or drop it if
+    // the chain is no longer lockable); resetBacking left the old one in place.
+    void *bbCpu = nullptr, *bbOwned = nullptr;
+    uint32_t bbPitch = 0;
+    allocLockableBackBufferMirror(lockable, desc, bbCpu, bbPitch, bbOwned);
+    m_backBuffers[i]->resetLockableMirror(bbCpu, bbPitch, bbOwned);
   }
   // BackBufferCount grew: append fresh surfaces for the new tail.
   for (UINT i = keep; i < new_count; ++i) {
+    void *bbCpu = nullptr, *bbOwned = nullptr;
+    uint32_t bbPitch = 0;
+    allocLockableBackBufferMirror(lockable, desc, bbCpu, bbPitch, bbOwned);
     auto *bb = new MTLD3D9Surface(
         m_device, desc, static_cast<IDirect3DSwapChain9 *>(this), WMT::Reference<WMT::Texture>(new_raw_textures[i]),
         /*mipLevel=*/0,
         /*selfPin=*/false,
         /*parentTextureType=*/WMTTextureType2D,
         /*buffer=*/{},
-        /*cpuPtr=*/nullptr,
-        /*pitch=*/0,
+        /*cpuPtr=*/bbCpu,
+        /*pitch=*/bbPitch,
         /*arraySlice=*/0,
-        /*ownedBacking=*/nullptr,
+        /*ownedBacking=*/bbOwned,
         /*dxmtTexture=*/std::move(new_dxmt_textures[i])
     );
     m_backBuffers.emplace_back(bb);

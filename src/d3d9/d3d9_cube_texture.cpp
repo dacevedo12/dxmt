@@ -105,6 +105,11 @@ MTLD3D9CubeTexture::MTLD3D9CubeTexture(
       m_levels.emplace_back(level);
     }
   }
+  // Point every face/level surface at this cube texture's shared Lock/GetDC
+  // state so a GetDC or LockRect coordinates texture-wide (wined3d
+  // resource.map_count); two faces can be locked at once but a DC is exclusive.
+  for (auto &level : m_levels)
+    level->setSharedLockState(&m_shared_lock_state);
 }
 
 MTLD3D9CubeTexture::~MTLD3D9CubeTexture() {

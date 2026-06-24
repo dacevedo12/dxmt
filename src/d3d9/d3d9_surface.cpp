@@ -127,6 +127,15 @@ MTLD3D9Surface::markLosable() {
   }
 }
 
+void
+MTLD3D9Surface::resetLockableMirror(void *cpuPtr, uint32_t pitch, void *ownedBacking) {
+  if (m_owned_backing)
+    wsi::aligned_free(m_owned_backing);
+  m_owned_backing = ownedBacking;
+  m_cpu_ptr = cpuPtr;
+  m_pitch = pitch;
+}
+
 ULONG STDMETHODCALLTYPE
 MTLD3D9Surface::AddRef() {
   // Texture / cube mip-level surface: share the parent texture's public
@@ -315,6 +324,11 @@ MTLD3D9Surface::LockRect(D3DLOCKED_RECT *pLockedRect, const RECT *pRect, DWORD F
     return D3DERR_INVALIDCALL;
   if (m_locked)
     return D3DERR_INVALIDCALL;
+  // A GDI DC open on any sibling surface of this texture blocks LockRect
+  // texture-wide (wined3d: GetDC takes a map, and the map_count gate rejects).
+  // GetDC's own internal lock runs before it sets dc_open, so it is not blocked.
+  if (m_lock_state->dc_open)
+    return D3DERR_INVALIDCALL;
   // DXVK d3d9_device.cpp+ LockImage validation gates.
   // Pure flag normalization: no behavioural change on the sysmem-mirror
   // path (MANAGED + DYNAMIC DEFAULT). DISCARD/NOOVERWRITE are no-ops there
@@ -424,6 +438,7 @@ MTLD3D9Surface::LockRect(D3DLOCKED_RECT *pLockedRect, const RECT *pRect, DWORD F
   pLockedRect->Pitch = static_cast<INT>(m_pitch);
   pLockedRect->pBits = static_cast<uint8_t *>(m_cpu_ptr) + row_offset + col_offset;
   m_locked = true;
+  ++m_lock_state->map_count;
   // Remember the locked rect + READONLY hint so UnlockRect can do a
   // partial-extent replaceRegion (or skip it entirely on READONLY).
   // wined3d texture.c d3d9_surface_unmap pushes only the dirty rect.
@@ -471,8 +486,13 @@ MTLD3D9Surface::UnlockRect() {
   // relaxation is *only* for D3DRTYPE_TEXTURE; standalone surfaces,
   // cube faces, and swapchain backbuffers stay strict.
   if (!m_locked)
-    return m_is_texture_mip ? D3D_OK : D3DERR_INVALIDCALL;
+    // wined3d returns D3D_OK for an unlock of an unmapped surface while a GDI DC
+    // is open on the texture (WINED3D_TEXTURE_DC_IN_USE) or for a 2D-texture mip
+    // double-unlock; otherwise it is INVALIDCALL.
+    return (m_is_texture_mip || m_lock_state->dc_open) ? D3D_OK : D3DERR_INVALIDCALL;
   m_locked = false;
+  if (m_lock_state->map_count > 0)
+    --m_lock_state->map_count;
   // Buffer-backed surfaces (SYSTEMMEM/SCRATCH offscreen-plain): GPU-
   // visible, no upload step. Mirror-backed surfaces (MANAGED, DEFAULT
   // plain, DYNAMIC textures, lockable RTs): explicit upload to the
@@ -545,6 +565,11 @@ MTLD3D9Surface::GetDC(HDC *phdc) {
     return D3DERR_INVALIDCALL;
   if (!IsGetDCCompatibleFormat(m_desc.Format))
     return D3DERR_INVALIDCALL;
+  // wined3d: GetDC requires the whole texture to be unmapped (resource.map_count
+  // == 0). A DC is exclusive per texture and cannot be taken while any sibling
+  // surface is locked or already holds a DC.
+  if (m_lock_state->map_count > 0)
+    return D3DERR_INVALIDCALL;
 
   D3DLOCKED_RECT locked{};
   HRESULT hr = LockRect(&locked, nullptr, 0);
@@ -570,6 +595,7 @@ MTLD3D9Surface::GetDC(HDC *phdc) {
   }
   m_gdi_dc = create.hDc;
   m_gdi_bitmap = create.hBitmap;
+  m_lock_state->dc_open = true;
   *phdc = m_gdi_dc;
   return D3D_OK;
 #else
@@ -589,8 +615,10 @@ MTLD3D9Surface::ReleaseDC(HDC hdc) {
   d3dkmtDestroyDCFromMemory(&destroy);
   m_gdi_dc = nullptr;
   m_gdi_bitmap = nullptr;
+  m_lock_state->dc_open = false;
   // UnlockRect uploads the GDI-modified bytes to the Metal texture (the text
-  // quad samples them) through the same path a write-Lock uses.
+  // quad samples them) through the same path a write-Lock uses, and releases
+  // this surface's hold on the shared map_count.
   return UnlockRect();
 #else
   (void)hdc;

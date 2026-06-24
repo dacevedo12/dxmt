@@ -172,6 +172,10 @@ MTLD3D9Texture::MTLD3D9Texture(
   // One bit per mip level for the MANAGED mirror-eviction bookkeeping; a
   // 15-level (16K) texture fits a uint32 with room to spare.
   m_all_levels_mask = levels >= 32 ? ~0u : ((1u << levels) - 1u);
+  // Point every level surface at this texture's shared Lock/GetDC state so a
+  // GetDC or LockRect coordinates texture-wide (wined3d resource.map_count).
+  for (auto &level : m_levels)
+    level->setSharedLockState(&m_shared_lock_state);
 }
 
 void

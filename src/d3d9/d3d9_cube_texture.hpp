@@ -185,6 +185,9 @@ private:
   // is on the bind path so a vector lookup is cheaper than a
   // synchronization primitive.
   std::vector<Com<MTLD3D9Surface, false>> m_levels;
+  // Texture-wide Lock/GetDC coordination shared by every face/level surface
+  // (wined3d resource.map_count). Each surface is pointed at this in the ctor.
+  D3D9SurfaceLockState m_shared_lock_state;
   // Sysmem mirror for non-DEFAULT pools, sized for 6 faces × N
   // levels. Layout matches m_levels: face-major, then level. Per-
   // face/level offset table; total bytes at m_mirrorOffsets.back().
