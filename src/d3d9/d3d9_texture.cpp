@@ -169,6 +169,9 @@ MTLD3D9Texture::MTLD3D9Texture(
       this, m_device, width, height, levels, usage, format, pool, m_textureRaw, levelBackingBuffer, levelBackingPtr,
       bufferPitch, m_dxmtTexture, m_mirrorBuffer, m_mirrorBacking, m_mirrorOffsets, m_levels, m_metalFormat, userMemory
   );
+  // One bit per mip level for the MANAGED mirror-eviction bookkeeping; a
+  // 15-level (16K) texture fits a uint32 with room to spare.
+  m_all_levels_mask = levels >= 32 ? ~0u : ((1u << levels) - 1u);
 }
 
 void
@@ -235,6 +238,80 @@ MTLD3D9Texture::ensureMirror() {
     uint32_t pitch = D3DFormatRowPitch(m_format, level_w);
     m_levels[i]->patchMirror(level_ptr, m_mirrorBuffer.handle, static_cast<uint32_t>(m_mirrorOffsets[i]), pitch);
   }
+}
+
+// An app that reads a MANAGED texture back more than this many times keeps its
+// mirror resident: re-downloading on every read would thrash. Mirrors wined3d's
+// download_count > WINED3D_TEXTURE_DYNAMIC_MAP_THRESHOLD guard in evict_sysmem.
+static constexpr uint32_t kMirrorReadEvictThreshold = 4;
+
+void
+MTLD3D9Texture::dropMirror() {
+  if (m_userMemory || m_mirrorBacking == nullptr)
+    return;
+  // The level surfaces share one backing, and D3D9 lets an app hold two mip
+  // levels locked at once: freeing while any level is locked would yank the
+  // backing out from under a live pBits. Skip; the next write-Unlock retries
+  // (m_uploaded_mask stays complete until the drop actually happens).
+  for (auto &level : m_levels)
+    if (level->locked())
+      return;
+  // The GPU never samples the mirror buffer (UnlockRect snapshots into the
+  // upload ring rather than blitting from the mirror), so releasing it cannot
+  // race in-flight work. Null every level surface's cpu_ptr so the next Lock
+  // re-arms ensureMirror, then hand the backing to the device pool (the byte
+  // cap there returns it to the OS when the pool is over budget).
+  for (auto &level : m_levels)
+    level->clearMirrorPatch();
+  const size_t mirror_bytes = m_mirrorOffsets.empty() ? 0u : m_mirrorOffsets.back();
+  m_device->releaseBufferBacking(std::move(m_mirrorBuffer), m_mirrorBacking, /*gpu_address=*/0, mirror_bytes);
+  m_mirrorBacking = nullptr;
+  m_mirror_stale_mask = m_all_levels_mask;
+  m_uploaded_mask = 0;
+}
+
+void
+MTLD3D9Texture::noteLevelUploaded(uint32_t level) {
+  // Only MANAGED reclaims: SYSTEMMEM/SCRATCH mirrors are the CPU master with no
+  // GPU copy to restore from, and DEFAULT/DYNAMIC stream every frame.
+  if (m_pool != D3DPOOL_MANAGED || m_userMemory || m_mirrorBacking == nullptr)
+    return;
+  if (level < 32) {
+    m_uploaded_mask |= (1u << level);
+    // The level just written matches the Metal texture again.
+    m_mirror_stale_mask &= ~(1u << level);
+  }
+  if (m_uploaded_mask == m_all_levels_mask && m_mirror_download_count <= kMirrorReadEvictThreshold)
+    dropMirror();
+}
+
+void
+MTLD3D9Texture::materializeLevelForLock(uint32_t level) {
+  if (level >= 32 || !(m_mirror_stale_mask & (1u << level)))
+    return;
+  // ensureMirror (run by the surface before this) re-allocated a blank backing;
+  // download the level's bytes back from the Metal texture so the Lock hands
+  // out the real contents.
+  if (m_mirrorBacking != nullptr && level < m_levels.size()) {
+    m_device->readbackSurfaceMirror(m_levels[level].ptr());
+    ++m_mirror_download_count;
+  }
+  m_mirror_stale_mask &= ~(1u << level);
+}
+
+void
+MTLD3D9Texture::restoreMirrorForSource() {
+  // UpdateTexture reads mirrorBase() directly; re-materialize every evicted
+  // level before it does. ensureMirror re-allocates the backing if needed.
+  if (m_mirror_stale_mask == 0)
+    return;
+  ensureMirror();
+  for (uint32_t i = 0; i < m_levels.size() && i < 32; ++i) {
+    if (m_mirror_stale_mask & (1u << i))
+      m_device->readbackSurfaceMirror(m_levels[i].ptr());
+  }
+  m_mirror_stale_mask = 0;
+  ++m_mirror_download_count;
 }
 
 MTLD3D9Texture::~MTLD3D9Texture() {

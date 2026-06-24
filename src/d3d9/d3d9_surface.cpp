@@ -12,6 +12,48 @@
 
 namespace dxmt {
 
+#ifdef _WIN32
+namespace {
+// GetDC backs a GDI device context with a bitmap created directly over the
+// surface's locked CPU bytes (D3DKMTCreateDCFromMemory), the wined3d
+// (wined3d_texture_get_dc) and DXVK (D3D9Surface::GetDC) shape. The toolchain
+// ships no DDK header for it and the import lib may not carry the symbol, so
+// declare the stable kernel-thunk ABI here and resolve the two entry points
+// from gdi32 at runtime (wine exports both, mapped to win32u NtGdiDdDDI*).
+struct D3DKMT_CREATEDCFROMMEMORY {
+  void *pMemory;
+  D3DFORMAT Format; // D3DDDIFORMAT, numerically a D3DFORMAT for these formats
+  UINT Width;
+  UINT Height;
+  UINT Pitch;
+  HDC hDeviceDc;
+  PALETTEENTRY *pColorTable;
+  HDC hDc;
+  HANDLE hBitmap;
+};
+struct D3DKMT_DESTROYDCFROMMEMORY {
+  HDC hDc;
+  HANDLE hBitmap;
+};
+
+LONG
+d3dkmtCreateDCFromMemory(D3DKMT_CREATEDCFROMMEMORY *arg) {
+  using Fn = LONG(WINAPI *)(D3DKMT_CREATEDCFROMMEMORY *);
+  static Fn fn =
+      reinterpret_cast<Fn>(::GetProcAddress(::GetModuleHandleA("gdi32.dll"), "D3DKMTCreateDCFromMemory"));
+  return fn ? fn(arg) : -1;
+}
+
+LONG
+d3dkmtDestroyDCFromMemory(const D3DKMT_DESTROYDCFROMMEMORY *arg) {
+  using Fn = LONG(WINAPI *)(const D3DKMT_DESTROYDCFROMMEMORY *);
+  static Fn fn =
+      reinterpret_cast<Fn>(::GetProcAddress(::GetModuleHandleA("gdi32.dll"), "D3DKMTDestroyDCFromMemory"));
+  return fn ? fn(arg) : -1;
+}
+} // namespace
+#endif
+
 MTLD3D9Surface::MTLD3D9Surface(
     MTLD3D9Device *device, const D3DSURFACE_DESC &desc, IUnknown *container, WMT::Reference<WMT::Texture> texture,
     uint32_t mipLevel, bool selfPin, WMTTextureType parentTextureType, WMT::Reference<WMT::Buffer> buffer, void *cpuPtr,
@@ -45,6 +87,18 @@ MTLD3D9Surface::MTLD3D9Surface(
 }
 
 MTLD3D9Surface::~MTLD3D9Surface() {
+#ifdef _WIN32
+  // A GDI DC left open at destruction (a GetDC with no matching ReleaseDC):
+  // tear it down through the same kernel thunk that created it (see GetDC).
+  // The DC's bitmap aliases the surface's CPU bytes, so destroy it before the
+  // backing it points at is freed below.
+  if (m_gdi_dc) {
+    D3DKMT_DESTROYDCFROMMEMORY destroy{};
+    destroy.hDc = m_gdi_dc;
+    destroy.hBitmap = m_gdi_bitmap;
+    d3dkmtDestroyDCFromMemory(&destroy);
+  }
+#endif
   // Drop the texture-view and the underlying MTLBuffer first so the
   // GPU stops referencing the backing before we free it. WMT::Reference
   // destructors handle the release; explicit reset for ordering clarity.
@@ -333,6 +387,14 @@ MTLD3D9Surface::LockRect(D3DLOCKED_RECT *pLockedRect, const RECT *pRect, DWORD F
                  static_cast<UINT>(pRect->bottom) >= m_desc.Height);
   if (!full_resource || m_desc.Pool != D3DPOOL_DEFAULT)
     Flags &= ~D3DLOCK_DISCARD;
+  // Re-materialize an evicted MANAGED mirror level (freed after upload to
+  // reclaim 32-bit address space) before the pointer goes out: ensureMirror
+  // above re-allocated a blank backing, so the bytes are re-downloaded from the
+  // Metal texture (the wined3d sysmem-reload shape). MANAGED always reloads:
+  // DISCARD was stripped above (it is DEFAULT-only), so there is no
+  // whole-level-overwrite hint that would let the download be skipped.
+  if (m_lazyMirrorParent && m_desc.Pool == D3DPOOL_MANAGED)
+    m_lazyMirrorParent->materializeLevelForLock(m_mip_level);
   // GPU-authoritative mirror surfaces: the contents live in the Metal
   // texture (a render pass, ColorFill, StretchRect or UpdateSurface is the
   // writer), so the host mirror is refreshed before the pointer goes out
@@ -448,6 +510,12 @@ MTLD3D9Surface::UnlockRect() {
     (void)m_mirror_level_offset;
     const void *src = static_cast<const uint8_t *>(m_cpu_ptr) + src_row_off + src_col_off;
     m_device->stageTextureUpload(m_texture, m_dxmtTexture, m_mip_level, m_array_slice, origin, size, src, m_pitch, compressed);
+    // The bytes are now snapshotted into the upload ring; the mirror is no
+    // longer referenced. A MANAGED parent reclaims it once every level has
+    // been uploaded (the level surfaces' cpu_ptr is nulled, so a later Lock
+    // re-arms ensureMirror). Must run after the last m_cpu_ptr use above.
+    if (m_lazyMirrorParent)
+      m_lazyMirrorParent->noteLevelUploaded(m_mip_level);
   }
   // Reset locked-rect bookkeeping so a subsequent LockRect with a
   // wider area doesn't accidentally inherit stale narrow bounds.
@@ -458,16 +526,76 @@ MTLD3D9Surface::UnlockRect() {
 }
 
 HRESULT STDMETHODCALLTYPE
-MTLD3D9Surface::GetDC(HDC *) {
-  // GDI-compatible surface readback. Apple Silicon has no GDI; only
-  // the LOCKABLE+GDI_COMPATIBLE backbuffer path could ever return a
-  // real HDC, and dxmt does not currently expose one.
+MTLD3D9Surface::GetDC(HDC *phdc) {
+#ifdef _WIN32
+  // GDI text composition: some apps rasterize UI text into a sampled texture by
+  // GetDC'ing the surface, drawing glyphs with GDI, then ReleaseDC. wined3d
+  // (wined3d_texture_get_dc) and DXVK both back the DC with a bitmap created
+  // directly over the surface's locked CPU bytes via D3DKMTCreateDCFromMemory,
+  // so GDI paints into the exact memory LockRect exposes and UnlockRect uploads
+  // to the Metal texture. Every coherence concern (download-on-lock,
+  // upload-on-unlock, mirror residency) is delegated to the lock path instead
+  // of a second hand-managed copy. The padded lock pitch satisfies GDI's
+  // DWORD-aligned stride because the surface pitch is always 4-byte aligned.
+  // Leave *phdc untouched on every failure path: D3D9 only writes it on success
+  // (a failed GetDC must not clobber the caller's HDC). Matches DXVK.
+  if (!phdc)
+    return D3DERR_INVALIDCALL;
+  if (m_gdi_dc != nullptr) // a DC is already open on this surface
+    return D3DERR_INVALIDCALL;
+  if (!IsGetDCCompatibleFormat(m_desc.Format))
+    return D3DERR_INVALIDCALL;
+
+  D3DLOCKED_RECT locked{};
+  HRESULT hr = LockRect(&locked, nullptr, 0);
+  if (FAILED(hr))
+    return hr;
+
+  D3DKMT_CREATEDCFROMMEMORY create{};
+  create.pMemory = locked.pBits;
+  create.Format = m_desc.Format;
+  create.Width = m_desc.Width;
+  create.Height = m_desc.Height;
+  create.Pitch = static_cast<UINT>(locked.Pitch);
+  create.hDeviceDc = ::CreateCompatibleDC(nullptr);
+  create.pColorTable = nullptr;
+  // The output bitmap/DC own the memory mapping; the device DC is only needed
+  // for the call and is freed regardless of outcome (DXVK does the same).
+  LONG status = d3dkmtCreateDCFromMemory(&create);
+  if (create.hDeviceDc)
+    ::DeleteDC(create.hDeviceDc);
+  if (status != 0 || create.hDc == nullptr) {
+    UnlockRect();
+    return D3DERR_INVALIDCALL;
+  }
+  m_gdi_dc = create.hDc;
+  m_gdi_bitmap = create.hBitmap;
+  *phdc = m_gdi_dc;
+  return D3D_OK;
+#else
+  (void)phdc;
   return D3DERR_INVALIDCALL;
+#endif
 }
 
 HRESULT STDMETHODCALLTYPE
-MTLD3D9Surface::ReleaseDC(HDC) {
+MTLD3D9Surface::ReleaseDC(HDC hdc) {
+#ifdef _WIN32
+  if (m_gdi_dc == nullptr || hdc != m_gdi_dc)
+    return D3DERR_INVALIDCALL;
+  D3DKMT_DESTROYDCFROMMEMORY destroy{};
+  destroy.hDc = m_gdi_dc;
+  destroy.hBitmap = m_gdi_bitmap;
+  d3dkmtDestroyDCFromMemory(&destroy);
+  m_gdi_dc = nullptr;
+  m_gdi_bitmap = nullptr;
+  // UnlockRect uploads the GDI-modified bytes to the Metal texture (the text
+  // quad samples them) through the same path a write-Lock uses.
+  return UnlockRect();
+#else
+  (void)hdc;
   return D3DERR_INVALIDCALL;
+#endif
 }
 
 } // namespace dxmt

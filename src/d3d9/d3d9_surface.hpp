@@ -171,6 +171,10 @@ public:
     };
   }
   bool
+  locked() const {
+    return m_locked;
+  }
+  bool
   lockedReadOnly() const {
     return m_locked_readonly;
   }
@@ -201,6 +205,15 @@ public:
     m_mirror_src_buffer = buffer_handle;
     m_mirror_level_offset = level_offset;
     m_pitch = pitch;
+  }
+  // Inverse of patchMirror for MANAGED mirror eviction (MTLD3D9Texture::
+  // dropMirror): null the CPU pointer so the next LockRect re-arms the mirror
+  // through m_lazyMirrorParent->ensureMirror(). The lazy back-pointer stays
+  // set; ensureMirror re-patches every level on the re-allocation.
+  void
+  clearMirrorPatch() {
+    m_cpu_ptr = nullptr;
+    m_mirror_src_buffer = 0;
   }
 
   // Swap Metal backing in place (swapchain ResetForDeviceReset).
@@ -257,6 +270,16 @@ private:
   void *m_cpu_ptr = nullptr;
   uint32_t m_pitch = 0;
   bool m_locked = false;
+#ifdef _WIN32
+  // GDI text composition (GetDC/ReleaseDC): apps rasterize UI text into a
+  // sampled texture via GDI. GetDC locks the surface and hands GDI a DC created
+  // directly over the locked bytes (D3DKMTCreateDCFromMemory), so GDI paints
+  // into the same memory LockRect exposes and UnlockRect uploads. Matches
+  // wined3d's get_dc and DXVK's D3D9Surface::GetDC. These handles are live only
+  // between a GetDC and its matching ReleaseDC.
+  HDC m_gdi_dc = nullptr;
+  HANDLE m_gdi_bitmap = nullptr;
+#endif
   // True iff the parent container is a D3DRTYPE_TEXTURE (2D). Toggles
   // the relaxed double-Unlock contract: wined3d surface.c returns
   // D3D_OK for a double-unlock when the container is a 2D texture and

@@ -1080,6 +1080,7 @@ MTLD3D9Device::acquireBufferBacking(
       out_owned = it->owned_backing;
       out_host = it->owned_backing;
       out_gpu = it->gpu_address;
+      m_bufferBackingPoolBytes -= it->capacity;
       m_bufferBackingPool.erase(it);
       return true;
     }
@@ -1091,10 +1092,11 @@ void
 MTLD3D9Device::releaseBufferBacking(
     WMT::Reference<WMT::Buffer> &&buffer, void *owned, uint64_t gpu_address, size_t capacity
 ) {
-  if (m_bufferBackingPool.size() >= kMaxBufferBackingPoolSize) {
-    // Pool full: drop on the floor. The moved-in WMT::Reference
-    // releases the Metal buffer when it goes out of scope below; we
-    // free the wsi backing here.
+  if (m_bufferBackingPool.size() >= kMaxBufferBackingPoolSize ||
+      m_bufferBackingPoolBytes + capacity > kMaxBufferBackingPoolBytes) {
+    // Pool full (by count or by bytes): drop on the floor. The moved-in
+    // WMT::Reference releases the Metal buffer when it goes out of scope
+    // below; we free the wsi backing here.
     buffer = WMT::Reference<WMT::Buffer>{};
     if (owned)
       wsi::aligned_free(owned);
@@ -1105,6 +1107,7 @@ MTLD3D9Device::releaseBufferBacking(
   entry.owned_backing = owned;
   entry.gpu_address = gpu_address;
   entry.capacity = capacity;
+  m_bufferBackingPoolBytes += capacity;
   m_bufferBackingPool.push_back(std::move(entry));
 }
 
@@ -1202,6 +1205,7 @@ MTLD3D9Device::~MTLD3D9Device() {
         wsi::aligned_free(entry.owned_backing);
     }
     m_bufferBackingPool.clear();
+    m_bufferBackingPoolBytes = 0;
   }
   // A BeginStateBlock with no matching EndStateBlock leaves the
   // recording block holding only its ctor self-pin (no public ref was
@@ -1761,7 +1765,11 @@ MTLD3D9Device::readbackSurfaceMirror(MTLD3D9Surface *surface) {
   const uint32_t pitch = surface->pitch();
   const uint32_t width = desc.Width;
   const uint32_t height = desc.Height;
-  const size_t total_bytes = static_cast<size_t>(pitch) * height;
+  // Byte counts run over block-rows, not pixel-rows: a compressed format packs
+  // 4 texel rows per row of pitch, so pitch * height would over-read by 4x. The
+  // blit's source size below stays in pixels (Metal blocks internally).
+  const uint32_t row_count = D3DFormatRowCount(desc.Format, height);
+  const size_t total_bytes = static_cast<size_t>(pitch) * row_count;
   if (surface->metalTexture().handle == 0 || surface->cpuPtr() == nullptr || total_bytes == 0)
     return;
 
@@ -1785,7 +1793,8 @@ MTLD3D9Device::readbackSurfaceMirror(MTLD3D9Surface *surface) {
 
   auto *chunk = m_dxmtQueue->CurrentChunk();
   chunk->emitcc([src_tex_retain = std::move(src_tex_retain), src_texture_handle, dst_buffer_handle, offset, pitch,
-                 width, height, src_mip, src_slice, event_handle, signal_seq](ArgumentEncodingContext &ctx) mutable {
+                 width, height, row_count, src_mip, src_slice, event_handle,
+                 signal_seq](ArgumentEncodingContext &ctx) mutable {
     ctx.startBlitPass();
     auto &cmd = ctx.encodeBlitCommand<wmtcmd_blit_copy_from_texture_to_buffer>();
     cmd.type = WMTBlitCommandCopyFromTextureToBuffer;
@@ -1797,7 +1806,7 @@ MTLD3D9Device::readbackSurfaceMirror(MTLD3D9Surface *surface) {
     cmd.dst = dst_buffer_handle;
     cmd.offset = offset;
     cmd.bytes_per_row = pitch;
-    cmd.bytes_per_image = pitch * height;
+    cmd.bytes_per_image = pitch * row_count;
     ctx.endPass();
     ctx.signalEventByHandle(event_handle, signal_seq);
   });
@@ -3781,6 +3790,9 @@ MTLD3D9Device::UpdateTexture(IDirect3DBaseTexture9 *pSourceTexture, IDirect3DBas
       return D3DERR_INVALIDCALL;
     if (src_tail.Width != dst0.Width || src_tail.Height != dst0.Height)
       return D3DERR_INVALIDCALL;
+    // A MANAGED source whose mirror was evicted after upload is
+    // re-materialized from the Metal texture first.
+    src->restoreMirrorForSource();
     // Source from the CPU mirror base, not the Metal mirror buffer: the
     // copy below stages through the upload ring from mirrorBase(), and a
     // user-memory source aliases the app pointer with no mirror buffer.

@@ -339,6 +339,21 @@ IsNullFormat(D3DFORMAT format) {
   return format == D3DFMT_NULL;
 }
 
+bool
+IsGetDCCompatibleFormat(D3DFORMAT format) {
+  switch (format) {
+  case D3DFMT_R5G6B5:
+  case D3DFMT_X1R5G5B5:
+  case D3DFMT_A1R5G5B5:
+  case D3DFMT_R8G8B8:
+  case D3DFMT_X8R8G8B8:
+  case D3DFMT_A8R8G8B8:
+    return true;
+  default:
+    return false;
+  }
+}
+
 float
 DepthBiasScale(D3DFORMAT format) {
   switch (format) {

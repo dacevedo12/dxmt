@@ -75,6 +75,12 @@ bool IsHardwarePCFDepthFormat(D3DFORMAT format);
 // `max_levels = log2(max(W,H)/4) + 1`.
 bool IsCompressedFormat(D3DFORMAT format);
 
+// Formats GetDC accepts: the uncompressed RGB color formats GDI can paint into.
+// D3DKMTCreateDCFromMemory maps each to a DIB bit-depth, so the surface's
+// stored pitch and this format agree. Matches DXVK d3d9_format.h
+// IsSurfaceGetDCCompatibleFormat and the set wined3d's get_dc accepts.
+bool IsGetDCCompatibleFormat(D3DFORMAT format);
+
 // Subset of IsDepthStencilFormat: true only for formats that carry a
 // clearable stencil aspect. D3DFMT_D24X8 is depth-stencil-shaped on the
 // Metal side (we alias to Depth32Float_Stencil8) but D3D9 forbids

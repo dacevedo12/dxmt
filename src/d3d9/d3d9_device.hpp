@@ -1278,6 +1278,13 @@ private:
     size_t capacity;
   };
   std::vector<BufferBackingPoolEntry> m_bufferBackingPool;
+  // Running sum of m_bufferBackingPool entry capacities. The count cap alone
+  // does not bound address space: MANAGED mirror eviction routes full-texture
+  // backings here, so 128 of them would re-hoard the very <4 GB space the
+  // eviction freed. Past kMaxBufferBackingPoolBytes a release frees the
+  // backing to the OS instead of pooling it (small VB/IB churn still pools
+  // freely below the cap).
+  size_t m_bufferBackingPoolBytes = 0;
   // Cap so a pathological create/destroy churn doesn't accumulate
   // unbounded VRAM. 128 entries × typical D3D9 buffer/texture sizes
   // caps worst-case pool memory in the low-hundreds-of-MB range on
@@ -1286,6 +1293,10 @@ private:
   // next level's CreateTexture could reuse them, paying the cold-
   // allocate cliff on every level boundary.
   static constexpr size_t kMaxBufferBackingPoolSize = 128;
+  // Byte budget for the pool (see m_bufferBackingPoolBytes). 64 MB absorbs a
+  // level-transition VB/IB burst while keeping the pool from re-hoarding
+  // evicted MANAGED mirrors in the scarce 32-bit address space.
+  static constexpr size_t kMaxBufferBackingPoolBytes = 64ull << 20;
   // True between BeginStateBlock and EndStateBlock. While set, every
   // Set* path validates as usual, then writes its value into
   // m_recordingBlock's snapshot storage + changed mask and returns

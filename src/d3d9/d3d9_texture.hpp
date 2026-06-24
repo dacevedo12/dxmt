@@ -110,6 +110,22 @@ public:
   // that batch-create textures up front (audit M-PERF #2).
   void ensureMirror();
 
+  // MANAGED mirror eviction, the wined3d evict_sysmem shape. A
+  // D3DPOOL_MANAGED texture's host mirror (the wsi::aligned_malloc backing in
+  // the calling process's scarce <4 GB space) is redundant once every level
+  // has been uploaded: the Metal texture is the authoritative copy and
+  // survives Reset. noteLevelUploaded records a level as GPU-resident and,
+  // when all levels are covered, frees the mirror back to the device pool so
+  // a 32-bit title reclaims that address space. ensureMirror re-allocates it
+  // lazily on a later Lock; materializeLevelForLock re-downloads a level's
+  // bytes from the Metal texture before a read-Lock hands the pointer out;
+  // restoreMirrorForSource does the same before UpdateTexture reads the
+  // mirror. A texture read back more than a small threshold keeps its mirror
+  // (wined3d's download_count heuristic) to avoid re-download thrash.
+  void noteLevelUploaded(uint32_t level);
+  void materializeLevelForLock(uint32_t level);
+  void restoreMirrorForSource();
+
   // Mirror accessors used by UpdateTexture to source from a SYSTEMMEM
   // or MANAGED master texture's CPU-side mirror buffer (allocated in
   // buildLevelsAndMirror). Empty WMT::Buffer / 0 offset on DEFAULT-pool
@@ -227,6 +243,18 @@ private:
   // pixel storage rather than a dxmt allocation (no m_mirrorBuffer). The
   // dtor must not pool or free it; the app owns the lifetime.
   bool m_userMemory = false;
+  // MANAGED mirror eviction state; see noteLevelUploaded. m_all_levels_mask
+  // has one bit per mip level (set at ctor). m_uploaded_mask accumulates
+  // uploaded levels and triggers dropMirror once it equals all_levels_mask.
+  // m_mirror_stale_mask marks levels whose mirror bytes were freed and must
+  // be re-downloaded from the Metal texture on the next read-Lock or
+  // UpdateTexture. m_mirror_download_count pins the mirror once an app reads
+  // it back repeatedly.
+  uint32_t m_all_levels_mask = 0;
+  uint32_t m_uploaded_mask = 0;
+  uint32_t m_mirror_stale_mask = 0;
+  uint32_t m_mirror_download_count = 0;
+  void dropMirror();
   DWORD m_usage;
   D3DPOOL m_pool;
   D3DFORMAT m_format;
