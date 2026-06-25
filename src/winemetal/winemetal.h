@@ -926,6 +926,7 @@ enum WMTBlitCommandType : uint16_t {
   WMTBlitCommandUpdateFence,
   WMTBlitCommandFillBuffer,
   WMTBlitCommandResolveCounters,
+  WMTBlitCommandOptimizeContentsForGPUAccess,
 };
 
 struct wmtcmd_base {
@@ -1001,6 +1002,15 @@ struct wmtcmd_blit_generate_mipmaps {
   uint16_t reserved[3];
   struct WMTMemoryPointer next;
   obj_handle_t texture;
+};
+
+struct wmtcmd_blit_optimize_contents {
+  enum WMTBlitCommandType type;
+  uint16_t reserved[3];
+  struct WMTMemoryPointer next;
+  obj_handle_t texture;
+  uint32_t slice;
+  uint32_t level;
 };
 
 struct wmtcmd_blit_fence_op {

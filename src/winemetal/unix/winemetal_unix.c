@@ -1387,6 +1387,7 @@ dxmt_apitrace_record_blit_commands(apitrace_metal_session_t *session, obj_handle
     }
     case WMTBlitCommandCopyFromTextureToBuffer:
     case WMTBlitCommandGenerateMipmaps:
+    case WMTBlitCommandOptimizeContentsForGPUAccess:
     case WMTBlitCommandResolveCounters:
       dxmt_apitrace_begin_blit_encoder_if_needed(session, encoder, state);
       dxmt_apitrace_flush_blit_ops(session, encoder, state);
@@ -2670,6 +2671,11 @@ _MTLBlitCommandEncoder_encodeCommands(void *obj) {
     case WMTBlitCommandGenerateMipmaps: {
       struct wmtcmd_blit_generate_mipmaps *body = (struct wmtcmd_blit_generate_mipmaps *)next;
       [encoder generateMipmapsForTexture:(id<MTLTexture>)body->texture];
+      break;
+    }
+    case WMTBlitCommandOptimizeContentsForGPUAccess: {
+      struct wmtcmd_blit_optimize_contents *body = (struct wmtcmd_blit_optimize_contents *)next;
+      [encoder optimizeContentsForGPUAccess:(id<MTLTexture>)body->texture slice:body->slice level:body->level];
       break;
     }
     case WMTBlitCommandUpdateFence: {

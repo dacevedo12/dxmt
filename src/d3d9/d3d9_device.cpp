@@ -8080,6 +8080,11 @@ MTLD3D9Device::FlushDrawBatch() {
           // each call via access(src, Read)+(dst, Write), matching
           // the Copy path's discipline.
           end_current_pass();
+          // The scale path samples the source in a render pass; re-tile it for
+          // GPU access first so a source last written by a blit/fill is not read
+          // through a stale GPU-compressed layout (Metal3 backend only; the
+          // StretchBlit encoder is compiled out under Metal4).
+          ctx.optimizeTextureForGPUAccess(op.src_tex, op.src_mip, op.src_slice);
           EmitStretchBlitOp_d9(ctx.stretch_blit_cmd, op);
           break;
         case MTLD3D9Device::PendingBlitOp::Kind::Resolve:

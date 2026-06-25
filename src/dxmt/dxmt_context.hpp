@@ -838,6 +838,20 @@ public:
       WMTOrigin dst_origin, WMTSize dst_size
   );
 
+  // optimizeContentsForGPUAccess on one texture subresource, as its own blit
+  // pass. A DEFAULT-pool (Private, GPU-optimized) texture written by a blit or
+  // fill can be left in a GPU-compressed layout that a render-pass sampler
+  // misreads; this re-tiles that subresource for GPU access so a subsequent
+  // sample (the StretchRect render-pass scale) reads the real texels. The Metal
+  // analogue of Vulkan's TRANSFER_DST -> SHADER_READ_ONLY transition. It is a
+  // no-op when the contents are already GPU-optimal (e.g. a render-written
+  // source), so the scaled-blit path issues it unconditionally rather than
+  // tracking each source's last-write kind. Metal3 backend only (the StretchRect
+  // scale path, its sole caller, is compiled out under Metal4).
+#if !DXMT_DX12_METAL4
+  void optimizeTextureForGPUAccess(const Rc<Texture> &texture, unsigned level, unsigned slice);
+#endif
+
   RenderEncoderData *startRenderPass(
       uint8_t dsv_planar_flags, uint8_t dsv_readonly_flags, uint8_t render_target_count, uint64_t argument_buffer_size
   );

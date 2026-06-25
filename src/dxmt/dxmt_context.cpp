@@ -2738,6 +2738,25 @@ ArgumentEncodingContext::stretchBlit(
   endPass();
 }
 
+// Only the Metal3 backend enqueues this (its sole caller is the d3d9 StretchRect
+// scale path, whose StretchBlit encoder is itself compiled out under Metal4).
+#if !DXMT_DX12_METAL4
+void
+ArgumentEncodingContext::optimizeTextureForGPUAccess(const Rc<Texture> &texture, unsigned level, unsigned slice) {
+  assert(!encoder_current);
+  // Write access: the re-tile mutates the texture's layout, so it must register
+  // as the subresource's last writer for the following sample to wait on it.
+  startBlitPass();
+  auto tex = access<PipelineStage::Compute>(texture, level, slice, ResourceAccess::Write);
+  auto &cmd = encodeBlitCommand<wmtcmd_blit_optimize_contents>();
+  cmd.type = WMTBlitCommandOptimizeContentsForGPUAccess;
+  cmd.texture = tex.handle;
+  cmd.slice = slice;
+  cmd.level = level;
+  endPass();
+}
+#endif
+
 void
 ArgumentEncodingContext::present(Rc<Texture> &texture, TextureViewKey view,
                                  Rc<Presenter> &presenter, double after,
