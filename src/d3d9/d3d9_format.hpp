@@ -44,6 +44,15 @@ uint32_t D3DFormatBytesPerPixel(D3DFORMAT format);
 // replaceRegion bytesPerRow argument on UnlockRect.
 uint32_t D3DFormatRowPitch(D3DFORMAT format, uint32_t width);
 
+// The LockRect pitch the D3D9 runtime reports to apps: the tight row
+// bytes rounded up to a 4-byte boundary. Some apps depend on the exact
+// value, not just the alignment. Matches wined3d_format_calculate_pitch
+// (align to the device surface alignment, 4) and DXVK's align(pitch, 4);
+// keep it distinct from any Metal linear-texture row alignment, which is a
+// device artifact that must not leak into the reported pitch. Returns 0
+// when the format is unsupported (D3DFormatRowPitch returned 0).
+uint32_t D3DFormatLockPitch(D3DFORMAT format, uint32_t width);
+
 // Number of rows in a level of the given format and height. For DXT
 // formats this is rows of 4×4 BLOCKS (height rounded up to a multiple
 // of 4 then divided by 4). For uncompressed formats this is just

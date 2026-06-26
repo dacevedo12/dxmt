@@ -255,6 +255,14 @@ D3DFormatRowPitch(D3DFORMAT format, uint32_t width) {
 }
 
 uint32_t
+D3DFormatLockPitch(D3DFORMAT format, uint32_t width) {
+  // Block-compressed pitches are already a multiple of 8, so the round-up
+  // is a no-op for them and exact for the uncompressed bytes-per-row.
+  uint32_t tight = D3DFormatRowPitch(format, width);
+  return (tight + 3u) & ~3u;
+}
+
+uint32_t
 D3DFormatRowCount(D3DFORMAT format, uint32_t height) {
   if (IsCompressedFormat(format))
     return (height + 3u) / 4u;

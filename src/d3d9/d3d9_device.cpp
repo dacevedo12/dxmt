@@ -4881,7 +4881,7 @@ MTLD3D9Device::CreateOffscreenPlainSurface(
     dxmt_texture->rename(std::move(allocation));
     // DEFAULT surfaces always lockable (MSDN). Private texture can't carry CPU pointer; buffer-backed loses
     // RenderTarget (Apple Silicon disallows RT on linear textures). Solution: host-side mirror (MANAGED pattern).
-    pitch = D3DFormatRowPitch(Format, Width);
+    pitch = D3DFormatLockPitch(Format, Width);
     if (pitch == 0)
       return D3DERR_INVALIDCALL;
     const uint64_t mirror_bytes = static_cast<uint64_t>(pitch) * D3DFormatRowCount(Format, Height);
@@ -4909,14 +4909,16 @@ MTLD3D9Device::CreateOffscreenPlainSurface(
     texture = WMT::Reference<WMT::Texture>(allocation->texture());
     dxmt_texture->rename(std::move(allocation));
     cpuPtr = user_memory;
-  } else if (IsCompressedFormat(Format)) {
-    // SYSTEMMEM/SCRATCH block-compressed: Metal has no buffer-backed compressed
-    // textures, so use a private Metal texture for the handle plus a host mirror
-    // for the lock pointer, the same shape as the DEFAULT branch. The handle is
-    // a CpuInvisible placeholder (never sampled; UpdateSurface/lock work off the
-    // mirror), so it carries Private storage like the DEFAULT branch rather than
-    // the Shared mode the CPU pools use for their buffer-backed textures. Pitch
-    // and backing height are counted in 4x4 blocks.
+  } else {
+    // SYSTEMMEM / SCRATCH (the CPU pools, any format): a host mirror is the
+    // lock storage and the UpdateSurface staging source; the Metal texture is
+    // a Private CpuInvisible placeholder that is never sampled (these pools
+    // are never a GPU bind or StretchRect endpoint, and every consumer reads
+    // cpuPtr()). Backing the surface with an MTLBuffer-aliased linear texture
+    // instead would force the reported pitch up to Metal's per-format row
+    // alignment, which is a device artifact: LockRect must report the D3D9
+    // pitch (D3DFormatLockPitch). Pitch and backing height count in 4x4 blocks
+    // for the compressed formats.
     info.options = WMTResourceStorageModePrivate;
     dxmt_texture = new dxmt::Texture(info, m_metalDevice);
     dxmt::Flags<dxmt::TextureAllocationFlag> alloc_flags;
@@ -4926,61 +4928,18 @@ MTLD3D9Device::CreateOffscreenPlainSurface(
       return D3DERR_OUTOFVIDEOMEMORY;
     texture = WMT::Reference<WMT::Texture>(allocation->texture());
     dxmt_texture->rename(std::move(allocation));
-    pitch = D3DFormatRowPitch(Format, Width);
+    pitch = D3DFormatLockPitch(Format, Width);
     if (pitch == 0)
       return D3DERR_INVALIDCALL;
     const uint64_t mirror_bytes = static_cast<uint64_t>(pitch) * D3DFormatRowCount(Format, Height);
+    // 32-bit WoW64: pre-allocate backing in process address space so LockRect
+    // pBits is 32-bit-addressable, and pre-fault it (see CreateVertexBuffer's
+    // matching comment for the Rosetta x86_32 first-touch cliff rationale).
     ownedBacking = wsi::aligned_malloc(mirror_bytes, DXMT_PAGE_SIZE);
     if (!ownedBacking)
       return D3DERR_OUTOFVIDEOMEMORY;
     std::memset(ownedBacking, 0, mirror_bytes);
     cpuPtr = ownedBacking;
-  } else {
-    // Lockable pools: back the texture with an MTLBuffer so LockRect
-    // can hand out a CPU pointer without a getBytes copy. Pitch is
-    // padded to the device's per-format alignment requirement.
-    uint32_t bpp = D3DFormatBytesPerPixel(Format);
-    if (bpp == 0)
-      return D3DERR_INVALIDCALL;
-    uint64_t alignment = m_metalDevice.minimumLinearTextureAlignmentForPixelFormat(pixelFormat);
-    if (alignment == 0)
-      alignment = 1;
-    uint64_t row_bytes = static_cast<uint64_t>(Width) * bpp;
-    pitch = static_cast<uint32_t>((row_bytes + alignment - 1) & ~(alignment - 1));
-    // Apps that write rows at width*bpp regardless of the reported
-    // pitch shear on the padded value (CreateTexture's zero-copy path
-    // falls back to a tight mirror for the same reason); surface the
-    // divergence until this path grows the same fallback.
-    if (pitch != row_bytes)
-      Logger::warn(str::format(
-          "d3d9: CreateOffscreenPlainSurface: padded pitch ", pitch, " (tight ", (unsigned)row_bytes,
-          ") exposed for format ", (unsigned)Format, " width ", Width
-      ));
-    const uint64_t backing_bytes = static_cast<uint64_t>(pitch) * Height;
-    // 32-bit WoW64: pre-allocate backing in process address space.
-    // LockRect pBits always 32-bit-addressable (WoW64 thunk space limit).
-    ownedBacking = wsi::aligned_malloc(backing_bytes, DXMT_PAGE_SIZE);
-    if (!ownedBacking)
-      return D3DERR_OUTOFVIDEOMEMORY;
-    // Pre-fault: see CreateVertexBuffer's matching comment for the
-    // Rosetta x86_32 first-touch cliff rationale.
-    std::memset(ownedBacking, 0, backing_bytes);
-    WMTBufferInfo binfo{};
-    binfo.length = backing_bytes;
-    binfo.options = storage;
-    binfo.memory.set(ownedBacking);
-    buffer = m_metalDevice.newBuffer(binfo);
-    if (buffer == nullptr) {
-      wsi::aligned_free(ownedBacking);
-      return D3DERR_OUTOFVIDEOMEMORY;
-    }
-    cpuPtr = ownedBacking;
-    texture = buffer.newTexture(info, /*offset=*/0, /*bytes_per_row=*/pitch);
-    if (texture == nullptr) {
-      buffer = WMT::Reference<WMT::Buffer>{};
-      wsi::aligned_free(ownedBacking);
-      return D3DERR_OUTOFVIDEOMEMORY;
-    }
   }
 
   D3DSURFACE_DESC desc{};
