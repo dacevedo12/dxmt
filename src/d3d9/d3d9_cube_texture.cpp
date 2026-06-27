@@ -26,9 +26,10 @@ MTLD3D9CubeTexture::MTLD3D9CubeTexture(
 
   // Per-bind sample views (sRGB / swizzle) are resolved off m_texture
   // via dxmt::Texture::createView, which carries the parent's TextureCube
-  // type; the cube only caches its metal pixel format here.
-  WMT::Texture parentTex = m_texture->current()->texture();
-  m_metalFormat = parentTex.pixelFormat();
+  // type; the cube only caches its metal pixel format here. A texture-less
+  // mirror (packed-YUV SCRATCH) has no parent and is CPU-only.
+  WMT::Texture parentTex = m_texture ? m_texture->current()->texture() : WMT::Texture();
+  m_metalFormat = parentTex ? parentTex.pixelFormat() : WMTPixelFormatInvalid;
 
   // Sysmem mirror for non-DEFAULT pools. Layout matches m_levels:
   // face-major, then level. m_mirrorOffsets[face*levels + lvl] is the

@@ -84,6 +84,21 @@ bool IsHardwarePCFDepthFormat(D3DFORMAT format);
 // `max_levels = log2(max(W,H)/4) + 1`.
 bool IsCompressedFormat(D3DFORMAT format);
 
+// True for formats Metal cannot realize (no equivalent MTLPixelFormat) but that
+// D3D9 still permits as a system-memory SCRATCH resource: packed YUV (YUY2,
+// UYVY). The create paths build these mirror-only (no backing dxmt::Texture);
+// any non-SCRATCH pool stays D3DERR_INVALIDCALL, and CheckDeviceFormat keeps
+// reporting them NOTAVAILABLE. Mirrors DXVK's unsupported-but-scratchable path.
+bool IsScratchableUnsupportedFormat(D3DFORMAT format);
+
+// Block dimensions in texels: DXTn are 4x4, packed-YUV (YUY2/UYVY) are 2x1
+// (a macropixel spans two horizontal texels), every other format is 1x1.
+// LockBox uses these to reject partial-block boxes and to step the byte
+// offset in whole blocks. Mirrors wined3d's per-format block_width/
+// block_height table and DXVK's block-extent info.
+uint32_t D3DFormatBlockWidth(D3DFORMAT format);
+uint32_t D3DFormatBlockHeight(D3DFORMAT format);
+
 // Formats GetDC accepts: the uncompressed RGB color formats GDI can paint into.
 // D3DKMTCreateDCFromMemory maps each to a DIB bit-depth, so the surface's
 // stored pitch and this format agree. Matches DXVK d3d9_format.h

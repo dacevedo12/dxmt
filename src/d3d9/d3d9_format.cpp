@@ -193,6 +193,11 @@ D3DFormatBytesPerPixel(D3DFORMAT format) {
   // point is GPU-side sampling), but a software-readback path needs a
   // stride.
   case D3DFMT_DF16:
+  // Packed YUV (a 2x1 macro-pixel carries Y0/U/Y1/V in 4 bytes, so 2 bytes
+  // per pixel). Metal has no 422 format, so these exist only as CPU-only
+  // SCRATCH resources; the bytes-per-pixel feeds their host-mirror pitch.
+  case D3DFMT_YUY2:
+  case D3DFMT_UYVY:
     return 2;
   case D3DFMT_X8R8G8B8:
   case D3DFMT_A8R8G8B8:
@@ -324,6 +329,43 @@ IsCompressedFormat(D3DFORMAT format) {
   default:
     return false;
   }
+}
+
+bool
+IsScratchableUnsupportedFormat(D3DFORMAT format) {
+  // Packed-YUV formats Metal cannot realize as a sampled texture, but which the
+  // D3D9 runtime still creates as a system-memory SCRATCH copy (never bound or
+  // sampled). CheckDeviceFormat reports them NOTAVAILABLE; the create paths back
+  // them with a host mirror alone, the same shape as a DXTn SCRATCH volume.
+  // DXVK takes the equivalent unsupported-but-scratchable branch.
+  switch (format) {
+  case D3DFMT_YUY2:
+  case D3DFMT_UYVY:
+    return true;
+  default:
+    return false;
+  }
+}
+
+uint32_t
+D3DFormatBlockWidth(D3DFORMAT format) {
+  if (IsCompressedFormat(format))
+    return 4u;
+  switch (format) {
+  // A packed-YUV macropixel spans two horizontal texels (one chroma pair
+  // shared by two luma samples), so a lock must start and end on a pair.
+  case D3DFMT_YUY2:
+  case D3DFMT_UYVY:
+    return 2u;
+  default:
+    return 1u;
+  }
+}
+
+uint32_t
+D3DFormatBlockHeight(D3DFORMAT format) {
+  // DXTn pack 4 rows per block; packed-YUV and plain formats are one row.
+  return IsCompressedFormat(format) ? 4u : 1u;
 }
 
 bool

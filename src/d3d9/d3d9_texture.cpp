@@ -25,7 +25,9 @@ buildLevelsAndMirror(
     std::vector<size_t> &mirrorOffsets, std::vector<Com<MTLD3D9Surface, false>> &levelsOut,
     WMTPixelFormat &metalFormatOut, void *userMemory
 ) {
-  metalFormatOut = parentTex.pixelFormat();
+  // A texture-less mirror (packed-YUV SCRATCH: no Metal format to back it)
+  // has no parent to read a pixel format from; the levels are CPU-only.
+  metalFormatOut = parentTex ? parentTex.pixelFormat() : WMTPixelFormatInvalid;
 
   const bool buffer_backed = (backingBuffer != nullptr);
   // D3D9Ex user-memory (single level): the app pointer is the packed CPU
@@ -138,7 +140,7 @@ MTLD3D9Texture::MTLD3D9Texture(
     Rc<dxmt::Texture> texture, uint32_t bufferPitch, void *userMemory
 ) :
     m_device(device),
-    m_textureRaw(WMT::Reference<WMT::Texture>(texture->current()->texture())),
+    m_textureRaw(texture ? WMT::Reference<WMT::Texture>(texture->current()->texture()) : WMT::Reference<WMT::Texture>()),
     m_dxmtTexture(std::move(texture)),
     m_userMemory(userMemory != nullptr),
     m_usage(usage),

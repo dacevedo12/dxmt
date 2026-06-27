@@ -116,21 +116,24 @@ MTLD3D9Volume::LockBox(D3DLOCKED_BOX *pLockedVolume, const D3DBOX *pBox, DWORD F
   if (m_desc.Pool != D3DPOOL_DEFAULT)
     Flags &= ~D3DLOCK_DISCARD;
 
+  // Block-addressed formats: DXTn are 4x4, packed-YUV (YUY2/UYVY) are 2x1.
+  const uint32_t block_w = D3DFormatBlockWidth(m_desc.Format);
+  const uint32_t block_h = D3DFormatBlockHeight(m_desc.Format);
   uint32_t x0 = 0, y0 = 0, z0 = 0;
   uint32_t w = m_desc.Width, h = m_desc.Height, d = m_desc.Depth;
   if (pBox) {
     if (pBox->Right <= pBox->Left || pBox->Bottom <= pBox->Top || pBox->Back <= pBox->Front ||
         pBox->Right > m_desc.Width || pBox->Bottom > m_desc.Height || pBox->Back > m_desc.Depth)
       return D3DERR_INVALIDCALL;
-    // Block-compressed (DXTn) volumes require block-aligned box edges. Unlike
-    // 2D surfaces, volumes enforce this on EVERY pool (wined3d forgives a
+    // Block-addressed volumes require block-aligned box edges. Unlike 2D
+    // surfaces, volumes enforce this on EVERY pool (wined3d forgives a
     // misaligned box only for buffers and 2D textures; a 3D texture never gets
     // that escape), so the gate is unconditional. Depth (Front/Back) is not
     // block compressed. right/bottom may sit at the volume extent.
-    if (IsCompressedFormat(m_desc.Format) &&
-        ((pBox->Left & 3) || (pBox->Top & 3) ||
-         ((pBox->Right & 3) && pBox->Right != m_desc.Width) ||
-         ((pBox->Bottom & 3) && pBox->Bottom != m_desc.Height)))
+    if ((block_w > 1 || block_h > 1) &&
+        ((pBox->Left % block_w) || (pBox->Top % block_h) ||
+         ((pBox->Right % block_w) && pBox->Right != m_desc.Width) ||
+         ((pBox->Bottom % block_h) && pBox->Bottom != m_desc.Height)))
       return D3DERR_INVALIDCALL;
     x0 = pBox->Left;
     y0 = pBox->Top;
@@ -140,15 +143,12 @@ MTLD3D9Volume::LockBox(D3DLOCKED_BOX *pLockedVolume, const D3DBOX *pBox, DWORD F
     d = pBox->Back - pBox->Front;
   }
   // Byte offset of the locked box's first byte into the mirror. Block-
-  // compressed volumes are addressed in 4x4 blocks: the row offset steps by
-  // block rows and the column offset by bytes-per-block-column. Depth carries
-  // no block compression (block depth is 1), so z0 indexes whole slices.
-  // D3DFormatRowPitch(format, block_w) yields the bytes per block column for
-  // DXTn and the bytes-per-pixel for plain formats, so both share one path.
-  // The block gate above keeps x0/y0 block-aligned for DXTn, so the divisions
-  // are exact.
-  const uint32_t block_w = IsCompressedFormat(m_desc.Format) ? 4u : 1u;
-  const uint32_t block_h = IsCompressedFormat(m_desc.Format) ? 4u : 1u;
+  // addressed volumes step the row offset by block rows and the column offset
+  // by bytes-per-block-column. Depth carries no block compression (block depth
+  // is 1), so z0 indexes whole slices. D3DFormatRowPitch(format, block_w)
+  // yields the bytes per block column for DXTn / packed-YUV and the bytes-per-
+  // pixel for plain formats, so all share one path. The block gate above keeps
+  // x0/y0 block-aligned, so the divisions are exact.
   const uint32_t col_step = D3DFormatRowPitch(m_desc.Format, block_w);
   uint8_t *base = static_cast<uint8_t *>(m_cpu_ptr);
   size_t offset = static_cast<size_t>(z0) * m_slice_pitch +

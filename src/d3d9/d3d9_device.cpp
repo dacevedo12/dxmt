@@ -2708,7 +2708,11 @@ MTLD3D9Device::CreateTexture(
   // so it is correctness-neutral; shrinking it is a deferred memory tidy.
   if (IsNullFormat(Format) && (Usage & D3DUSAGE_RENDERTARGET))
     pixelFormat = WMTPixelFormatBGRA8Unorm;
-  if (pixelFormat == WMTPixelFormatInvalid) {
+  // Packed-YUV formats have no Metal pixel format but are creatable as a
+  // CPU-only SCRATCH mirror; the texture-less branch below builds them. Let
+  // them past the unsupported-format reject (any other pool stays
+  // INVALIDCALL via the SCRATCH guard there).
+  if (pixelFormat == WMTPixelFormatInvalid && !IsScratchableUnsupportedFormat(Format)) {
     Logger::warn(str::format("d3d9: CreateTexture: unsupported format ", (unsigned)Format, " usage ", (unsigned)Usage));
     return D3DERR_INVALIDCALL;
   }
@@ -2744,6 +2748,23 @@ MTLD3D9Device::CreateTexture(
   uint32_t app_levels = real_levels;
   if (Usage & D3DUSAGE_AUTOGENMIPMAP) {
     app_levels = 1;
+  }
+
+  // Packed-YUV SCRATCH texture: no Metal format, so there is no backing
+  // dxmt::Texture. Build it mirror-only (null allocation); the level
+  // surfaces are texture-less and Lock straight into the host mirror, the
+  // same shape as the offscreen-plain and volume YUV paths. Any other pool
+  // already failed the format reject above with INVALIDCALL.
+  if (IsScratchableUnsupportedFormat(Format)) {
+    if (Pool != D3DPOOL_SCRATCH)
+      return D3DERR_INVALIDCALL;
+    auto *tex = new MTLD3D9Texture(
+        this, Width, Height, app_levels, Usage, Format, Pool, Rc<dxmt::Texture>(nullptr), 0, nullptr
+    );
+    captureTextureLeafVtable(tex, kLeaf2D);
+    tex->AddRef();
+    *ppTexture = tex;
+    return D3D_OK;
   }
 
   // Pool → storage (like CreateOffscreenPlainSurface + usage flags).
@@ -2981,15 +3002,15 @@ MTLD3D9Device::CreateVolumeTexture(
       return D3DERR_INVALIDCALL;
   }
 
-  // Block-compressed (DXTn) volumes: Metal has no 3D block-compressed pixel
-  // format, so there is no GPU-side texture to allocate. D3D9 still permits a
-  // SCRATCH copy, a pure system-memory staging blob that is never bound or
-  // sampled; the other pools imply a GPU binding we cannot honour, and
-  // CheckDeviceFormat reports DXT volumes unsupported so the runtime makes them
-  // INVALIDCALL there. The volume is created mirror-only (no backing
-  // dxmt::Texture): LockBox serves the host mirror and the GPU push no-ops on
-  // the absent texture.
-  if (IsCompressedFormat(Format)) {
+  // Formats Metal cannot realize as a 3D texture but D3D9 still copies into a
+  // SCRATCH blob: block-compressed (DXTn) volumes (no 3D BC pixel format) and
+  // packed YUV (no 422 format). These exist only as a pure system-memory
+  // staging blob that is never bound or sampled; the other pools imply a GPU
+  // binding we cannot honour, and CheckDeviceFormat reports them unsupported so
+  // the runtime makes them INVALIDCALL there. The volume is created mirror-only
+  // (no backing dxmt::Texture): LockBox serves the host mirror and the GPU push
+  // no-ops on the absent texture.
+  if (IsCompressedFormat(Format) || IsScratchableUnsupportedFormat(Format)) {
     if (Pool != D3DPOOL_SCRATCH)
       return D3DERR_INVALIDCALL;
     auto *tex = new MTLD3D9VolumeTexture(
@@ -3106,7 +3127,9 @@ MTLD3D9Device::CreateCubeTexture(
   // 2D path to keep caps and create consistent. The desc keeps D3DFMT_NULL.
   if (IsNullFormat(Format) && (Usage & D3DUSAGE_RENDERTARGET))
     pixelFormat = WMTPixelFormatBGRA8Unorm;
-  if (pixelFormat == WMTPixelFormatInvalid) {
+  // Packed-YUV cube: creatable only as a CPU-only SCRATCH mirror; see the
+  // texture-less branch below. Let it past the unsupported-format reject.
+  if (pixelFormat == WMTPixelFormatInvalid && !IsScratchableUnsupportedFormat(Format)) {
     Logger::warn(str::format("d3d9: CreateCubeTexture: unsupported format ", (unsigned)Format, " usage ", (unsigned)Usage));
     return D3DERR_INVALIDCALL;
   }
@@ -3136,6 +3159,18 @@ MTLD3D9Device::CreateCubeTexture(
   uint32_t app_levels = real_levels;
   if (Usage & D3DUSAGE_AUTOGENMIPMAP) {
     app_levels = 1;
+  }
+
+  // Packed-YUV SCRATCH cube: no Metal format, so mirror-only (null
+  // allocation); see CreateTexture. Other pools already failed the reject.
+  if (IsScratchableUnsupportedFormat(Format)) {
+    if (Pool != D3DPOOL_SCRATCH)
+      return D3DERR_INVALIDCALL;
+    auto *tex = new MTLD3D9CubeTexture(this, EdgeLength, app_levels, Usage, Format, Pool, Rc<dxmt::Texture>(nullptr));
+    captureTextureLeafVtable(tex, kLeafCube);
+    tex->AddRef();
+    *ppCubeTexture = tex;
+    return D3D_OK;
   }
 
   WMTResourceOptions storage;
@@ -4810,6 +4845,41 @@ MTLD3D9Device::CreateOffscreenPlainSurface(
         /*mipLevel=*/0, /*selfPin=*/true, WMTTextureType2D, WMT::Reference<WMT::Buffer>{},
         /*cpuPtr=*/backing, depth_pitch, /*arraySlice=*/0,
         /*ownedBacking=*/user_memory ? nullptr : backing, /*dxmtTexture=*/{}
+    );
+    surface->AddRef();
+    *ppSurface = surface;
+    return D3D_OK;
+  }
+
+  // Packed-YUV SCRATCH surfaces: Metal has no 422 format, so there is no
+  // placeholder texture to allocate. D3D9 still permits a system-memory copy,
+  // backed by a host mirror alone (texture-less), the same shape as a DXTn
+  // SCRATCH volume. CheckDeviceFormat reports the format NOTAVAILABLE, so any
+  // non-SCRATCH pool stays INVALIDCALL.
+  if (IsScratchableUnsupportedFormat(Format)) {
+    if (Pool != D3DPOOL_SCRATCH)
+      return D3DERR_INVALIDCALL;
+    const uint32_t yuv_pitch = D3DFormatLockPitch(Format, Width);
+    if (yuv_pitch == 0)
+      return D3DERR_INVALIDCALL;
+    const uint64_t mirror_bytes = static_cast<uint64_t>(yuv_pitch) * D3DFormatRowCount(Format, Height);
+    void *backing = wsi::aligned_malloc(mirror_bytes, DXMT_PAGE_SIZE);
+    if (!backing)
+      return D3DERR_OUTOFVIDEOMEMORY;
+    std::memset(backing, 0, mirror_bytes);
+    D3DSURFACE_DESC desc{};
+    desc.Format = Format;
+    desc.Type = D3DRTYPE_SURFACE;
+    desc.Usage = 0;
+    desc.Pool = Pool;
+    desc.MultiSampleType = D3DMULTISAMPLE_NONE;
+    desc.MultiSampleQuality = 0;
+    desc.Width = Width;
+    desc.Height = Height;
+    auto *surface = new MTLD3D9Surface(
+        this, desc, static_cast<IDirect3DDevice9 *>(this), WMT::Reference<WMT::Texture>{},
+        /*mipLevel=*/0, /*selfPin=*/true, WMTTextureType2D, WMT::Reference<WMT::Buffer>{},
+        /*cpuPtr=*/backing, yuv_pitch, /*arraySlice=*/0, /*ownedBacking=*/backing, /*dxmtTexture=*/{}
     );
     surface->AddRef();
     *ppSurface = surface;
