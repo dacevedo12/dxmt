@@ -108,9 +108,11 @@ MTLD3D9Volume::LockBox(D3DLOCKED_BOX *pLockedVolume, const D3DBOX *pBox, DWORD F
     return D3DERR_INVALIDCALL;
 
   // DXVK-shaped lock flag normalisation: same as MTLD3D9Surface's
-  // LockRect: DISCARD+READONLY combo is invalid; DISCARD on non-DEFAULT
-  // pools is silently dropped; DONOTWAIT is silently dropped.
-  if ((Flags & (D3DLOCK_DISCARD | D3DLOCK_READONLY)) == (D3DLOCK_DISCARD | D3DLOCK_READONLY))
+  // LockRect: the DISCARD+READONLY combo is invalid on DEFAULT pool only (the
+  // CPU pools drop DISCARD anyway); DISCARD on non-DEFAULT pools is silently
+  // dropped; DONOTWAIT is silently dropped.
+  if ((Flags & (D3DLOCK_DISCARD | D3DLOCK_READONLY)) == (D3DLOCK_DISCARD | D3DLOCK_READONLY) &&
+      m_desc.Pool == D3DPOOL_DEFAULT)
     return D3DERR_INVALIDCALL;
   Flags &= ~D3DLOCK_DONOTWAIT;
   if ((Flags & (D3DLOCK_DISCARD | D3DLOCK_NOOVERWRITE)) == (D3DLOCK_DISCARD | D3DLOCK_NOOVERWRITE))

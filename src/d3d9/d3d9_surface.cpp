@@ -317,7 +317,7 @@ MTLD3D9Surface::LockRect(D3DLOCKED_RECT *pLockedRect, const RECT *pRect, DWORD F
   // an already-locked surface) reads back its own values. wined3d and DXVK
   // both write Pitch/pBits on the success path only.
   // Lazy-mirror parent owned: alloc the mirror buffer + patch this
-  // (and all sibling level) surfaces' cpu_ptr/mirror_src_buffer/pitch
+  // (and all sibling level) surfaces' cpu_ptr/pitch
   // before the null check below. Idempotent; every Lock after the
   // first early-outs inside ensureMirror.
   if (!m_cpu_ptr && m_lazyMirrorParent)
@@ -336,7 +336,11 @@ MTLD3D9Surface::LockRect(D3DLOCKED_RECT *pLockedRect, const RECT *pRect, DWORD F
   // path (MANAGED + DYNAMIC DEFAULT). DISCARD/NOOVERWRITE are no-ops there
   // by spec; per-frame DISCARD re-lock safety comes from UnlockRect's
   // upload-ring snapshot, not from honouring the flag here.
-  if ((Flags & (D3DLOCK_DISCARD | D3DLOCK_READONLY)) == (D3DLOCK_DISCARD | D3DLOCK_READONLY))
+  // The contradictory DISCARD+READONLY combo is rejected only on DEFAULT pool;
+  // the CPU pools drop DISCARD anyway, so the pair is harmless there (DXVK
+  // d3d9_device.cpp).
+  if ((Flags & (D3DLOCK_DISCARD | D3DLOCK_READONLY)) == (D3DLOCK_DISCARD | D3DLOCK_READONLY) &&
+      m_desc.Pool == D3DPOOL_DEFAULT)
     return D3DERR_INVALIDCALL;
   // DXVK: "Games like Beyond Good and Evil break if [DONOTWAIT] doesn't
   // succeed." We don't honour it either; strip it so downstream code
@@ -537,8 +541,6 @@ MTLD3D9Surface::UnlockRect() {
     // Direct blit would race: GPU reads mirror bytes at execution time,
     // but next Lock could overwrite them (Apple Silicon UMA). Per-surface
     // rename ring on mirror would recover perf; follow-on work.
-    (void)m_mirror_src_buffer;
-    (void)m_mirror_level_offset;
     const void *src = static_cast<const uint8_t *>(m_cpu_ptr) + src_row_off + src_col_off;
     m_device->stageTextureUpload(m_texture, m_dxmtTexture, m_mip_level, m_array_slice, origin, size, src, m_pitch, compressed);
     // The bytes are now snapshotted into the upload ring; the mirror is no
