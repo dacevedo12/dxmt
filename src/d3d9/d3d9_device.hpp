@@ -8,6 +8,7 @@
 #include "d3d9_common_texture.hpp"
 #include "d3d9_diag.hpp"
 #include "d3d9_enc_state.hpp"
+#include "dxmt_buffer.hpp"
 #include "dxmt_command.hpp"
 #include "dxmt_command_queue.hpp"
 #include "dxmt_ring_bump_allocator.hpp"
@@ -898,6 +899,13 @@ public:
     // pins; VB/IB need explicit pins. Migration: 17 slots per-draw, 23 on device.
     Com<class MTLD3D9VertexBuffer, false> resolved_vb_pins[D3D9_MAX_VERTEX_STREAMS];
     Com<class MTLD3D9IndexBuffer, false> resolved_ib_pin;
+    // BUFFER-mode streams only: the tracked Private allocation to register
+    // a Vertex-stage read access against so the fence tracker orders the
+    // staged upload copy ahead of this draw. Null for DIRECT-mode and
+    // override (UP) streams, which bind by raw handle and need no read
+    // tracking. The wrapper pins above keep these alive regardless.
+    Rc<dxmt::Buffer> resolved_vb_dxmt[D3D9_MAX_VERTEX_STREAMS];
+    Rc<dxmt::Buffer> resolved_ib_dxmt;
     // VS/PS f/i/b register-file + clip-plane constant uploads. Resolve
     // pulls the data from D9EncodingState, allocates from m_constRing,
     // and stores the resulting (buffer, offset) pairs here. Fixed slot
@@ -948,10 +956,22 @@ public:
     // Stretch / format-convert path: render-pass sample/store vs copy.
     // Copy is same-extent bit copy ignoring filter (Metal semantics);
     // Stretch viewport spans dst sub-rect (differs from src under scaling).
-    enum class Kind : uint8_t { Copy = 0, Stretch = 1, Resolve = 2 };
+    // BufferCopy stages a locked BUFFER-mode buffer's dirty range from an
+    // upload-ring block into its Private buffer; its access<Compute> write
+    // is what the draw's read access synchronises against.
+    enum class Kind : uint8_t { Copy = 0, Stretch = 1, Resolve = 2, BufferCopy = 3 };
     Kind kind = Kind::Copy;
     WMTSize dst_size = {};
     D3DTEXTUREFILTERTYPE filter = D3DTEXF_NONE;
+    // BufferCopy fields. buf_dst is the tracked destination (its write is
+    // registered via access<Compute> so the fence tracker orders the copy
+    // against draws reading the buffer); buf_src_handle / buf_src_offset
+    // name the upload-ring source block.
+    Rc<dxmt::Buffer> buf_dst;
+    obj_handle_t buf_src_handle = 0;
+    uint64_t buf_src_offset = 0;
+    uint64_t buf_dst_offset = 0;
+    uint64_t buf_length = 0;
   };
 
   // Calling-thread record of ref-counted state mutation. Setter AddRefPrivate
@@ -1766,6 +1786,14 @@ public:
       WMT::Texture dst, const Rc<dxmt::Texture> &dst_alloc, uint32_t mip_level, uint32_t slice, WMTOrigin origin,
       WMTSize size, const void *src, uint32_t src_pitch, bool is_compressed, uint32_t src_slice_pitch = 0
   );
+
+  // Stage a BUFFER-mode buffer's dirty range into its Private allocation.
+  // Copies src into an m_uploadRing block on the calling thread, then
+  // queues a BufferCopy blit op (arrival-order, so it interleaves with
+  // draws). The op's access<Compute> write against dst is what orders the
+  // copy against draws that register a read on the same allocation; see
+  // MTLD3D9VertexBuffer::flushDirty and the op-stream walker.
+  void stageBufferUpload(const Rc<dxmt::Buffer> &dst, uint64_t dst_offset, const void *src, uint64_t length);
 
   // Synchronous GPU -> host-mirror readback for a lockable render
   // target's LockRect: drain queued draws, blit the surface's texture

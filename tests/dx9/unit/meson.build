@@ -24,6 +24,7 @@ dx9_unit_tests = [
   ['vertex-decl-validation',  'test_vertex_decl_validation.cpp', 'd3d9_validation.cpp'],
   ['shader-bytecode-length',  'test_shader_bytecode_length.cpp', 'd3d9_shader_scan.cpp'],
   ['texture-upload-layout',   'test_texture_upload_layout.cpp', ''],
+  ['buffer-map',              'test_buffer_map.cpp',            ''],
 ]
 
 foreach spec : dx9_unit_tests

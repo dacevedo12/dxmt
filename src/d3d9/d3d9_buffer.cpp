@@ -108,12 +108,14 @@ lockDiscardRotate(
   retired.erase(retired.begin());
 }
 
-// GPU-sync gate for a plain Lock (neither DISCARD nor NOOVERWRITE nor
-// READONLY). dxmt direct-maps buffers in every pool, so the returned
-// pointer aliases memory queued draws may still read; DXVK's
-// LockBuffer routes the same case through WaitForResource
-// (d3d9_device.cpp). Returns false when D3DLOCK_DONOTWAIT is set and
-// the buffer's last GPU use hasn't retired (the caller answers
+// GPU-sync gate for a plain DIRECT-mode Lock (neither DISCARD nor
+// NOOVERWRITE nor READONLY). A DIRECT buffer's lock pointer aliases the
+// placed backing the GPU reads in place, so the returned pointer aliases
+// memory queued draws may still read; DXVK's LockBuffer routes the same
+// case through WaitForResource (d3d9_device.cpp). BUFFER-mode buffers
+// never reach here: their Lock writes a host mirror, never the GPU-read
+// backing. Returns false when D3DLOCK_DONOTWAIT is set and the buffer's
+// last GPU use hasn't retired (the caller answers
 // D3DERR_WASSTILLDRAWING). last_use_seq comes from BuildDrawCapture's
 // per-draw stamp; the common never-drawn-since-last-fence case costs
 // one atomic load.
@@ -158,17 +160,25 @@ lockSyncLastGpuUse(
 
 MTLD3D9VertexBuffer::MTLD3D9VertexBuffer(
     MTLD3D9Device *device, UINT size, DWORD usage, DWORD fvf, D3DPOOL pool, WMT::Reference<WMT::Buffer> buffer,
-    uint64_t gpu_address, void *host_ptr, void *owned_backing
+    uint64_t gpu_address, void *host_ptr, void *owned_backing, Rc<dxmt::Buffer> dxmt_buffer
 ) :
     m_device(device),
+    m_mapMode(determine_buffer_map_mode(pool, usage)),
     m_buffer(std::move(buffer)),
     m_gpuAddress(gpu_address),
-    m_hostPtr(host_ptr),
     m_ownedBacking(owned_backing),
+    m_dxmtBuffer(std::move(dxmt_buffer)),
+    m_hostPtr(host_ptr),
     m_size(size),
     m_usage(usage),
     m_fvf(fvf),
     m_pool(pool) {
+  // A non-DEFAULT staged buffer is dirty over its whole extent from
+  // creation so its first bind or Unlock uploads the mirror; DEFAULT
+  // contents are undefined until the app writes them (DXVK
+  // d3d9_common_buffer.cpp).
+  if (m_mapMode == D3D9BufferMapMode::Buffer && m_pool != D3DPOOL_DEFAULT)
+    m_dirtyRange = {0, m_size};
   // Self-pin: same shape as MTLD3D9Surface / MTLD3D9Texture. The
   // override Release path drops the device pin after ComObject::
   // Release has decremented public to 0; the self-pin keeps `this`
@@ -177,21 +187,43 @@ MTLD3D9VertexBuffer::MTLD3D9VertexBuffer(
 }
 
 MTLD3D9VertexBuffer::~MTLD3D9VertexBuffer() {
-  // Donate the active backing + every retired backing to the device's
-  // shared pool. By dtor time the GPU drain (FlushDrawBatch +
-  // CommitCurrentChunk + WaitCPUFence in any teardown path the device
-  // owns) has ensured no in-flight cmdbuf still reads from these
-  // regions, so they're safe to hand to the next caller. Same total
-  // VRAM behaviour as the prior free-on-dtor path; only the timing of
-  // the free changes (deferred until the pool fills past
-  // kMaxBufferBackingPoolSize).
-  m_device->releaseBufferBacking(std::move(m_buffer), m_ownedBacking, m_gpuAddress, m_size);
-  for (auto &entry : m_retiredBackings) {
-    m_device->releaseBufferBacking(std::move(entry.mtl_buffer), entry.owned_backing, entry.gpu_address, m_size);
+  if (m_mapMode == D3D9BufferMapMode::Direct) {
+    // Donate the active backing + every retired backing to the device's
+    // shared pool. By dtor time the GPU drain (FlushDrawBatch +
+    // CommitCurrentChunk + WaitCPUFence in any teardown path the device
+    // owns) has ensured no in-flight cmdbuf still reads from these
+    // regions, so they're safe to hand to the next caller. Same total
+    // VRAM behaviour as the prior free-on-dtor path; only the timing of
+    // the free changes (deferred until the pool fills past
+    // kMaxBufferBackingPoolSize).
+    m_device->releaseBufferBacking(std::move(m_buffer), m_ownedBacking, m_gpuAddress, m_size);
+    for (auto &entry : m_retiredBackings) {
+      m_device->releaseBufferBacking(std::move(entry.mtl_buffer), entry.owned_backing, entry.gpu_address, m_size);
+    }
+    m_retiredBackings.clear();
+  } else {
+    // BUFFER mode: the Private allocation is completion-pinned by the ref
+    // tracker (its copy write / draw read access() calls) and released
+    // with m_dxmtBuffer here. The host mirror was never registered with
+    // Metal and the GPU never reads it (the staged copy reads the upload
+    // ring), so free it directly. It cannot be donated to the backing
+    // pool, whose entries require a Metal registration.
+    if (m_hostPtr)
+      wsi::aligned_free(m_hostPtr);
   }
-  m_retiredBackings.clear();
   if (m_isLosable)
     m_device->onLosableResourceDestroyed(m_size);
+}
+
+void
+MTLD3D9VertexBuffer::flushDirty() {
+  if (m_mapMode != D3D9BufferMapMode::Buffer || m_dirtyRange.empty())
+    return;
+  m_device->stageBufferUpload(
+      m_dxmtBuffer, m_dirtyRange.min, static_cast<const char *>(m_hostPtr) + m_dirtyRange.min,
+      m_dirtyRange.max - m_dirtyRange.min
+  );
+  m_dirtyRange.clear();
 }
 
 bool
@@ -346,48 +378,49 @@ MTLD3D9VertexBuffer::Lock(UINT OffsetToLock, UINT SizeToLock, void **ppbData, DW
   *ppbData = nullptr;
   if (!m_hostPtr)
     return D3DERR_INVALIDCALL;
-  // Flag sanitisation, DXVK d3d9_device.cpp LockBuffer order. DISCARD
-  // drops when READONLY or NOOVERWRITE rides along; DISCARD and
-  // NOOVERWRITE drop entirely outside DEFAULT pool (the docs tie this
-  // to D3DUSAGE_DYNAMIC but tests say it's the pool, per DXVK's
-  // comment); DONOTWAIT drops for DYNAMIC buffers. No bounds
+  // Flag sanitisation (d3d9_buffer_map.hpp): drop the flags this
+  // pool/usage does not honour before any of them take effect. No bounds
   // validation: the runtime neither clamps nor rejects OffsetToLock /
   // SizeToLock, the returned pointer is simply base + offset.
-  if ((Flags & (D3DLOCK_DISCARD | D3DLOCK_NOOVERWRITE | D3DLOCK_READONLY)) != D3DLOCK_DISCARD)
-    Flags &= ~D3DLOCK_DISCARD;
-  if (m_pool != D3DPOOL_DEFAULT)
-    Flags &= ~(D3DLOCK_DISCARD | D3DLOCK_NOOVERWRITE);
-  if (m_usage & D3DUSAGE_DYNAMIC)
-    Flags &= ~D3DLOCK_DONOTWAIT;
-  // D3DLOCK_DISCARD: retire active backing and allocate fresh or reuse
-  // signaled retired entry; app promises previous contents unneeded.
-  // The sanitisation above guarantees DEFAULT pool here; no DYNAMIC
-  // gate, DXVK's LockBuffer discards any DEFAULT-pool buffer.
-  // D3DLOCK_NOOVERWRITE: app promises no GPU-read regions written;
-  // active backing stays put.
-  if (Flags & D3DLOCK_DISCARD) {
-    lockDiscardRotate(
-        m_device->m_currentCmdSeq, m_device->m_cachedSignaled, m_device->m_completionEvent,
-        [this] { m_device->forceFlushAndCommit(); }, m_buffer, m_hostPtr, m_ownedBacking, m_gpuAddress,
-        m_retiredBackings,
-        [this](WMT::Reference<WMT::Buffer> &out_buffer, uint64_t &out_gpu, void *&out_host, void *&out_owned) {
-          return allocateFreshBacking(out_buffer, out_gpu, out_host, out_owned);
-        }
-    );
-    // The rotation only installs a GPU-idle backing (signaled retired
-    // entry, fresh allocation, or stall-and-reuse), so the use stamp
-    // from the pre-rotation backing no longer applies.
-    m_lastUseSeq = 0;
-  } else if (!(Flags & (D3DLOCK_NOOVERWRITE | D3DLOCK_READONLY))) {
-    // Plain map, any pool: dxmt direct-maps MANAGED / SYSTEMMEM
-    // buffers onto the same backing the GPU reads, so they need the
-    // wait exactly like DEFAULT. Wait for the last draw that captured
-    // this buffer to retire before handing out the live pointer.
-    if (!lockSyncLastGpuUse(
-            m_lastUseSeq, m_device->m_cachedSignaled, m_device->m_completionEvent, Flags,
-            [this] { m_device->forceFlushAndCommit(); }
-        ))
-      return D3DERR_WASSTILLDRAWING;
+  Flags = sanitize_buffer_lock_flags(Flags, m_pool, m_usage);
+  if (m_mapMode == D3D9BufferMapMode::Direct) {
+    // The lock pointer aliases the placed backing the GPU reads in place.
+    // D3DLOCK_DISCARD retires the active backing and installs a GPU-idle
+    // one (sanitisation guarantees DEFAULT pool here; DXVK discards any
+    // DEFAULT-pool buffer). A plain map waits for the last draw that
+    // captured this buffer to retire before handing out the live pointer;
+    // NOOVERWRITE / READONLY skip the wait (app promises no GPU-read
+    // region is written).
+    if (Flags & D3DLOCK_DISCARD) {
+      lockDiscardRotate(
+          m_device->m_currentCmdSeq, m_device->m_cachedSignaled, m_device->m_completionEvent,
+          [this] { m_device->forceFlushAndCommit(); }, m_buffer, m_hostPtr, m_ownedBacking, m_gpuAddress,
+          m_retiredBackings,
+          [this](WMT::Reference<WMT::Buffer> &out_buffer, uint64_t &out_gpu, void *&out_host, void *&out_owned) {
+            return allocateFreshBacking(out_buffer, out_gpu, out_host, out_owned);
+          }
+      );
+      // The rotation only installs a GPU-idle backing, so the use stamp
+      // from the pre-rotation backing no longer applies.
+      m_lastUseSeq = 0;
+    } else if (!(Flags & (D3DLOCK_NOOVERWRITE | D3DLOCK_READONLY))) {
+      if (!lockSyncLastGpuUse(
+              m_lastUseSeq, m_device->m_cachedSignaled, m_device->m_completionEvent, Flags,
+              [this] { m_device->forceFlushAndCommit(); }
+          ))
+        return D3DERR_WASSTILLDRAWING;
+    }
+  } else {
+    // The lock pointer is the host mirror, disjoint from the GPU-read
+    // Private buffer, so a Lock never waits, never renames, and never
+    // returns WASSTILLDRAWING. Any DISCARD that survived sanitisation (a
+    // DEFAULT non-DYNAMIC buffer) is ignored: the mirror is never
+    // GPU-read, so a rename buys nothing (DXVK ignores DISCARD for staged
+    // buffers the same way). Track the dirty span the outer Unlock (or a
+    // bind) uploads into the Private buffer.
+    if (buffer_lock_updates_dirty(Flags, m_pool))
+      m_dirtyRange.conjoin(buffer_lock_dirty_range(Flags, OffsetToLock, SizeToLock, m_size, m_pool, m_usage));
+    m_lockCount.increment();
   }
   *ppbData = static_cast<char *>(m_hostPtr) + OffsetToLock;
   return D3D_OK;
@@ -395,6 +428,14 @@ MTLD3D9VertexBuffer::Lock(UINT OffsetToLock, UINT SizeToLock, void **ppbData, DW
 
 HRESULT STDMETHODCALLTYPE
 MTLD3D9VertexBuffer::Unlock() {
+  // DIRECT buffers were written in place; nothing to do. A BUFFER-mode
+  // buffer uploads its dirty range on the outer Unlock only (D3D9 permits
+  // nested locks).
+  if (m_mapMode != D3D9BufferMapMode::Buffer)
+    return D3D_OK;
+  if (m_lockCount.decrement() != 0)
+    return D3D_OK;
+  flushDirty();
   return D3D_OK;
 }
 
@@ -417,29 +458,50 @@ MTLD3D9VertexBuffer::GetDesc(D3DVERTEXBUFFER_DESC *pDesc) {
 
 MTLD3D9IndexBuffer::MTLD3D9IndexBuffer(
     MTLD3D9Device *device, UINT size, DWORD usage, D3DFORMAT format, D3DPOOL pool, WMT::Reference<WMT::Buffer> buffer,
-    uint64_t gpu_address, void *host_ptr, void *owned_backing
+    uint64_t gpu_address, void *host_ptr, void *owned_backing, Rc<dxmt::Buffer> dxmt_buffer
 ) :
     m_device(device),
+    m_mapMode(determine_buffer_map_mode(pool, usage)),
     m_buffer(std::move(buffer)),
     m_hostPtr(host_ptr),
     m_ownedBacking(owned_backing),
     m_gpuAddress(gpu_address),
+    m_dxmtBuffer(std::move(dxmt_buffer)),
     m_size(size),
     m_usage(usage),
     m_format(format),
     m_pool(pool) {
+  // See MTLD3D9VertexBuffer's ctor: a non-DEFAULT staged buffer starts
+  // wholly dirty.
+  if (m_mapMode == D3D9BufferMapMode::Buffer && m_pool != D3DPOOL_DEFAULT)
+    m_dirtyRange = {0, m_size};
   AddRefPrivate();
 }
 
 MTLD3D9IndexBuffer::~MTLD3D9IndexBuffer() {
   // See MTLD3D9VertexBuffer::~MTLD3D9VertexBuffer: same shape.
-  m_device->releaseBufferBacking(std::move(m_buffer), m_ownedBacking, m_gpuAddress, m_size);
-  for (auto &entry : m_retiredBackings) {
-    m_device->releaseBufferBacking(std::move(entry.mtl_buffer), entry.owned_backing, entry.gpu_address, m_size);
+  if (m_mapMode == D3D9BufferMapMode::Direct) {
+    m_device->releaseBufferBacking(std::move(m_buffer), m_ownedBacking, m_gpuAddress, m_size);
+    for (auto &entry : m_retiredBackings) {
+      m_device->releaseBufferBacking(std::move(entry.mtl_buffer), entry.owned_backing, entry.gpu_address, m_size);
+    }
+    m_retiredBackings.clear();
+  } else if (m_hostPtr) {
+    wsi::aligned_free(m_hostPtr);
   }
-  m_retiredBackings.clear();
   if (m_isLosable)
     m_device->onLosableResourceDestroyed(m_size);
+}
+
+void
+MTLD3D9IndexBuffer::flushDirty() {
+  if (m_mapMode != D3D9BufferMapMode::Buffer || m_dirtyRange.empty())
+    return;
+  m_device->stageBufferUpload(
+      m_dxmtBuffer, m_dirtyRange.min, static_cast<const char *>(m_hostPtr) + m_dirtyRange.min,
+      m_dirtyRange.max - m_dirtyRange.min
+  );
+  m_dirtyRange.clear();
 }
 
 bool
@@ -577,29 +639,30 @@ MTLD3D9IndexBuffer::Lock(UINT OffsetToLock, UINT SizeToLock, void **ppbData, DWO
   *ppbData = nullptr;
   if (!m_hostPtr)
     return D3DERR_INVALIDCALL;
-  if ((Flags & (D3DLOCK_DISCARD | D3DLOCK_NOOVERWRITE | D3DLOCK_READONLY)) != D3DLOCK_DISCARD)
-    Flags &= ~D3DLOCK_DISCARD;
-  if (m_pool != D3DPOOL_DEFAULT)
-    Flags &= ~(D3DLOCK_DISCARD | D3DLOCK_NOOVERWRITE);
-  if (m_usage & D3DUSAGE_DYNAMIC)
-    Flags &= ~D3DLOCK_DONOTWAIT;
-  if (Flags & D3DLOCK_DISCARD) {
-    lockDiscardRotate(
-        m_device->m_currentCmdSeq, m_device->m_cachedSignaled, m_device->m_completionEvent,
-        [this] { m_device->forceFlushAndCommit(); }, m_buffer, m_hostPtr, m_ownedBacking, m_gpuAddress,
-        m_retiredBackings,
-        [this](WMT::Reference<WMT::Buffer> &out_buffer, uint64_t &out_gpu, void *&out_host, void *&out_owned) {
-          return allocateFreshBacking(out_buffer, out_gpu, out_host, out_owned);
-        }
-    );
-    // See MTLD3D9VertexBuffer::Lock: the rotated-in backing is GPU-idle.
-    m_lastUseSeq = 0;
-  } else if (!(Flags & (D3DLOCK_NOOVERWRITE | D3DLOCK_READONLY))) {
-    if (!lockSyncLastGpuUse(
-            m_lastUseSeq, m_device->m_cachedSignaled, m_device->m_completionEvent, Flags,
-            [this] { m_device->forceFlushAndCommit(); }
-        ))
-      return D3DERR_WASSTILLDRAWING;
+  Flags = sanitize_buffer_lock_flags(Flags, m_pool, m_usage);
+  if (m_mapMode == D3D9BufferMapMode::Direct) {
+    if (Flags & D3DLOCK_DISCARD) {
+      lockDiscardRotate(
+          m_device->m_currentCmdSeq, m_device->m_cachedSignaled, m_device->m_completionEvent,
+          [this] { m_device->forceFlushAndCommit(); }, m_buffer, m_hostPtr, m_ownedBacking, m_gpuAddress,
+          m_retiredBackings,
+          [this](WMT::Reference<WMT::Buffer> &out_buffer, uint64_t &out_gpu, void *&out_host, void *&out_owned) {
+            return allocateFreshBacking(out_buffer, out_gpu, out_host, out_owned);
+          }
+      );
+      // See MTLD3D9VertexBuffer::Lock: the rotated-in backing is GPU-idle.
+      m_lastUseSeq = 0;
+    } else if (!(Flags & (D3DLOCK_NOOVERWRITE | D3DLOCK_READONLY))) {
+      if (!lockSyncLastGpuUse(
+              m_lastUseSeq, m_device->m_cachedSignaled, m_device->m_completionEvent, Flags,
+              [this] { m_device->forceFlushAndCommit(); }
+          ))
+        return D3DERR_WASSTILLDRAWING;
+    }
+  } else {
+    if (buffer_lock_updates_dirty(Flags, m_pool))
+      m_dirtyRange.conjoin(buffer_lock_dirty_range(Flags, OffsetToLock, SizeToLock, m_size, m_pool, m_usage));
+    m_lockCount.increment();
   }
   *ppbData = static_cast<char *>(m_hostPtr) + OffsetToLock;
   return D3D_OK;
@@ -607,6 +670,12 @@ MTLD3D9IndexBuffer::Lock(UINT OffsetToLock, UINT SizeToLock, void **ppbData, DWO
 
 HRESULT STDMETHODCALLTYPE
 MTLD3D9IndexBuffer::Unlock() {
+  // See MTLD3D9VertexBuffer::Unlock.
+  if (m_mapMode != D3D9BufferMapMode::Buffer)
+    return D3D_OK;
+  if (m_lockCount.decrement() != 0)
+    return D3D_OK;
+  flushDirty();
   return D3D_OK;
 }
 

@@ -1767,6 +1767,32 @@ MTLD3D9Device::stageTextureUpload(
 }
 
 void
+MTLD3D9Device::stageBufferUpload(const Rc<dxmt::Buffer> &dst, uint64_t dst_offset, const void *src, uint64_t length) {
+  if (dst == nullptr || src == nullptr || length == 0)
+    return;
+  // Calling-thread staging cost: the ring alloc + memcpy + queue.
+  D9StallScope _upload_timer(&g_d9stall.upload_ns);
+  d9NoteUploadBytes(length);
+  d9NoteApiEvent();
+  // Copy the dirty range into an upload-ring block on the calling thread.
+  // Tagged with the open chunk's seq (as the const/upload rings are), so
+  // the block recycles only after the chunk whose BufferCopy op reads it
+  // retires. No seq bump: the op rides the arrival-order stream and is
+  // emitted by FlushDrawBatch, not directly like stageTextureUpload.
+  uint64_t coherent_id = m_cachedSignaled.load(std::memory_order_acquire);
+  auto [block, offset] = m_uploadRing.allocate(m_currentCmdSeq, coherent_id, length, 16);
+  std::memcpy(static_cast<char *>(block.mapped_address) + offset, src, length);
+  PendingBlitOp op;
+  op.kind = PendingBlitOp::Kind::BufferCopy;
+  op.buf_dst = dst;
+  op.buf_dst_offset = dst_offset;
+  op.buf_src_handle = block.buffer.handle;
+  op.buf_src_offset = offset;
+  op.buf_length = length;
+  QueueBlitOp(std::move(op));
+}
+
+void
 MTLD3D9Device::readbackSurfaceMirror(MTLD3D9Surface *surface) {
   // Local pool for the same reason as GetRenderTargetData: the commit
   // and wait below go through autoreleased Metal selectors and wine's
@@ -3333,6 +3359,29 @@ MTLD3D9Device::CreateCubeTexture(
   *ppCubeTexture = tex;
   return D3D_OK;
 }
+// BUFFER-mode storage: a process-owned host mirror plus a GPU-only
+// Private allocation. The mirror is never registered with Metal, so the
+// lockable pointer stays in the 32-bit guest address space and no
+// unix-side host-mapping path is involved. dxmt::Buffer::allocate builds
+// its own WMTBufferInfo per newBuffer, so no info is reused across calls.
+static bool
+allocateStagedBufferStorage(WMT::Device device, UINT length, Rc<dxmt::Buffer> &out_buffer, void *&out_mirror) {
+  void *mirror = wsi::aligned_malloc(length, DXMT_PAGE_SIZE);
+  if (!mirror)
+    return false;
+  std::memset(mirror, 0, length);
+  Rc<dxmt::Buffer> buffer = new dxmt::Buffer(length, device);
+  auto allocation = buffer->allocate(BufferAllocationFlag::GpuPrivate);
+  if (allocation == nullptr || allocation->buffer().handle == 0) {
+    wsi::aligned_free(mirror);
+    return false;
+  }
+  buffer->rename(std::move(allocation));
+  out_buffer = std::move(buffer);
+  out_mirror = mirror;
+  return true;
+}
+
 HRESULT STDMETHODCALLTYPE
 MTLD3D9Device::CreateVertexBuffer(
     UINT Length, DWORD Usage, DWORD FVF, D3DPOOL Pool, IDirect3DVertexBuffer9 **ppVertexBuffer, HANDLE *pSharedHandle
@@ -3392,16 +3441,27 @@ MTLD3D9Device::CreateVertexBuffer(
     return D3DERR_INVALIDCALL;
   }
 
-  // 32-bit WoW64: pre-allocate backing (4GB limit). DYNAMIC: per-DISCARD retire-pool (wined3d pattern), bounded by
-  // cmdbuf depth. Safety: within-cmdbuf GPU-read-during-write impossible (retire on DISCARD prevents overlap).
+  // Storage per map mode (d3d9_buffer_map.hpp). DIRECT (DEFAULT +
+  // DYNAMIC): placed Shared backing the GPU reads in place, from the
+  // pooled path. 32-bit WoW64: pre-allocated backing (4 GB limit);
+  // DISCARD rotates a retire pool (wined3d pattern) bounded by cmdbuf
+  // depth. BUFFER (every other pool/usage): host mirror + GPU-only
+  // Private allocation, uploaded on Unlock/bind.
   WMT::Reference<WMT::Buffer> buffer{};
   uint64_t gpu_address = 0;
   void *backing = nullptr;
   void *host_ptr = nullptr;
-  if (HRESULT hr = acquireOrAllocateBufferBacking(Length, buffer, gpu_address, host_ptr, backing); FAILED(hr))
-    return hr;
+  Rc<dxmt::Buffer> dxmt_buffer{};
+  if (determine_buffer_map_mode(Pool, Usage) == D3D9BufferMapMode::Direct) {
+    if (HRESULT hr = acquireOrAllocateBufferBacking(Length, buffer, gpu_address, host_ptr, backing); FAILED(hr))
+      return hr;
+  } else if (!allocateStagedBufferStorage(m_metalDevice, Length, dxmt_buffer, host_ptr)) {
+    return D3DERR_OUTOFVIDEOMEMORY;
+  }
 
-  auto *vb = new MTLD3D9VertexBuffer(this, Length, Usage, FVF, Pool, std::move(buffer), gpu_address, host_ptr, backing);
+  auto *vb = new MTLD3D9VertexBuffer(
+      this, Length, Usage, FVF, Pool, std::move(buffer), gpu_address, host_ptr, backing, std::move(dxmt_buffer)
+  );
   if (Pool == D3DPOOL_DEFAULT)
     vb->markLosable();
   vb->AddRef();
@@ -3459,17 +3519,23 @@ MTLD3D9Device::CreateIndexBuffer(
     return D3DERR_INVALIDCALL;
   }
 
-  // CpuPlaced backing: see CreateVertexBuffer for the 32-bit
-  // rationale, device-pool routing, and DYNAMIC retire-pool shape.
+  // Storage per map mode: see CreateVertexBuffer for the DIRECT placed
+  // backing vs BUFFER host-mirror + Private allocation split.
   WMT::Reference<WMT::Buffer> buffer{};
   uint64_t gpu_address = 0;
   void *backing = nullptr;
   void *host_ptr = nullptr;
-  if (HRESULT hr = acquireOrAllocateBufferBacking(Length, buffer, gpu_address, host_ptr, backing); FAILED(hr))
-    return hr;
+  Rc<dxmt::Buffer> dxmt_buffer{};
+  if (determine_buffer_map_mode(Pool, Usage) == D3D9BufferMapMode::Direct) {
+    if (HRESULT hr = acquireOrAllocateBufferBacking(Length, buffer, gpu_address, host_ptr, backing); FAILED(hr))
+      return hr;
+  } else if (!allocateStagedBufferStorage(m_metalDevice, Length, dxmt_buffer, host_ptr)) {
+    return D3DERR_OUTOFVIDEOMEMORY;
+  }
 
-  auto *ib =
-      new MTLD3D9IndexBuffer(this, Length, Usage, Format, Pool, std::move(buffer), gpu_address, host_ptr, backing);
+  auto *ib = new MTLD3D9IndexBuffer(
+      this, Length, Usage, Format, Pool, std::move(buffer), gpu_address, host_ptr, backing, std::move(dxmt_buffer)
+  );
   if (Pool == D3DPOOL_DEFAULT)
     ib->markLosable();
   ib->AddRef();
@@ -6362,6 +6428,13 @@ MTLD3D9Device::BuildDrawCapture() {
     auto *vb = m_vertexBuffers[s].ptr();
     if (!vb)
       continue;
+    // Flush a bound staged buffer's dirty range before recording the
+    // draw, so the copy op lands in the arrival-order stream ahead of
+    // this draw (DXVK flushes bound dirty buffers at draw time). No-op in
+    // DIRECT mode or with an empty dirty range. The handle / gpu_address
+    // captured below are stable across the upload (the Private allocation
+    // never renames).
+    vb->flushDirty();
     cap.vb_slots[s].offset = m_streamOffsets[s];
     cap.vb_slots[s].stride = m_streamStrides[s];
     cap.vb_slots[s].buffer = vb->metalBuffer().handle;
@@ -6371,6 +6444,7 @@ MTLD3D9Device::BuildDrawCapture() {
     vb->markPendingGpuUse(m_currentCmdSeq);
   }
   if (m_indexBuffer.ptr() != nullptr) {
+    m_indexBuffer->flushDirty();
     cap.ib_buffer = m_indexBuffer->metalBuffer().handle;
     cap.ib_offset = m_indexBuffer->currentOffset();
     cap.ib_format = m_indexBuffer->indexFormat();
@@ -6689,6 +6763,17 @@ EmitCommonRenderSetup_d9(
     obj_handle_t h = bd.resolved_vs_resident_handles[slot];
     if (!h)
       continue;
+    // Register a Vertex-stage read on a BUFFER-mode stream's tracked
+    // allocation so the fence tracker orders the staged upload copy ahead
+    // of this draw (the copy registers the matching write). DIRECT /
+    // override streams carry no tracked buffer and skip this; the
+    // per-encoder fence set collapses repeats within an encoder and
+    // retainAllocation dedups within the chunk. Runs before the resident
+    // dedup so a new encoder after a copy re-establishes the dependency.
+    if (auto *vb_alloc = bd.resolved_vb_dxmt[slot].ptr())
+      ctx.access<PipelineStage::Vertex>(
+          bd.resolved_vb_dxmt[slot], 0, static_cast<unsigned>(vb_alloc->length()), ResourceAccess::Read
+      );
     if (s.vs_resident[slot] == h)
       continue;
     auto &cmd = ctx.encodeRenderCommand<wmtcmd_render_useresource>();
@@ -6698,6 +6783,11 @@ EmitCommonRenderSetup_d9(
     cmd.stages = WMTRenderStageVertex;
     s.vs_resident[slot] = h;
   }
+  // Same Vertex-stage read dependency for a BUFFER-mode index buffer.
+  if (auto *ib_alloc = bd.resolved_ib_dxmt.ptr())
+    ctx.access<PipelineStage::Vertex>(
+        bd.resolved_ib_dxmt, 0, static_cast<unsigned>(ib_alloc->length()), ResourceAccess::Read
+    );
 
   // PSO bind.
   if (s.pso != bd.resolved_pso) {
@@ -6967,6 +7057,26 @@ EmitBlitOp_d9(ArgumentEncodingContext &ctx, MTLD3D9Device::PendingBlitOp &op) {
   cmd.dst_slice = op.dst_slice;
   cmd.dst_level = op.dst_mip;
   cmd.dst_origin = op.dst_origin;
+}
+
+// Copy a BUFFER-mode buffer's dirty range from an upload-ring block into
+// its Private allocation. The access<Compute> write registers the
+// destination in the fence tracker so the encoder scheduler keeps this
+// copy ordered against draws that register a Vertex-stage read on the
+// same allocation; without it a same-RT render merge would fold across
+// the blit and let a later update overwrite an earlier draw's source.
+inline void
+EmitBufferCopyOp_d9(ArgumentEncodingContext &ctx, MTLD3D9Device::PendingBlitOp &op) {
+  auto [dst_alloc, dst_base] = ctx.access<PipelineStage::Compute>(
+      op.buf_dst, static_cast<unsigned>(op.buf_dst_offset), static_cast<unsigned>(op.buf_length), ResourceAccess::Write
+  );
+  auto &cmd = ctx.encodeBlitCommand<wmtcmd_blit_copy_from_buffer_to_buffer>();
+  cmd.type = WMTBlitCommandCopyFromBufferToBuffer;
+  cmd.src = op.buf_src_handle;
+  cmd.src_offset = op.buf_src_offset;
+  cmd.dst = dst_alloc->buffer().handle;
+  cmd.dst_offset = dst_base + op.buf_dst_offset;
+  cmd.copy_length = op.buf_length;
 }
 
 // Render-pass StretchRect for different extents/format aliases.
@@ -7896,10 +8006,17 @@ MTLD3D9Device::ResolveBatchedDrawForChunk(
   for (uint32_t slot = 0; slot < D3D9_MAX_VERTEX_STREAMS; ++slot) {
     if (!(bd.resolved_slot_mask & (1u << slot)))
       continue;
-    if (slot == 0 && bd.override_vb_buffer != 0)
+    if (slot == 0 && bd.override_vb_buffer != 0) {
       bd.resolved_vs_resident_handles[slot] = bd.override_vb_buffer;
-    else
+    } else {
       bd.resolved_vs_resident_handles[slot] = cap.vb_slots[slot].buffer;
+      // Carry the tracked Private allocation for a BUFFER-mode stream so
+      // the emit registers a Vertex-stage read against it; null for
+      // DIRECT streams, which bind by raw handle and need no read
+      // tracking. Override (UP) streams are ring-fed and skip this.
+      if (auto *vb = refs.vertex_buffers[slot].ptr())
+        bd.resolved_vb_dxmt[slot] = vb->dxmtBuffer();
+    }
     bd.resolved_vb_pins[slot] = refs.vertex_buffers[slot];
   }
 
@@ -7915,6 +8032,9 @@ MTLD3D9Device::ResolveBatchedDrawForChunk(
       // Pin the IB wrapper through chunk lifetime; see resolved_vb_pins
       // for the trap.
       bd.resolved_ib_pin = refs.index_buffer;
+      // Tracked Private allocation for a BUFFER-mode IB; null for DIRECT.
+      if (auto *ib = refs.index_buffer.ptr())
+        bd.resolved_ib_dxmt = ib->dxmtBuffer();
     }
   }
 
@@ -8237,6 +8357,14 @@ MTLD3D9Device::FlushDrawBatch() {
             pass = D9PassKind::Blit;
           }
           EmitBlitOp_d9(ctx, op);
+          break;
+        case MTLD3D9Device::PendingBlitOp::Kind::BufferCopy:
+          if (pass != D9PassKind::Blit) {
+            end_current_pass();
+            ctx.startBlitPass();
+            pass = D9PassKind::Blit;
+          }
+          EmitBufferCopyOp_d9(ctx, op);
           break;
         }
       }
