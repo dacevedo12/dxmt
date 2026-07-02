@@ -57,18 +57,12 @@ public:
     m_changes.store_stream_offset = false;
   }
 
-  // dxmt-internal: Reset path marks every outstanding StateBlock
-  // invalid. Per MSDN the runtime destroys all StateBlocks at Reset;
-  // dxmt's blocks have a self-pin so they survive externally-held
-  // refs across Reset, but Capture / Apply on a marked block must
-  // return INVALIDCALL (the snapshot would reference Reset-cleared
-  // state: texture refs, decl, RT bindings. And Apply would
-  // restore stale values that look correct but reference destroyed
-  // resources). wined3d / DXVK match this shape.
-  void
-  invalidate() {
-    m_invalid = true;
-  }
+  // Count this block in the device's losable-resource gate from the
+  // moment it is handed to the app: a non-Ex Reset with a live state
+  // block fails INVALIDCALL, the gate DXVK applies to match native
+  // D3D9. Called by CreateStateBlock and EndStateBlock; the pub-to-zero
+  // Release uncounts.
+  void markLosable();
 
 private:
   // The device's Set* recording arms write straight into the snapshot
@@ -169,13 +163,8 @@ private:
   // transition long enough for the override to drop the device pin.
   // Released exactly once on the first pub→0 transition.
   bool m_self_pinned = true;
-  // Set by MTLD3D9Device::Reset via invalidate(); read by Capture /
-  // Apply to short-circuit with INVALIDCALL. The snapshot's reference-
-  // pinned slots (textures, decl, shaders, buffers) may still point
-  // at pre-Reset objects that the Reset path has now orphaned; replaying
-  // them would restore stale state. Per spec, apps must recreate
-  // StateBlocks after Reset.
-  bool m_invalid = false;
+  // Losable-resource accounting; see markLosable.
+  bool m_isLosable = false;
 };
 
 } // namespace dxmt

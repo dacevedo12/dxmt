@@ -20,13 +20,16 @@ MTLD3D9StateBlock::MTLD3D9StateBlock(MTLD3D9Device *device, D3DSTATEBLOCKTYPE ty
   // apps shouldn't see it in practice, but the init guards against UB
   // if a future code path Apply's without Capture.
   AddRefPrivate();
-  // Register with the device so Reset can invalidate every
-  // outstanding block. Pairs with the unregister in the dtor.
-  m_device->registerStateBlock(this);
 }
 
-MTLD3D9StateBlock::~MTLD3D9StateBlock() {
-  m_device->unregisterStateBlock(this);
+MTLD3D9StateBlock::~MTLD3D9StateBlock() = default;
+
+void
+MTLD3D9StateBlock::markLosable() {
+  if (!m_isLosable) {
+    m_isLosable = true;
+    m_device->onLosableResourceCreated();
+  }
 }
 
 ULONG STDMETHODCALLTYPE
@@ -52,10 +55,17 @@ MTLD3D9StateBlock::Release() {
     return 0;
   ULONG ref = ComObject::Release();
   if (ref == 0) {
-    // The destructor deregisters from the device's StateBlock registry, so the
-    // device has to outlive it. Drop the device pin LAST: capture it locally
-    // (ReleasePrivate frees `this`), let the destructor run while the pin still
-    // keeps the device alive, then release the pin, which may now free it.
+    // Uncount from the losable gate on the app-visible release edge,
+    // before the device pin can drop (Reset's gate must see the block
+    // gone the moment the app lets go of it).
+    if (m_isLosable) {
+      m_isLosable = false;
+      m_device->onLosableResourceDestroyed();
+    }
+    // The captured Com slots release against device-owned resources in the
+    // destructor, so the device has to outlive it. Drop the device pin LAST:
+    // capture it locally (ReleasePrivate frees `this`), let the destructor run
+    // while the pin still keeps the device alive, then release the pin.
     auto *device = m_device;
     if (m_self_pinned) {
       m_self_pinned = false;
@@ -90,13 +100,6 @@ MTLD3D9StateBlock::GetDevice(IDirect3DDevice9 **ppDevice) {
 
 HRESULT STDMETHODCALLTYPE
 MTLD3D9StateBlock::Capture() {
-  // Reset-invalidation gate: the device's last Reset called invalidate()
-  // on every outstanding block. Capture / Apply on a marked block
-  // return INVALIDCALL: its reference-pinned slots may now be
-  // orphaned and the snapshot's stale values must not propagate.
-  // wined3d / DXVK match this shape.
-  if (m_invalid)
-    return D3DERR_INVALIDCALL;
   // Capture between Begin/EndStateBlock is INVALIDCALL (wine
   // dlls/d3d9/tests/device.c test_begin_end_state_block asserts it).
   // BeginStateBlock's internal seed-capture stays legal: it runs
@@ -245,9 +248,6 @@ MTLD3D9StateBlock::Capture() {
 
 HRESULT STDMETHODCALLTYPE
 MTLD3D9StateBlock::Apply() {
-  // Reset-invalidation gate: see Capture() above for the rationale.
-  if (m_invalid)
-    return D3DERR_INVALIDCALL;
   // Same mid-recording gate as Capture: the wine test asserts Apply
   // also fails between Begin/EndStateBlock.
   if (m_device->m_inStateBlockRecord)

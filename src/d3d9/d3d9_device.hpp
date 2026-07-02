@@ -29,7 +29,6 @@
 #include <limits>
 #include <memory>
 #include <unordered_map>
-#include <unordered_set>
 #include <vector>
 
 namespace dxmt {
@@ -700,21 +699,6 @@ private:
   // prior m_depthStencilSurface beforehand.
   void createAutoDepthStencil(const D3DPRESENT_PARAMETERS &params);
 
-  // StateBlock registry: Reset walks this set and calls invalidate()
-  // on every outstanding block. Pre-Reset Captures replay ref-pinned slots
-  // but Reset orphans snapshots (swapchain backbuffers replaced in place,
-  // auto-DS recreated, app-held DEFAULT-pool resources destroyed). Raw
-  // pointers safe: device strictly outlives blocks (pub-AddRef pins device;
-  // self-pin keeps block alive until ReleasePrivate, before device dtor).
-  void
-  registerStateBlock(class MTLD3D9StateBlock *sb) {
-    m_stateBlocks.insert(sb);
-  }
-  void
-  unregisterStateBlock(class MTLD3D9StateBlock *sb) {
-    m_stateBlocks.erase(sb);
-  }
-
   // Shared body for Draw{,Indexed}Primitive{,UP}. override_* fields
   // non-zero: use override via setVertexBuffer at unused slot (Apple
   // guarantees this retains MTLBuffer; useResource is residency-only).
@@ -1291,10 +1275,6 @@ private:
   // Bytes of device-local allocation reported through GetAvailableTextureMem;
   // tracked alongside the losable count (same DEFAULT-pool lifecycle).
   std::atomic<int64_t> m_reportedTextureMemory{0};
-  // StateBlock registry; see registerStateBlock / unregisterStateBlock
-  // above. Reset walks the set and calls invalidate() on each entry.
-  // Single-threaded (calling thread only); no lock.
-  std::unordered_set<class MTLD3D9StateBlock *> m_stateBlocks;
   // Pooled buffer backings; see acquireBufferBacking comment above.
   // Vector is fine: typical workloads keep the pool small (a handful
   // of distinct sizes); a hash-map keyed by size would add allocator

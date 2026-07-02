@@ -1211,7 +1211,7 @@ MTLD3D9Device::~MTLD3D9Device() {
   // A BeginStateBlock with no matching EndStateBlock leaves the
   // recording block holding only its ctor self-pin (no public ref was
   // ever handed out), so nothing else will ever destruct it. Drop the
-  // pin so the block unregisters from m_stateBlocks before teardown.
+  // pin before teardown.
   if (m_recordingBlock) {
     auto *sb = m_recordingBlock;
     m_recordingBlock = nullptr;
@@ -2352,11 +2352,13 @@ MTLD3D9Device::Reset(D3DPRESENT_PARAMETERS *pPresentationParameters) {
     return D3DERR_DEVICELOST;
 
   // Spec gate: non-Ex devices reject Reset when any app-held
-  // D3DPOOL_DEFAULT resource is still alive. wined3d device.c
-  // runs reset_enum_callback only on !extended; DXVK d3d9_device.cpp
-  // gates with !IsExtended(). Ex devices are expected to
-  // succeed Reset with live DEFAULT resources; the runtime drops
-  // those resources via internal release rather than failing the call.
+  // D3DPOOL_DEFAULT resource or state block is still alive. wined3d
+  // device.c runs reset_enum_callback only on !extended; DXVK
+  // d3d9_device.cpp gates with !IsExtended() and counts state blocks in
+  // the same losable counter to match native D3D9 (wined3d instead keeps
+  // blocks usable across Reset; native fails the call). Ex devices are
+  // expected to succeed Reset with live DEFAULT resources; the runtime
+  // drops those resources via internal release rather than failing.
   if (!m_isEx && m_losableResourceCount.load(std::memory_order_relaxed) != 0) {
     m_deviceState.store(DeviceState::NotReset, std::memory_order_relaxed);
     return D3DERR_INVALIDCALL;
@@ -2447,10 +2449,6 @@ MTLD3D9Device::Reset(D3DPRESENT_PARAMETERS *pPresentationParameters) {
       m_recordingBlock = nullptr;
       recording->ReleasePrivate();
     }
-    // Invalidate outstanding StateBlocks (per MSDN, Reset destroys them). Self-pinned blocks survive app-held refs but
-    // Capture/Apply hard-fail: snapshot may reference Reset-orphaned resources; replay would corrupt state.
-    for (MTLD3D9StateBlock *sb : m_stateBlocks)
-      sb->invalidate();
     // Reset closes the implicit scene per MSDN ("Reset...returns all
     // resources to a state similar to the state immediately after
     // the device is created"). Apps that called BeginScene before a
@@ -5955,6 +5953,7 @@ MTLD3D9Device::CreateStateBlock(D3DSTATEBLOCKTYPE Type, IDirect3DStateBlock9 **p
   // (wined3d store_stream_offset). Recorded blocks never take this path.
   sb->freezeStreamOffset();
   sb->AddRef();
+  sb->markLosable();
   *ppSB = sb;
   return D3D_OK;
 }
@@ -6014,6 +6013,7 @@ MTLD3D9Device::EndStateBlock(IDirect3DStateBlock9 **ppSB) {
   auto *sb = m_recordingBlock;
   m_recordingBlock = nullptr;
   sb->AddRef();
+  sb->markLosable();
   *ppSB = sb;
   return D3D_OK;
 }
