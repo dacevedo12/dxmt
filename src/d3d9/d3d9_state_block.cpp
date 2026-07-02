@@ -269,9 +269,9 @@ MTLD3D9StateBlock::Apply() {
   }
   if (m_changes.texture_stage_states) {
     std::memcpy(m_device->m_textureStageStates, m_snapTextureStageStates, sizeof(m_snapTextureStageStates));
-    // No POD-snapshot bump: texture_stage_states isn't carried in
-    // BatchedDraw::pod_snapshot today (FFP shader generator hasn't
-    // landed).
+    // Resolve reads texture-stage state per draw off pod_snapshot, so an
+    // Apply that restores it must dirty the axis like the setters do.
+    pod_dirty |= dxmt::D9ES_DIRTY_TEXTURE_STAGE_STATES;
   }
   if (m_changes.transforms) {
     std::memcpy(m_device->m_transforms, m_snapTransforms, sizeof(m_snapTransforms));

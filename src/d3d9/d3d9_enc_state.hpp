@@ -22,7 +22,8 @@ enum D9EncStateDirtyBit : uint32_t {
   D9ES_DIRTY_PS_CONST_F_MAX = 1u << 11,
   D9ES_DIRTY_VIEWPORT = 1u << 12,
   D9ES_DIRTY_SCISSOR_RECT = 1u << 13,
-  D9ES_DIRTY_ALL = (1u << 14) - 1,
+  D9ES_DIRTY_TEXTURE_STAGE_STATES = 1u << 14,
+  D9ES_DIRTY_ALL = (1u << 15) - 1,
 };
 
 // Sizes mirror the matching MTLD3D9Device::m_* shadow fields. The
@@ -31,6 +32,9 @@ enum D9EncStateDirtyBit : uint32_t {
 // dependency surface of this header. Keep them in sync by hand;
 // static_asserts in d3d9_device.cpp verify the pairs.
 inline constexpr unsigned D9ES_MAX_TEXTURE_UNITS = 20;
+// FFP texture-blend stages, D3DCAPS9::MaxTextureBlendStages; matches the
+// device's m_textureStageStates first dimension.
+inline constexpr unsigned D9ES_MAX_TEXTURE_STAGES = 8;
 inline constexpr unsigned D9ES_MAX_VERTEX_STREAMS = 16;
 inline constexpr unsigned D9ES_MAX_VS_CONST_F = 256;
 inline constexpr unsigned D9ES_MAX_VS_CONST_I = 16;
@@ -40,7 +44,7 @@ inline constexpr unsigned D9ES_MAX_PS_CONST_I = 16;
 inline constexpr unsigned D9ES_MAX_PS_CONST_B = 16;
 
 // Per-draw POD snapshot (COW per state cluster). Compact: ~10 KB
-// (transforms/texture_stage_states parked on calling-thread until FFP).
+// (transforms parked on the calling thread until FFP).
 // ~200 clusters/frame cuts bandwidth from 5 MB to 2 MB.
 struct D9EncodingState {
   // Render state. D3DRS_* enum runs up to 209; storage sized to 256
@@ -50,6 +54,12 @@ struct D9EncodingState {
   // Per-stage sampler state, indexed [stage][D3DSAMP_*]. wined3d's
   // shape (combined PS + VS samplers).
   DWORD sampler_states[D9ES_MAX_TEXTURE_UNITS][D3DSAMP_DMAPOFFSET + 1] = {};
+
+  // Per-stage texture-stage state, indexed [stage][D3DTSS_*]. Read on the
+  // encode thread by Resolve for PS bump-env constants and the SM1.x
+  // projected-texturing mask, so it must be frozen per draw here rather
+  // than read live off the device member.
+  DWORD texture_stage_states[D9ES_MAX_TEXTURE_STAGES][D3DTSS_CONSTANT + 1] = {};
 
   // User clip planes. VS path reads these when
   // D3DRS_CLIPPLANEENABLE bit i is set; Resolve packs the active

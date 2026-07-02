@@ -6155,10 +6155,12 @@ MTLD3D9Device::SetTextureStageState(DWORD Stage, D3DTEXTURESTAGESTATETYPE Type, 
   if (m_textureStageStates[Stage][Type] == Value)
     return D3D_OK;
   m_textureStageStates[Stage][Type] = Value;
-  // texture_stage_states isn't read by Resolve/Emit today (FFP shader
-  // generator hasn't landed) so we don't dirty m_encShadowDirty; the
-  // POD snapshot doesn't carry these. Re-enable the dirty flag when
-  // the FFP generator starts consuming them.
+  // Resolve reads texture-stage state on the encode thread (PS bump-env
+  // constants, the SM1.x projected-texturing mask), so the per-draw POD
+  // snapshot must pick up the change: dirty the axis exactly like the
+  // render-state and sampler-state setters. The device member stays the
+  // source of truth for Get and state-block capture (calling-thread only).
+  m_encShadowDirty |= dxmt::D9ES_DIRTY_TEXTURE_STAGE_STATES;
   return D3D_OK;
 }
 
@@ -6494,6 +6496,13 @@ MTLD3D9Device::QueueBatchedDraw(BatchedDraw &&draw) {
       std::memcpy(snap->render_states, m_renderStates, sizeof(snap->render_states));
     if (dirty & dxmt::D9ES_DIRTY_SAMPLER_STATES)
       std::memcpy(snap->sampler_states, m_samplerStates, sizeof(snap->sampler_states));
+    if (dirty & dxmt::D9ES_DIRTY_TEXTURE_STAGE_STATES) {
+      static_assert(
+          sizeof(dxmt::D9EncodingState::texture_stage_states) == sizeof(m_textureStageStates),
+          "TSS snapshot shape must match the device member"
+      );
+      std::memcpy(snap->texture_stage_states, m_textureStageStates, sizeof(snap->texture_stage_states));
+    }
     if (dirty & dxmt::D9ES_DIRTY_CLIP_PLANES)
       std::memcpy(snap->clip_planes, m_clipPlanes, sizeof(snap->clip_planes));
     if (dirty & dxmt::D9ES_DIRTY_STREAM_FREQ)
@@ -7483,7 +7492,7 @@ MTLD3D9Device::ResolveBatchedDrawForChunk(
       for (uint32_t stage = 0; stage < 8; ++stage) {
         if (!(ps->metadata().bem_stage_mask & (1u << stage)))
           continue;
-        const DWORD *tss = m_textureStageStates[stage];
+        const DWORD *tss = pod.texture_stage_states[stage];
         bump_env_args.mat[stage][0] = bits_to_float(tss[D3DTSS_BUMPENVMAT00]);
         bump_env_args.mat[stage][1] = bits_to_float(tss[D3DTSS_BUMPENVMAT01]);
         bump_env_args.mat[stage][2] = bits_to_float(tss[D3DTSS_BUMPENVMAT10]);
