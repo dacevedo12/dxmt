@@ -1095,6 +1095,20 @@ compile_dxso(
     Value *bias_raw = builder.CreateLoad(builder.getInt32Ty(), bias_ptr);
     return builder.CreateBitCast(bias_raw, builder.getFloatTy());
   };
+  // Shared SM1.x projected-texturing divide: coord / coord.w, gated on the
+  // per-stage PROJECTED bit in the runtime bool-constant blob at index 27
+  // (bit = stage). The runtime select leaves a non-projected stage untouched,
+  // so a w==0 texcoord on a non-projected app never divides. coord is a 4-lane
+  // texcoord; callers gate by opcode/version and pass their stage slot.
+  auto apply_projected = [&](Value *coord, uint32_t slot) -> Value * {
+    Value *proj_ptr = builder.CreateGEP(builder.getInt32Ty(), fn->getArg(bc_arg_idx), builder.getInt32(27));
+    Value *proj_mask = builder.CreateLoad(builder.getInt32Ty(), proj_ptr);
+    Value *proj_bit =
+        builder.CreateICmpNE(builder.CreateAnd(proj_mask, builder.getInt32(1u << slot)), builder.getInt32(0));
+    Value *w = builder.CreateExtractElement(coord, builder.getInt32(3));
+    Value *w_splat = builder.CreateVectorSplat(4, w);
+    return builder.CreateSelect(proj_bit, builder.CreateFDiv(coord, w_splat), coord);
+  };
   auto load_src = [&](const DxsoSrcRegister &src) -> Value * {
     Value *v = nullptr;
     switch (src.base.type) {
@@ -2123,6 +2137,17 @@ compile_dxso(
       }
       if (!coord4)
         break;
+      // SM1.0-1.3 implicit projected texturing (D3DTTFF_PROJECTED): the
+      // pre-1.4 pixel shader divides the texcoord by its w at a PROJECTED
+      // stage (see apply_projected). DXVK gates the same divide on a
+      // per-sampler projected spec constant. Cube samples are excluded (a
+      // direction vector is not projected); SM1.4 and SM2+ do not take this
+      // path, and TexBem/TexBemL project in their own arm. Projecting coord4
+      // here, before the shuffle, also feeds the depth-compare reference
+      // extracted below.
+      if (!is_vertex && ins.opcode == DxsoOpcode::Tex && shader->header.major < 2 && shader->header.minor < 4 &&
+          samp_kind[slot] != DxsoTextureType::TextureCube)
+        coord4 = apply_projected(coord4, slot);
       // Coord shape follows the dcl'd texture type: 2D reads xy, Cube
       // reads xyz (Metal's cube sampler takes a direction vector, not
       // a face/uv pair), 3D reads xyz. TexLdl reads lane 3 as the LOD
@@ -2557,18 +2582,13 @@ compile_dxso(
       // TexM3x* family.
       auto *gep_tc = builder.CreateGEP(texInputArrTy, tex_inputs, {builder.getInt32(0), builder.getInt32(slot)});
       Value *tc4 = builder.CreateLoad(float4Ty, gep_tc);
-      // Use raw .xy from the texcoord. DXVK dxso_compiler.cpp calls
-      // DoProjection(tc, /*switchProjRes=*/true) which is a SpecSampler-
-      // Projected-keyed opSelect (dynamic gate on the D3DTSS_TEXTURE-
-      // TRANSFORMFLAGS PROJECTED bit), NOT an unconditional divide.
-      // A prior judge-fix here applied an unconditional /w that produced
-      // NaN/Inf when tc.w==0 and over-divided non-PROJECTED apps with
-      // non-unit tc.w; both regressions vs the per-spec gate. Plain
-      // .xy matches the common non-PROJECTED case (the vast majority of
-      // SM 1.x TexBem content); the PROJECTED-stage case is left as a
-      // known gap and would need either a per-stage projection mask on
-      // DXSO_SHADER_PS_BUMP_ENV_DATA + a variant-cache axis, or DXVK's
-      // spec-constant runtime gate.
+      // Projected bump-env texturing. DXVK dxso_compiler.cpp projects the
+      // texcoord (DoProjection, switchProjRes=true) BEFORE the bump
+      // perturbation, gated on the per-sampler PROJECTED bit. Project tc4
+      // here (see apply_projected), then perturb the projected x,y below;
+      // the bump sample n is not projected. TexBem/TexBemL are SM1.x-only,
+      // so no version gate is needed here.
+      tc4 = apply_projected(tc4, slot);
       Value *tc_x = builder.CreateExtractElement(tc4, builder.getInt32(0));
       Value *tc_y = builder.CreateExtractElement(tc4, builder.getInt32(1));
       Value *n_x = builder.CreateExtractElement(n4, builder.getInt32(0));

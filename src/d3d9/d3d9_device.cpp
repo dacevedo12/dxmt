@@ -8127,10 +8127,11 @@ MTLD3D9Device::ResolveBatchedDrawForChunk(
     // Per-draw PS data sharing buffer(2): bool bits at byte 0,
     // D3DRS_FOGCOLOR as float4 rgba at byte 16, sampler LOD biases as
     // float[16] at byte 32, table-fog params (FOGSTART/FOGEND/FOGDENSITY)
-    // as float[3] at byte 96. The PS epilogue reads the fog params at
-    // uint32 index 24/25/26; keep this layout in lockstep with
-    // dxso_compile.cpp's load_blob_f offsets. The 256-byte
-    // sub-allocation alignment absorbs the growth.
+    // as float[3] at byte 96, and the SM1.x projected-texturing mask at
+    // uint32 index 27 (byte 108). The PS reads the fog params at uint32
+    // index 24/25/26 and the projected mask at 27; keep this layout in
+    // lockstep with dxso_compile.cpp's load_blob_f / projected-mask
+    // offsets. The 256-byte sub-allocation alignment absorbs the growth.
     uint32_t ps_b_blob[28] = {};
     ps_b_blob[0] = ps_b_bits;
     {
@@ -8168,6 +8169,20 @@ MTLD3D9Device::ResolveBatchedDrawForChunk(
           pod.render_states[D3DRS_FOGDENSITY],
       };
       std::memcpy(fog_params, raw, sizeof(raw));
+    }
+    {
+      // SM1.0-1.3 projected-texturing mask at uint32 index 27: bit s set
+      // when stage s has D3DTSS_TEXTURETRANSFORMFLAGS & D3DTTFF_PROJECTED.
+      // The pre-1.4 pixel shader reads this per sampler and divides the
+      // texcoord by w at each projected stage; higher shader models never
+      // compile that path, so the mask is inert for them. DXVK derives the
+      // same per-sampler projected spec constant from this flag.
+      uint32_t projected = 0;
+      for (uint32_t s = 0; s < dxmt::D9ES_MAX_TEXTURE_STAGES; ++s) {
+        if (pod.texture_stage_states[s][D3DTSS_TEXTURETRANSFORMFLAGS] & D3DTTFF_PROJECTED)
+          projected |= 1u << s;
+      }
+      ps_b_blob[27] = projected;
     }
 
     constexpr size_t kSubAlign = 256;
