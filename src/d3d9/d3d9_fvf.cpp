@@ -63,7 +63,9 @@ build_fvf_decl_elements(DWORD fvf, std::vector<D3DVERTEXELEMENT9> &out) {
   if (has_pos) {
     if (!has_blend && (fvf & D3DFVF_XYZRHW) == D3DFVF_XYZRHW)
       fvf_append_element(out, offset, D3DDECLTYPE_FLOAT4, D3DDECLUSAGE_POSITIONT, 0);
-    else if ((fvf & D3DFVF_XYZW) == D3DFVF_XYZW)
+    // A projected-W position is mutually exclusive with blend weights, the same
+    // gate wined3d applies (dlls/d3d9 vertexdeclaration.c).
+    else if (!has_blend && (fvf & D3DFVF_XYZW) == D3DFVF_XYZW)
       fvf_append_element(out, offset, D3DDECLTYPE_FLOAT4, D3DDECLUSAGE_POSITION, 0);
     else
       fvf_append_element(out, offset, D3DDECLTYPE_FLOAT3, D3DDECLUSAGE_POSITION, 0);

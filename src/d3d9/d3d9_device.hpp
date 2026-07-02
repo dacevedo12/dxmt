@@ -1476,7 +1476,7 @@ private:
   // (D3D9 has no D3DSAMP_0). Defaults are seeded in the ctor; the
   // values feed the Metal sampler descriptor via
   // sampler_info_from_d3d9_state.
-  DWORD m_samplerStates[D3D9_MAX_TEXTURE_UNITS][D3DSAMP_DMAPOFFSET + 1];
+  DWORD m_samplerStates[D3D9_MAX_TEXTURE_UNITS][D3DSAMP_DMAPOFFSET + 1] = {};
   // FFP texture-stage state: wined3d's shape, indexed by D3DTSS_* up
   // to D3DTSS_CONSTANT (32). 8 stages matches D3DCAPS9::MaxTextureBlendStages
   // and wined3d MAX_TEXTURES. Programmable-PS games still issue

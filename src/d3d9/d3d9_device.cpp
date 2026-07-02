@@ -4513,6 +4513,10 @@ MTLD3D9Device::GetFrontBufferData(UINT iSwapChain, IDirect3DSurface9 *pDestSurfa
     return D3DERR_INVALIDCALL;
 
   MTLD3D9Surface *front = m_implicitSwapChain->backBuffer();
+  // A failed Reset can leave the swapchain without a backbuffer; bail rather
+  // than dereference a null front buffer.
+  if (!front)
+    return D3DERR_INVALIDCALL;
   const D3DSURFACE_DESC &sd = front->desc();
   // TODO: MSAA backbuffer resolve (DXVK swapchain.cpp; temp
   // 1-sample image + resolveImage + texture-to-buffer copy). Today the
@@ -5036,6 +5040,11 @@ MTLD3D9Device::CreateOffscreenPlainSurface(
         /*cpuPtr=*/backing, depth_pitch, /*arraySlice=*/0,
         /*ownedBacking=*/user_memory ? nullptr : backing, /*dxmtTexture=*/{}
     );
+    // DEFAULT-pool offscreen surfaces are losable; the SYSTEMMEM / SCRATCH
+    // copies live in CPU pools and never go through Reset's gate. Mirrors the
+    // normal offscreen-plain branch below.
+    if (Pool == D3DPOOL_DEFAULT)
+      surface->markLosable();
     surface->AddRef();
     *ppSurface = surface;
     return D3D_OK;
