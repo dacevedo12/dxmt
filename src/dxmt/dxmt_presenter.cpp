@@ -51,7 +51,11 @@ Presenter::changeLayerProperties(
   if (should_invalidated)
     pso_valid.clear(); // defer changes
   else
-    layer_.setProps(layer_props_);
+    // A size-only change also defers to synchronizeLayerProperties: setting
+    // the props here would mutate the layer while the encode thread may be
+    // inside nextDrawable for an in-flight present; the deferred apply runs
+    // behind the present drain (see changeGammaRamp for the same shape).
+    props_dirty_ = true;
   return should_invalidated;
 }
 
@@ -137,6 +141,15 @@ Presenter::synchronizeLayerProperties() {
     buildRenderPipelineState(final_colorspace == WMTColorSpaceHDR_PQ, is_hdr && hdr_metadata != nullptr, sample_count_ > 1, gamma_enabled_);
     layer_.setProps(layer_props_);
     layer_.setColorSpace(final_colorspace);
+    props_dirty_ = false;
+  } else if (unlikely(props_dirty_)) {
+    // Size-only layer change (changeLayerProperties): apply it behind the
+    // same present drain the invalidation path uses, so the layer is never
+    // mutated while the encode thread acquires a drawable. No PSO rebuild:
+    // the pipeline does not depend on the drawable size.
+    frame_presented_.wait(frame_requested_);
+    layer_.setProps(layer_props_);
+    props_dirty_ = false;
   }
 
   DXMTPresentMetadata metadata;

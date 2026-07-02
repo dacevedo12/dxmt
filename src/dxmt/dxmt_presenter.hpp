@@ -115,6 +115,11 @@ private:
   // default 0 preserves the upstream DXGI path; d3d9 overrides it to 3 (IGNORE).
   uint32_t present_alpha_mode_ = 0;
   std::atomic_flag pso_valid = 0;
+  // Set by a size-only changeLayerProperties (calling thread) and consumed
+  // by synchronizeLayerProperties (also the calling thread, at Present):
+  // the layer props apply behind the present drain instead of racing the
+  // encode thread's drawable acquisition. Plain bool: no cross-thread use.
+  bool props_dirty_ = false;
   uint64_t frame_requested_ = 0;
   CpuFence frame_presented_ = 0;
 
