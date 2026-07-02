@@ -1275,12 +1275,13 @@ MTLD3D9Device::getOrCreateSampler(const WMTSamplerInfo &info) {
 
 obj_handle_t
 MTLD3D9Device::dummyFragmentTexture(WMTTextureType type) {
-  // Opaque-black 1×1 placeholder for sampled-but-unbound PS stages.
-  // Typed per sampler kind because a 2D bind on a 3D/cube sampler is a
-  // Metal type mismatch (wined3d keeps per-type dummies too). The fill
-  // is (0, 0, 0, 1): D3D9 unbound samples read opaque black (wined3d's
-  // WINED3D_LEGACY_UNBOUND_RESOURCE_COLOR), and shaders that sample an
-  // intentionally-unbound stage rely on the alpha being 1.
+  // Opaque-black 1×1 placeholder for a sampled-but-unbound stage, pixel or
+  // vertex: the texture is ShaderRead, so the bind stage is the only
+  // difference and the same dummies serve both. Typed per sampler kind because
+  // a 2D bind on a 3D/cube sampler is a Metal type mismatch (wined3d keeps
+  // per-type dummies too). The fill is (0, 0, 0, 1): D3D9 unbound samples read
+  // opaque black (wined3d's WINED3D_LEGACY_UNBOUND_RESOURCE_COLOR), and shaders
+  // that sample an intentionally-unbound stage rely on the alpha being 1.
   uint32_t idx;
   switch (type) {
   case WMTTextureType3D:
@@ -7061,24 +7062,30 @@ EmitCommonRenderSetup_d9(
   }
 
   // Vertex texture fetch (VTF): bind the VS-sampled textures on the vertex
-  // stage (D3DVERTEXTEXTURESAMPLER0-3 -> Metal vertex index 0-3). ctx.access<
-  // Vertex> registers the read dependency + residency. VTF draws are rare, so
-  // bind directly each draw (no per-slot shadow); slots with no app texture
-  // bound just leave whatever was last set, which the VS won't sample.
+  // stage (D3DVERTEXTEXTURESAMPLER0-3 -> Metal vertex index 0-3). A bound slot
+  // goes through ctx.access<Vertex> (read dependency + residency); a slot the
+  // VS declared but the app left unbound carries an opaque-black dummy from
+  // Resolve, bound by raw handle so the VS never samples a stale texture. A
+  // slot the VS does not declare stays 0 and is left untouched (never sampled).
+  // VTF draws are rare, so bind directly each draw (no per-slot shadow).
   for (uint32_t vslot = 0; vslot < 4; ++vslot) {
-    if (!bd.resolved_vert_texture_dxmt[vslot].ptr())
-      continue;
-    auto &view = ctx.access<PipelineStage::Vertex>(
-        bd.resolved_vert_texture_dxmt[vslot], bd.resolved_vert_view[vslot], ResourceAccess::Read
-    );
-    obj_handle_t mt = view.texture.handle;
-    if (mt) {
-      auto &uc = ctx.encodeRenderCommand<wmtcmd_render_useresource>();
-      uc.type = WMTRenderCommandUseResource;
-      uc.resource = mt;
-      uc.usage = WMTResourceUsageRead;
-      uc.stages = WMTRenderStageVertex;
+    const auto &rc = bd.resolved_vert_texture_dxmt[vslot];
+    obj_handle_t mt;
+    if (rc.ptr()) {
+      auto &view = ctx.access<PipelineStage::Vertex>(rc, bd.resolved_vert_view[vslot], ResourceAccess::Read);
+      mt = view.texture.handle;
+    } else {
+      // Device-owned dummy for a declared-but-unbound slot, or 0 when the VS
+      // does not declare this slot.
+      mt = bd.resolved_vert_textures[vslot];
     }
+    if (!mt)
+      continue;
+    auto &uc = ctx.encodeRenderCommand<wmtcmd_render_useresource>();
+    uc.type = WMTRenderCommandUseResource;
+    uc.resource = mt;
+    uc.usage = WMTResourceUsageRead;
+    uc.stages = WMTRenderStageVertex;
     auto &cmd = ctx.encodeRenderCommand<wmtcmd_render_settexture>();
     cmd.type = WMTRenderCommandSetVertexTexture;
     cmd.texture = mt;
@@ -7976,13 +7983,42 @@ MTLD3D9Device::ResolveBatchedDrawForChunk(
   // them via s0..s3 -> Metal vertex texture index 0..3. Resolved here (common
   // to both cluster paths, not cached) because VTF draws are rare. Most draws
   // bind nothing here and leave the four slots null.
+  //
+  // A slot the VS declares (dcl_2d / dcl_volume / dcl_cube s0..s3) but the app
+  // left unbound gets an opaque-black dummy of the declared kind, mirroring the
+  // fragment path: without it the VS would sample the previous draw's texture.
+  // Only declared slots are touched (vs_samp_type stays Unknown otherwise).
+  // VTF exists only in vs_3_0, so the scan is skipped for fixed-function and
+  // pre-SM3 vertex paths entirely, and a SM3 VS with no sampler dcls finds
+  // nothing here: the common no-VTF draw pays zero cost.
+  DxsoTextureType vs_samp_type[4] = {};
+  if (vs && vs->metadata().major >= 3) {
+    for (const auto &d : vs->metadata().dcls) {
+      if (d.bound_to.type == DxsoRegisterType::Sampler && d.bound_to.num < 4)
+        vs_samp_type[d.bound_to.num] = d.dcl.texture_type;
+    }
+  }
   for (uint32_t vslot = 0; vslot < 4; ++vslot) {
     auto *tex = refs.textures[16 + vslot].ptr();
     if (!tex) {
-      bd.resolved_vert_textures[vslot] = 0;
       bd.resolved_vert_texture_dxmt[vslot] = {};
       bd.resolved_vert_view[vslot] = 0;
       bd.resolved_vert_samplers[vslot] = 0;
+      if (vs_samp_type[vslot] != DxsoTextureType::Unknown) {
+        // Declared-but-unbound: type-correct opaque-black dummy + a sampler so
+        // the vertex bind is complete and the VS reads (0, 0, 0, 1).
+        WMTTextureType dummy_type = WMTTextureType2D;
+        if (vs_samp_type[vslot] == DxsoTextureType::Texture3D)
+          dummy_type = WMTTextureType3D;
+        else if (vs_samp_type[vslot] == DxsoTextureType::TextureCube)
+          dummy_type = WMTTextureTypeCube;
+        bd.resolved_vert_textures[vslot] = dummyFragmentTexture(dummy_type);
+        WMTSamplerInfo sinfo = sampler_info_from_d3d9_state(samp_states[16 + vslot]);
+        if (auto sampler = getOrCreateSampler(sinfo))
+          bd.resolved_vert_samplers[vslot] = sampler->sampler_state.handle;
+      } else {
+        bd.resolved_vert_textures[vslot] = 0;
+      }
       continue;
     }
     const Rc<dxmt::Texture> &rc = tex->dxmtTexture();
