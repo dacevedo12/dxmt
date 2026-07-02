@@ -225,10 +225,11 @@ MTLD3D9Texture::ensureMirror() {
 
     WMTBufferInfo binfo{};
     binfo.length = total_bytes;
-    // Hazard-tracking default (Tracked); see the eager-alloc note in
-    // buildLevelsAndMirror's prior shape: UnlockRect blits this buffer
-    // into the GPU texture; without the barrier a follow-on sample in
-    // the same cmdbuf reads stale texels.
+    // Shared storage so the backing can be donated to and reused from the
+    // device block pool (releaseBufferBacking / acquireBufferBacking, whose
+    // entries require a Metal registration). The GPU never reads this buffer:
+    // UnlockRect snapshots the mirror bytes through the upload ring, and
+    // readbackSurfaceMirror copies GPU texels back into the CPU backing.
     binfo.options = (WMTResourceOptions)(WMTResourceCPUCacheModeDefaultCache | WMTResourceStorageModeShared);
     binfo.memory.set(m_mirrorBacking);
     m_mirrorBuffer = m_device->metalDevice().newBuffer(binfo);
@@ -239,15 +240,14 @@ MTLD3D9Texture::ensureMirror() {
     }
   }
 
-  // Patch every level surface: fills in cpu_ptr, mirror_src_buffer,
-  // mirror_level_offset, and pitch (computed per-level from m_format
-  // and the dimension cached at ctor time).
+  // Patch every level surface: fills in cpu_ptr and pitch (computed per-level
+  // from m_format and the dimension cached at ctor time).
   for (UINT i = 0; i < m_levels.size(); ++i) {
     void *level_ptr = static_cast<uint8_t *>(m_mirrorBacking) + m_mirrorOffsets[i];
     UINT level_w = std::max<UINT>(1u, m_width >> i);
     // Aligned stride, matching the mirror sizing in buildLevelsAndMirror.
     uint32_t pitch = D3DFormatLockPitch(m_format, level_w);
-    m_levels[i]->patchMirror(level_ptr, m_mirrorBuffer.handle, static_cast<uint32_t>(m_mirrorOffsets[i]), pitch);
+    m_levels[i]->patchMirror(level_ptr, pitch);
   }
 }
 

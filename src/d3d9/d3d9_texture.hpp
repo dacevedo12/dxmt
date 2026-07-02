@@ -105,7 +105,7 @@ public:
   // both MTLD3D9Texture::LockRect (the IDirect3DTexture9 path) and
   // MTLD3D9Surface::LockRect (the GetSurfaceLevel-direct path). Safe to
   // call repeatedly; the first call allocates and patches every level
-  // surface's m_cpu_ptr + m_mirror_src_buffer, subsequent calls early-
+  // surface's m_cpu_ptr + pitch, subsequent calls early-
   // out. Cuts boot-time VA pressure and wine_unix_call rate for apps
   // that batch-create textures up front (audit M-PERF #2).
   void ensureMirror();

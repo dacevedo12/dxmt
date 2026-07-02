@@ -190,15 +190,6 @@ public:
     return m_locked_no_dirty_update;
   }
 
-  // dxmt-internal: parent texture sets the mirror source after ctor so
-  // UnlockRect knows which buffer backs this level. Called once per
-  // per-level surface in MTLD3D9Texture's buildLevelsAndMirror.
-  void
-  setMirrorSource(obj_handle_t buffer_handle, uint32_t level_offset) {
-    m_mirror_src_buffer = buffer_handle;
-    m_mirror_level_offset = level_offset;
-  }
-
   // Lazy-mirror back-pointer: MTLD3D9Texture defers mirror allocation
   // until first LockRect. Surface-direct LockRect path drives alloc via
   // m_lazyMirrorParent; patchMirror called from ensureMirror().
@@ -215,10 +206,8 @@ public:
       m_lock_state = state;
   }
   void
-  patchMirror(void *cpu_ptr, obj_handle_t buffer_handle, uint32_t level_offset, uint32_t pitch) {
+  patchMirror(void *cpu_ptr, uint32_t pitch) {
     m_cpu_ptr = cpu_ptr;
-    m_mirror_src_buffer = buffer_handle;
-    m_mirror_level_offset = level_offset;
     m_pitch = pitch;
   }
   // Inverse of patchMirror for MANAGED mirror eviction (MTLD3D9Texture::
@@ -228,7 +217,6 @@ public:
   void
   clearMirrorPatch() {
     m_cpu_ptr = nullptr;
-    m_mirror_src_buffer = 0;
   }
 
   // Swap Metal backing in place (swapchain ResetForDeviceReset).
@@ -330,15 +318,6 @@ private:
   uint32_t m_locked_y = 0;
   uint32_t m_locked_w = 0;
   uint32_t m_locked_h = 0;
-  // Mirror-buffer upload source. Distinct from m_buffer (which marks
-  // "surface storage IS this buffer, skip upload": the buffer-backed
-  // path). When m_mirror_src_buffer is non-zero, MANAGED UnlockRect
-  // records a buffer→texture blit using this handle directly, no host
-  // memcpy. m_mirror_level_offset is the start of this level inside
-  // the parent's mirror buffer; the dirty-rect offset is added on top
-  // at Unlock time.
-  obj_handle_t m_mirror_src_buffer = 0;
-  uint32_t m_mirror_level_offset = 0;
   // Lazy-mirror parent: only set on per-level surfaces of a MANAGED/
   // SYSTEMMEM/SCRATCH MTLD3D9Texture whose mirror hasn't been alloc'd
   // yet. LockRect dispatches to ensureMirror() through this pointer

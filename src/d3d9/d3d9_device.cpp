@@ -1093,6 +1093,10 @@ void
 MTLD3D9Device::releaseBufferBacking(
     WMT::Reference<WMT::Buffer> &&buffer, void *owned, uint64_t gpu_address, size_t capacity
 ) {
+  // Precondition: the donated backing is GPU-idle. The only callers are
+  // resource dtors, and a bound resource's wrapper is pinned by the chunk's
+  // resolved pins until the GPU retires it, so the dtor (and this donation)
+  // runs only once no in-flight cmdbuf still reads the backing.
   if (m_bufferBackingPool.size() >= kMaxBufferBackingPoolSize ||
       m_bufferBackingPoolBytes + capacity > kMaxBufferBackingPoolBytes) {
     // Pool full (by count or by bytes): drop on the floor. The moved-in

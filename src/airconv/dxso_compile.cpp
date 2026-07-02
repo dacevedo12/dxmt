@@ -32,7 +32,7 @@ namespace dxmt {
 
 // TODO: d3d9 should route CreateVertexShader/CreatePixelShader through
 // DXSOInitialize for validation and walk instead of duplicating.
-// Emit placeholder DXSO entry into externally-owned Module,
+// Translate a complete SM1-3 shader into the externally-owned Module,
 // mirroring dxbc::convertDXBC's role in the optimization pipeline.
 void
 compile_dxso(
@@ -1580,10 +1580,8 @@ compile_dxso(
     return sum;
   };
 
-  // Walk the body. No opcodes are lowered yet; the iterator + switch
-  // are the spine real lowerings hang off. Anything we don't recognize
-  // is silently skipped so the output stays a valid zero-filled
-  // placeholder until per-opcode commits land.
+  // Walk the body: the iterator drives the per-opcode lowering dispatch in the
+  // switch below. Anything we don't recognize is silently skipped.
   // DWORD is `typedef uint32_t DWORD` in this codebase
   // (windows_base.h), so DxsoBytecodeIter's `const DWORD *`
   // accepts a `const uint32_t *` directly with no cast.
@@ -3379,10 +3377,10 @@ compile_dxso(
       Value *fog_in = fn->getArg(ps_fog_arg_idx);
       factor = builder.CreateExtractElement(fog_in, builder.getInt32(0));
     } else {
-      // D3D9 table-fog depth = z * (1/w). [[position]].z is window depth
-      // (z/w) and .w is 1/w, so depth = .z / .w. Mirrors DXVK
-      // d3d9_fixed_function.cpp DoFixedFunctionFog (z * (1.0 / w) off
-      // position.z / position.w recovers clip-space z: the ZFOG-shaped
+      // D3D9 table fog samples clip-space z. Metal's [[position]].z is window
+      // depth (z/w) and [[position]].w is 1/w_clip, so position.z / position.w
+      // recovers clip-space z, matching DXVK's z * (1/w) table-fog input (DXVK
+      // d3d9_fixed_function.cpp).
       Value *pos = fn->getArg(ps_position_arg_idx);
       Value *pz = builder.CreateExtractElement(pos, builder.getInt32(2));
       Value *pw = builder.CreateExtractElement(pos, builder.getInt32(3));

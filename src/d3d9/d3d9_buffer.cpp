@@ -189,13 +189,14 @@ MTLD3D9VertexBuffer::MTLD3D9VertexBuffer(
 MTLD3D9VertexBuffer::~MTLD3D9VertexBuffer() {
   if (m_mapMode == D3D9BufferMapMode::Direct) {
     // Donate the active backing + every retired backing to the device's
-    // shared pool. By dtor time the GPU drain (FlushDrawBatch +
-    // CommitCurrentChunk + WaitCPUFence in any teardown path the device
-    // owns) has ensured no in-flight cmdbuf still reads from these
-    // regions, so they're safe to hand to the next caller. Same total
-    // VRAM behaviour as the prior free-on-dtor path; only the timing of
-    // the free changes (deferred until the pool fills past
-    // kMaxBufferBackingPoolSize).
+    // shared pool. A draw that binds this buffer pins the wrapper through the
+    // chunk's resolved pins (BatchedDraw::resolved_vb_pins) until the GPU
+    // retires that chunk, so the dtor cannot run while any in-flight cmdbuf
+    // still reads these regions: a mid-frame Release only drops the app's
+    // reference, and the wrapper outlives it until GPU completion. Handing the
+    // regions to the next caller here is therefore safe. Same total VRAM
+    // behaviour as the prior free-on-dtor path; only the timing of the free
+    // changes (deferred until the pool fills past kMaxBufferBackingPoolSize).
     m_device->releaseBufferBacking(std::move(m_buffer), m_ownedBacking, m_gpuAddress, m_size);
     for (auto &entry : m_retiredBackings) {
       m_device->releaseBufferBacking(std::move(entry.mtl_buffer), entry.owned_backing, entry.gpu_address, m_size);
