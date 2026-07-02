@@ -276,12 +276,15 @@ MTLD3D9VolumeTexture::UnlockBox(UINT Level) {
 
 void
 MTLD3D9VolumeTexture::flushLevelOnUnlock(uint32_t level, const MTLD3D9Volume *vol) {
-  // MANAGED pool: push the just-written box to the GPU so subsequent
-  // samples see the new content. Other pools have no GPU side
-  // (SYSTEMMEM/SCRATCH) or no CPU master (DEFAULT; LockBox failed already
-  // with a null m_cpu_ptr). Mirrors MTLD3D9Surface's per-surface upload
-  // for 2D textures; wined3d d3d9_volume_unmap pushes on the same edge.
-  if (m_pool == D3DPOOL_MANAGED && !vol->lockedReadOnly())
+  // Pools with both a CPU mirror and a GPU texture push the just-written
+  // box so subsequent samples see the new content: MANAGED, and the
+  // DYNAMIC DEFAULT volumes that get a lockable mirror in the ctor.
+  // SYSTEMMEM/SCRATCH have no GPU side; non-DYNAMIC DEFAULT has no mirror
+  // (LockBox already failed on the null m_cpu_ptr). Mirrors MTLD3D9Surface's
+  // per-surface upload for 2D textures; wined3d d3d9_volume_unmap pushes on
+  // the same edge.
+  if ((m_pool == D3DPOOL_MANAGED || (m_pool == D3DPOOL_DEFAULT && (m_usage & D3DUSAGE_DYNAMIC))) &&
+      !vol->lockedReadOnly())
     pushLevelToGpu(level, vol);
   // Dirty-region auto-mark; wined3d texture.c top-level only.
   // D3DLOCK_NO_DIRTY_UPDATE suppresses the implicit auto-record so apps
@@ -337,8 +340,8 @@ MTLD3D9VolumeTexture::pushLevelToGpu(uint32_t level, const MTLD3D9Volume *vol) {
   if (m_mirror.empty())
     return;
   // Mirror-only block-compressed SCRATCH volumes have no GPU texture; there is
-  // nothing to push. The only current caller gates on MANAGED so this is never
-  // reached for them, but guard locally so the safety is not caller-dependent.
+  // nothing to push. The caller's pool gate never reaches them, but guard
+  // locally so the safety is not caller-dependent.
   if (m_texture == nullptr)
     return;
   WMT::Texture tex = m_texture->current()->texture();
