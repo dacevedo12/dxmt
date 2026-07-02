@@ -2577,6 +2577,9 @@ MTLD3D9Device::createAutoDepthStencil(const D3DPRESENT_PARAMETERS &params) {
         /*ownedBacking=*/nullptr,
         /*dxmtTexture=*/std::move(dxmt_ds_texture)
     );
+    // Counts in the device loss gate while the app holds a public ref: native
+    // fails a non-Ex Reset with an app-held auto depth-stencil alive.
+    dsSurface->markImplicitLosable();
     m_autoDepthStencilSurface = dsSurface;
   }
   m_depthStencilSurface = m_autoDepthStencilSurface.ptr();

@@ -344,9 +344,18 @@ private:
   // count.
   bool m_isLosable = false;
   int64_t m_losableBytes = 0;
+  // Implicit-surface loss accounting (swapchain backbuffers, auto depth-
+  // stencil). Unlike m_isLosable (counted at create for app-created DEFAULT
+  // resources), an implicit surface counts in the device's loss gate only
+  // while the app holds a public reference: markImplicitLosable() sets this
+  // one-shot flag and the public 0<->1 refcount edge drives the counter.
+  // Native fails a non-Ex Reset while an app-held backbuffer / auto-DS is
+  // alive; this is the pub-edge form of that. The two flags never co-occur.
+  bool m_isImplicitLosable = false;
 
 public:
   void markLosable();
+  void markImplicitLosable();
   // D3D9Ex CreateRenderTargetEx / CreateDepthStencilSurfaceEx carry extra
   // informational Usage bits (RESTRICTED_CONTENT, the shared-resource
   // restrictions) that the fixed non-Ex create signature cannot thread in.

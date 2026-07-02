@@ -129,6 +129,13 @@ MTLD3D9Surface::markLosable() {
 }
 
 void
+MTLD3D9Surface::markImplicitLosable() {
+  // One-shot flag; the counting happens on the public refcount edge in AddRef /
+  // Release, not here. See m_isImplicitLosable.
+  m_isImplicitLosable = true;
+}
+
+void
 MTLD3D9Surface::resetLockableMirror(void *cpuPtr, uint32_t pitch, void *ownedBacking) {
   if (m_owned_backing)
     wsi::aligned_free(m_owned_backing);
@@ -151,8 +158,14 @@ MTLD3D9Surface::AddRef() {
   // identity only: the backbuffer's container is the swapchain, but its ref
   // pins the device.
   ULONG ref = ComObject::AddRef();
-  if (ref == 1)
+  if (ref == 1) {
     m_device->AddRef();
+    // Implicit surface (backbuffer / auto-DS): count in the device's loss gate
+    // while the app holds a public ref, so a non-Ex Reset fails until the app
+    // releases it. Bytes 0: implicit resources stay out of the memory report.
+    if (m_isImplicitLosable)
+      m_device->onLosableResourceCreated();
+  }
   return ref;
 }
 
@@ -180,6 +193,11 @@ MTLD3D9Surface::Release() {
       m_isLosable = false;
       m_device->onLosableResourceDestroyed(m_losableBytes);
     }
+    // Implicit surface: mirror the pub-ref edge. The flag persists (the app can
+    // re-acquire the same object through GetBackBuffer /
+    // GetDepthStencilSurface), so only the count toggles here, not the flag.
+    if (m_isImplicitLosable)
+      m_device->onLosableResourceDestroyed();
     // device->Release() can synchronously destruct the device. A standalone
     // self-pinned surface survives that teardown via its self-pin (dropped just
     // below); the implicit backbuffer (no self-pin) is instead deleted inside

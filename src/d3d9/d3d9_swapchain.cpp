@@ -315,6 +315,9 @@ MTLD3D9SwapChain::buildBackBuffer() {
         /*ownedBacking=*/bbOwned,
         /*dxmtTexture=*/std::move(dxmt_bb_texture)
     );
+    // Counts in the device loss gate while the app holds a public ref: native
+    // fails a non-Ex Reset with an app-held backbuffer alive.
+    bb->markImplicitLosable();
     m_backBuffers.emplace_back(bb);
   }
   return true;
@@ -399,6 +402,7 @@ MTLD3D9SwapChain::ResetForDeviceReset(const D3DPRESENT_PARAMETERS &params, HWND 
         /*ownedBacking=*/bbOwned,
         /*dxmtTexture=*/std::move(new_dxmt_textures[i])
     );
+    bb->markImplicitLosable();
     m_backBuffers.emplace_back(bb);
   }
 
