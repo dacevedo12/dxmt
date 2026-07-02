@@ -2378,12 +2378,11 @@ MTLD3D9Device::Reset(D3DPRESENT_PARAMETERS *pPresentationParameters) {
   if (m_currentCmdSeq > 1)
     m_completionEvent.waitUntilSignaledValue(m_currentCmdSeq - 1, UINT64_MAX);
 
-  // Reset must drop the COW snapshots eagerly: the gen bump governs
-  // reads, not lifetime, and a deferred dtor would run resource
-  // teardown after the new device state exists. wined3d's reset path
-  // unbinds state up front (wined3d_device_reset,
-  // state_unbind_resources).
-  m_encShadowLastSnap.reset();
+  // Invalidate the COW snapshot: its ring block recycles with the old
+  // chunks, and the next QueueBatchedDraw must rebuild from the freshly
+  // reset device shadows rather than copy stale state forward.
+  m_encShadowLastSnap = nullptr;
+  m_encShadowLastSnapChunk = ~0ull;
 
   // Unbind ALL RT slots + DS (encoder mirror must be clear).
   // MRT apps: slots 1+ must be cleared or losable-resource gate blocks Reset.
@@ -6485,13 +6484,34 @@ void
 MTLD3D9Device::QueueBatchedDraw(BatchedDraw &&draw) {
   // Per-draw queue cost (paired with BuildDrawCapture above).
   D9StallScope _record_timer(&g_d9stall.record_ns);
-  // Freeze POD state: m_encShadowDirty==0 means all draws share one shared_ptr.
-  // Non-zero: copy-construct fresh snapshot, overwrite ONLY dirty axes (~13KB vs ~20KB rebuild).
-  // Resolve reads draw.pod_snapshot, letting setters skip FlushDrawBatch (each frozen independently).
-  if (m_encShadowDirty != 0) {
-    auto snap = m_encShadowLastSnap ? std::make_shared<dxmt::D9EncodingState>(*m_encShadowLastSnap)
-                                    : std::make_shared<dxmt::D9EncodingState>();
-    const uint32_t dirty = m_encShadowDirty;
+  // Freeze POD state: m_encShadowDirty==0 means all draws in the chunk share
+  // one snapshot. Non-zero: build a fresh snapshot, overwriting only dirty
+  // axes. Resolve reads draw.pod_snapshot, letting setters skip
+  // FlushDrawBatch (each frozen independently). Storage comes from the
+  // queue's command-data ring rather than the process heap: the snapshot is
+  // recycled wholesale once its chunk retires, so the ~200 clusters a heavy
+  // frame produces cost no allocator locking and no cross-thread frees. A
+  // snapshot only stays valid for its own chunk; when the chunk has moved
+  // on, the previous block may already be recycled, so a chunk change
+  // rebuilds every axis from the device shadows instead of copying the old
+  // snapshot forward.
+  static_assert(
+      std::is_trivially_copyable_v<dxmt::D9EncodingState> && std::is_trivially_destructible_v<dxmt::D9EncodingState>,
+      "ring-allocated snapshots are recycled without destruction"
+  );
+  const uint64_t snap_chunk = m_dxmtQueue->CurrentSeqId();
+  const bool snap_reusable = m_encShadowLastSnap != nullptr && m_encShadowLastSnapChunk == snap_chunk;
+  if (m_encShadowDirty != 0 || !snap_reusable) {
+    auto *snap = static_cast<dxmt::D9EncodingState *>(
+        m_dxmtQueue->AllocateCommandData(sizeof(dxmt::D9EncodingState), alignof(dxmt::D9EncodingState))
+    );
+    uint32_t dirty = m_encShadowDirty;
+    if (snap_reusable)
+      new (snap) dxmt::D9EncodingState(*m_encShadowLastSnap);
+    else {
+      new (snap) dxmt::D9EncodingState();
+      dirty = dxmt::D9ES_DIRTY_ALL;
+    }
     if (dirty & dxmt::D9ES_DIRTY_RENDER_STATES)
       std::memcpy(snap->render_states, m_renderStates, sizeof(snap->render_states));
     if (dirty & dxmt::D9ES_DIRTY_SAMPLER_STATES)
@@ -6527,7 +6547,8 @@ MTLD3D9Device::QueueBatchedDraw(BatchedDraw &&draw) {
       snap->viewport = m_viewport;
     if (dirty & dxmt::D9ES_DIRTY_SCISSOR_RECT)
       snap->scissor_rect = m_scissorRect;
-    m_encShadowLastSnap = std::move(snap);
+    m_encShadowLastSnap = snap;
+    m_encShadowLastSnapChunk = snap_chunk;
     m_encShadowDirty = 0;
   }
   draw.pod_snapshot = m_encShadowLastSnap;
@@ -7218,7 +7239,7 @@ MTLD3D9Device::ResolveBatchedDrawForChunk(
   if (!vs || !ps || !decl || !rt0)
     return false;
 
-  // POD state lives on the per-draw pod_snapshot shared_ptr so POD
+  // POD state lives on the per-draw pod_snapshot so POD
   // setters never need to FlushDrawBatch. Every call below reads
   // through `*bd.pod_snapshot`; guaranteed non-null because
   // QueueBatchedDraw populates it before push_back.
@@ -7232,7 +7253,7 @@ MTLD3D9Device::ResolveBatchedDrawForChunk(
   bool up_vb = bd.override_vb_buffer != 0;
   bool up_ib = bd.override_ib_buffer != 0;
   bool indexed = (bd.type == BatchedDraw::kIndexed);
-  bool cluster_hit = resolve_cache.pod_ptr == bd.pod_snapshot.get() && resolve_cache.pod_ptr != nullptr &&
+  bool cluster_hit = resolve_cache.pod_ptr == bd.pod_snapshot && resolve_cache.pod_ptr != nullptr &&
                      resolve_cache.ref_gen == m_encodeSideRefsGen && resolve_cache.ref_gen != 0 &&
                      resolve_cache.up_vb == up_vb && resolve_cache.up_ib == up_ib &&
                      resolve_cache.up_ib_format == bd.override_ib_format &&
@@ -7876,7 +7897,7 @@ MTLD3D9Device::ResolveBatchedDrawForChunk(
 
     // ---- Populate cluster cache so the next draw in the cluster can
     // skip the FNV+map-lookup work above. ----
-    resolve_cache.pod_ptr = bd.pod_snapshot.get();
+    resolve_cache.pod_ptr = bd.pod_snapshot;
     resolve_cache.ref_gen = m_encodeSideRefsGen;
     resolve_cache.up_vb = up_vb;
     resolve_cache.up_ib = up_ib;
@@ -8096,7 +8117,7 @@ MTLD3D9Device::ResolveBatchedDrawForChunk(
   // Reuse prior draw's uploads if pod_snapshot pointer equals (implies byte-equality)
   // and the def-stamping shaders match. VS/PS constants, clip planes
   // live on pod. ~80% hit rate skips 8 KB memcpy+mutex.
-  if (bd.pod_snapshot.get() == const_cache.pod_ptr && const_cache.pod_ptr != nullptr &&
+  if (bd.pod_snapshot == const_cache.pod_ptr && const_cache.pod_ptr != nullptr &&
       const_cache.vs_defs_key == vs_defs_key && const_cache.ps_defs_key == ps_defs_key) {
     bd.resolved_const_uploads = const_cache.uploads;
   } else {
@@ -8283,7 +8304,7 @@ MTLD3D9Device::ResolveBatchedDrawForChunk(
       bd.resolved_const_uploads[i].buffer = buf;
       bd.resolved_const_uploads[i].offset = base_off + sub_off[i];
     }
-    const_cache.pod_ptr = bd.pod_snapshot.get();
+    const_cache.pod_ptr = bd.pod_snapshot;
     const_cache.vs_defs_key = vs_defs_key;
     const_cache.ps_defs_key = ps_defs_key;
     const_cache.uploads = bd.resolved_const_uploads;

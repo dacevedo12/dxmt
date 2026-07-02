@@ -780,8 +780,10 @@ public:
     D3D9DrawCapture cap;
     // Per-draw POD snapshot captured at queue time for Resolve to read
     // frozen state without racing setters. COW via m_encShadowDirty:
-    // consecutive draws share same shared_ptr, O(state-change clusters).
-    std::shared_ptr<dxmt::D9EncodingState> pod_snapshot;
+    // consecutive draws share one snapshot, O(state-change clusters).
+    // Points into the queue's command-data ring; valid until the owning
+    // chunk retires, which outlives every Resolve read of it.
+    const dxmt::D9EncodingState *pod_snapshot = nullptr;
     // Ref-counted state is no longer per-draw; the chunk walker
     // mutates the persistent device-side D9EncodingRefs mirror
     // (MTLD3D9Device::m_encodeSideRefs) by replaying the SetRef ops in
@@ -1141,7 +1143,7 @@ private:
   };
   // Cluster cache for the cluster-stable resolved bundle (PSO, DSSO,
   // sampler+texture views, RT/DS resolve, viewport/scissor, IA layout
-  // metadata). Predicate: pod_snapshot.get() + m_encodeSideRefsGen
+  // metadata). Predicate: the pod_snapshot pointer + m_encodeSideRefsGen
   // plus per-draw shape bits (UP override flags, primitive_type, draw
   // type). On hit, copy cached fields into bd and skip the FNV
   // hashes + cache-lookups + atomic incRefs that fill them. Same
@@ -1398,10 +1400,17 @@ private:
   WMT::Reference<WMT::Device> m_metalDevice;
   // COW snapshot cache for BatchedDraw::pod_snapshot. m_encShadowDirty
   // bitmask; setters OR category on value-change. Fresh snapshot copies
-  // only dirty axes (~10 KB → ~5 KB per heavy cluster). Consecutive draws
-  // with no setters share one shared_ptr via atomic refcount.
+  // only dirty axes; consecutive draws with no setters share one snapshot.
+  // Storage lives in the queue's command-data ring, tagged with the
+  // recording chunk and recycled wholesale at completion, so snapshots
+  // never touch the process heap. m_encShadowLastSnapChunk records the
+  // owning chunk: a snapshot is reusable only within it, because the
+  // previous chunk's ring block may already be recycled by the time the
+  // next chunk records (QueueBatchedDraw rebuilds from the device shadows
+  // on a chunk change).
   uint32_t m_encShadowDirty = dxmt::D9ES_DIRTY_ALL;
-  std::shared_ptr<dxmt::D9EncodingState> m_encShadowLastSnap;
+  const dxmt::D9EncodingState *m_encShadowLastSnap = nullptr;
+  uint64_t m_encShadowLastSnapChunk = ~0ull;
   // dxmt::CommandQueue; spins up encode/commit/event-listener worker
   // threads. Owns WMT::CommandQueue, InternalCommandLibrary, staging/
   // argbuf allocators. Sequenced after m_metalDevice; unique_ptr for
