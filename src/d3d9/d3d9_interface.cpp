@@ -217,6 +217,80 @@ MTLD3D9Interface::CheckDeviceType(
   return D3D_OK;
 }
 
+namespace {
+
+// Color-render-target and depth-stencil format identity, shared by
+// CheckDeviceFormat and CheckDepthStencilMatch so the two probes cannot
+// diverge: apps query one and then the other and expect consistent
+// answers before creating the pair.
+bool
+isColorRTFormat(D3DFORMAT f) {
+  switch (f) {
+  case D3DFMT_X8R8G8B8:
+  case D3DFMT_A8R8G8B8:
+  case D3DFMT_R5G6B5:
+  case D3DFMT_X1R5G5B5:
+  case D3DFMT_A1R5G5B5:
+  case D3DFMT_A2R10G10B10:
+  case D3DFMT_A2B10G10R10:
+  case D3DFMT_A16B16G16R16:
+  case D3DFMT_A16B16G16R16F:
+  case D3DFMT_R16F:
+  case D3DFMT_G16R16F:
+  case D3DFMT_R32F:
+  case D3DFMT_G32R32F:
+  case D3DFMT_A32B32G32R32F:
+  case D3DFMT_G16R16:
+  // ABGR pair: RGBA8Unorm is Metal's native layout; DXVK and wined3d
+  // both report these RT-capable.
+  case D3DFMT_A8B8G8R8:
+  case D3DFMT_X8B8G8R8:
+    return true;
+  // D3DFMT_R8G8B8 (24-bit RGB) is intentionally not listed: Metal has
+  // no padded-RGB8 pixel format and Vulkan/DXVK also reject it. Apps
+  // that probe and get NOTAVAILABLE fall back to a 32-bit variant
+  // (typically X8R8G8B8 → BGRX8Unorm).
+  default:
+    return false;
+  }
+}
+
+// D16_LOCKABLE and D32_LOCKABLE are NOT advertised: a lockable depth surface
+// lets the app read depth back via LockRect, which needs a host-visible
+// backing dxmt's GPU-private depth textures do not have, so the lock would
+// fail. D16_LOCKABLE is AMD-only and D32_LOCKABLE is unsupported everywhere
+// (DXVK d3d9_format.cpp). Plain D32 (32-bit unorm depth) is likewise dropped:
+// no hardware driver exposes it, so wined3d intentionally refuses it too
+// (wined3d utils.c); apps fall back to D24X8 / D16. D32F_LOCKABLE stays: it
+// is the only float depth format, used as a plain depth buffer (the unlikely
+// lock path is the separate lockable-depth feature).
+bool
+isDSFormat(D3DFORMAT f) {
+  switch (f) {
+  case D3DFMT_D16:
+  case D3DFMT_D24S8:
+  case D3DFMT_D24X8:
+  case D3DFMT_D24X4S4:
+  case D3DFMT_D32F_LOCKABLE:
+  case D3DFMT_D24FS8:
+  case D3DFMT_D15S1:
+  // FOURCC sampleable-depth aliases (D3DFormatToMetal maps them).
+  // Games probe via CheckDeviceFormat(... DEPTHSTENCIL ...,
+  // INTZ) before allocating a shadow-map intermediate; NOTAVAILABLE
+  // here forces them off the fast PCF path even though creation
+  // would succeed. wined3d directx.c reports these as available
+  // whenever the matching native depth format is.
+  case D3DFMT_INTZ:
+  case D3DFMT_DF24:
+  case D3DFMT_DF16:
+    return true;
+  default:
+    return false;
+  }
+}
+
+} // namespace
+
 HRESULT STDMETHODCALLTYPE
 MTLD3D9Interface::CheckDeviceFormat(
     UINT Adapter, D3DDEVTYPE DeviceType, D3DFORMAT AdapterFormat, DWORD Usage, D3DRESOURCETYPE RType,
@@ -272,70 +346,6 @@ MTLD3D9Interface::CheckDeviceFormat(
     if (metal_fmt == WMTPixelFormatInvalid || Recall_sRGB(metal_fmt) == metal_fmt)
       return D3DERR_NOTAVAILABLE;
   }
-
-  auto isColorRTFormat = [](D3DFORMAT f) {
-    switch (f) {
-    case D3DFMT_X8R8G8B8:
-    case D3DFMT_A8R8G8B8:
-    case D3DFMT_R5G6B5:
-    case D3DFMT_X1R5G5B5:
-    case D3DFMT_A1R5G5B5:
-    case D3DFMT_A2R10G10B10:
-    case D3DFMT_A2B10G10R10:
-    case D3DFMT_A16B16G16R16:
-    case D3DFMT_A16B16G16R16F:
-    case D3DFMT_R16F:
-    case D3DFMT_G16R16F:
-    case D3DFMT_R32F:
-    case D3DFMT_G32R32F:
-    case D3DFMT_A32B32G32R32F:
-    case D3DFMT_G16R16:
-    // ABGR pair: RGBA8Unorm is Metal's native layout; DXVK and wined3d
-    // both report these RT-capable.
-    case D3DFMT_A8B8G8R8:
-    case D3DFMT_X8B8G8R8:
-      return true;
-    // D3DFMT_R8G8B8 (24-bit RGB) is intentionally not listed: Metal has
-    // no padded-RGB8 pixel format and Vulkan/DXVK also reject it. Apps
-    // that probe and get NOTAVAILABLE fall back to a 32-bit variant
-    // (typically X8R8G8B8 → BGRX8Unorm).
-    default:
-      return false;
-    }
-  };
-
-  // D16_LOCKABLE and D32_LOCKABLE are NOT advertised: a lockable depth surface
-  // lets the app read depth back via LockRect, which needs a host-visible
-  // backing dxmt's GPU-private depth textures do not have, so the lock would
-  // fail. D16_LOCKABLE is AMD-only and D32_LOCKABLE is unsupported everywhere
-  // (DXVK d3d9_format.cpp). Plain D32 (32-bit unorm depth) is likewise dropped:
-  // no hardware driver exposes it, so wined3d intentionally refuses it too
-  // (wined3d utils.c); apps fall back to D24X8 / D16. D32F_LOCKABLE stays: it
-  // is the only float depth format, used as a plain depth buffer (the unlikely
-  // lock path is the separate lockable-depth feature).
-  auto isDSFormat = [](D3DFORMAT f) {
-    switch (f) {
-    case D3DFMT_D16:
-    case D3DFMT_D24S8:
-    case D3DFMT_D24X8:
-    case D3DFMT_D24X4S4:
-    case D3DFMT_D32F_LOCKABLE:
-    case D3DFMT_D24FS8:
-    case D3DFMT_D15S1:
-    // FOURCC sampleable-depth aliases (D3DFormatToMetal maps them).
-    // Games probe via CheckDeviceFormat(... DEPTHSTENCIL ...,
-    // INTZ) before allocating a shadow-map intermediate; NOTAVAILABLE
-    // here forces them off the fast PCF path even though creation
-    // would succeed. wined3d directx.c reports these as available
-    // whenever the matching native depth format is.
-    case D3DFMT_INTZ:
-    case D3DFMT_DF24:
-    case D3DFMT_DF16:
-      return true;
-    default:
-      return false;
-    }
-  };
 
   auto isSamplable2D = [&](D3DFORMAT f) {
     if (isColorRTFormat(f))
@@ -526,53 +536,14 @@ MTLD3D9Interface::CheckDepthStencilMatch(
   if (AdapterFormat != D3DFMT_X8R8G8B8 && AdapterFormat != D3DFMT_R5G6B5 && AdapterFormat != D3DFMT_X1R5G5B5)
     return D3DERR_NOTAVAILABLE;
 
-  // Lists must match CheckDeviceFormat's color-RT + DS coverage: apps
-  // that probe one then the other expect consistent answers. wined3d
-  // does real bit-depth pairing; on Metal the depth/stencil attachment
-  // is independent of the colour attachment, so any legal (RT, DS) is
-  // compatible.
-  auto isColorRT = [](D3DFORMAT f) {
-    switch (f) {
-    case D3DFMT_X8R8G8B8:
-    case D3DFMT_A8R8G8B8:
-    case D3DFMT_R5G6B5:
-    case D3DFMT_X1R5G5B5:
-    case D3DFMT_A1R5G5B5:
-    case D3DFMT_A2R10G10B10:
-    case D3DFMT_A2B10G10R10:
-    case D3DFMT_A16B16G16R16:
-    case D3DFMT_A16B16G16R16F:
-    case D3DFMT_R16F:
-    case D3DFMT_G16R16F:
-    case D3DFMT_R32F:
-    case D3DFMT_G32R32F:
-    case D3DFMT_A32B32G32R32F:
-    case D3DFMT_G16R16:
-      return true;
-    default:
-      return false;
-    }
-  };
-  auto isDS = [](D3DFORMAT f) {
-    switch (f) {
-    // D16_LOCKABLE / plain D32 not matched here, consistent with
-    // CheckDeviceFormat: dxmt cannot host-read a lockable depth surface and
-    // no driver exposes 32-bit unorm depth, so neither is advertised.
-    case D3DFMT_D16:
-    case D3DFMT_D24S8:
-    case D3DFMT_D24X8:
-    case D3DFMT_D24X4S4:
-    case D3DFMT_D32F_LOCKABLE:
-    case D3DFMT_D24FS8:
-      return true;
-    default:
-      return false;
-    }
-  };
-
+  // Shares CheckDeviceFormat's format predicates so the two probes cannot
+  // diverge; apps query one then the other and expect consistent answers.
+  // wined3d does real bit-depth pairing; on Metal the depth/stencil
+  // attachment is independent of the colour attachment, so any legal
+  // (RT, DS) pair is compatible.
   // A 'NULL' colour target pairs with any real depth/stencil: a depth-only
   // pass binds NULL as the colour slot and a genuine DS attachment.
-  return ((isColorRT(RenderTargetFormat) || IsNullFormat(RenderTargetFormat)) && isDS(DepthStencilFormat))
+  return ((isColorRTFormat(RenderTargetFormat) || IsNullFormat(RenderTargetFormat)) && isDSFormat(DepthStencilFormat))
              ? D3D_OK
              : D3DERR_NOTAVAILABLE;
 }
