@@ -1933,6 +1933,28 @@ MTLD3D9Device::GetAvailableTextureMem() {
   constexpr uint64_t kReportCap = 0xfff00000ull;
   if (bytes > kReportCap)
     bytes = kReportCap;
+  // Configurable ceiling on the advertised budget. Era engines size their
+  // texture and streaming pools off this figure; on a 32-bit guest an
+  // unrestricted UMA report lets them commit past the limited process address
+  // space until a Metal command buffer faults out of memory. DXVK exposes
+  // d3d9.maxAvailableMemory for the same reason; honor DXMT_MAX_VRAM_MB and
+  // keep a conservative default on the 32-bit build so streaming titles fit
+  // without per-game configuration.
+  static const uint64_t cap_bytes = []() -> uint64_t {
+    if (const char *e = std::getenv("DXMT_MAX_VRAM_MB"); e && e[0]) {
+      char *end = nullptr;
+      unsigned long mb = std::strtoul(e, &end, 10);
+      if (end != e && mb > 0)
+        return static_cast<uint64_t>(mb) << 20;
+    }
+#ifdef __i386__
+    return 1024ull << 20;
+#else
+    return 0;
+#endif
+  }();
+  if (cap_bytes && bytes > cap_bytes)
+    bytes = cap_bytes;
   // Subtract the device-local (DEFAULT-pool) allocations the app has made so
   // the figure falls as resources are created, the behavior era engines poll
   // for. wined3d and DXVK keep the same running counter.
