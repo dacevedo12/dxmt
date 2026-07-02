@@ -48,7 +48,9 @@ MTLD3D9CubeTexture::MTLD3D9CubeTexture(
     for (uint32_t lvl = 0; lvl < levels; ++lvl) {
       UINT level_dim = std::max<UINT>(1u, edgeLength >> lvl);
       m_mirrorOffsets[idx++] = total_bytes;
-      total_bytes += static_cast<size_t>(D3DFormatRowPitch(format, level_dim)) *
+      // 4-byte-aligned mirror stride, the pitch LockRect reports; see
+      // d3d9_texture.cpp buildLevelsAndMirror.
+      total_bytes += static_cast<size_t>(D3DFormatLockPitch(format, level_dim)) *
                      static_cast<size_t>(D3DFormatRowCount(format, level_dim));
     }
     // Each cube face's mip chain starts on a 16-byte boundary within the
@@ -82,7 +84,7 @@ MTLD3D9CubeTexture::MTLD3D9CubeTexture(
       uint32_t pitch = 0;
       if (!m_mirror.empty()) {
         cpu_ptr = m_mirror.data() + m_mirrorOffsets[idx];
-        pitch = D3DFormatRowPitch(format, level_dim);
+        pitch = D3DFormatLockPitch(format, level_dim);
       }
       ++idx;
 

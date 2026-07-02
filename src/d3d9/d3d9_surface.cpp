@@ -566,8 +566,10 @@ MTLD3D9Surface::GetDC(HDC *phdc) {
   // so GDI paints into the exact memory LockRect exposes and UnlockRect uploads
   // to the Metal texture. Every coherence concern (download-on-lock,
   // upload-on-unlock, mirror residency) is delegated to the lock path instead
-  // of a second hand-managed copy. The padded lock pitch satisfies GDI's
-  // DWORD-aligned stride because the surface pitch is always 4-byte aligned.
+  // of a second hand-managed copy. The lock pitch of every mirror-backed
+  // surface GetDC can target (texture mips, offscreen plains, lockable RTs)
+  // is the 4-byte-aligned D3DFormatLockPitch, which satisfies GDI's
+  // DWORD-aligned stride requirement.
   // Leave *phdc untouched on every failure path: D3D9 only writes it on success
   // (a failed GetDC must not clobber the caller's HDC). Matches DXVK.
   if (!phdc)

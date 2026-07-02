@@ -53,7 +53,11 @@ buildLevelsAndMirror(
     UINT level_w = std::max<UINT>(1u, width >> i);
     UINT level_h = std::max<UINT>(1u, height >> i);
     mirrorOffsets[i] = total_bytes;
-    total_bytes += static_cast<size_t>(D3DFormatRowPitch(format, level_w)) *
+    // The mirror stride is the 4-byte-aligned row pitch (D3DFormatLockPitch),
+    // the value LockRect reports and native D3D9 lays rows out at; a tight
+    // pitch would diverge from the reported one for sub-DWORD-width rows. The
+    // aligned stride is a no-op for block-compressed and 4-bpp formats.
+    total_bytes += static_cast<size_t>(D3DFormatLockPitch(format, level_w)) *
                    static_cast<size_t>(D3DFormatRowCount(format, level_h));
   }
   mirrorOffsets[levels] = total_bytes;
@@ -241,7 +245,8 @@ MTLD3D9Texture::ensureMirror() {
   for (UINT i = 0; i < m_levels.size(); ++i) {
     void *level_ptr = static_cast<uint8_t *>(m_mirrorBacking) + m_mirrorOffsets[i];
     UINT level_w = std::max<UINT>(1u, m_width >> i);
-    uint32_t pitch = D3DFormatRowPitch(m_format, level_w);
+    // Aligned stride, matching the mirror sizing in buildLevelsAndMirror.
+    uint32_t pitch = D3DFormatLockPitch(m_format, level_w);
     m_levels[i]->patchMirror(level_ptr, m_mirrorBuffer.handle, static_cast<uint32_t>(m_mirrorOffsets[i]), pitch);
   }
 }

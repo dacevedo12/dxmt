@@ -3659,8 +3659,10 @@ MTLD3D9Device::CreateRenderTarget(
   if (Lockable) {
     // 'NULL' has no real pixel layout; treat it as the BGRA8 dummy (4 bpp) so
     // a lockable NULL RT hands back a defined, desc-sized region. The bytes
-    // are never read by the GPU (the slot is write-skipped).
-    pitch = isNullRT ? (Width * 4u) : D3DFormatRowPitch(Format, Width);
+    // are never read by the GPU (the slot is write-skipped). Real formats use
+    // the 4-byte-aligned lock pitch; moot for the 4-bpp majority, but R16F is
+    // RT-capable and 2 bpp, where an odd width needs the alignment.
+    pitch = isNullRT ? (Width * 4u) : D3DFormatLockPitch(Format, Width);
     if (pitch == 0)
       return D3DERR_INVALIDCALL;
     const uint64_t mirror_bytes = static_cast<uint64_t>(pitch) * Height;
@@ -4093,7 +4095,11 @@ MTLD3D9Device::UpdateTexture(IDirect3DBaseTexture9 *pSourceTexture, IDirect3DBas
       size.width = static_cast<uint32_t>(r - l);
       size.height = static_cast<uint32_t>(b - t);
       size.depth = 1;
-      uint32_t src_pitch = D3DFormatRowPitch(src->d3dFormat(), d.Width);
+      // Aligned mirror row stride (D3DFormatLockPitch): the source mirror is
+      // laid out with the 4-byte-aligned pitch, so the row walk and the staging
+      // src pitch must use it. The per-column step below stays tight (block
+      // bytes / bpp).
+      uint32_t src_pitch = D3DFormatLockPitch(src->d3dFormat(), d.Width);
       if (src_pitch == 0)
         continue;
       // Byte offset into the mirror for the dirty sub-rect: the level
@@ -4204,7 +4210,7 @@ MTLD3D9Device::UpdateTexture(IDirect3DBaseTexture9 *pSourceTexture, IDirect3DBas
       size.width = r - l;
       size.height = b - t;
       size.depth = bk - f;
-      uint32_t src_pitch = D3DFormatRowPitch(src->d3dFormat(), d.Width);
+      uint32_t src_pitch = D3DFormatLockPitch(src->d3dFormat(), d.Width);
       if (src_pitch == 0 || bpp == 0)
         continue;
       // 3D mirror layout: level base + slice_pitch×Front + row_pitch×Top + bpp×Left.
@@ -4304,7 +4310,7 @@ MTLD3D9Device::UpdateTexture(IDirect3DBaseTexture9 *pSourceTexture, IDirect3DBas
         size.width = static_cast<uint32_t>(r - l);
         size.height = static_cast<uint32_t>(b - t);
         size.depth = 1;
-        uint32_t src_pitch = D3DFormatRowPitch(src->d3dFormat(), d.Width);
+        uint32_t src_pitch = D3DFormatLockPitch(src->d3dFormat(), d.Width);
         if (src_pitch == 0)
           continue;
         size_t row_off, col_off;

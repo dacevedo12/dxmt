@@ -51,7 +51,10 @@ MTLD3D9VolumeTexture::MTLD3D9VolumeTexture(
     UINT lh = std::max<UINT>(1u, height >> lvl);
     UINT ld = std::max<UINT>(1u, depth >> lvl);
     m_mirrorOffsets[lvl] = total_bytes;
-    total_bytes += static_cast<size_t>(D3DFormatRowPitch(format, lw)) *
+    // 4-byte-aligned row stride, the pitch LockBox reports; slice stride is
+    // that times the block-row count. See d3d9_texture.cpp
+    // buildLevelsAndMirror.
+    total_bytes += static_cast<size_t>(D3DFormatLockPitch(format, lw)) *
                    static_cast<size_t>(D3DFormatRowCount(format, lh)) * static_cast<size_t>(ld);
   }
   m_mirrorOffsets[levels] = total_bytes;
@@ -78,7 +81,7 @@ MTLD3D9VolumeTexture::MTLD3D9VolumeTexture(
     uint32_t slice_pitch = 0;
     if (!m_mirror.empty()) {
       cpu_ptr = m_mirror.data() + m_mirrorOffsets[lvl];
-      row_pitch = D3DFormatRowPitch(format, lw);
+      row_pitch = D3DFormatLockPitch(format, lw);
       slice_pitch = row_pitch * D3DFormatRowCount(format, lh);
     }
     auto *vol = new MTLD3D9Volume(m_device, this, desc, lvl, cpu_ptr, row_pitch, slice_pitch);
@@ -350,7 +353,10 @@ MTLD3D9VolumeTexture::pushLevelToGpu(uint32_t level, const MTLD3D9Volume *vol) {
 
   D3DVOLUME_DESC d{};
   m_levels[level]->GetDesc(&d);
-  uint32_t row_pitch = D3DFormatRowPitch(m_format, d.Width);
+  // Aligned row stride to match the mirror layout; the row / slice offsets and
+  // the staging src pitch below all derive from it. The per-column step stays
+  // tight (bpp) at col_off. See buildLevelsAndMirror.
+  uint32_t row_pitch = D3DFormatLockPitch(m_format, d.Width);
   if (row_pitch == 0)
     return;
 
