@@ -6640,6 +6640,15 @@ MTLD3D9Device::ApplyRefOp_d9(const PendingRefOp &op) {
 
 namespace {
 
+// Whether two draws can share one render-pass encoder: identical RT/DS
+// attachments and views, and the same depth read-only state. The pass bakes
+// its depth store action and read-only flags from its FIRST draw
+// (StartRenderPassForBatch_d9), so a read-only transition must close the
+// encoder. A read-only-depth pass stores DontCare, so a later depth-writing
+// draw merged into it would lose its writes at pass end; the reverse would host
+// a depth-sampling draw inside a writable-depth pass, an in-pass sample-vs-write
+// hazard. DXVK splits the framebuffer on the same transition (it binds a
+// distinct read-only DSV per state).
 inline bool
 RtDsAttachmentsMatch(const MTLD3D9Device::BatchedDraw &a, const MTLD3D9Device::BatchedDraw &b) {
   if (a.resolved_rt_count != b.resolved_rt_count)
@@ -6665,6 +6674,9 @@ RtDsAttachmentsMatch(const MTLD3D9Device::BatchedDraw &a, const MTLD3D9Device::B
     if (a.resolved_ds_slice != b.resolved_ds_slice)
       return false;
     if (a.resolved_ds_view != b.resolved_ds_view)
+      return false;
+    // Store action and read-only flags are baked per pass; see above.
+    if (a.resolved_ds_readonly != b.resolved_ds_readonly)
       return false;
   }
   return true;
