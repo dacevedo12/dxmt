@@ -19,8 +19,9 @@ bool ValidatePresentParams(const D3DPRESENT_PARAMETERS &p, bool isEx);
 // GetClientRect of hwndFallback, 8px floor). Mutates p in place.
 // Returns false on a value that's invalid in a way ValidatePresentParams
 // doesn't catch (unmappable BackBufferFormat, zero extent on a hwndless
-// chain). Reference: wined3d swapchain.c.
-bool CanonicalisePresentParams(D3DPRESENT_PARAMETERS &p, HWND hwndFallback);
+// chain, or a fullscreen extent absent from the adapter mode list).
+// Reference: wined3d swapchain.c.
+bool CanonicalisePresentParams(D3DPRESENT_PARAMETERS &p, HWND hwndFallback, UINT adapter);
 
 class MTLD3D9Interface final : public ComObject<IDirect3D9Ex> {
 public:

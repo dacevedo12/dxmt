@@ -816,11 +816,35 @@ ValidatePresentParams(const D3DPRESENT_PARAMETERS &p, bool isEx) {
   return true;
 }
 
-// Resolve spec "use runtime default" placeholders in params; return false
-// on invalid format or zero extent on hidden window. hwndFallback is
-// hFocusWindow; spec: hDeviceWindow takes precedence (wined3d swapchain.c).
+// A fullscreen (Windowed=FALSE) present must name a mode the adapter actually
+// enumerates. dxmt has no real display-mode switch on macOS (wined3d and DXVK
+// let the OS ChangeDisplaySettings reject a bogus mode); validate against the
+// same wsi mode list GetAdapterModeCount / EnumAdapterModes walk so the
+// enumeration and the gate can never disagree. D3D9 advertises only X8R8G8B8
+// modes, so the width/height comparison spans the enumerable set; the refresh
+// rate is matched only when the app pins a nonzero FullScreen_RefreshRateInHz.
+static bool
+fullscreenModeSupported(UINT adapter, UINT width, UINT height, UINT refreshRate) {
+  HMONITOR mon = wsi::enumMonitors(adapter);
+  if (!mon)
+    return false;
+  wsi::WsiMode wm{};
+  for (UINT i = 0; wsi::getDisplayMode(mon, i, &wm); ++i) {
+    if (wm.width != width || wm.height != height)
+      continue;
+    if (refreshRate != 0 && refreshRateHzOr60(wm) != refreshRate)
+      continue;
+    return true;
+  }
+  return false;
+}
+
+// Resolve spec "use runtime default" placeholders in params; return false on
+// invalid format, zero extent on a hidden window, or a fullscreen extent that
+// is not an enumerable adapter mode. hwndFallback is hFocusWindow; spec:
+// hDeviceWindow takes precedence (wined3d swapchain.c).
 bool
-CanonicalisePresentParams(D3DPRESENT_PARAMETERS &p, HWND hwndFallback) {
+CanonicalisePresentParams(D3DPRESENT_PARAMETERS &p, HWND hwndFallback, UINT adapter) {
   if (p.BackBufferCount == 0)
     p.BackBufferCount = 1;
   if (p.BackBufferFormat == D3DFMT_UNKNOWN)
@@ -854,6 +878,12 @@ CanonicalisePresentParams(D3DPRESENT_PARAMETERS &p, HWND hwndFallback) {
   }
 
   if (p.BackBufferWidth == 0 || p.BackBufferHeight == 0)
+    return false;
+  // Fullscreen present: the extent must be a real adapter display mode; native
+  // fails the fullscreen create / reset otherwise. Windowed present composites
+  // into a window and accepts any size.
+  if (!p.Windowed &&
+      !fullscreenModeSupported(adapter, p.BackBufferWidth, p.BackBufferHeight, p.FullScreen_RefreshRateInHz))
     return false;
   return true;
 }
@@ -897,7 +927,7 @@ MTLD3D9Interface::CreateDevice(
   // backbuffer count) in place. D3D9 writes the realized values back into the
   // caller's struct, the same as Reset and CreateAdditionalSwapChain, and that
   // is what apps read after CreateDevice.
-  if (!CanonicalisePresentParams(*pPresentationParameters, hFocusWindow))
+  if (!CanonicalisePresentParams(*pPresentationParameters, hFocusWindow, Adapter))
     return D3DERR_INVALIDCALL;
 
   WMT::Reference<WMT::Device> metalDevice = m_adapters.object(Adapter);
@@ -1011,7 +1041,7 @@ MTLD3D9Interface::CreateDeviceEx(
 
   // Canonicalise in place so the caller reads back the realized extent /
   // format / count, matching CreateDevice and the Reset path.
-  if (!CanonicalisePresentParams(*pPresentationParameters, hFocusWindow))
+  if (!CanonicalisePresentParams(*pPresentationParameters, hFocusWindow, Adapter))
     return D3DERR_INVALIDCALL;
 
   WMT::Reference<WMT::Device> metalDevice = m_adapters.object(Adapter);

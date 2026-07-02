@@ -2132,7 +2132,9 @@ MTLD3D9Device::CreateAdditionalSwapChain(
   // window's client rect and a zero count to 1).
   if (!ValidatePresentParams(*pPresentationParameters, m_isEx))
     return D3DERR_INVALIDCALL;
-  if (!CanonicalisePresentParams(*pPresentationParameters, m_creationParams.hFocusWindow))
+  if (!CanonicalisePresentParams(*pPresentationParameters,
+                                 m_creationParams.hFocusWindow,
+                                 m_creationParams.AdapterOrdinal))
     return D3DERR_INVALIDCALL;
 
   // hDeviceWindow falls back to the device focus window (wined3d
@@ -2341,8 +2343,14 @@ MTLD3D9Device::Reset(D3DPRESENT_PARAMETERS *pPresentationParameters) {
   // validate SwapEffect/BackBufferCount/SampleQuality, write back to caller.
   if (!ValidatePresentParams(*pPresentationParameters, m_isEx))
     return D3DERR_INVALIDCALL;
-  if (!CanonicalisePresentParams(*pPresentationParameters, m_creationParams.hFocusWindow))
+  if (!CanonicalisePresentParams(*pPresentationParameters,
+                                 m_creationParams.hFocusWindow,
+                                 m_creationParams.AdapterOrdinal)) {
+    // A failed fullscreen-mode (or extent) validation leaves the device needing
+    // a reset, so TestCooperativeLevel reports DEVICENOTRESET (native shape).
+    m_deviceState.store(DeviceState::NotReset, std::memory_order_relaxed);
     return D3DERR_INVALIDCALL;
+  }
 
   // Non-Ex device + Lost state: Reset is rejected until the driver
   // transitions Lost → NotReset internally. wined3d device.c
