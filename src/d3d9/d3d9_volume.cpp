@@ -3,6 +3,7 @@
 #include "d3d9_device.hpp"
 #include "d3d9_format.hpp"
 #include "d3d9_private_data.hpp"
+#include "d3d9_stall.hpp"
 #include "d3d9_volume_texture.hpp"
 
 namespace dxmt {
@@ -95,6 +96,7 @@ MTLD3D9Volume::GetDesc(D3DVOLUME_DESC *pDesc) {
 
 HRESULT STDMETHODCALLTYPE
 MTLD3D9Volume::LockBox(D3DLOCKED_BOX *pLockedVolume, const D3DBOX *pBox, DWORD Flags) {
+  D9StallLockTimer _lock_timer;
   if (!pLockedVolume)
     return D3DERR_INVALIDCALL;
   pLockedVolume->RowPitch = 0;

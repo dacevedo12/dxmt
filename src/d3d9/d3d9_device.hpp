@@ -360,6 +360,12 @@ public:
   // every chunk the device enqueues; the device owns it via unique_ptr
   // below.
   dxmt::CommandQueue &dxmtQueue() const;
+  // CommitCurrentChunk wrapper that RAII-times the calling-thread commit
+  // into the stall instrument (chunk-ring backpressure: the calling thread
+  // can block here on a free chunk while the encode thread is busy). Every
+  // d3d9 calling-thread commit routes through here, including the swapchain
+  // Present and query flush paths, whose queue is this device's queue.
+  void commitCurrentChunkTimed();
   // Current device-wide frame latency, as Set/Get via the d3d9Ex API.
   // Read by MTLD3D9SwapChain to clamp the queue's max_latency_ to
   // min(m_frameLatency, BackBufferCount + 1): DXVK d3d9_swapchain.cpp

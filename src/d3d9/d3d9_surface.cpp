@@ -4,6 +4,7 @@
 #include "d3d9_device.hpp"
 #include "d3d9_format.hpp"
 #include "d3d9_private_data.hpp"
+#include "d3d9_stall.hpp"
 #include "d3d9_texture.hpp"
 #include "wsi_platform.hpp"
 
@@ -304,6 +305,7 @@ MTLD3D9Surface::GetDesc(D3DSURFACE_DESC *pDesc) {
 // cpu_ptr and correctly falls out at the null check below.
 HRESULT STDMETHODCALLTYPE
 MTLD3D9Surface::LockRect(D3DLOCKED_RECT *pLockedRect, const RECT *pRect, DWORD Flags) {
+  D9StallLockTimer _lock_timer;
   // T0.3 latency histogram: per-LockRect caller-thread cost. The
   // counter above gives "how many" (sum), the histogram captures
   // distribution. Lazy-mirror first-touch pages (incl. DYNAMIC DEFAULT

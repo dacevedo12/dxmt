@@ -1,6 +1,7 @@
 #include "d3d9_query.hpp"
 
 #include "d3d9_device.hpp"
+#include "d3d9_stall.hpp"
 #include "dxmt_command_queue.hpp"
 
 #include <algorithm>
@@ -113,6 +114,7 @@ MTLD3D9Query::GetDataSize() {
 
 HRESULT STDMETHODCALLTYPE
 MTLD3D9Query::Issue(DWORD dwIssueFlags) {
+  d9NotePoll(g_d9stall.issue_count);
   // D3DISSUE_BEGIN starts a query (only OCCLUSION uses BEGIN; EVENT
   // and TIMESTAMP are END-only). D3DISSUE_END signals the GPU to
   // capture the current value. wined3d query.c d3d9_query_Issue
@@ -184,6 +186,20 @@ MTLD3D9Query::Issue(DWORD dwIssueFlags) {
 
 HRESULT STDMETHODCALLTYPE
 MTLD3D9Query::GetData(void *pData, DWORD dwSize, DWORD dwGetDataFlags) {
+  // Thin instrument wrapper: count the poll and record the API event once at
+  // entry, and the S_FALSE (not-ready) return once at exit, so the six
+  // not-ready return paths below need no per-site edits. The behaviour is
+  // exactly getDataImpl's.
+  d9NotePoll(g_d9stall.getdata_count);
+  d9NoteApiEvent();
+  HRESULT hr = getDataImpl(pData, dwSize, dwGetDataFlags);
+  if (hr == S_FALSE)
+    d9NotePoll(g_d9stall.getdata_false_count);
+  return hr;
+}
+
+HRESULT
+MTLD3D9Query::getDataImpl(void *pData, DWORD dwSize, DWORD dwGetDataFlags) {
   const DWORD data_size = GetDataSize();
 
   // wined3d query.c state machine, surfaced through dlls/d3d9 query.c GetData.
@@ -222,7 +238,7 @@ MTLD3D9Query::GetData(void *pData, DWORD dwSize, DWORD dwGetDataFlags) {
     // submits, 100% CPU spin with encode/finish threads idle. D3D9 contract.
     if (queue.CurrentSeqId() == m_event_seq) {
       m_device->FlushDrawBatch();
-      queue.CommitCurrentChunk();
+      m_device->commitCurrentChunkTimed();
     }
     if (queue.CoherentSeqId() < m_event_seq) {
       // Caller polling readiness with no-buffer call: S_FALSE on
@@ -251,7 +267,7 @@ MTLD3D9Query::GetData(void *pData, DWORD dwSize, DWORD dwGetDataFlags) {
     // lambda is already on the chunk (FlushDrawBatch ran at Issue(END)),
     // so no extra FlushDrawBatch is needed here.
     if (queue.CurrentSeqId() == m_event_seq)
-      queue.CommitCurrentChunk();
+      m_device->commitCurrentChunkTimed();
     uint64_t probe = 0;
     if (!m_visibility_query->getValue(&probe)) {
       if (pData == nullptr || dwSize == 0)

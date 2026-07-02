@@ -29,6 +29,9 @@ public:
   HRESULT STDMETHODCALLTYPE GetData(void *pData, DWORD dwSize, DWORD dwGetDataFlags) override;
 
 private:
+  // GetData's body; the public override is a thin stall-instrument wrapper
+  // around it (poll count at entry, S_FALSE count at exit).
+  HRESULT getDataImpl(void *pData, DWORD dwSize, DWORD dwGetDataFlags);
   // Drains an in-flight OCCLUSION visibility query: emits the same
   // endVisibilityResultQuery chunk lambda an explicit Issue(END) would,
   // matched 1:1 with the prior Begin so dxmt_context's pending_queries_

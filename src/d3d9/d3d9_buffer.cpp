@@ -5,6 +5,7 @@
 #include "d3d9_device.hpp"
 #include "d3d9_private_data.hpp"
 #include "d3d9_resource_priority.hpp"
+#include "d3d9_stall.hpp"
 #include "log/log.hpp"
 #include "wsi_platform.hpp"
 
@@ -211,7 +212,7 @@ MTLD3D9VertexBuffer::allocateFreshBacking(
   void *backing = wsi::aligned_malloc(m_size, DXMT_PAGE_SIZE);
   if (!backing)
     return false;
-  std::memset(backing, 0, m_size);
+  prefaultBacking(backing, m_size);
   WMTBufferInfo info{};
   info.length = m_size;
   info.options = WMTResourceStorageModeShared;
@@ -339,6 +340,7 @@ MTLD3D9VertexBuffer::GetType() {
 
 HRESULT STDMETHODCALLTYPE
 MTLD3D9VertexBuffer::Lock(UINT OffsetToLock, UINT SizeToLock, void **ppbData, DWORD Flags) {
+  D9StallLockTimer _lock_timer;
   if (!ppbData)
     return D3DERR_INVALIDCALL;
   *ppbData = nullptr;
@@ -450,7 +452,7 @@ MTLD3D9IndexBuffer::allocateFreshBacking(
   void *backing = wsi::aligned_malloc(m_size, DXMT_PAGE_SIZE);
   if (!backing)
     return false;
-  std::memset(backing, 0, m_size);
+  prefaultBacking(backing, m_size);
   WMTBufferInfo info{};
   info.length = m_size;
   info.options = WMTResourceStorageModeShared;
@@ -566,6 +568,7 @@ MTLD3D9IndexBuffer::GetType() {
 
 HRESULT STDMETHODCALLTYPE
 MTLD3D9IndexBuffer::Lock(UINT OffsetToLock, UINT SizeToLock, void **ppbData, DWORD Flags) {
+  D9StallLockTimer _lock_timer;
   // Same shape as MTLD3D9VertexBuffer::Lock: see the rationale there
   // for the flag sanitisation, DISCARD / NOOVERWRITE semantics, and
   // the plain-map GPU sync.

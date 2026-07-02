@@ -12,6 +12,7 @@
 #include "d3d9_state_defaults.hpp"
 #include "d3d9_texture_upload.hpp"
 #include "d3d9_surface.hpp"
+#include "d3d9_stall.hpp"
 #include "d3d9_state_block.hpp"
 #include "d3d9_swapchain.hpp"
 #include "d3d9_texture.hpp"
@@ -1124,7 +1125,7 @@ MTLD3D9Device::acquireOrAllocateBufferBacking(
   // touch pays a steep page-fault cost under 32-bit x86 translation;
   // faulting the whole block up front moves that cost off the draw
   // path that would otherwise hit it lazily.
-  std::memset(out_owned, 0, length);
+  prefaultBacking(out_owned, length);
   // A fresh WMTBufferInfo per newBuffer call; reusing one aliases the
   // prior buffer's storage.
   WMTBufferInfo info{};
@@ -1180,7 +1181,7 @@ MTLD3D9Device::~MTLD3D9Device() {
       // forever waiting for a value never set.
       emitCmdbufTailSignal();
       uint64_t seq = m_dxmtQueue->CurrentSeqId();
-      m_dxmtQueue->CommitCurrentChunk();
+      commitCurrentChunkTimed();
       m_dxmtQueue->WaitCPUFence(seq);
     }
     // Wait for the GPU to retire every cmdbuf we ever submitted before
@@ -1242,6 +1243,12 @@ MTLD3D9Device::~MTLD3D9Device() {
 dxmt::CommandQueue &
 MTLD3D9Device::dxmtQueue() const {
   return *m_dxmtQueue;
+}
+
+void
+MTLD3D9Device::commitCurrentChunkTimed() {
+  D9StallScope _commit_timer(&g_d9stall.commit_ns, &g_d9stall.commit_count);
+  m_dxmtQueue->CommitCurrentChunk();
 }
 
 // Sampler cache lookup. Builds the prefix key from the input info,
@@ -1702,6 +1709,9 @@ MTLD3D9Device::stageTextureUpload(
 ) {
   if (dst.handle == 0 || src == nullptr || src_pitch == 0 || size.width == 0 || size.height == 0)
     return;
+  // Calling-thread staging cost: the ring alloc + memcpy + queue.
+  D9StallScope _upload_timer(&g_d9stall.upload_ns);
+  d9NoteApiEvent();
 
   // Per-destination-slice + total staging bytes (texture_upload_layout
   // handles the compressed block-row rounding and the depth scaling).
@@ -1718,6 +1728,7 @@ MTLD3D9Device::stageTextureUpload(
   const uint32_t bytes_per_image = layout.bytes_per_image;
   const uint32_t src_slice = src_slice_pitch ? src_slice_pitch : bytes_per_image;
   const size_t total_bytes = layout.total_bytes;
+  d9NoteUploadBytes(total_bytes);
 
   // Coherent_id reads the GPU's last signalled cmdbuf seq so the ring
   // can recycle blocks whose tag has retired. Same shape as the
@@ -1817,7 +1828,7 @@ MTLD3D9Device::readbackSurfaceMirror(MTLD3D9Surface *surface) {
   // right after this returns. Wait for the chunk's encode AND the
   // GPU-side retirement, then copy the block into the mirror.
   uint64_t seq = m_dxmtQueue->CurrentSeqId();
-  m_dxmtQueue->CommitCurrentChunk();
+  commitCurrentChunkTimed();
   m_dxmtQueue->WaitCPUFence(seq);
   m_completionEvent.waitUntilSignaledValue(signal_seq, UINT64_MAX);
   std::memcpy(surface->cpuPtr(), static_cast<const char *>(block.mapped_address) + offset, total_bytes);
@@ -1864,6 +1875,8 @@ MTLD3D9Device::QueryInterface(REFIID riid, void **ppvObject) {
 
 HRESULT STDMETHODCALLTYPE
 MTLD3D9Device::TestCooperativeLevel() {
+  d9NotePoll(g_d9stall.tcl_count);
+  d9NoteApiEvent();
   // D3D9Ex spec: always returns S_OK; apps probe device loss via
   // CheckDeviceState on the Ex interface. wined3d device.c d3d9_device_
   // TestCooperativeLevel and DXVK both match this.
@@ -2311,7 +2324,7 @@ MTLD3D9Device::Reset(D3DPRESENT_PARAMETERS *pPresentationParameters) {
   if (m_dxmtQueue) {
     emitCmdbufTailSignal();
     uint64_t seq = m_dxmtQueue->CurrentSeqId();
-    m_dxmtQueue->CommitCurrentChunk();
+    commitCurrentChunkTimed();
     m_dxmtQueue->WaitCPUFence(seq);
   }
   if (m_currentCmdSeq > 1)
@@ -2534,7 +2547,88 @@ HRESULT STDMETHODCALLTYPE
 MTLD3D9Device::Present(
     const RECT *pSourceRect, const RECT *pDestRect, HWND hDestWindowOverride, const RGNDATA *pDirtyRegion
 ) {
-  return m_implicitSwapChain->Present(pSourceRect, pDestRect, hDestWindowOverride, pDirtyRegion, 0);
+  uint32_t stall_thr = d9StallThresholdMs();
+  std::chrono::steady_clock::time_point present_enter;
+  if (stall_thr)
+    present_enter = std::chrono::steady_clock::now();
+  // Present entry is an API event: closes the gap opened by the last draw /
+  // Lock / upload of the frame (that hole is often the game-CPU lump).
+  d9NoteApiEvent();
+  HRESULT hr = m_implicitSwapChain->Present(pSourceRect, pDestRect, hDestWindowOverride, pDirtyRegion, 0);
+  if (stall_thr) {
+    using clock = std::chrono::steady_clock;
+    static clock::time_point s_last{};
+    // Previous frame's cumulative render-thread CPU time (100ns units). The
+    // per-frame delta tells a stall frame apart: cpu ~= frame means the thread
+    // computes through the API-silent gap, cpu << frame means it blocks.
+    static uint64_t s_last_thread_kernel = 0;
+    static uint64_t s_last_thread_user = 0;
+    auto now = clock::now();
+    uint64_t thread_kernel = 0;
+    uint64_t thread_user = 0;
+    FILETIME ft_create, ft_exit, ft_kernel, ft_user;
+    if (GetThreadTimes(GetCurrentThread(), &ft_create, &ft_exit, &ft_kernel, &ft_user)) {
+      thread_kernel = (static_cast<uint64_t>(ft_kernel.dwHighDateTime) << 32) | ft_kernel.dwLowDateTime;
+      thread_user = (static_cast<uint64_t>(ft_user.dwHighDateTime) << 32) | ft_user.dwLowDateTime;
+    }
+    int64_t present_us = std::chrono::duration_cast<std::chrono::microseconds>(now - present_enter).count();
+    if (s_last.time_since_epoch().count()) {
+      int64_t dt_us = std::chrono::duration_cast<std::chrono::microseconds>(now - s_last).count();
+      if (dt_us >= int64_t(stall_thr) * 1000) {
+        // Render-thread CPU consumed across the frame interval (100ns -> ms).
+        uint64_t cpu_ms = ((thread_kernel - s_last_thread_kernel) + (thread_user - s_last_thread_user)) / 10000;
+        uint64_t cpu_k_ms = (thread_kernel - s_last_thread_kernel) / 10000;
+        // Split the frame interval into the Present call itself (drawable wait /
+        // encode backpressure, i.e. GPU-side) versus everything before it
+        // (draws, Locks, game CPU). The pre-present total is decomposed into
+        // record (per-draw capture + queue), lock, commit (chunk-ring
+        // backpressure), pso-wait (encode-thread cold link), create (resource
+        // churn) and upload (staging memcpy + queue). first-touch is the
+        // placed-buffer page-fault cost; gpu-allocated is the full Metal
+        // working set the DEFAULT-pool counter cannot see (streamed MANAGED
+        // textures live in Shared storage).
+        uint64_t ft_ms = g_d9stall.first_touch_ns.load(std::memory_order_relaxed) / 1000000;
+        uint64_t lock_ms = g_d9stall.lock_ns.load(std::memory_order_relaxed) / 1000000;
+        uint32_t locks = g_d9stall.lock_count.load(std::memory_order_relaxed);
+        uint32_t draws = g_d9stall.draw_count.load(std::memory_order_relaxed);
+        uint64_t record_ms = g_d9stall.record_ns.load(std::memory_order_relaxed) / 1000000;
+        uint64_t commit_ms = g_d9stall.commit_ns.load(std::memory_order_relaxed) / 1000000;
+        uint32_t commits = g_d9stall.commit_count.load(std::memory_order_relaxed);
+        uint64_t pso_ms = g_d9stall.pso_wait_ns.load(std::memory_order_relaxed) / 1000000;
+        uint32_t pso_waits = g_d9stall.pso_wait_count.load(std::memory_order_relaxed);
+        uint64_t create_ms = g_d9stall.create_ns.load(std::memory_order_relaxed) / 1000000;
+        uint32_t creates = g_d9stall.create_count.load(std::memory_order_relaxed);
+        uint64_t upload_ms = g_d9stall.upload_ns.load(std::memory_order_relaxed) / 1000000;
+        uint64_t upload_mb = g_d9stall.upload_bytes.load(std::memory_order_relaxed) >> 20;
+        uint64_t max_gap_ms = g_d9stall.max_gap_ns.load(std::memory_order_relaxed) / 1000000;
+        uint32_t max_gap_draw = g_d9stall.max_gap_draw.load(std::memory_order_relaxed);
+        uint32_t getdata = g_d9stall.getdata_count.load(std::memory_order_relaxed);
+        uint32_t getdata_false = g_d9stall.getdata_false_count.load(std::memory_order_relaxed);
+        uint32_t issues = g_d9stall.issue_count.load(std::memory_order_relaxed);
+        uint32_t rasters = g_d9stall.raster_count.load(std::memory_order_relaxed);
+        uint32_t tcls = g_d9stall.tcl_count.load(std::memory_order_relaxed);
+        Logger::warn(str::format(
+            "d9 stall: frame ", dt_us / 1000, "ms (present ", present_us / 1000, "ms, pre ",
+            (dt_us - present_us) / 1000, "ms) | cpu ", cpu_ms, "ms (k ", cpu_k_ms, "ms) | draws ", draws,
+            " record ", record_ms, "ms | lock ", lock_ms,
+            "ms/", locks, " | commit ", commit_ms, "ms/", commits, " | pso-wait ", pso_ms, "ms/", pso_waits,
+            " | create ", create_ms, "ms/", creates, " | upload ", upload_ms, "ms ", upload_mb, "MB",
+            " | first-touch ", ft_ms, "ms | gpu-allocated ", m_metalDevice.currentAllocatedSize() >> 20, "MB",
+            " | gaps max", max_gap_ms, "ms@d", max_gap_draw, " | polls getdata ", getdata, "/", getdata_false,
+            " falses, issue ", issues, ", raster ", rasters, ", tcl ", tcls
+        ));
+      }
+    }
+    g_d9stall.reset();
+    s_last = now;
+    s_last_thread_kernel = thread_kernel;
+    s_last_thread_user = thread_user;
+    // Re-stamp the API-event clock at Present exit (reset() left it alone), so
+    // the next frame's first gap measures the Present-return-to-first-call
+    // window: where a post-present game-logic / streaming lump sits.
+    g_d9stall.last_api_event = now;
+  }
+  return hr;
 }
 // Device-level GetBackBuffer is a thin forwarder to the chain identified
 // by iSwapChain (we only have one). wined3d device.c same shape.
@@ -2606,6 +2700,7 @@ MTLD3D9Device::CreateTexture(
     UINT Width, UINT Height, UINT Levels, DWORD Usage, D3DFORMAT Format, D3DPOOL Pool, IDirect3DTexture9 **ppTexture,
     HANDLE *pSharedHandle
 ) {
+  D9StallScope _create_timer(&g_d9stall.create_ns, &g_d9stall.create_count);
   if (!ppTexture)
     return D3DERR_INVALIDCALL;
   *ppTexture = nullptr;
@@ -2927,6 +3022,7 @@ MTLD3D9Device::CreateVolumeTexture(
     UINT Width, UINT Height, UINT Depth, UINT Levels, DWORD Usage, D3DFORMAT Format, D3DPOOL Pool,
     IDirect3DVolumeTexture9 **ppVolumeTexture, HANDLE *pSharedHandle
 ) {
+  D9StallScope _create_timer(&g_d9stall.create_ns, &g_d9stall.create_count);
   if (!ppVolumeTexture)
     return D3DERR_INVALIDCALL;
   *ppVolumeTexture = nullptr;
@@ -3071,6 +3167,7 @@ MTLD3D9Device::CreateCubeTexture(
     UINT EdgeLength, UINT Levels, DWORD Usage, D3DFORMAT Format, D3DPOOL Pool, IDirect3DCubeTexture9 **ppCubeTexture,
     HANDLE *pSharedHandle
 ) {
+  D9StallScope _create_timer(&g_d9stall.create_ns, &g_d9stall.create_count);
   if (!ppCubeTexture)
     return D3DERR_INVALIDCALL;
   *ppCubeTexture = nullptr;
@@ -3240,6 +3337,7 @@ HRESULT STDMETHODCALLTYPE
 MTLD3D9Device::CreateVertexBuffer(
     UINT Length, DWORD Usage, DWORD FVF, D3DPOOL Pool, IDirect3DVertexBuffer9 **ppVertexBuffer, HANDLE *pSharedHandle
 ) {
+  D9StallScope _create_timer(&g_d9stall.create_ns, &g_d9stall.create_count);
   if (!ppVertexBuffer)
     return D3DERR_INVALIDCALL;
   *ppVertexBuffer = nullptr;
@@ -3315,6 +3413,7 @@ MTLD3D9Device::CreateIndexBuffer(
     UINT Length, DWORD Usage, D3DFORMAT Format, D3DPOOL Pool, IDirect3DIndexBuffer9 **ppIndexBuffer,
     HANDLE *pSharedHandle
 ) {
+  D9StallScope _create_timer(&g_d9stall.create_ns, &g_d9stall.create_count);
   if (!ppIndexBuffer)
     return D3DERR_INVALIDCALL;
   *ppIndexBuffer = nullptr;
@@ -4234,7 +4333,7 @@ MTLD3D9Device::GetRenderTargetData(IDirect3DSurface9 *pRenderTarget, IDirect3DSu
     // returning. m_currentCmdSeq was bumped after posting, so the chunk's
     // signal target is the pre-bump value.
     uint64_t seq = m_dxmtQueue->CurrentSeqId();
-    m_dxmtQueue->CommitCurrentChunk();
+    commitCurrentChunkTimed();
     m_dxmtQueue->WaitCPUFence(seq);
     m_completionEvent.waitUntilSignaledValue(signal_seq, UINT64_MAX);
     return D3D_OK;
@@ -4284,7 +4383,7 @@ MTLD3D9Device::GetRenderTargetData(IDirect3DSurface9 *pRenderTarget, IDirect3DSu
   refreshSignaledAndTrimRings();
 
   uint64_t seq = m_dxmtQueue->CurrentSeqId();
-  m_dxmtQueue->CommitCurrentChunk();
+  commitCurrentChunkTimed();
   m_dxmtQueue->WaitCPUFence(seq);
   m_completionEvent.waitUntilSignaledValue(signal_seq, UINT64_MAX);
 
@@ -4390,7 +4489,7 @@ MTLD3D9Device::GetFrontBufferData(UINT iSwapChain, IDirect3DSurface9 *pDestSurfa
   refreshSignaledAndTrimRings();
 
   uint64_t seq = m_dxmtQueue->CurrentSeqId();
-  m_dxmtQueue->CommitCurrentChunk();
+  commitCurrentChunkTimed();
   m_dxmtQueue->WaitCPUFence(seq);
   m_completionEvent.waitUntilSignaledValue(signal_seq, UINT64_MAX);
 
@@ -6139,6 +6238,7 @@ MTLD3D9Device::GetNPatchMode() {
 // Per-(RT,DS) encoder batching avoids tile-store/load; BatchedDraw POD-COW is DXVK m_dirty analogue.
 HRESULT STDMETHODCALLTYPE
 MTLD3D9Device::DrawPrimitive(D3DPRIMITIVETYPE PrimitiveType, UINT StartVertex, UINT PrimitiveCount) {
+  d9NoteDraw();
   // Caller-thread cost is queue-into-chunk only; encode/dispatch happen on the encode thread.
   // wined3d gates on vertex_declaration only; no BeginScene gate; stream 0 not required (multi-stream use
   // [[vertex_id]]).
@@ -6183,6 +6283,7 @@ MTLD3D9Device::DrawIndexedPrimitive(
     D3DPRIMITIVETYPE PrimitiveType, INT BaseVertexIndex, UINT MinVertexIndex, UINT NumVertices, UINT StartIndex,
     UINT PrimitiveCount
 ) {
+  d9NoteDraw();
   (void)MinVertexIndex;
   // wined3d d3d9_device_DrawIndexedPrimitive (device.c) gates on
   // vertex_declaration AND index_buffer; no BeginScene gate, no
@@ -6243,6 +6344,10 @@ MTLD3D9Device::DrawIndexedPrimitive(
 // UP build at queue time ensures validation sees shader/RT bindings from draw thread, not FlushDrawBatch thread.
 MTLD3D9Device::D3D9DrawCapture
 MTLD3D9Device::BuildDrawCapture() {
+  // Per-draw capture cost (paired with QueueBatchedDraw below); includes any
+  // draw-time flushDirty of a bound staged buffer, which also self-times as
+  // upload, so the two axes overlap on that draw.
+  D9StallScope _record_timer(&g_d9stall.record_ns);
   // POD state read by Resolve from D9EncodingState; setter-flush invariant ensures batch shares one snapshot.
   // Ref-counted state via setter ops into m_encodeSideRefs.
   // BuildDrawCapture must freeze per-draw rename cursors (gpu_address/currentOffset advance on Lock(DISCARD)).
@@ -6280,6 +6385,8 @@ MTLD3D9Device::BuildDrawCapture() {
 
 void
 MTLD3D9Device::QueueBatchedDraw(BatchedDraw &&draw) {
+  // Per-draw queue cost (paired with BuildDrawCapture above).
+  D9StallScope _record_timer(&g_d9stall.record_ns);
   // Freeze POD state: m_encShadowDirty==0 means all draws share one shared_ptr.
   // Non-zero: copy-construct fresh snapshot, overwrite ONLY dirty axes (~13KB vs ~20KB rebuild).
   // Resolve reads draw.pod_snapshot, letting setters skip FlushDrawBatch (each frozen independently).
@@ -8083,7 +8190,10 @@ MTLD3D9Device::FlushDrawBatch() {
         // the calling thread never blocks on a PSO link. Null state()
         // means newRenderPipelineState failed; skip.
         if (bd.resolved_pso_task) {
-          bd.resolved_pso_task->Wait();
+          {
+            D9StallScope _pso_timer(&g_d9stall.pso_wait_ns, &g_d9stall.pso_wait_count);
+            bd.resolved_pso_task->Wait();
+          }
           bd.resolved_pso = bd.resolved_pso_task->state().handle;
           if (bd.resolved_pso == 0)
             continue;
@@ -8182,7 +8292,7 @@ MTLD3D9Device::forceFlushAndCommit() {
   FlushDrawBatch();
   flushOpenWork();
   emitCmdbufTailSignal();
-  m_dxmtQueue->CommitCurrentChunk();
+  commitCurrentChunkTimed();
 }
 
 void
@@ -8269,6 +8379,7 @@ HRESULT STDMETHODCALLTYPE
 MTLD3D9Device::DrawPrimitiveUP(
     D3DPRIMITIVETYPE PrimitiveType, UINT PrimitiveCount, const void *pVertexStreamZeroData, UINT VertexStreamZeroStride
 ) {
+  d9NoteDraw();
   // wined3d device.c gates on vertex_declaration only; no
   // BeginScene gate. UP-draws on loading screens / OSD overlays
   // frequently fire outside any BeginScene/EndScene bracket.
@@ -8374,6 +8485,7 @@ MTLD3D9Device::DrawIndexedPrimitiveUP(
     D3DPRIMITIVETYPE PrimitiveType, UINT MinVertexIndex, UINT NumVertices, UINT PrimitiveCount, const void *pIndexData,
     D3DFORMAT IndexDataFormat, const void *pVertexStreamZeroData, UINT VertexStreamZeroStride
 ) {
+  d9NoteDraw();
   // wined3d device.c gates on vertex_declaration only; no
   // BeginScene gate. Same rationale as DrawPrimitiveUP above.
   //
@@ -8631,6 +8743,7 @@ MTLD3D9Device::GetFVF(DWORD *pFVF) {
 // Length via shader_bytecode_dword_count helper (not full decoder; swappable later).
 HRESULT STDMETHODCALLTYPE
 MTLD3D9Device::CreateVertexShader(const DWORD *pFunction, IDirect3DVertexShader9 **ppShader) {
+  D9StallScope _create_timer(&g_d9stall.create_ns, &g_d9stall.create_count);
   if (!ppShader)
     return D3DERR_INVALIDCALL;
   *ppShader = nullptr;
@@ -9027,6 +9140,7 @@ MTLD3D9Device::GetIndices(IDirect3DIndexBuffer9 **ppIndexData) {
 // mismatch reject (DXVK d3d9_device.cpp).
 HRESULT STDMETHODCALLTYPE
 MTLD3D9Device::CreatePixelShader(const DWORD *pFunction, IDirect3DPixelShader9 **ppShader) {
+  D9StallScope _create_timer(&g_d9stall.create_ns, &g_d9stall.create_count);
   if (!ppShader)
     return D3DERR_INVALIDCALL;
   *ppShader = nullptr;

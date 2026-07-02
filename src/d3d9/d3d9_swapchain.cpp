@@ -11,6 +11,7 @@
 #include "d3d9_device.hpp"
 #include "d3d9_format.hpp"
 #include "d3d9_interface.hpp"
+#include "d3d9_stall.hpp"
 #include "d3d9_surface.hpp"
 #include "dxmt_command_queue.hpp"
 #include "dxmt_context.hpp"
@@ -679,7 +680,7 @@ MTLD3D9SwapChain::Present(
   // Present chunk is the natural end of a frame's cmdbuf; sync paths
   // (UpdateTexture / GetRenderTargetData) still emit their own signal.
   m_device->emitCmdbufTailSignal();
-  queue.CommitCurrentChunk();
+  m_device->commitCurrentChunkTimed();
   queue.PresentBoundary();
 
   m_presentationCount++;
@@ -716,6 +717,11 @@ MTLD3D9SwapChain::GetBackBuffer(UINT iBackBuffer, D3DBACKBUFFER_TYPE Type, IDire
 
 HRESULT STDMETHODCALLTYPE
 MTLD3D9SwapChain::GetRasterStatus(D3DRASTER_STATUS *pRasterStatus) {
+  // Chokepoint for raster polling: the device-level GetRasterStatus forwards
+  // here, so counting only here attributes each app call once (counting both
+  // would double every device-routed call).
+  d9NotePoll(g_d9stall.raster_count);
+  d9NoteApiEvent();
   if (!pRasterStatus)
     return D3DERR_INVALIDCALL;
   // Apple Silicon has no software-readable raster pointer (D3DKMTGetScanLine
