@@ -665,6 +665,14 @@ public:
   losableResourceCount() const {
     return m_losableResourceCount.load(std::memory_order_relaxed);
   }
+  // Device created with software vertex processing only. Buffers on such a
+  // device ignore DISCARD and NOOVERWRITE: native processes vertices on the
+  // CPU, so the lock pointer stays stable and the contents persist (DXVK
+  // d3d9_device.h CanOnlySWVP).
+  bool
+  canOnlySWVP() const {
+    return (m_creationParams.BehaviorFlags & D3DCREATE_SOFTWARE_VERTEXPROCESSING) != 0;
+  }
   // Running total of device-local (DEFAULT-pool) allocation bytes, subtracted
   // from the GetAvailableTextureMem base so the reported figure falls as the
   // app creates resources (DXVK/wined3d keep the same counter).

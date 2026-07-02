@@ -382,7 +382,7 @@ MTLD3D9VertexBuffer::Lock(UINT OffsetToLock, UINT SizeToLock, void **ppbData, DW
   // pool/usage does not honour before any of them take effect. No bounds
   // validation: the runtime neither clamps nor rejects OffsetToLock /
   // SizeToLock, the returned pointer is simply base + offset.
-  Flags = sanitize_buffer_lock_flags(Flags, m_pool, m_usage);
+  Flags = sanitize_buffer_lock_flags(Flags, m_pool, m_usage, m_device->canOnlySWVP());
   if (m_mapMode == D3D9BufferMapMode::Direct) {
     // The lock pointer aliases the placed backing the GPU reads in place.
     // D3DLOCK_DISCARD retires the active backing and installs a GPU-idle
@@ -639,7 +639,7 @@ MTLD3D9IndexBuffer::Lock(UINT OffsetToLock, UINT SizeToLock, void **ppbData, DWO
   *ppbData = nullptr;
   if (!m_hostPtr)
     return D3DERR_INVALIDCALL;
-  Flags = sanitize_buffer_lock_flags(Flags, m_pool, m_usage);
+  Flags = sanitize_buffer_lock_flags(Flags, m_pool, m_usage, m_device->canOnlySWVP());
   if (m_mapMode == D3D9BufferMapMode::Direct) {
     if (Flags & D3DLOCK_DISCARD) {
       lockDiscardRotate(

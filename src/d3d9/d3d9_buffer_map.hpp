@@ -32,14 +32,19 @@ determine_buffer_map_mode(D3DPOOL pool, DWORD usage) {
 }
 
 // Lock-flag sanitisation. The runtime silently drops flags that the
-// pool/usage combination does not honour before any of them take effect.
+// pool/usage/device combination does not honour before any of them take
+// effect.
 inline DWORD
-sanitize_buffer_lock_flags(DWORD flags, D3DPOOL pool, DWORD usage) {
+sanitize_buffer_lock_flags(DWORD flags, D3DPOOL pool, DWORD usage, bool swvp_only) {
   // DISCARD is honoured only when it rides alone.
   if ((flags & (D3DLOCK_DISCARD | D3DLOCK_NOOVERWRITE | D3DLOCK_READONLY)) != D3DLOCK_DISCARD)
     flags &= ~D3DLOCK_DISCARD;
-  // DISCARD and NOOVERWRITE are honoured only in the DEFAULT pool.
-  if (pool != D3DPOOL_DEFAULT)
+  // DISCARD and NOOVERWRITE are honoured only in the DEFAULT pool, and never
+  // on a software-vertex-processing-only device: native keeps the lock
+  // pointer stable and the contents intact there (DXVK d3d9_device.cpp
+  // strips both the same way; wine's d3d9 device tests assert the pinned
+  // behaviour).
+  if (pool != D3DPOOL_DEFAULT || swvp_only)
     flags &= ~(D3DLOCK_DISCARD | D3DLOCK_NOOVERWRITE);
   // DONOTWAIT is honoured only for non-DYNAMIC buffers.
   if (usage & D3DUSAGE_DYNAMIC)

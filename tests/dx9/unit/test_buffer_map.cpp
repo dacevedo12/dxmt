@@ -69,54 +69,67 @@ main() {
   // DISCARD survives alone in DEFAULT.
   check(
       "discard survives alone in default",
-      sanitize_buffer_lock_flags(D3DLOCK_DISCARD, D3DPOOL_DEFAULT, D3DUSAGE_DYNAMIC) & D3DLOCK_DISCARD
+      sanitize_buffer_lock_flags(D3DLOCK_DISCARD, D3DPOOL_DEFAULT, D3DUSAGE_DYNAMIC, false) & D3DLOCK_DISCARD
   );
   // DISCARD drops when NOOVERWRITE rides along.
   check(
       "discard drops with nooverwrite",
-      !(sanitize_buffer_lock_flags(D3DLOCK_DISCARD | D3DLOCK_NOOVERWRITE, D3DPOOL_DEFAULT, D3DUSAGE_DYNAMIC) &
+      !(sanitize_buffer_lock_flags(D3DLOCK_DISCARD | D3DLOCK_NOOVERWRITE, D3DPOOL_DEFAULT, D3DUSAGE_DYNAMIC, false) &
         D3DLOCK_DISCARD)
   );
   // DISCARD drops when READONLY rides along.
   check(
       "discard drops with readonly",
-      !(sanitize_buffer_lock_flags(D3DLOCK_DISCARD | D3DLOCK_READONLY, D3DPOOL_DEFAULT, D3DUSAGE_DYNAMIC) &
+      !(sanitize_buffer_lock_flags(D3DLOCK_DISCARD | D3DLOCK_READONLY, D3DPOOL_DEFAULT, D3DUSAGE_DYNAMIC, false) &
         D3DLOCK_DISCARD)
   );
   // DISCARD / NOOVERWRITE drop outside DEFAULT.
   check(
       "discard drops in managed",
-      !(sanitize_buffer_lock_flags(D3DLOCK_DISCARD, D3DPOOL_MANAGED, 0) & D3DLOCK_DISCARD)
+      !(sanitize_buffer_lock_flags(D3DLOCK_DISCARD, D3DPOOL_MANAGED, 0, false) & D3DLOCK_DISCARD)
   );
   check(
       "nooverwrite drops in sysmem",
-      !(sanitize_buffer_lock_flags(D3DLOCK_NOOVERWRITE, D3DPOOL_SYSTEMMEM, 0) & D3DLOCK_NOOVERWRITE)
+      !(sanitize_buffer_lock_flags(D3DLOCK_NOOVERWRITE, D3DPOOL_SYSTEMMEM, 0, false) & D3DLOCK_NOOVERWRITE)
   );
   check(
       "nooverwrite survives in default",
-      sanitize_buffer_lock_flags(D3DLOCK_NOOVERWRITE, D3DPOOL_DEFAULT, D3DUSAGE_DYNAMIC) & D3DLOCK_NOOVERWRITE
+      sanitize_buffer_lock_flags(D3DLOCK_NOOVERWRITE, D3DPOOL_DEFAULT, D3DUSAGE_DYNAMIC, false) & D3DLOCK_NOOVERWRITE
   );
   // DONOTWAIT drops for DYNAMIC, survives otherwise.
   check(
       "donotwait drops for dynamic",
-      !(sanitize_buffer_lock_flags(D3DLOCK_DONOTWAIT, D3DPOOL_DEFAULT, D3DUSAGE_DYNAMIC) & D3DLOCK_DONOTWAIT)
+      !(sanitize_buffer_lock_flags(D3DLOCK_DONOTWAIT, D3DPOOL_DEFAULT, D3DUSAGE_DYNAMIC, false) & D3DLOCK_DONOTWAIT)
   );
   check(
       "donotwait survives for static default",
-      sanitize_buffer_lock_flags(D3DLOCK_DONOTWAIT, D3DPOOL_DEFAULT, 0) & D3DLOCK_DONOTWAIT
+      sanitize_buffer_lock_flags(D3DLOCK_DONOTWAIT, D3DPOOL_DEFAULT, 0, false) & D3DLOCK_DONOTWAIT
   );
   // READONLY survives only in MANAGED.
   check(
       "readonly survives in managed",
-      sanitize_buffer_lock_flags(D3DLOCK_READONLY, D3DPOOL_MANAGED, 0) & D3DLOCK_READONLY
+      sanitize_buffer_lock_flags(D3DLOCK_READONLY, D3DPOOL_MANAGED, 0, false) & D3DLOCK_READONLY
   );
   check(
       "readonly drops in sysmem",
-      !(sanitize_buffer_lock_flags(D3DLOCK_READONLY, D3DPOOL_SYSTEMMEM, 0) & D3DLOCK_READONLY)
+      !(sanitize_buffer_lock_flags(D3DLOCK_READONLY, D3DPOOL_SYSTEMMEM, 0, false) & D3DLOCK_READONLY)
+  );
+
+  // A software-vertex-processing-only device never honours DISCARD or
+  // NOOVERWRITE, regardless of pool and usage: native keeps the lock
+  // pointer stable there.
+  check(
+      "swvp_drops_discard",
+      !(sanitize_buffer_lock_flags(D3DLOCK_DISCARD, D3DPOOL_DEFAULT, D3DUSAGE_DYNAMIC, true) & D3DLOCK_DISCARD)
+  );
+  check(
+      "swvp_drops_nooverwrite",
+      !(sanitize_buffer_lock_flags(D3DLOCK_NOOVERWRITE, D3DPOOL_DEFAULT, D3DUSAGE_DYNAMIC, true) &
+        D3DLOCK_NOOVERWRITE)
   );
   check(
       "readonly drops in default",
-      !(sanitize_buffer_lock_flags(D3DLOCK_READONLY, D3DPOOL_DEFAULT, 0) & D3DLOCK_READONLY)
+      !(sanitize_buffer_lock_flags(D3DLOCK_READONLY, D3DPOOL_DEFAULT, 0, false) & D3DLOCK_READONLY)
   );
 
   // ---- respectUserBounds ----
