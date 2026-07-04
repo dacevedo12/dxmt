@@ -97,6 +97,14 @@ struct D3D9StateBlockChanges {
   bool render_states[256] = {};
   bool sampler_states = false;
   bool texture_stage_states = false;
+  // Predefined PIXELSTATE / VERTEXSTATE subsets restore only the per-stage
+  // texture-stage / sampler ELEMENTS wined3d lists (pixel_states_texture /
+  // _sampler, vertex_states_texture / _sampler in stateblock.c). 0 restores the
+  // whole array (D3DSBT_ALL and Begin/End-recorded blocks stay coarse); a
+  // non-zero mask restores only the (1u << D3DTSS_* / D3DSAMP_*) elements set.
+  // Paired with the texture_stage_states / sampler_states bools.
+  uint32_t tss_element_mask = 0;
+  uint32_t samp_element_mask = 0;
   bool transforms = false;
   bool clip_planes = false;
   bool viewport = false;
@@ -158,12 +166,11 @@ struct D3D9StateBlockChanges {
 
   // D3DSBT_PIXELSTATE subset: render states from wined3d's
   // pixel_states_render[] (dlls/wined3d/stateblock.c), plus the
-  // pixel-pipeline categories (sampler / texture-stage / textures /
-  // pixel shader / PS constants). pixel_states_texture[] and
-  // pixel_states_sampler[] are reflected through the coarse
-  // texture_stage_states / sampler_states bools; TODO: replace with
-  // per-stage / per-state-element bitmaps once a game shows
-  // per-element divergence.
+  // pixel-pipeline categories (sampler / texture-stage / pixel shader /
+  // PS constants; bound textures belong to D3DSBT_ALL, not here). The
+  // texture-stage and sampler restore is narrowed to the exact
+  // pixel_states_texture[] / pixel_states_sampler[] elements via the
+  // tss_element_mask / samp_element_mask populated below.
   void
   markPixelStateSubset() {
     static constexpr D3DRENDERSTATETYPE pixel_states_render[] = {
@@ -230,8 +237,46 @@ struct D3D9StateBlockChanges {
     };
     for (auto rs : pixel_states_render)
       render_states[rs] = true;
-    // TODO: per-stage / per-state-element granularity (wined3d's
-    // pixel_states_texture[] / pixel_states_sampler[]).
+    // wined3d pixel_states_texture[] / pixel_states_sampler[] (stateblock.c):
+    // the per-stage TSS / sampler elements PIXELSTATE restores. The sampler
+    // list notably omits D3DSAMP_DMAPOFFSET (a vertex-only element).
+    static constexpr D3DTEXTURESTAGESTATETYPE pixel_states_texture[] = {
+        D3DTSS_ALPHAARG0,
+        D3DTSS_ALPHAARG1,
+        D3DTSS_ALPHAARG2,
+        D3DTSS_ALPHAOP,
+        D3DTSS_BUMPENVLOFFSET,
+        D3DTSS_BUMPENVLSCALE,
+        D3DTSS_BUMPENVMAT00,
+        D3DTSS_BUMPENVMAT01,
+        D3DTSS_BUMPENVMAT10,
+        D3DTSS_BUMPENVMAT11,
+        D3DTSS_COLORARG0,
+        D3DTSS_COLORARG1,
+        D3DTSS_COLORARG2,
+        D3DTSS_COLOROP,
+        D3DTSS_RESULTARG,
+        D3DTSS_TEXCOORDINDEX,
+        D3DTSS_TEXTURETRANSFORMFLAGS,
+    };
+    static constexpr D3DSAMPLERSTATETYPE pixel_states_sampler[] = {
+        D3DSAMP_ADDRESSU,
+        D3DSAMP_ADDRESSV,
+        D3DSAMP_ADDRESSW,
+        D3DSAMP_BORDERCOLOR,
+        D3DSAMP_MAGFILTER,
+        D3DSAMP_MINFILTER,
+        D3DSAMP_MIPFILTER,
+        D3DSAMP_MIPMAPLODBIAS,
+        D3DSAMP_MAXMIPLEVEL,
+        D3DSAMP_MAXANISOTROPY,
+        D3DSAMP_SRGBTEXTURE,
+        D3DSAMP_ELEMENTINDEX,
+    };
+    for (auto e : pixel_states_texture)
+      tss_element_mask |= 1u << e;
+    for (auto e : pixel_states_sampler)
+      samp_element_mask |= 1u << e;
     texture_stage_states = true;
     sampler_states = true;
     pixel_shader = true;
@@ -245,10 +290,10 @@ struct D3D9StateBlockChanges {
 
   // D3DSBT_VERTEXSTATE subset: render states from wined3d's
   // vertex_states_render[] (dlls/wined3d/stateblock.c), plus the
-  // vertex-pipeline categories. vertex_states_sampler[] (DMAP_OFFSET)
-  // and vertex_states_texture[] (TEXCOORD_INDEX, TEXTURE_TRANSFORM_FLAGS)
-  // are reflected through the coarse sampler_states /
-  // texture_stage_states bools; same TODO as the pixel subset.
+  // vertex-pipeline categories. The texture-stage and sampler restore is
+  // narrowed to the exact vertex_states_texture[] (TEXCOORDINDEX,
+  // TEXTURETRANSFORMFLAGS) / vertex_states_sampler[] (DMAPOFFSET) elements
+  // via tss_element_mask / samp_element_mask populated below.
   void
   markVertexStateSubset() {
     static constexpr D3DRENDERSTATETYPE vertex_states_render[] = {
@@ -300,8 +345,16 @@ struct D3D9StateBlockChanges {
     };
     for (auto rs : vertex_states_render)
       render_states[rs] = true;
-    // TODO: per-stage / per-state-element granularity (wined3d's
-    // vertex_states_texture[] / vertex_states_sampler[]).
+    // wined3d vertex_states_texture[] / vertex_states_sampler[] (stateblock.c):
+    // VERTEXSTATE restores only these per-stage elements, and its sampler list
+    // is exactly D3DSAMP_DMAPOFFSET (the element PIXELSTATE omits).
+    static constexpr D3DTEXTURESTAGESTATETYPE vertex_states_texture[] = {
+        D3DTSS_TEXCOORDINDEX,
+        D3DTSS_TEXTURETRANSFORMFLAGS,
+    };
+    for (auto e : vertex_states_texture)
+      tss_element_mask |= 1u << e;
+    samp_element_mask |= 1u << D3DSAMP_DMAPOFFSET;
     texture_stage_states = true;
     sampler_states = true;
     vertex_shader = true;

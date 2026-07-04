@@ -5793,8 +5793,14 @@ MTLD3D9Device::SetLight(DWORD Index, const D3DLIGHT9 *pLight) {
     enables.resize(Index + 1, FALSE);
   }
   lights[Index] = *pLight;
-  if (m_inStateBlockRecord)
+  if (m_inStateBlockRecord) {
     m_recordingBlock->m_changes.lights = true;
+    // Track this light index so Apply restores only the touched lights, not the
+    // whole seed-captured set (wined3d records into changed.changed_lights).
+    auto &idxs = m_recordingBlock->m_snapLightIndices;
+    if (std::find(idxs.begin(), idxs.end(), Index) == idxs.end())
+      idxs.push_back(Index);
+  }
   return D3D_OK;
 }
 
@@ -5834,8 +5840,14 @@ MTLD3D9Device::LightEnable(DWORD Index, BOOL Enable) {
     lights[Index] = def;
   }
   enables[Index] = Enable ? TRUE : FALSE;
-  if (m_inStateBlockRecord)
+  if (m_inStateBlockRecord) {
     m_recordingBlock->m_changes.lights = true;
+    // Track this light index so Apply restores only the touched lights, not the
+    // whole seed-captured set (wined3d records into changed.changed_lights).
+    auto &idxs = m_recordingBlock->m_snapLightIndices;
+    if (std::find(idxs.begin(), idxs.end(), Index) == idxs.end())
+      idxs.push_back(Index);
+  }
   return D3D_OK;
 }
 
@@ -6023,6 +6035,9 @@ MTLD3D9Device::BeginStateBlock() {
   sb->setChanges(seed);
   sb->Capture();
   sb->setChanges(D3D9StateBlockChanges{});
+  // The seed capture recorded every existing light index; a recorded block
+  // instead tracks only the lights its Set / Enable arms touch, so start empty.
+  sb->m_snapLightIndices.clear();
   m_recordingBlock = sb;
   m_inStateBlockRecord = true;
   return D3D_OK;
@@ -8915,6 +8930,9 @@ MTLD3D9Device::SetVertexDeclaration(IDirect3DVertexDeclaration9 *pDecl) {
   if (m_inStateBlockRecord) {
     m_recordingBlock->m_snapVertexDeclaration = decl;
     m_recordingBlock->m_changes.vertex_declaration = true;
+    // Record the derived FVF alongside the decl (the live arm keeps m_fvf in
+    // lockstep below) so an applied block leaves GetFVF consistent.
+    m_recordingBlock->m_snapFvf = decl ? decl->fvf() : 0;
     return D3D_OK;
   }
   // GetFVF reports the bound declaration's FVF: the source FVF for a

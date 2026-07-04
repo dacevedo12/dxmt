@@ -183,7 +183,9 @@ MTLD3D9StateBlock::Capture() {
     m_snapViewport = m_device->m_viewport;
   if (m_changes.scissor)
     m_snapScissorRect = m_device->m_scissorRect;
-  if (m_changes.fvf)
+  // Capture the FVF whenever the declaration is captured: wined3d derives the
+  // FVF from the decl, so the two must move together (see Apply).
+  if (m_changes.fvf || m_changes.vertex_declaration)
     m_snapFvf = m_device->m_fvf;
   // Per-stream mask: one bit covers the buffer binding + offset +
   // stride + freq for that stream.
@@ -241,6 +243,14 @@ MTLD3D9StateBlock::Capture() {
   if (m_changes.lights) {
     m_snapLights = m_device->m_lights;
     m_snapLightEnables = m_device->m_lightEnables;
+    // Record every existing light index (wined3d's set_all captures the whole
+    // light tree). A Type==0 slot was only grown by a higher-index Set and never
+    // Set itself, so it does not exist; skip it. Begin/End recording clears this
+    // list after the seed capture and tracks only the indices it touches.
+    m_snapLightIndices.clear();
+    for (DWORD i = 0; i < m_snapLights.size(); ++i)
+      if (m_snapLights[i].Type != 0)
+        m_snapLightIndices.push_back(i);
   }
   (void)m_type;
   return D3D_OK;
@@ -264,11 +274,32 @@ MTLD3D9StateBlock::Apply() {
     pod_dirty |= dxmt::D9ES_DIRTY_RENDER_STATES;
   }
   if (m_changes.sampler_states) {
-    std::memcpy(m_device->m_samplerStates, m_snapSamplerStates, sizeof(m_snapSamplerStates));
+    if (m_changes.samp_element_mask == 0) {
+      std::memcpy(m_device->m_samplerStates, m_snapSamplerStates, sizeof(m_snapSamplerStates));
+    } else {
+      // Predefined subset: restore only the wined3d-listed per-stage elements.
+      for (uint32_t e = 0; e <= D3DSAMP_DMAPOFFSET; ++e) {
+        if (!(m_changes.samp_element_mask & (1u << e)))
+          continue;
+        for (uint32_t s = 0; s < D3D9_MAX_TEXTURE_UNITS; ++s)
+          m_device->m_samplerStates[s][e] = m_snapSamplerStates[s][e];
+      }
+    }
     pod_dirty |= dxmt::D9ES_DIRTY_SAMPLER_STATES;
   }
   if (m_changes.texture_stage_states) {
-    std::memcpy(m_device->m_textureStageStates, m_snapTextureStageStates, sizeof(m_snapTextureStageStates));
+    if (m_changes.tss_element_mask == 0) {
+      std::memcpy(m_device->m_textureStageStates, m_snapTextureStageStates, sizeof(m_snapTextureStageStates));
+    } else {
+      // Predefined subset: restore only the wined3d-listed per-stage elements.
+      // The subset elements are all below 32, so the shift never overflows.
+      for (uint32_t e = 0; e < 32; ++e) {
+        if (!(m_changes.tss_element_mask & (1u << e)))
+          continue;
+        for (uint32_t s = 0; s < 8; ++s)
+          m_device->m_textureStageStates[s][e] = m_snapTextureStageStates[s][e];
+      }
+    }
     // Resolve reads texture-stage state per draw off pod_snapshot, so an
     // Apply that restores it must dirty the axis like the setters do.
     pod_dirty |= dxmt::D9ES_DIRTY_TEXTURE_STAGE_STATES;
@@ -289,7 +320,11 @@ MTLD3D9StateBlock::Apply() {
     m_device->m_scissorRect = m_snapScissorRect;
     pod_dirty |= dxmt::D9ES_DIRTY_SCISSOR_RECT;
   }
-  if (m_changes.fvf)
+  // Restore the FVF alongside the declaration: wined3d derives the FVF from the
+  // decl, so a VERTEXSTATE / ALL block that restores the decl must also restore
+  // dxmt's separately-stored m_fvf, keeping GetFVF consistent. A standalone
+  // recorded SetFVF sets only the fvf bit.
+  if (m_changes.fvf || m_changes.vertex_declaration)
     m_device->m_fvf = m_snapFvf;
   if (m_changes.streams) {
     for (uint32_t i = 0; i < D3D9_MAX_VERTEX_STREAMS; ++i) {
@@ -404,8 +439,17 @@ MTLD3D9StateBlock::Apply() {
   }
   m_device->m_encShadowDirty |= pod_dirty;
   if (m_changes.lights) {
-    m_device->m_lights = m_snapLights;
-    m_device->m_lightEnables = m_snapLightEnables;
+    // Restore only the recorded lights (wined3d walks changed_lights, setting
+    // each recorded light + its enable by index): a block that touched light N
+    // must not reset the other lights to Begin-time values.
+    for (DWORD idx : m_snapLightIndices) {
+      if (idx >= m_device->m_lights.size()) {
+        m_device->m_lights.resize(idx + 1, D3DLIGHT9{});
+        m_device->m_lightEnables.resize(idx + 1, FALSE);
+      }
+      m_device->m_lights[idx] = m_snapLights[idx];
+      m_device->m_lightEnables[idx] = m_snapLightEnables[idx];
+    }
   }
   // RT/DS not restored: wined3d stateblock excludes framebuffer.
   // Capturing would un-bind post-snapshot DS, forcing no-DS fallback.

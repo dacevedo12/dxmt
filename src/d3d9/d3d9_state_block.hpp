@@ -158,6 +158,11 @@ private:
   // handles allocation and the trivially-copyable element layout.
   std::vector<D3DLIGHT9> m_snapLights;
   std::vector<BOOL> m_snapLightEnables;
+  // The light indices this block actually restores (wined3d's
+  // changed.changed_lights list). A predefined block records every existing
+  // light at capture; a Begin/End-recorded block records only the indices its
+  // SetLight / LightEnable touched, so Apply leaves the others alone.
+  std::vector<DWORD> m_snapLightIndices;
   // Self-pin shape mirrors MTLD3D9Surface / MTLD3D9Texture: the
   // ctor's AddRefPrivate keeps the block alive across the public 1→0
   // transition long enough for the override to drop the device pin.
