@@ -223,6 +223,13 @@ public:
   // Preserves IDirect3DSurface9* identity; apps see current backbuffer
   // contents, not stale snapshot. New desc/texture replace backing.
   // Per-bind views resolved off m_dxmtTexture.
+  // Reset orphaned this backbuffer: the chain no longer owns it, so
+  // GetContainer identity falls back to the device (E_NOINTERFACE for the
+  // swapchain, the device still answers), while the desc and contents stay
+  // the pre-Reset ones. Refs already pin the device, so this is only the
+  // identity swap; wine's d3d9ex tests pin the contract.
+  void detachContainer();
+
   void
   resetBacking(const D3DSURFACE_DESC &desc, WMT::Reference<WMT::Texture> texture, Rc<dxmt::Texture> dxmtTexture) {
     m_desc = desc;

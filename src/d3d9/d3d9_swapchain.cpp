@@ -328,8 +328,11 @@ MTLD3D9SwapChain::buildBackBuffer() {
 
 HRESULT
 MTLD3D9SwapChain::ResetForDeviceReset(const D3DPRESENT_PARAMETERS &params, HWND hEffectiveWindow) {
-  // Identity-preserving rebuild: reuse MTLD3D9Surface objects, swap Metal
-  // backing so app-held IDirect3DSurface9* refs point to new content after Reset.
+  // Reset detaches the old backbuffer surfaces and hands out fresh objects:
+  // an app-held pre-Reset backbuffer keeps its old desc and contents, loses
+  // its swapchain container, and still answers GetContainer for the device
+  // (wine's d3d9ex tests pin the contract). Only an Ex app can observe the
+  // detach; the non-Ex Reset fails while implicit surfaces are app-held.
   // Allocate textures first; only swap on success to keep chain coherent on OOM.
   const UINT new_count = std::max<UINT>(1u, params.BackBufferCount);
   const uint32_t sampleCount = m_device->metalSampleCount(params.MultiSampleType, params.MultiSampleQuality);
@@ -366,30 +369,16 @@ MTLD3D9SwapChain::ResetForDeviceReset(const D3DPRESENT_PARAMETERS &params, HWND 
   m_params.hDeviceWindow = hEffectiveWindow;
   m_resolveTarget = std::move(new_resolve_target);
 
-  // BackBufferCount shrunk: trim trailing slots. Surfaces with an
-  // outstanding app-held public ref get destroyed when the app drops
-  // the ref; identity is only preserved for the slots that still
-  // exist on both sides of the Reset.
-  if (new_count < m_backBuffers.size())
-    m_backBuffers.resize(new_count);
-
-  // Slots 0..min(old, new)-1: keep the same MTLD3D9Surface object and
-  // swap its inner texture/format/desc in place.
+  // Detach every old surface first (a dying surface's detach is harmless),
+  // then rebuild the chain's slots as fresh objects. The COPY front canvas
+  // is extent-bound; drop it for lazy re-materialisation like buildBackBuffer.
+  for (auto &old_bb : m_backBuffers)
+    old_bb->detachContainer();
+  m_backBuffers.clear();
+  m_frontCanvas = nullptr;
   const bool lockable = (params.Flags & D3DPRESENTFLAG_LOCKABLE_BACKBUFFER) != 0;
-  const UINT keep = std::min<UINT>(static_cast<UINT>(m_backBuffers.size()), new_count);
-  for (UINT i = 0; i < keep; ++i) {
-    m_backBuffers[i]->resetBacking(
-        desc, WMT::Reference<WMT::Texture>(new_raw_textures[i]), std::move(new_dxmt_textures[i])
-    );
-    // Re-fit the lockable host mirror to the new extent/format (or drop it if
-    // the chain is no longer lockable); resetBacking left the old one in place.
-    void *bbCpu = nullptr, *bbOwned = nullptr;
-    uint32_t bbPitch = 0;
-    allocLockableBackBufferMirror(lockable, desc, bbCpu, bbPitch, bbOwned);
-    m_backBuffers[i]->resetLockableMirror(bbCpu, bbPitch, bbOwned);
-  }
-  // BackBufferCount grew: append fresh surfaces for the new tail.
-  for (UINT i = keep; i < new_count; ++i) {
+  m_backBuffers.reserve(new_count);
+  for (UINT i = 0; i < new_count; ++i) {
     void *bbCpu = nullptr, *bbOwned = nullptr;
     uint32_t bbPitch = 0;
     allocLockableBackBufferMirror(lockable, desc, bbCpu, bbPitch, bbOwned);

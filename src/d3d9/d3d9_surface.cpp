@@ -287,6 +287,11 @@ MTLD3D9Surface::GetContainer(REFIID riid, void **ppContainer) {
 }
 
 void
+MTLD3D9Surface::detachContainer() {
+  m_container = static_cast<IUnknown *>(static_cast<IDirect3DDevice9Ex *>(m_device));
+}
+
+void
 MTLD3D9Surface::flagContainerAutoGenDirty() {
   if (!m_container)
     return;
