@@ -106,6 +106,13 @@ private:
   // m_backBuffers[0] into this and presents it (the DXVK/wined3d shape). Null
   // for a single-sample chain, where Present blits the backbuffer directly.
   Rc<dxmt::Texture> m_resolveTarget;
+  // Persistent front canvas for D3DSWAPEFFECT_COPY partial presents,
+  // materialised by the first Present that passes rects: presents
+  // composite into it (full frame or source-to-dest rect) and the
+  // presenter blits it, so the area a rect leaves uncovered keeps its
+  // previous contents the way the native front buffer does. Null until
+  // an app passes rects; dropped on Reset.
+  Rc<dxmt::Texture> m_frontCanvas;
   // CAMetalLayer the chain blits to at Present, plus the NSView wrapper
   // returned by CreateMetalViewFromHWND that owns its lifetime. Null
   // when no HWND was provided (smokes and headless test harnesses);

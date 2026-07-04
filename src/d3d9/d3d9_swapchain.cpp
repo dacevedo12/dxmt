@@ -269,6 +269,9 @@ bool
 MTLD3D9SwapChain::buildBackBuffer() {
   m_backBuffers.clear();
   m_resolveTarget = nullptr;
+  // Reset drops the COPY front canvas; the first rect present after the
+  // new backbuffer exists re-materialises it at the new extent.
+  m_frontCanvas = nullptr;
   const UINT count = std::max<UINT>(1u, m_params.BackBufferCount);
 
   const uint32_t sampleCount = m_device->metalSampleCount(m_params.MultiSampleType, m_params.MultiSampleQuality);
@@ -512,8 +515,8 @@ MTLD3D9SwapChain::Present(
     return m_isEx ? S_PRESENT_OCCLUDED : D3D_OK;
   }
   // No in-scene gate: apps Present mid-scene (driver behavior, not spec).
-  // pSourceRect/pDestRect/hDestWindowOverride: accepted but currently ignored;
-  // Presenter retargeting and partial-region blits deferred.
+  // hDestWindowOverride: accepted but currently ignored; Presenter
+  // retargeting deferred.
   if (hDestWindowOverride != nullptr) {
     static std::atomic<bool> warned{false};
     if (!warned.exchange(true))
@@ -544,11 +547,48 @@ MTLD3D9SwapChain::Present(
   // Headless chain (no layer): no-op success. Existing per-call cmdbufs
   // commit immediately, so there's nothing to flush. Real apps reach
   // here with m_layer non-null.
-  // pSourceRect / pDestRect honour-under-COPY is still a TODO (the
-  // Presenter would need a sub-region blit path); apps that pass them
-  // under COPY today get a full-frame blit until that lands.
-  (void)pSourceRect;
-  (void)pDestRect;
+  //
+  // D3DSWAPEFFECT_COPY partial present: the rects copy a backbuffer
+  // sub-rect onto the front at a possibly different position, and the
+  // uncovered front area keeps its previous contents. The drawable pool
+  // cannot preserve history across frames, so the first rect present
+  // materialises a persistent front canvas: from then on every present
+  // composites into it (full frame without rects, source rect to dest
+  // rect with them) and the canvas is what the presenter blits. Chains
+  // that never pass rects never allocate it. The rects are COPY-only per
+  // the spec; other swap effects ignore them (wined3d swapchain.c honours
+  // them through its front-buffer blit, DXVK through its present region).
+  const uint32_t bb_w = m_params.BackBufferWidth;
+  const uint32_t bb_h = m_params.BackBufferHeight;
+  bool canvas_seed = false;
+  if (m_params.SwapEffect == D3DSWAPEFFECT_COPY && (pSourceRect || pDestRect) && m_frontCanvas == nullptr &&
+      m_resolveTarget == nullptr) {
+    WMTTextureInfo cinfo;
+    D3DSURFACE_DESC cdesc;
+    backBufferDescriptors(m_params, /*sampleCount=*/1, cinfo, cdesc);
+    m_frontCanvas = buildResolveTarget(m_device, cinfo);
+    // Seed the whole canvas from the current backbuffer so the area the
+    // first rect leaves uncovered shows the frame the app already drew.
+    canvas_seed = m_frontCanvas != nullptr;
+  }
+  // Clamp the rects to the backbuffer/canvas extent; wined3d clips the
+  // same way rather than rejecting. Null means the full extent.
+  auto clamp_rect = [](const RECT *r, uint32_t w, uint32_t h, WMTOrigin &origin, WMTSize &size) {
+    LONG l = r ? std::max<LONG>(0, r->left) : 0;
+    LONG tp = r ? std::max<LONG>(0, r->top) : 0;
+    LONG rt = r ? std::min<LONG>(w, r->right) : static_cast<LONG>(w);
+    LONG bt = r ? std::min<LONG>(h, r->bottom) : static_cast<LONG>(h);
+    origin = {static_cast<uint32_t>(l), static_cast<uint32_t>(tp), 0};
+    size = {static_cast<uint32_t>(std::max<LONG>(0, rt - l)), static_cast<uint32_t>(std::max<LONG>(0, bt - tp)), 1};
+    return size.width > 0 && size.height > 0;
+  };
+  WMTOrigin rect_src_origin{}, rect_dst_origin{};
+  WMTSize rect_src_size{}, rect_dst_size{};
+  bool canvas_rect_blit = false;
+  if (m_frontCanvas != nullptr && m_params.SwapEffect == D3DSWAPEFFECT_COPY && (pSourceRect || pDestRect)) {
+    canvas_rect_blit = clamp_rect(pSourceRect, bb_w, bb_h, rect_src_origin, rect_src_size) &&
+                       clamp_rect(pDestRect, bb_w, bb_h, rect_dst_origin, rect_dst_size);
+  }
   auto pool = WMT::MakeAutoreleasePool();
   // Present routes through a chunk so the present-blit's wine_unix_calls
   // (cmdbuf.commit, presentDrawable, encodeCommands) run on the dxmt
@@ -641,11 +681,11 @@ MTLD3D9SwapChain::Present(
   }
   auto bb_dxmt = m_backBuffers[0]->dxmtTexture();
   Rc<dxmt::Texture> resolve_target = m_resolveTarget;
-  const uint32_t bb_w = m_params.BackBufferWidth;
-  const uint32_t bb_h = m_params.BackBufferHeight;
+  Rc<dxmt::Texture> canvas = m_frontCanvas;
   Rc<Presenter> presenter = m_presenter;
   chunk->emitcc([backbuffer = std::move(bb_dxmt), resolve_target = std::move(resolve_target),
-                 presenter = std::move(presenter), vsync_duration, bb_w, bb_h,
+                 canvas = std::move(canvas), canvas_seed, canvas_rect_blit, rect_src_origin, rect_src_size,
+                 rect_dst_origin, rect_dst_size, presenter = std::move(presenter), vsync_duration, bb_w, bb_h,
                  state = std::move(state)](ArgumentEncodingContext &ctx) mutable {
     // D3D9 auto-resolves an MSAA backbuffer at Present; the CAMetalLayer
     // drawable is single-sample, so average-resolve into the resolve target
@@ -663,6 +703,23 @@ MTLD3D9SwapChain::Present(
           WMTSize{bb_w, bb_h, 1}
       );
       ctx.present(resolve_target, presenter, vsync_duration, state.metadata);
+    } else if (canvas != nullptr) {
+      // COPY front canvas: composite this present's contribution, then blit
+      // the canvas. A rect-less present (and the one-time seed) contributes
+      // the whole backbuffer; a rect present contributes source to dest.
+      // Point filtering: a same-size copy must not resample, and a
+      // stretching Present rect pair is a copy, not a filtered scale.
+      if (canvas_seed || !canvas_rect_blit)
+        ctx.stretch_blit_cmd.blit(
+            backbuffer, backbuffer->fullView, canvas, canvas->fullView, StretchBlitContext::Filter::Point,
+            WMTOrigin{0, 0, 0}, WMTSize{bb_w, bb_h, 1}, WMTOrigin{0, 0, 0}, WMTSize{bb_w, bb_h, 1}
+        );
+      if (canvas_rect_blit)
+        ctx.stretch_blit_cmd.blit(
+            backbuffer, backbuffer->fullView, canvas, canvas->fullView, StretchBlitContext::Filter::Point,
+            rect_src_origin, rect_src_size, rect_dst_origin, rect_dst_size
+        );
+      ctx.present(canvas, presenter, vsync_duration, state.metadata);
     } else {
       ctx.present(backbuffer, presenter, vsync_duration, state.metadata);
     }
