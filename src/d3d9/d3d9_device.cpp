@@ -9883,9 +9883,20 @@ HRESULT STDMETHODCALLTYPE
 MTLD3D9Device::ResetEx(D3DPRESENT_PARAMETERS *pPresentationParameters, D3DDISPLAYMODEEX *pFullscreenDisplayMode) {
   if (!m_isEx)
     return D3DERR_INVALIDCALL;
-  // pFullscreenDisplayMode ignored (no WSI mode switch on macOS).
-  // Mode change happens via swapchain rebuild.
-  (void)pFullscreenDisplayMode;
+  if (!pPresentationParameters)
+    return D3DERR_INVALIDCALL;
+  // The mode is passed if and only if the present is fullscreen, and its
+  // extent must match the backbuffer (wine d3d9 device.c ResetEx; note
+  // CreateDeviceEx deliberately tolerates a stale windowed mode instead,
+  // see d3d9_interface.cpp). Beyond the validation the mode itself is not
+  // consumed: there is no WSI display-mode switch on this backend, the
+  // extent change happens via the swapchain rebuild in Reset.
+  if (!pPresentationParameters->Windowed == !pFullscreenDisplayMode)
+    return D3DERR_INVALIDCALL;
+  if (pFullscreenDisplayMode &&
+      (pFullscreenDisplayMode->Width != pPresentationParameters->BackBufferWidth ||
+       pFullscreenDisplayMode->Height != pPresentationParameters->BackBufferHeight))
+    return D3DERR_INVALIDCALL;
   return Reset(pPresentationParameters);
 }
 HRESULT STDMETHODCALLTYPE
