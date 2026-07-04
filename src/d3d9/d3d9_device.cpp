@@ -1962,8 +1962,12 @@ MTLD3D9Device::GetAvailableTextureMem() {
     bytes = cap_bytes;
   // Subtract the device-local (DEFAULT-pool) allocations the app has made so
   // the figure falls as resources are created, the behavior era engines poll
-  // for. wined3d and DXVK keep the same running counter.
-  int64_t used = reportedTextureMemory();
+  // for. wined3d and DXVK keep the same running counter. An Ex device
+  // reports the WDDM-virtualised figure that does NOT fall with
+  // allocations (wine's d3d9ex tests assert a near-constant report across
+  // twenty render-target creates; DXVK's ChangeReportedMemory early-outs
+  // on IsExtended the same way).
+  int64_t used = m_isEx ? 0 : reportedTextureMemory();
   if (used > 0) {
     uint64_t u = static_cast<uint64_t>(used);
     bytes = u >= bytes ? 0 : bytes - u;
