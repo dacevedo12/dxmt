@@ -7,6 +7,7 @@
 #include "rc/util_rc_ptr.hpp"
 
 #include <chrono>
+#include <unordered_map>
 #include <vector>
 
 namespace dxmt {
@@ -118,6 +119,22 @@ private:
   // when no HWND was provided (smokes and headless test harnesses);
   // Present then commits a no-op cmdbuf and returns S_OK.
   WMT::Object m_view;
+  // Present hDestWindowOverride retarget: a per-window (view, layer,
+  // presenter) created on first use; the overridden frame presents through
+  // it, the device window's chain state stays untouched. DXVK keeps the
+  // same per-window presenter map (d3d9_swapchain.cpp). A window whose
+  // view creation failed caches a null presenter so the failure is not
+  // retried every frame. Entries live until the swapchain dies.
+  struct OverrideTarget {
+    WMT::Object view{};
+    WMT::MetalLayer layer{};
+    Rc<Presenter> presenter;
+    uint32_t last_w = 0;
+    uint32_t last_h = 0;
+    double refresh_hz = 60.0;
+  };
+  std::unordered_map<HWND, OverrideTarget> m_overrideTargets;
+  OverrideTarget *resolveOverrideTarget(HWND hwnd);
   WMT::MetalLayer m_layer;
   // Resolved hWnd the Presenter is bound to: used by Present's
   // wsi::isMinimized probe. Stashed from the ctor's hEffectiveWindow

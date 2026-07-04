@@ -427,6 +427,31 @@ MTLD3D9SwapChain::ResetForDeviceReset(const D3DPRESENT_PARAMETERS &params, HWND 
   return D3D_OK;
 }
 
+MTLD3D9SwapChain::OverrideTarget *
+MTLD3D9SwapChain::resolveOverrideTarget(HWND hwnd) {
+  auto it = m_overrideTargets.find(hwnd);
+  if (it != m_overrideTargets.end())
+    return it->second.presenter != nullptr ? &it->second : nullptr;
+  OverrideTarget target{};
+  target.view = WMT::CreateMetalViewFromHWND(reinterpret_cast<intptr_t>(hwnd), m_device->metalDevice(), target.layer);
+  if (target.layer.handle != 0) {
+    target.presenter = Rc(new Presenter(
+        m_device->metalDevice(), target.layer, m_device->internalCommandLibrary(),
+        /*scale_factor=*/1.0f, /*sample_count=*/1
+    ));
+    // Same present composite contract as the device window's presenter:
+    // the backbuffer alpha is scene scratch, not window coverage.
+    target.presenter->setPresentAlphaMode(/*DXGI_ALPHA_MODE_IGNORE=*/3);
+    queryMonitorRefreshRate(windowMonitor(hwnd), &target.refresh_hz);
+  } else {
+    static std::atomic<bool> warned{false};
+    if (!warned.exchange(true))
+      Logger::warn("d3d9: Present hDestWindowOverride window has no presentable view; presenting to the device window");
+  }
+  auto [ins, added] = m_overrideTargets.emplace(hwnd, std::move(target));
+  return ins->second.presenter != nullptr ? &ins->second : nullptr;
+}
+
 MTLD3D9SwapChain::~MTLD3D9SwapChain() {
   // Drop the Presenter before tearing down the NSView; the Presenter
   // holds a non-retaining WMT::MetalLayer copy whose backing CALayer is
@@ -435,8 +460,15 @@ MTLD3D9SwapChain::~MTLD3D9SwapChain() {
   // of normal field destruction, but ReleaseMetalView happens explicitly
   // above any field destruction, so we sequence it here.
   m_presenter = nullptr;
+  for (auto &entry : m_overrideTargets)
+    entry.second.presenter = nullptr;
+  auto pool = WMT::MakeAutoreleasePool();
+  for (auto &entry : m_overrideTargets) {
+    if (entry.second.view.handle != 0)
+      WMT::ReleaseMetalView(entry.second.view);
+  }
+  m_overrideTargets.clear();
   if (m_view.handle != 0) {
-    auto pool = WMT::MakeAutoreleasePool();
     WMT::ReleaseMetalView(m_view);
   }
 }
@@ -515,13 +547,6 @@ MTLD3D9SwapChain::Present(
     return m_isEx ? S_PRESENT_OCCLUDED : D3D_OK;
   }
   // No in-scene gate: apps Present mid-scene (driver behavior, not spec).
-  // hDestWindowOverride: accepted but currently ignored; Presenter
-  // retargeting deferred.
-  if (hDestWindowOverride != nullptr) {
-    static std::atomic<bool> warned{false};
-    if (!warned.exchange(true))
-      Logger::warn("d3d9: Present hDestWindowOverride is currently ignored");
-  }
   // D3DPRESENT_FORCEIMMEDIATE is documented to be legal only when the
   // swapchain was created with D3DSWAPEFFECT_FLIPEX; "improperly
   // specified" is INVALIDCALL per the D3DPRESENT remarks table. Apps
@@ -598,7 +623,38 @@ MTLD3D9SwapChain::Present(
   // work.
   m_device->FlushDrawBatch();
   m_device->flushOpenWork();
-  if (m_layer.handle == 0 || m_presenter == nullptr) {
+  // Present hDestWindowOverride: retarget this frame to the override
+  // window's presenter (created on first use), leaving the device
+  // window's chain state untouched. wined3d hands the override window to
+  // its swapchain present the same way; a failed view resolution falls
+  // back to the device window.
+  WMT::MetalLayer active_layer = m_layer;
+  Rc<Presenter> active_presenter = m_presenter;
+  double active_refresh = m_refreshRateHz;
+  bool override_present = false;
+  if (hDestWindowOverride != nullptr && hDestWindowOverride != m_hWindow) {
+    if (OverrideTarget *target = resolveOverrideTarget(hDestWindowOverride)) {
+      uint32_t win_w = 0, win_h = 0;
+      wsi::getWindowSize(hDestWindowOverride, &win_w, &win_h);
+      if (win_w > 0 && win_h > 0 && (win_w != target->last_w || win_h != target->last_h)) {
+        target->last_w = win_w;
+        target->last_h = win_h;
+        WMTLayerProps current{};
+        target->layer.getProps(current);
+        double drawable_w, drawable_h;
+        layerDrawableExtent(hDestWindowOverride, current, m_params, drawable_w, drawable_h);
+        target->presenter->changeLayerProperties(
+            D3DFormatToMetal(m_params.BackBufferFormat, D3D9FormatUsage::RenderTarget), WMTColorSpaceSRGB, drawable_w,
+            drawable_h, /*sample_count=*/1
+        );
+      }
+      active_layer = target->layer;
+      active_presenter = target->presenter;
+      active_refresh = target->refresh_hz;
+      override_present = true;
+    }
+  }
+  if (active_layer.handle == 0 || active_presenter == nullptr) {
     return D3D_OK;
   }
 
@@ -606,7 +662,7 @@ MTLD3D9SwapChain::Present(
   // game window changes, so drawable size goes stale across Reset. Re-probe
   // here so layer snaps to new window once resize settles (cheap: GetClientRect
   // only fires changeLayerProperties on actual size change).
-  if (m_hWindow) {
+  if (m_hWindow && !override_present) {
     uint32_t win_w = 0, win_h = 0;
     wsi::getWindowSize(m_hWindow, &win_w, &win_h);
     if (win_w > 0 && win_h > 0 && (win_w != m_lastWindowW || win_h != m_lastWindowH)) {
@@ -631,6 +687,9 @@ MTLD3D9SwapChain::Present(
       m_lastMonitor = mon;
       queryMonitorRefreshRate(mon, &m_refreshRateHz);
     }
+    // The re-probe above may have just updated the rate; the vsync dwell
+    // below must use this frame's value, not the pre-probe copy.
+    active_refresh = m_refreshRateHz;
   }
 
   // synchronizeLayerProperties picks up display-side colorspace / EDR /
@@ -642,7 +701,7 @@ MTLD3D9SwapChain::Present(
   // chunk lambda (NOT copied out as metadata) so the dtor fires when
   // the lambda is destroyed (post-Metal-retire) rather than when this
   // function returns. d3d11_swapchain.cpp is the literal model.
-  auto state = m_presenter->synchronizeLayerProperties();
+  auto state = active_presenter->synchronizeLayerProperties();
 
   // d3d11_swapchain.cpp is the literal model: chunk->emitcc with
   // ctx.present(backbuffer Rc<>, presenter, vsync_duration, metadata).
@@ -677,12 +736,12 @@ MTLD3D9SwapChain::Present(
       multiplier = 3;
     else if (pi & D3DPRESENT_INTERVAL_TWO)
       multiplier = 2;
-    vsync_duration = static_cast<double>(multiplier) / m_refreshRateHz;
+    vsync_duration = static_cast<double>(multiplier) / active_refresh;
   }
   auto bb_dxmt = m_backBuffers[0]->dxmtTexture();
   Rc<dxmt::Texture> resolve_target = m_resolveTarget;
   Rc<dxmt::Texture> canvas = m_frontCanvas;
-  Rc<Presenter> presenter = m_presenter;
+  Rc<Presenter> presenter = std::move(active_presenter);
   chunk->emitcc([backbuffer = std::move(bb_dxmt), resolve_target = std::move(resolve_target),
                  canvas = std::move(canvas), canvas_seed, canvas_rect_blit, rect_src_origin, rect_src_size,
                  rect_dst_origin, rect_dst_size, presenter = std::move(presenter), vsync_duration, bb_w, bb_h,
