@@ -3234,6 +3234,27 @@ compile_dxso(
       builder.SetInsertPoint(next_bb);
       break;
     }
+    case DxsoOpcode::BreakP: {
+      // Predicate-driven early loop exit: break when the swizzle-selected
+      // p0 lane, after the source modifier, is set. wined3d lowers breakp
+      // as a conditional break off the x-swizzled source lane
+      // (glsl_shader.c shader_glsl_conditional_op); DXVK carries no breakp
+      // arm, so wined3d is the reference. Same open-block discipline as
+      // Break above.
+      if (loop_stack.empty())
+        break;
+      if (ins.src_count < 1 || ins.src[0].base.type != DxsoRegisterType::Predicate || ins.src[0].base.num != 0)
+        break;
+      BasicBlock *merge_bb = loop_stack.back().merge_bb;
+      auto *next_bb = BasicBlock::Create(context, "breakp.cont", fn);
+      Value *pmask = builder.CreateLoad(bool4Ty, p0_slot);
+      Value *cond = builder.CreateExtractElement(pmask, builder.getInt32((int)ins.src[0].swizzle[0]));
+      if (ins.src[0].modifier == DxsoRegModifier::Not)
+        cond = builder.CreateNot(cond);
+      builder.CreateCondBr(cond, merge_bb, next_bb);
+      builder.SetInsertPoint(next_bb);
+      break;
+    }
     // SM 1.x TexM3x{2,3}Pad: literal no-ops. Dependent ops read via
     // register-file lookup, not preserved state. Explicit case avoids spurious warnings.
     case DxsoOpcode::TexDepth: {
