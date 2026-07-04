@@ -1084,9 +1084,12 @@ compile_dxso(
   // D3DSAMP_MIPMAPLODBIAS for a PS sampler, host-written into the
   // bool-constant buffer tail (float at u32 index 8 + slot). Metal
   // samplers carry no LOD bias so every sample site applies it, the
-  // same way the d3d11 path reads it from its argument buffer. Not
-  // implemented for vertex samplers; their buffer(2) carries no
-  // bias table.
+  // same way the d3d11 path reads it from its argument buffer. Every
+  // pixel-shader sample pays the biased form and the uniform load even
+  // when the app leaves the bias at zero (a numeric no-op): skipping it
+  // would take a compile-time variant per bias-in-use mask, and forking
+  // PSOs is costlier than the always-on bias operand. Not implemented
+  // for vertex samplers; their buffer(2) carries no bias table.
   auto load_samp_bias = [&](uint32_t slot) -> Value * {
     if (is_vertex)
       return nullptr;
