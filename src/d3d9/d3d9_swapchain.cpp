@@ -563,7 +563,10 @@ MTLD3D9SwapChain::Present(
   // DXVK honors this; we're strict-spec at trivial cost.
   if (dwFlags & D3DPRESENT_DONOTWAIT) {
     auto &queue = m_device->dxmtQueue();
-    uint32_t max_latency = queue.GetMaxLatency();
+    // Probe with the same clamp the pre-boundary re-clamp below applies, so a
+    // SetMaximumFrameLatency earlier this frame is already reflected here
+    // rather than one Present late.
+    uint32_t max_latency = std::min(m_device->getFrameLatency(), m_params.BackBufferCount + 1u);
     uint64_t next_seq = queue.CurrentFrameSeq();
     if (next_seq > max_latency && queue.FrameLatencySignaled() < next_seq - max_latency)
       return D3DERR_WASSTILLDRAWING;
