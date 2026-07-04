@@ -736,7 +736,13 @@ MTLD3D9SwapChain::GetRasterStatus(D3DRASTER_STATUS *pRasterStatus) {
   // / frame-pacing to scanline progress. Earlier dxmt returned
   // InVBlank=FALSE / ScanLine=0 statically, which broke that pattern.
   constexpr uint32_t vblank_line_count = 20; // DXVK constant
-  const uint32_t height = m_params.BackBufferHeight ? m_params.BackBufferHeight : 1;
+  // Scanline range spans the display-mode height, not the backbuffer: in
+  // windowed mode the two differ, and DXVK paces GetRasterStatus off the
+  // display mode (d3d9_swapchain.cpp, mode.Height). Fall back to the backbuffer
+  // if the adapter mode query fails.
+  D3DDISPLAYMODE dm{};
+  const uint32_t mode_h = SUCCEEDED(m_device->GetDisplayMode(0, &dm)) ? dm.Height : 0u;
+  const uint32_t height = mode_h ? mode_h : (m_params.BackBufferHeight ? m_params.BackBufferHeight : 1);
   const double refresh = m_refreshRateHz > 0.0 ? m_refreshRateHz : 60.0;
   const uint32_t scanline_count = height + vblank_line_count;
   const double frame_us = 1'000'000.0 / refresh;
