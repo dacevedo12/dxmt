@@ -676,6 +676,8 @@ public:
   HRESULT STDMETHODCALLTYPE SetMaximumFrameLatency(UINT MaxLatency) override;
   HRESULT STDMETHODCALLTYPE GetMaximumFrameLatency(UINT *pMaxLatency) override;
   HRESULT STDMETHODCALLTYPE CheckDeviceState(HWND hDestinationWindow) override;
+
+  bool fullscreenOwnsDisplay();
   HRESULT STDMETHODCALLTYPE CreateRenderTargetEx(
       UINT Width, UINT Height, D3DFORMAT Format, D3DMULTISAMPLE_TYPE MultiSample, DWORD MultisampleQuality,
       BOOL Lockable, IDirect3DSurface9 **ppSurface, HANDLE *pSharedHandle, DWORD Usage
@@ -1336,6 +1338,11 @@ private:
   // Bytes of device-local allocation reported through GetAvailableTextureMem;
   // tracked alongside the losable count (same DEFAULT-pool lifecycle).
   std::atomic<int64_t> m_reportedTextureMemory{0};
+  // Fullscreen activation latch behind fullscreenOwnsDisplay(); the
+  // sample seeds at construction and Reset so a stale creation-time
+  // foreground never reads as occlusion.
+  HWND m_lastForegroundSample = nullptr;
+  bool m_fullscreenOccluded = false;
   // Pooled buffer backings; see acquireBufferBacking comment above.
   // Vector is fine: typical workloads keep the pool small (a handful
   // of distinct sizes); a hash-map keyed by size would add allocator

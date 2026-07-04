@@ -50,6 +50,11 @@ public:
     return m_hWindow;
   }
 
+  bool
+  windowed() const {
+    return m_params.Windowed;
+  }
+
   ULONG STDMETHODCALLTYPE AddRef() override;
   ULONG STDMETHODCALLTYPE Release() override;
   HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void **ppvObject) override;

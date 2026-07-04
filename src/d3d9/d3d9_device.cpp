@@ -906,6 +906,10 @@ MTLD3D9Device::MTLD3D9Device(
   m_creationParams.AdapterOrdinal = adapter;
   m_creationParams.DeviceType = deviceType;
   m_creationParams.hFocusWindow = focusWindow;
+  // Seed the fullscreen activation latch: whatever is foreground at
+  // create time is the baseline, so the first ownership poll only reacts
+  // to a subsequent activation change (wine's device state starts OK).
+  m_lastForegroundSample = wsi::foregroundWindow();
   m_creationParams.BehaviorFlags = behaviorFlags;
   m_presentParams = validatedParams;
   // hDeviceWindow falls back to hFocusWindow per D3D9 spec; see
@@ -2513,6 +2517,11 @@ MTLD3D9Device::Reset(D3DPRESENT_PARAMETERS *pPresentationParameters) {
     m_encShadowDirty |= dxmt::D9ES_DIRTY_VIEWPORT;
   }
   m_deviceState.store(DeviceState::Ok, std::memory_order_relaxed);
+  // Re-latch the fullscreen activation state the way wine re-initialises
+  // its device state on Reset; the current foreground becomes the new
+  // edge-detection baseline.
+  m_fullscreenOccluded = false;
+  m_lastForegroundSample = wsi::foregroundWindow();
   return D3D_OK;
 }
 
@@ -2619,6 +2628,11 @@ MTLD3D9Device::Present(
   // Present entry is an API event: closes the gap opened by the last draw /
   // Lock / upload of the frame (that hole is often the game-CPU lump).
   d9NoteApiEvent();
+  // An Ex device presenting an unfocused fullscreen chain reports
+  // occlusion without presenting (wine d3d9 device.c; the non-Ex device
+  // transitions toward the lost state instead, a separate machine).
+  if (m_isEx && m_implicitSwapChain && !m_implicitSwapChain->windowed() && !fullscreenOwnsDisplay())
+    return S_PRESENT_OCCLUDED;
   HRESULT hr = m_implicitSwapChain->Present(pSourceRect, pDestRect, hDestWindowOverride, pDirtyRegion, 0);
   if (stall_thr) {
     using clock = std::chrono::steady_clock;
@@ -9725,6 +9739,11 @@ HRESULT STDMETHODCALLTYPE
 MTLD3D9Device::PresentEx(
     const RECT *pSourceRect, const RECT *pDestRect, HWND hDestWindowOverride, const RGNDATA *pDirtyRegion, DWORD dwFlags
 ) {
+  // An Ex present on an unfocused fullscreen chain reports occlusion
+  // without presenting (wine d3d9 device.c returns it off the device
+  // state ahead of the swapchain present).
+  if (m_implicitSwapChain && !m_implicitSwapChain->windowed() && !fullscreenOwnsDisplay())
+    return S_PRESENT_OCCLUDED;
   return m_implicitSwapChain->Present(pSourceRect, pDestRect, hDestWindowOverride, pDirtyRegion, dwFlags);
 }
 // Device9Ex bookkeeping returns. Pre-Reset / pre-frame-pacing dxmt
@@ -9791,13 +9810,51 @@ MTLD3D9Device::GetMaximumFrameLatency(UINT *pMaxLatency) {
   *pMaxLatency = m_frameLatency;
   return D3D_OK;
 }
+bool
+MTLD3D9Device::fullscreenOwnsDisplay() {
+  // Edge-triggered reconstruction of wine's WM_ACTIVATEAPP device state
+  // from polls: the latch starts owning (wine initialises the state OK at
+  // create and Reset) and flips only when the observed foreground window
+  // CHANGES, to whether the new foreground is the focus window. A level
+  // poll would misread a stale creation-time foreground as occlusion;
+  // the latch shares wine's blind spot for a device that is never
+  // activated at all, which is the message model's own behavior.
+  HWND focus = m_creationParams.hFocusWindow;
+  if (!focus && m_implicitSwapChain)
+    focus = m_implicitSwapChain->hWindow();
+  HWND foreground = wsi::foregroundWindow();
+  if (foreground != m_lastForegroundSample) {
+    // Only a transition that involves the focus window is an activation
+    // event; foreground moving between two foreign windows never raises
+    // WM_ACTIVATEAPP and must not disturb the state.
+    const bool was_focus = m_lastForegroundSample == focus;
+    const bool is_focus = focus != nullptr && foreground == focus;
+    m_lastForegroundSample = foreground;
+    if (was_focus != is_focus)
+      m_fullscreenOccluded = !is_focus;
+  }
+  return !m_fullscreenOccluded;
+}
+
 HRESULT STDMETHODCALLTYPE
 MTLD3D9Device::CheckDeviceState(HWND hDestinationWindow) {
-  // Mirror the Present path's occlusion probe; DXVK's CheckDeviceState
-  // routes through the same wsi::isMinimized check. The previous bare
-  // S_OK return left Ex apps that poll CheckDeviceState (instead of
-  // letting Present surface S_PRESENT_OCCLUDED) running their render
-  // loop full-speed while minimized. Falls back to the swapchain's
+  // Fullscreen: display ownership keys the answer, polled off the
+  // foreground window (wine d3d9 device.c CheckDeviceState keys the same
+  // branches off its focus-message device state; its FIXME notes the
+  // cross-device case is unhandled there too). A window other than the
+  // device window is occluded exactly while the fullscreen chain owns
+  // the display; the device window itself is occluded once it loses it.
+  // The caller's null stays null here: wine compares it raw, and the
+  // tests rely on null meaning "some other window".
+  if (m_implicitSwapChain && !m_implicitSwapChain->windowed()) {
+    const bool owns_display = fullscreenOwnsDisplay();
+    if (hDestinationWindow != m_implicitSwapChain->hWindow())
+      return owns_display ? S_PRESENT_OCCLUDED : D3D_OK;
+    return owns_display ? D3D_OK : S_PRESENT_OCCLUDED;
+  }
+  // Windowed: DXVK's shape, the minimized probe, so Ex apps that poll
+  // CheckDeviceState instead of letting Present surface the status stop
+  // rendering full-speed while minimized. Falls back to the swapchain's
   // own window when the caller passes null (DXVK does the same).
   HWND hWindow = hDestinationWindow;
   if (!hWindow && m_implicitSwapChain)
