@@ -20,6 +20,11 @@ Presenter::Presenter(WMT::Device device, WMT::MetalLayer layer, InternalCommandL
   layer_props_.display_sync_enabled = false;
   layer_props_.framebuffer_only = false; // how strangely setting it true results in worse performance
   layer_props_.contents_scale = layer_props_.contents_scale * scale_factor;
+  // The presenter does not own the drawable-depth policy: a client that
+  // caps maximumDrawableCount writes it on the layer directly, and the
+  // unix setProps skips a zero. Round-tripping the value read here would
+  // clobber such a cap with the layer's default on every property sync.
+  layer_props_.maximum_drawable_count = 0;
 
   WMTTextureInfo texture_info;
   texture_info.type = WMTTextureType2D;
