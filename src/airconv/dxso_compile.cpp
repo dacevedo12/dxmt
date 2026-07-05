@@ -3298,18 +3298,19 @@ compile_dxso(
     // SM 1.x TexM3x{2,3}Pad: literal no-ops. Dependent ops read via
     // register-file lookup, not preserved state. Explicit case avoids spurious warnings.
     case DxsoOpcode::TexDepth: {
-      // SM 1.4 TexDepth: depth = clamp(r.x / min(r.y, 1.0), 0, 1).
-      // r.y clamped to 1.0, negative x saturates to 0.
+      // SM 1.4 TexDepth: depth = clamp(r.x / r.y, 0, 1). The divisor is
+      // used as-is: vkd3d's d3dbc texdepth test pins the plain division
+      // against native (0.75 / 1.5 must give 0.5; wined3d's GLSL clamps
+      // the divisor to 1.0, which native does not do). Division by zero
+      // is documented to yield 1.0 and the saturate realises that for
+      // the +inf case; hardware itself disagrees on 0 / 0.
       if (is_vertex || !ins.has_dst || oDepth_arg_idx < 0 || !oDepth_slot)
         break;
       auto *gep_r = builder.CreateGEP(tempArrTy, temps, {builder.getInt32(0), builder.getInt32(ins.dst.base.num)});
       Value *r4 = builder.CreateLoad(float4Ty, gep_r);
-      auto *fT = Type::getFloatTy(context);
       Value *rx = builder.CreateExtractElement(r4, builder.getInt32(0));
       Value *ry = builder.CreateExtractElement(r4, builder.getInt32(1));
-      Value *one_f = ConstantFP::get(fT, 1.0f);
-      Value *ry_clamped = air.CreateFPBinOp(llvm::air::AIRBuilder::fmin, ry, one_f);
-      Value *depth = builder.CreateFDiv(rx, ry_clamped);
+      Value *depth = builder.CreateFDiv(rx, ry);
       depth = air.CreateFPUnOp(llvm::air::AIRBuilder::saturate, depth);
       // oDepth_slot is a float4; lane 0 is what the epilogue extracts
       // for [[depth]]. Splat for stable contents on the unused lanes.
