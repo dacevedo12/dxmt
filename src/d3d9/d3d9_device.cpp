@@ -1101,7 +1101,9 @@ MTLD3D9Device::releaseBufferBacking(
   // resource dtors, and a bound resource's wrapper is pinned by the chunk's
   // resolved pins until the GPU retires it, so the dtor (and this donation)
   // runs only once no in-flight cmdbuf still reads the backing.
-  if (m_bufferBackingPool.size() >= kMaxBufferBackingPoolSize ||
+  // Device teardown: member destruction order can run this after the pool
+  // vector is gone; free directly (the GPU was quiesced at dtor entry).
+  if (m_tearingDown || m_bufferBackingPool.size() >= kMaxBufferBackingPoolSize ||
       m_bufferBackingPoolBytes + capacity > kMaxBufferBackingPoolBytes) {
     // Pool full (by count or by bytes): drop on the floor. The moved-in
     // WMT::Reference releases the Metal buffer when it goes out of scope
@@ -1152,6 +1154,12 @@ MTLD3D9Device::acquireOrAllocateBufferBacking(
 }
 
 MTLD3D9Device::~MTLD3D9Device() {
+  // Buffer wrappers can drop their last reference from ANY later member's
+  // destructor (the encode-side refs, a bound stream, an unfinished
+  // recording block), and member teardown runs after the backing pool's
+  // drain below; from here on releaseBufferBacking frees donations
+  // directly instead of pushing into a pool that may already be gone.
+  m_tearingDown = true;
   // Restore the device window to its windowed style/rect so a fullscreen
   // game leaving does not strand a borderless, topmost window. No-op unless
   // a fullscreen window is currently held. unhook restores the focus window's

@@ -1353,6 +1353,9 @@ private:
     uint64_t gpu_address;
     size_t capacity;
   };
+  // Set at destructor entry; flips releaseBufferBacking to direct-free so
+  // late donors (members destructing after the pool) never touch it.
+  bool m_tearingDown = false;
   std::vector<BufferBackingPoolEntry> m_bufferBackingPool;
   // Running sum of m_bufferBackingPool entry capacities. The count cap alone
   // does not bound address space: MANAGED mirror eviction routes full-texture
