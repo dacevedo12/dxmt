@@ -149,6 +149,12 @@ D3DFormatToMetal(D3DFORMAT format, D3D9FormatUsage usage) {
   case D3DFMT_DXT4:
   case D3DFMT_DXT5:
     return usage != D3D9FormatUsage::SampleableTexture ? WMTPixelFormatInvalid : WMTPixelFormatBC3_RGBA;
+  // ATI1N/ATI2N (3Dc): BC4/BC5 storage, spec channel shape restored by
+  // D3DFormatSamplerSwizzle. Sampler-only like the DXTn family.
+  case D3DFMT_ATI1:
+    return usage != D3D9FormatUsage::SampleableTexture ? WMTPixelFormatInvalid : WMTPixelFormatBC4_RUnorm;
+  case D3DFMT_ATI2:
+    return usage != D3D9FormatUsage::SampleableTexture ? WMTPixelFormatInvalid : WMTPixelFormatBC5_RGUnorm;
 
   // Sampleable-depth FOURCC aliases. Same Metal storage as the
   // matching native depth format; legality on the SampleableTexture
@@ -242,6 +248,8 @@ uint32_t
 D3DFormatRowPitch(D3DFORMAT format, uint32_t width) {
   switch (format) {
   case D3DFMT_DXT1:
+  // ATI1N (one BC-style channel) shares DXT1's block size.
+  case D3DFMT_ATI1:
     // 8 bytes per 4×4 block.
     return ((width + 3u) / 4u) * 8u;
   case D3DFMT_DXT2:
@@ -318,12 +326,9 @@ IsCompressedFormat(D3DFORMAT format) {
   case D3DFMT_DXT3:
   case D3DFMT_DXT4:
   case D3DFMT_DXT5:
-  // ATI2N is 4x4 block compression like the DXTn family. dxmt does not lower
-  // it to Metal BC5 yet, so D3DFormatToMetal returns Invalid. Only the volume
-  // create path realizes it (as a system-memory SCRATCH blob, the same shape
-  // as a DXTn SCRATCH volume, with the block geometry below); the 2D and cube
-  // paths gate scratchability on IsScratchableUnsupportedFormat, which omits
-  // ATI2, so they return INVALIDCALL for it.
+  // ATI1N/ATI2N are 4x4 block compression like the DXTn family; volumes of
+  // any compressed format take the SCRATCH blob path (no 3D BC on Metal).
+  case D3DFMT_ATI1:
   case D3DFMT_ATI2:
     return true;
   default:
@@ -471,6 +476,13 @@ D3DFormatSamplerSwizzle(D3DFORMAT format) {
     // Depth-as-texture: Metal returns scalar red; replicate across RGBA
     // at view level for apps reading .gggg or .yyyy (soft-particle fades).
     return {WMTTextureSwizzleRed, WMTTextureSwizzleRed, WMTTextureSwizzleRed, WMTTextureSwizzleRed};
+  case D3DFMT_ATI1:
+    // (R, 0, 0, 1) over BC4 (DXVK d3d9_format.cpp).
+    return {WMTTextureSwizzleRed, WMTTextureSwizzleZero, WMTTextureSwizzleZero, WMTTextureSwizzleOne};
+  case D3DFMT_ATI2:
+    // (G, R, 1, 1) over BC5: 3Dc stores the channels swapped relative to
+    // BC5's RG order (DXVK d3d9_format.cpp).
+    return {WMTTextureSwizzleGreen, WMTTextureSwizzleRed, WMTTextureSwizzleOne, WMTTextureSwizzleOne};
   default:
     // {Zero,Zero,Zero,Zero} is the D3D9ViewKey "no override" sentinel;
     // the cache returns the parent texture verbatim and skips view

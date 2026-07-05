@@ -13,11 +13,12 @@ namespace dxmt {
 constexpr D3DFORMAT D3DFMT_INTZ = static_cast<D3DFORMAT>(MAKEFOURCC('I', 'N', 'T', 'Z'));
 constexpr D3DFORMAT D3DFMT_DF24 = static_cast<D3DFORMAT>(MAKEFOURCC('D', 'F', '2', '4'));
 constexpr D3DFORMAT D3DFMT_DF16 = static_cast<D3DFORMAT>(MAKEFOURCC('D', 'F', '1', '6'));
-// ATI2N (3Dc) two-channel 4x4 block compression, the same FOURCC games probe
-// inline. Metal could realize it as BC5_RGUnorm, but dxmt does not wire that
-// mapping yet, so it lowers to Invalid. The volume create path realizes it as
-// a system-memory SCRATCH blob (block geometry in IsCompressedFormat); the 2D
-// and cube create paths reject it (it is not in IsScratchableUnsupportedFormat).
+// ATI1N and ATI2N (3Dc) one- and two-channel 4x4 block compression, the
+// FOURCCs games probe inline for normal maps. Lowered to BC4/BC5 with the
+// DXVK swizzles (d3d9_format.cpp): ATI1 samples (R, 0, 0, 1), ATI2 swaps to
+// (G, R, 1, 1). Volumes stay on the SCRATCH blob path like every compressed
+// format; Metal has no 3D BC textures.
+constexpr D3DFORMAT D3DFMT_ATI1 = static_cast<D3DFORMAT>(MAKEFOURCC('A', 'T', 'I', '1'));
 constexpr D3DFORMAT D3DFMT_ATI2 = static_cast<D3DFORMAT>(MAKEFOURCC('A', 'T', 'I', '2'));
 
 // D3DFORMAT → MTLPixelFormat lowering. Returns WMTPixelFormatInvalid for

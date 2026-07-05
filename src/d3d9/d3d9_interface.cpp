@@ -362,6 +362,8 @@ MTLD3D9Interface::CheckDeviceFormat(
     case D3DFMT_DXT3:
     case D3DFMT_DXT4:
     case D3DFMT_DXT5:
+    case D3DFMT_ATI1:
+    case D3DFMT_ATI2:
     case D3DFMT_V8U8:
     case D3DFMT_Q8W8V8U8:
     case D3DFMT_V16U16:
