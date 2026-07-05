@@ -55,6 +55,13 @@ public:
     return m_params.Windowed;
   }
 
+  // The presented front image's backing when a COPY front canvas is
+  // active (see m_frontCanvas); null when the backbuffer is the front.
+  Rc<dxmt::Texture>
+  frontCanvas() const {
+    return m_frontCanvas;
+  }
+
   ULONG STDMETHODCALLTYPE AddRef() override;
   ULONG STDMETHODCALLTYPE Release() override;
   HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void **ppvObject) override;

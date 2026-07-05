@@ -4609,10 +4609,17 @@ MTLD3D9Device::GetFrontBufferData(UINT iSwapChain, IDirect3DSurface9 *pDestSurfa
   uint64_t coherent_id = m_cachedSignaled.load(std::memory_order_acquire);
   auto [block, block_offset] = m_uploadRing.allocate(m_currentCmdSeq, coherent_id, total_bytes, 16);
 
-  WMT::Reference<WMT::Texture> src_tex_retain(front->metalTexture());
-  obj_handle_t src_texture_handle = front->metalTexture().handle;
+  // The COPY front canvas, when rect presents materialised one, is the
+  // image the presenter actually blits; read the front from it so the
+  // grab reflects composited partial presents. Chains without rect
+  // presents keep reading the backbuffer.
+  Rc<dxmt::Texture> front_canvas = m_implicitSwapChain->frontCanvas();
+  WMT::Reference<WMT::Texture> src_tex_retain(
+      front_canvas != nullptr ? front_canvas->current()->texture() : front->metalTexture()
+  );
+  obj_handle_t src_texture_handle = src_tex_retain.handle;
   obj_handle_t ring_buffer_handle = block.buffer.handle;
-  uint32_t src_mip = front->mipLevel();
+  uint32_t src_mip = front_canvas != nullptr ? 0 : front->mipLevel();
 
   uint64_t signal_seq = m_currentCmdSeq;
   obj_handle_t event_handle = m_completionEvent.handle;
