@@ -1146,7 +1146,20 @@ compile_dxso(
     case DxsoRegisterType::Input: {
       if (src.base.num >= 16)
         return nullptr;
-      auto *gep = builder.CreateGEP(inputArrTy, inputs, {builder.getInt32(0), builder.getInt32(src.base.num)});
+      Value *in_idx = builder.getInt32(src.base.num);
+      // SM3 dynamic input indexing: v#[aL] in ps_3_0 (and vs_3_0). The
+      // inputs already live in an indexable register-file array, so the
+      // relative read is the same add-and-clamp the Const arm does; aL
+      // is the only legal index register for the input file.
+      if (src.has_relative) {
+        if (src.relative.base.type != DxsoRegisterType::Loop)
+          return nullptr;
+        Value *off = builder.CreateLoad(Type::getInt32Ty(context), aL_slot);
+        in_idx = builder.CreateAdd(in_idx, off);
+        in_idx = air.CreateIntBinOp(llvm::air::AIRBuilder::max, in_idx, builder.getInt32(0), /*Signed=*/true);
+        in_idx = air.CreateIntBinOp(llvm::air::AIRBuilder::min, in_idx, builder.getInt32(15), /*Signed=*/true);
+      }
+      auto *gep = builder.CreateGEP(inputArrTy, inputs, {builder.getInt32(0), in_idx});
       v = builder.CreateLoad(float4Ty, gep);
       break;
     }
