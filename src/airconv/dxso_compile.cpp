@@ -3163,7 +3163,11 @@ compile_dxso(
       builder.CreateBr(header_bb);
       builder.SetInsertPoint(header_bb);
       Value *cur = builder.CreateLoad(i32Ty, counter);
-      Value *cond = builder.CreateICmpSLT(cur, count);
+      // Unsigned compare: hardware reads the i# count as a uint, so a
+      // negative count means "iterate until the shader's own break", not
+      // zero iterations (vkd3d's d3dbc rep tests pin this against native;
+      // a shader relying on it carries its own limiter, as on hardware).
+      Value *cond = builder.CreateICmpULT(cur, count);
       builder.CreateCondBr(cond, body_bb, merge_bb);
       builder.SetInsertPoint(body_bb);
       loop_stack.push_back({counter, aL_backup, count, stride, header_bb, latch_bb, merge_bb});
