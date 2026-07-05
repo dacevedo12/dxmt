@@ -3793,6 +3793,27 @@ MTLD3D9Device::CreateDepthStencilSurface(
   WMT::Texture rawTex = allocation->texture();
   dxmt_texture->rename(std::move(allocation));
 
+  // Lockable depth (D32F_LOCKABLE; D16_LOCKABLE takes the same path if it
+  // is ever advertised): give the surface a host mirror like a lockable
+  // render target's, so LockRect's existing DEFAULT-pool download and
+  // UnlockRect's upload work unchanged; both sides are plain blit copies,
+  // which Metal permits for single-plane depth formats. Multisampled
+  // surfaces are not lockable, mirroring the render-target rule.
+  void *dsCpuPtr = nullptr;
+  void *dsOwnedBacking = nullptr;
+  uint32_t dsPitch = 0;
+  if ((Format == D3DFMT_D32F_LOCKABLE || Format == D3DFMT_D16_LOCKABLE) && sampleCount == 1) {
+    dsPitch = D3DFormatLockPitch(Format, Width);
+    if (dsPitch != 0) {
+      const uint64_t mirror_bytes = static_cast<uint64_t>(dsPitch) * Height;
+      dsOwnedBacking = wsi::aligned_malloc(mirror_bytes, DXMT_PAGE_SIZE);
+      if (!dsOwnedBacking)
+        return D3DERR_OUTOFVIDEOMEMORY;
+      std::memset(dsOwnedBacking, 0, mirror_bytes);
+      dsCpuPtr = dsOwnedBacking;
+    }
+  }
+
   D3DSURFACE_DESC desc{};
   desc.Format = Format;
   desc.Type = D3DRTYPE_SURFACE;
@@ -3810,10 +3831,10 @@ MTLD3D9Device::CreateDepthStencilSurface(
       /*selfPin=*/true,
       /*parentTextureType=*/WMTTextureType2D,
       /*buffer=*/{},
-      /*cpuPtr=*/nullptr,
-      /*pitch=*/0,
+      /*cpuPtr=*/dsCpuPtr,
+      /*pitch=*/dsPitch,
       /*arraySlice=*/0,
-      /*ownedBacking=*/nullptr,
+      /*ownedBacking=*/dsOwnedBacking,
       /*dxmtTexture=*/std::move(dxmt_texture)
   );
   // CreateDepthStencilSurface surfaces are always D3DPOOL_DEFAULT.
