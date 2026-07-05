@@ -695,31 +695,37 @@ compile_dxso(
         else if (sins.dst.base.type == DxsoRegisterType::RasterizerOut && sins.dst.base.num == 2)
           oPts_used = true;
       }
+      // The full legacy varying set is defined regardless of what the
+      // shader writes. The PS side always claims COLOR0..1, TEXCOORD0..7
+      // and FOG0 (its stub tail), and Metal delivers NaN for a claimed
+      // input the vertex function does not produce, so a sparse VS fed
+      // NaN into every unwritten varying a pixel shader read. Unwritten
+      // slots now carry their D3D9 default seeds instead.
+      (void)oD_used;
+      (void)oT_used;
+      (void)oFog_used;
       for (int i = 0; i < 2; ++i) {
-        if (oD_used[i])
-          oD_arg_idx[i] = (int)sig.DefineOutput(
-              air::OutputVertex{
-                  .user = "COLOR" + std::to_string(i),
-                  .type = air::msl_float4,
-              }
-          );
-      }
-      for (int i = 0; i < 8; ++i) {
-        if (oT_used[i])
-          oT_arg_idx[i] = (int)sig.DefineOutput(
-              air::OutputVertex{
-                  .user = "TEXCOORD" + std::to_string(i),
-                  .type = air::msl_float4,
-              }
-          );
-      }
-      if (oFog_used)
-        oFog_arg_idx = (int)sig.DefineOutput(
+        oD_arg_idx[i] = (int)sig.DefineOutput(
             air::OutputVertex{
-                .user = "FOG0",
+                .user = "COLOR" + std::to_string(i),
                 .type = air::msl_float4,
             }
         );
+      }
+      for (int i = 0; i < 8; ++i) {
+        oT_arg_idx[i] = (int)sig.DefineOutput(
+            air::OutputVertex{
+                .user = "TEXCOORD" + std::to_string(i),
+                .type = air::msl_float4,
+            }
+        );
+      }
+      oFog_arg_idx = (int)sig.DefineOutput(
+          air::OutputVertex{
+              .user = "FOG0",
+              .type = air::msl_float4,
+          }
+      );
       if (oPts_used)
         oPts_arg_idx = (int)sig.DefineOutput(air::OutputPointSize{});
     } else if (sm3_vs_outputs) {
@@ -729,6 +735,9 @@ compile_dxso(
       // oN_is_pointsize aliasing (mirroring oN_is_position). Color /
       // Texcoord / Fog become user-named varyings whose name matches
       // the PS InputFragmentStageIn naming convention so linkage works.
+      bool vs3_sem_color[2] = {};
+      bool vs3_sem_texcoord[8] = {};
+      bool vs3_sem_fog = false;
       for (const auto &d : shader->metadata.dcls) {
         if (d.bound_to.type != DxsoRegisterType::Output || d.bound_to.num >= oN_arg_idx.size())
           continue;
@@ -757,6 +766,17 @@ compile_dxso(
         }
         if (!base)
           continue;
+        // Track which of the PS-stub interpolants (COLOR0..1,
+        // TEXCOORD0..7, FOG0) the shader covers itself; semantics beyond
+        // that set (a matched SM3 pair may use COLOR2+ and declare the
+        // input on the PS side) are emitted as-is, an unclaimed vertex
+        // output links fine.
+        if (d.dcl.usage == DxsoUsage::Color && d.dcl.usage_index < 2)
+          vs3_sem_color[d.dcl.usage_index] = true;
+        else if (d.dcl.usage == DxsoUsage::Texcoord && d.dcl.usage_index < 8)
+          vs3_sem_texcoord[d.dcl.usage_index] = true;
+        else if (d.dcl.usage == DxsoUsage::Fog && d.dcl.usage_index == 0)
+          vs3_sem_fog = true;
         oN_arg_idx[d.bound_to.num] = (int)sig.DefineOutput(
             air::OutputVertex{
                 .user = std::string(base) + std::to_string(d.dcl.usage_index),
@@ -764,6 +784,34 @@ compile_dxso(
             }
         );
       }
+      // Stub the legacy interpolants the shader does not declare, the
+      // same full-set contract the SM1/2 path and the PS side keep:
+      // Metal reads NaN from a claimed input with no vertex output, so
+      // every slot must exist. Stubs ride the oD/oT/oFog machinery and
+      // deliver their default seeds.
+      for (uint32_t i = 0; i < 2; ++i)
+        if (!vs3_sem_color[i])
+          oD_arg_idx[i] = (int)sig.DefineOutput(
+              air::OutputVertex{
+                  .user = "COLOR" + std::to_string(i),
+                  .type = air::msl_float4,
+              }
+          );
+      for (uint32_t i = 0; i < 8; ++i)
+        if (!vs3_sem_texcoord[i])
+          oT_arg_idx[i] = (int)sig.DefineOutput(
+              air::OutputVertex{
+                  .user = "TEXCOORD" + std::to_string(i),
+                  .type = air::msl_float4,
+              }
+          );
+      if (!vs3_sem_fog)
+        oFog_arg_idx = (int)sig.DefineOutput(
+            air::OutputVertex{
+                .user = "FOG0",
+                .type = air::msl_float4,
+            }
+        );
       if (oPts_used)
         oPts_arg_idx = (int)sig.DefineOutput(air::OutputPointSize{});
     }
@@ -968,6 +1016,25 @@ compile_dxso(
         oN_slot[i] = builder.CreateAlloca(float4Ty, nullptr, ("o" + std::to_string(i)).c_str());
         builder.CreateStore(zero4, oN_slot[i]);
       }
+    }
+    // Stub interpolants (legacy semantics the shader never declares):
+    // zero-seeded slots so the epilogue has something to load. SM3
+    // keeps zero seeds, native SM3 defaults are hardware-chaotic and
+    // wine's tests accept zero alpha there; the D3D9 white-diffuse
+    // convention is a SM1/2 behavior.
+    for (int i = 0; i < 2; ++i)
+      if (oD_arg_idx[i] >= 0) {
+        oD_slot[i] = builder.CreateAlloca(float4Ty, nullptr, ("oD" + std::to_string(i) + ".stub").c_str());
+        builder.CreateStore(zero4, oD_slot[i]);
+      }
+    for (int i = 0; i < 8; ++i)
+      if (oT_arg_idx[i] >= 0) {
+        oT_slot[i] = builder.CreateAlloca(float4Ty, nullptr, ("oT" + std::to_string(i) + ".stub").c_str());
+        builder.CreateStore(zero4, oT_slot[i]);
+      }
+    if (oFog_arg_idx >= 0) {
+      oFog_slot = builder.CreateAlloca(float4Ty, nullptr, "oFog.stub");
+      builder.CreateStore(zero4, oFog_slot);
     }
   }
 
@@ -3660,6 +3727,24 @@ compile_dxso(
           continue;
         auto *v = builder.CreateLoad(float4Ty, oN_slot[i]);
         retval = builder.CreateInsertValue(retval, v, {(unsigned)oN_arg_idx[i]});
+      }
+      // Stub interpolants ride the oD/oT/oFog arrays (see the SM3
+      // signature tail); insert their seeded slots too.
+      for (int i = 0; i < 2; ++i) {
+        if (oD_arg_idx[i] < 0)
+          continue;
+        auto *v = builder.CreateLoad(float4Ty, oD_slot[i]);
+        retval = builder.CreateInsertValue(retval, v, {(unsigned)oD_arg_idx[i]});
+      }
+      for (int i = 0; i < 8; ++i) {
+        if (oT_arg_idx[i] < 0)
+          continue;
+        auto *v = builder.CreateLoad(float4Ty, oT_slot[i]);
+        retval = builder.CreateInsertValue(retval, v, {(unsigned)oT_arg_idx[i]});
+      }
+      if (oFog_arg_idx >= 0) {
+        auto *v = builder.CreateLoad(float4Ty, oFog_slot);
+        retval = builder.CreateInsertValue(retval, v, {(unsigned)oFog_arg_idx});
       }
     }
     if (oPts_arg_idx >= 0 && oPts_slot) {
