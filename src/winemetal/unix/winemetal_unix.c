@@ -3744,19 +3744,32 @@ _CreateMetalViewFromHWND(void *obj) {
     pfn_macdrv_view_get_metal_layer = dlsym(RTLD_DEFAULT, "macdrv_view_get_metal_layer");
   }
 
+  /* Write the outputs before any failure path: the wow64 dispatch hands
+   * this call a reused scratch buffer, so an unwritten field reads back
+   * as stale garbage from an earlier call, and a nonzero garbage layer
+   * handle passes the caller's null check and gets messaged (an
+   * NSInvalidArgumentException in getProps was the symptom). */
+  params->ret_view = 0;
+  params->ret_layer = 0;
+
   if (pfn_get_win_data && pfn_release_win_data && pfn_macdrv_view_create_metal_view &&
       pfn_macdrv_view_get_metal_layer) {
     struct macdrv_win_data *win_data = pfn_get_win_data((HWND)params->hwnd);
-    macdrv_metal_view view =
-        pfn_macdrv_view_create_metal_view(win_data->client_cocoa_view, (macdrv_metal_device)params->device);
-    params->ret_view = (obj_handle_t)view;
-    if (view) {
-      params->ret_layer = (obj_handle_t)pfn_macdrv_view_get_metal_layer(view);
-      execute_on_main(^{
-        dxmt_set_layer_background_black((CAMetalLayer *)params->ret_layer);
-      });
+    /* A window the mac driver does not own (message-only, foreign,
+     * not yet realised) has no win_data; report no view rather than
+     * dereferencing null. */
+    if (win_data) {
+      macdrv_metal_view view =
+          pfn_macdrv_view_create_metal_view(win_data->client_cocoa_view, (macdrv_metal_device)params->device);
+      params->ret_view = (obj_handle_t)view;
+      if (view) {
+        params->ret_layer = (obj_handle_t)pfn_macdrv_view_get_metal_layer(view);
+        execute_on_main(^{
+          dxmt_set_layer_background_black((CAMetalLayer *)params->ret_layer);
+        });
+      }
+      pfn_release_win_data(win_data);
     }
-    pfn_release_win_data(win_data);
   }
 
   return STATUS_SUCCESS;
