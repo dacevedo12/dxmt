@@ -922,17 +922,32 @@ compile_dxso(
   }
   if (sm12_vs_varyings) {
     auto *zero4 = ConstantAggregateZero::get(float4Ty);
+    // Unwritten varying lanes carry D3D9's defaults, not zero: diffuse
+    // seeds (1, 1, 1, 1) and specular / texcoords (0, 0, 0, 1), so a
+    // shader that writes only some lanes (mov oD0.x) leaves the spec
+    // values in the rest. wine's uninitialized-varyings tests pin the
+    // partial-write results (0.5, 1, 1, 1 for diffuse, alpha 1 on the
+    // others); wined3d's GLSL seeds the same constants.
+    auto splat4 = [&](float x, float y, float z, float w) -> Constant * {
+      Constant *lanes[4] = {
+          ConstantFP::get(builder.getFloatTy(), x), ConstantFP::get(builder.getFloatTy(), y),
+          ConstantFP::get(builder.getFloatTy(), z), ConstantFP::get(builder.getFloatTy(), w)
+      };
+      return ConstantVector::get(lanes);
+    };
+    Constant *diffuse_default = splat4(1.0f, 1.0f, 1.0f, 1.0f);
+    Constant *alpha1_default = splat4(0.0f, 0.0f, 0.0f, 1.0f);
     for (int i = 0; i < 2; ++i) {
       if (oD_arg_idx[i] < 0)
         continue;
       oD_slot[i] = builder.CreateAlloca(float4Ty, nullptr, ("oD" + std::to_string(i)).c_str());
-      builder.CreateStore(zero4, oD_slot[i]);
+      builder.CreateStore(i == 0 ? diffuse_default : alpha1_default, oD_slot[i]);
     }
     for (int i = 0; i < 8; ++i) {
       if (oT_arg_idx[i] < 0)
         continue;
       oT_slot[i] = builder.CreateAlloca(float4Ty, nullptr, ("oT" + std::to_string(i)).c_str());
-      builder.CreateStore(zero4, oT_slot[i]);
+      builder.CreateStore(alpha1_default, oT_slot[i]);
     }
     if (oFog_arg_idx >= 0) {
       oFog_slot = builder.CreateAlloca(float4Ty, nullptr, "oFog");
