@@ -485,8 +485,31 @@ compile_dxso(
       // SM 1.0..1.3: tex t#; sampler is implicit, slot matches
       // dst.base.num. The SM1.x decoder leaves src_count=0 and
       // dst.base.type=Texture.
-      bool is_sampling =
-          tins.opcode == DxsoOpcode::Tex || tins.opcode == DxsoOpcode::TexLdl || tins.opcode == DxsoOpcode::TexLdd;
+      // Every SM 1.x dependent-read opcode samples the texture bound at
+      // its DESTINATION t# slot; missing one here starves its arm of the
+      // texture argument and the instruction is silently dropped at the
+      // tex_arg_idx guard.
+      bool is_sampling;
+      switch (tins.opcode) {
+      case DxsoOpcode::Tex:
+      case DxsoOpcode::TexLdl:
+      case DxsoOpcode::TexLdd:
+      case DxsoOpcode::TexReg2Ar:
+      case DxsoOpcode::TexReg2Gb:
+      case DxsoOpcode::TexReg2Rgb:
+      case DxsoOpcode::TexBem:
+      case DxsoOpcode::TexBemL:
+      case DxsoOpcode::TexDp3Tex:
+      case DxsoOpcode::TexM3x2Tex:
+      case DxsoOpcode::TexM3x3Tex:
+      case DxsoOpcode::TexM3x3Spec:
+      case DxsoOpcode::TexM3x3VSpec:
+        is_sampling = true;
+        break;
+      default:
+        is_sampling = false;
+        break;
+      }
       if (!is_sampling)
         continue;
       uint32_t slot = UINT32_MAX;
