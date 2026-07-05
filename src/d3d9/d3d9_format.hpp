@@ -21,6 +21,11 @@ constexpr D3DFORMAT D3DFMT_DF16 = static_cast<D3DFORMAT>(MAKEFOURCC('D', 'F', '1
 constexpr D3DFORMAT D3DFMT_ATI1 = static_cast<D3DFORMAT>(MAKEFOURCC('A', 'T', 'I', '1'));
 constexpr D3DFORMAT D3DFMT_ATI2 = static_cast<D3DFORMAT>(MAKEFOURCC('A', 'T', 'I', '2'));
 
+inline bool
+Is3DcFormat(D3DFORMAT format) {
+  return format == D3DFMT_ATI1 || format == D3DFMT_ATI2;
+}
+
 // D3DFORMAT → MTLPixelFormat lowering. Returns WMTPixelFormatInvalid for
 // unsupported formats. Usage argument selects alias for ambiguous formats
 // (e.g. D24S8 → D32FS8 for DS, typeless for texture). Apple Silicon:
@@ -84,6 +89,11 @@ bool IsHardwarePCFDepthFormat(D3DFORMAT format);
 // Levels=0 against a compressed format, this is the place to add
 // `max_levels = log2(max(W,H)/4) + 1`.
 bool IsCompressedFormat(D3DFORMAT format);
+
+// Metal-copy geometry; equals RowPitch / RowCount except for the 3Dc
+// FOURCCs (linear app fiction over real BC storage, see the .cpp notes).
+uint32_t D3DFormatMetalTransferPitch(D3DFORMAT format, uint32_t width);
+uint32_t D3DFormatMetalTransferRows(D3DFORMAT format, uint32_t height);
 
 // True for formats Metal cannot realize (no equivalent MTLPixelFormat) but that
 // D3D9 still permits as a system-memory SCRATCH resource: packed YUV (YUY2,

@@ -43,10 +43,13 @@ buildLevelsAndMirror(
   // MTLD3D9Surface::UnlockRect makes the persistent mirror safe to re-lock
   // each frame (DXVK's per-lock-staging shape), so no DISCARD rename-ring
   // is needed here. RT/DS DEFAULT textures stay GPU-only.
+  // 3Dc is mappable regardless of pool or the dynamic flag (wined3d marks
+  // the vendor FOURCCs MAPPABLE; wine's resource-access test locks a plain
+  // DEFAULT ATI2 texture), so DEFAULT 3Dc rides the same mirror.
   const bool needs_mirror =
       !buffer_backed && (pool == D3DPOOL_MANAGED || pool == D3DPOOL_SYSTEMMEM || pool == D3DPOOL_SCRATCH ||
-                         (pool == D3DPOOL_DEFAULT && (usage & D3DUSAGE_DYNAMIC) && !(usage & D3DUSAGE_RENDERTARGET) &&
-                          !(usage & D3DUSAGE_DEPTHSTENCIL)));
+                         (pool == D3DPOOL_DEFAULT && ((usage & D3DUSAGE_DYNAMIC) || Is3DcFormat(format)) &&
+                          !(usage & D3DUSAGE_RENDERTARGET) && !(usage & D3DUSAGE_DEPTHSTENCIL)));
   mirrorOffsets.resize(levels + 1u);
   size_t total_bytes = 0;
   for (UINT i = 0; i < levels; ++i) {
@@ -195,7 +198,10 @@ MTLD3D9Texture::ensureMirror() {
   // exception is D3DUSAGE_DYNAMIC DEFAULT textures (gated into needs_mirror
   // in buildLevelsAndMirror): the app LockRects them per frame to stream
   // data, so they get a sysmem mirror + upload-on-unlock like MANAGED.
-  if (m_pool == D3DPOOL_DEFAULT && !(m_usage & D3DUSAGE_DYNAMIC))
+  // 3Dc stays mappable on DEFAULT without the dynamic flag (the vendor
+  // FOURCCs are MAPPABLE in wined3d's tables), same as the ctor-side
+  // needs_mirror rule.
+  if (m_pool == D3DPOOL_DEFAULT && !(m_usage & D3DUSAGE_DYNAMIC) && !Is3DcFormat(m_format))
     return;
   // Buffer-backed: level 0 already aliases the
   // wsi-malloc'd page owned by m_dxmtTexture's allocation, so the

@@ -1718,6 +1718,18 @@ MTLD3D9Device::stageTextureUpload(
 ) {
   if (dst.handle == 0 || src == nullptr || src_pitch == 0 || size.width == 0 || size.height == 0)
     return;
+  // 3Dc fiction to BC reality: callers speak the app-facing linear layout
+  // for ATI1/ATI2 (one byte per pixel, d3d9_format.cpp), while the Metal
+  // texture is real BC4/BC5. The mirror's contiguous byte stream IS the
+  // block stream, so the conversion is pitch and layout only; callers
+  // clamp 3Dc uploads to the full level, so src is the level start and
+  // size the level extent.
+  if (!is_compressed && dst_alloc != nullptr &&
+      (dst_alloc->pixelFormat() == WMTPixelFormatBC4_RUnorm || dst_alloc->pixelFormat() == WMTPixelFormatBC5_RGUnorm)) {
+    const uint32_t block_bytes = dst_alloc->pixelFormat() == WMTPixelFormatBC4_RUnorm ? 8u : 16u;
+    src_pitch = ((static_cast<uint32_t>(size.width) + 3u) / 4u) * block_bytes;
+    is_compressed = true;
+  }
   // Calling-thread staging cost: the ring alloc + memcpy + queue.
   D9StallScope _upload_timer(&g_d9stall.upload_ns);
   d9NoteApiEvent();
@@ -1808,13 +1820,16 @@ MTLD3D9Device::readbackSurfaceMirror(MTLD3D9Surface *surface) {
   // main thread has no outer NSAutoreleasePool.
   auto pool = WMT::MakeAutoreleasePool();
   const D3DSURFACE_DESC &desc = surface->desc();
-  const uint32_t pitch = surface->pitch();
+  // 3Dc reads back through the real BC geometry into the fiction mirror's
+  // head; every other format uses the mirror's own layout pitch.
+  const uint32_t pitch =
+      Is3DcFormat(desc.Format) ? D3DFormatMetalTransferPitch(desc.Format, desc.Width) : surface->pitch();
   const uint32_t width = desc.Width;
   const uint32_t height = desc.Height;
   // Byte counts run over block-rows, not pixel-rows: a compressed format packs
   // 4 texel rows per row of pitch, so pitch * height would over-read by 4x. The
   // blit's source size below stays in pixels (Metal blocks internally).
-  const uint32_t row_count = D3DFormatRowCount(desc.Format, height);
+  const uint32_t row_count = D3DFormatMetalTransferRows(desc.Format, height);
   const size_t total_bytes = static_cast<size_t>(pitch) * row_count;
   if (surface->metalTexture().handle == 0 || surface->cpuPtr() == nullptr || total_bytes == 0)
     return;
@@ -2999,7 +3014,7 @@ MTLD3D9Device::CreateTexture(
   bool buffer_backed_eligible = Pool == D3DPOOL_MANAGED && app_levels == 1 && metal_levels == 1 &&
                                 !(Usage & D3DUSAGE_AUTOGENMIPMAP) && !(Usage & D3DUSAGE_RENDERTARGET) &&
                                 !(Usage & D3DUSAGE_DEPTHSTENCIL) && !(Usage & D3DUSAGE_DYNAMIC) &&
-                                !IsCompressedFormat(Format) && !IsDepthStencilFormat(Format);
+                                !IsCompressedFormat(Format) && !Is3DcFormat(Format) && !IsDepthStencilFormat(Format);
   // Zero-copy aliasing exposes Metal's linear-texture row alignment
   // as the LockRect pitch. wined3d and DXVK hand back (near-)tight
   // pitches, and shipped titles write rows at width*bpp regardless of
@@ -3185,7 +3200,7 @@ MTLD3D9Device::CreateVolumeTexture(
   // the runtime makes them INVALIDCALL there. The volume is created mirror-only
   // (no backing dxmt::Texture): LockBox serves the host mirror and the GPU push
   // no-ops on the absent texture.
-  if (IsCompressedFormat(Format) || IsScratchableUnsupportedFormat(Format)) {
+  if (IsCompressedFormat(Format) || Is3DcFormat(Format) || IsScratchableUnsupportedFormat(Format)) {
     if (Pool != D3DPOOL_SCRATCH)
       return D3DERR_INVALIDCALL;
     auto *tex = new MTLD3D9VolumeTexture(
@@ -4180,6 +4195,14 @@ MTLD3D9Device::UpdateTexture(IDirect3DBaseTexture9 *pSourceTexture, IDirect3DBas
       // Matches DXVK (AllocStagingBuffer + packImageData) and wined3d upload_bo.
       if (src->mirrorBase() == nullptr)
         continue;
+      // 3Dc: whole-level copy from the mirror head; the fiction's rects
+      // have no block mapping (stageTextureUpload converts the layout).
+      if (Is3DcFormat(src->d3dFormat())) {
+        origin = WMTOrigin{0, 0, 0};
+        size = WMTSize{d.Width, d.Height, 1};
+        row_off = 0;
+        col_off = 0;
+      }
       const uint8_t *src_ptr =
           static_cast<const uint8_t *>(src->mirrorBase()) + src->mirrorOffset(src_level) + row_off + col_off;
       stageTextureUpload(dst_tex, dst->dxmtTexture(), dst_level, /*slice=*/0, origin, size, src_ptr, src_pitch, compressed);
@@ -5167,8 +5190,9 @@ MTLD3D9Device::CreateOffscreenPlainSurface(
     // Silicon: same gate as CreateTexture. A DEFAULT-pool DXT
     // offscreen surface stays sampler-only; StretchRect to it goes
     // through the blit-encoder path, not a render pass.
-    usage = IsCompressedFormat(Format) ? WMTTextureUsageShaderRead
-                                       : (WMTTextureUsage)(WMTTextureUsageShaderRead | WMTTextureUsageRenderTarget);
+    usage = (IsCompressedFormat(Format) || Is3DcFormat(Format))
+                ? WMTTextureUsageShaderRead
+                : (WMTTextureUsage)(WMTTextureUsageShaderRead | WMTTextureUsageRenderTarget);
     break;
   case D3DPOOL_SYSTEMMEM:
   case D3DPOOL_SCRATCH:

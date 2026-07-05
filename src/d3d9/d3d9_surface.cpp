@@ -387,7 +387,10 @@ MTLD3D9Surface::LockRect(D3DLOCKED_RECT *pLockedRect, const RECT *pRect, DWORD F
   LONG x0 = 0;
   LONG y0 = 0;
   if (pRect) {
-    if (IsCompressedFormat(m_desc.Format)) {
+    // 3Dc joins the block rules HERE only: rect validation follows the real
+    // 4x4 blocks (wined3d flags the formats compressed for this check) while
+    // the addressing below keeps their linear one-byte fiction.
+    if (IsCompressedFormat(m_desc.Format) || Is3DcFormat(m_desc.Format)) {
       // Compressed surfaces are addressed in 4x4 blocks. The box must be in
       // bounds, non-degenerate, and block-aligned (left/top block multiples,
       // right/bottom block multiples or the surface extent); the byte-offset
@@ -537,6 +540,15 @@ MTLD3D9Surface::UnlockRect() {
   if (m_buffer == nullptr && m_cpu_ptr != nullptr && m_texture != nullptr &&
       (m_desc.Pool == D3DPOOL_MANAGED || m_desc.Pool == D3DPOOL_DEFAULT) && !m_locked_readonly &&
       !IsNullFormat(m_desc.Format) && m_locked_w > 0 && m_locked_h > 0) {
+    // 3Dc: the fiction's partial rects have no block mapping; push the
+    // whole level (stageTextureUpload converts the layout, the mirror
+    // start is the block stream).
+    if (Is3DcFormat(m_desc.Format)) {
+      m_locked_x = 0;
+      m_locked_y = 0;
+      m_locked_w = m_desc.Width;
+      m_locked_h = m_desc.Height;
+    }
     // Push only the dirty rect to GPU. wined3d does the same; copying
     // the full level extent on every Unlock burns wine syscall RTT for
     // games that lock 100s of textures during loading. The src pointer

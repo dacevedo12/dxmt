@@ -38,8 +38,8 @@ MTLD3D9CubeTexture::MTLD3D9CubeTexture(
   // the same sysmem mirror; RT/DS DEFAULT cubes stay GPU-only.
   const bool needs_mirror =
       pool == D3DPOOL_MANAGED || pool == D3DPOOL_SYSTEMMEM || pool == D3DPOOL_SCRATCH ||
-      (pool == D3DPOOL_DEFAULT && (usage & D3DUSAGE_DYNAMIC) && !(usage & D3DUSAGE_RENDERTARGET) &&
-       !(usage & D3DUSAGE_DEPTHSTENCIL));
+      (pool == D3DPOOL_DEFAULT && ((usage & D3DUSAGE_DYNAMIC) || Is3DcFormat(format)) &&
+       !(usage & D3DUSAGE_RENDERTARGET) && !(usage & D3DUSAGE_DEPTHSTENCIL));
   const size_t total_subresources = static_cast<size_t>(6) * levels;
   m_mirrorOffsets.resize(total_subresources + 1u);
   size_t total_bytes = 0;

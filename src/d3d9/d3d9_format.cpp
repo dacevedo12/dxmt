@@ -181,6 +181,11 @@ D3DFormatToMetal(D3DFORMAT format, D3D9FormatUsage usage) {
 uint32_t
 D3DFormatBytesPerPixel(D3DFORMAT format) {
   switch (format) {
+  // 3Dc FOURCCs: the app-facing linear fiction is 1 byte per pixel (see
+  // IsCompressedFormat's note); the real BC payload never surfaces here.
+  case D3DFMT_ATI1:
+  case D3DFMT_ATI2:
+    return 1;
   case D3DFMT_A8:
   case D3DFMT_L8:
     return 1;
@@ -248,16 +253,12 @@ uint32_t
 D3DFormatRowPitch(D3DFORMAT format, uint32_t width) {
   switch (format) {
   case D3DFMT_DXT1:
-  // ATI1N (one BC-style channel) shares DXT1's block size.
-  case D3DFMT_ATI1:
     // 8 bytes per 4×4 block.
     return ((width + 3u) / 4u) * 8u;
   case D3DFMT_DXT2:
   case D3DFMT_DXT3:
   case D3DFMT_DXT4:
   case D3DFMT_DXT5:
-  // ATI2N (two BC-style channels) is also 16 bytes per 4×4 block.
-  case D3DFMT_ATI2:
     // 16 bytes per 4×4 block.
     return ((width + 3u) / 4u) * 16u;
   default: {
@@ -273,6 +274,35 @@ D3DFormatLockPitch(D3DFORMAT format, uint32_t width) {
   // is a no-op for them and exact for the uncompressed bytes-per-row.
   uint32_t tight = D3DFormatRowPitch(format, width);
   return (tight + 3u) & ~3u;
+}
+
+// GPU-transfer geometry: bytes per block-row and block-row count for the
+// Metal copy of a (possibly) block-compressed texture. Identical to
+// RowPitch / RowCount for every format except the 3Dc FOURCCs, whose
+// app-facing helpers speak the linear fiction while the Metal texture is
+// real BC4 / BC5: transfers read the mirror as the contiguous block
+// stream applications actually write.
+uint32_t
+D3DFormatMetalTransferPitch(D3DFORMAT format, uint32_t width) {
+  switch (format) {
+  case D3DFMT_ATI1:
+    return ((width + 3u) / 4u) * 8u;
+  case D3DFMT_ATI2:
+    return ((width + 3u) / 4u) * 16u;
+  default:
+    return D3DFormatRowPitch(format, width);
+  }
+}
+
+uint32_t
+D3DFormatMetalTransferRows(D3DFORMAT format, uint32_t height) {
+  switch (format) {
+  case D3DFMT_ATI1:
+  case D3DFMT_ATI2:
+    return (height + 3u) / 4u;
+  default:
+    return D3DFormatRowCount(format, height);
+  }
 }
 
 uint32_t
@@ -326,11 +356,14 @@ IsCompressedFormat(D3DFORMAT format) {
   case D3DFMT_DXT3:
   case D3DFMT_DXT4:
   case D3DFMT_DXT5:
-  // ATI1N/ATI2N are 4x4 block compression like the DXTn family; volumes of
-  // any compressed format take the SCRATCH blob path (no 3D BC on Metal).
-  case D3DFMT_ATI1:
-  case D3DFMT_ATI2:
     return true;
+  // ATI1N/ATI2N are deliberately NOT here: the app-facing contract for the
+  // 3Dc FOURCCs is a linear 1-byte-per-pixel fiction (wined3d utils.c marks
+  // them BROKEN_PITCH with byte_count 1, and wine's lockrect-offset test
+  // pins pitch = width and offset = y * width + x), so every lock, mirror
+  // and pitch computation treats them as plain 1-byte formats. Only the
+  // Metal transfer uses their real BC block geometry, through
+  // D3DFormatMetalTransferPitch / Rows.
   default:
     return false;
   }
