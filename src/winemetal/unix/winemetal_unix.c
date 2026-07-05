@@ -4885,6 +4885,7 @@ _MTLSharedEvent_signalValue(void *obj) {
 
 typedef struct {
   _Atomic(CFRunLoopRef) runloop_ref;
+  _Atomic(bool) destroyed;
   MTLSharedEventListener *shared_listener;
 } *shared_event_listener_t;
 
@@ -4895,22 +4896,35 @@ _MTLSharedEvent_setWin32EventAtValue(void *obj) {
   struct unixcall_mtlsharedevent_setevent *params = obj;
   void *nt_event_handle = (shared_event_listener_t)params->event_handle;
   shared_event_listener_t q = (shared_event_listener_t)params->shared_event_listener;
+  /* Resolve the runloop HERE, on the calling wine thread, and hand the
+   * notification block a retained reference plus the plain event handle:
+   * the block must not capture q. Metal copies the block and can run it
+   * after the listener owner has been destroyed (a late notification on
+   * device teardown), and a captured q would then be freed memory: the
+   * historical intermittent objc_retain crash and spin-hang here. The
+   * spin below only covers creation-time ordering (a notification
+   * registered before the listener thread has published its runloop),
+   * and the calling thread can wait for that safely. A retained runloop
+   * outlives its thread; performing on an exited runloop is a no-op,
+   * which is the correct fate for a notification nobody waits on. */
+  while (!atomic_load_explicit(&q->runloop_ref, memory_order_acquire)) {
+#if defined(__x86_64__)
+    _mm_pause();
+#elif defined(__aarch64__)
+    __asm__ __volatile__("yield");
+#endif
+  }
+  CFRunLoopRef runloop = atomic_load_explicit(&q->runloop_ref, memory_order_acquire);
+  CFRetain(runloop);
   [(id<MTLSharedEvent>)params->shared_event
       notifyListener:q->shared_listener
              atValue:params->value
                block:^(id<MTLSharedEvent> _e, uint64_t _v) {
-                 // NOTE: must ensure no more notification comes after listener been destroyed.
-                 while (!atomic_load_explicit(&q->runloop_ref, memory_order_acquire)) {
-#if defined(__x86_64__)
-                   _mm_pause();
-#elif defined(__aarch64__)
-          __asm__ __volatile__("yield");
-#endif
-                 }
-                 CFRunLoopPerformBlock(q->runloop_ref, kCFRunLoopCommonModes, ^{
+                 CFRunLoopPerformBlock(runloop, kCFRunLoopCommonModes, ^{
                    NtSetEvent(nt_event_handle, NULL);
                  });
-                 CFRunLoopWakeUp(q->runloop_ref);
+                 CFRunLoopWakeUp(runloop);
+                 CFRelease(runloop);
                }];
   return STATUS_SUCCESS;
 }
@@ -4920,12 +4934,27 @@ _SharedEventListener_start(void *obj) {
   struct unixcall_generic_obj_noret *params = obj;
   shared_event_listener_t q = (shared_event_listener_t)params->handle;
   CFRunLoopRef uninited = NULL;
-  if (q && atomic_compare_exchange_strong(&q->runloop_ref, &uninited, CFRunLoopGetCurrent())) {
-    /* Add a dummy source so the runloop stays running */
-    CFRunLoopSourceContext source_context = {0};
-    CFRunLoopSourceRef source = CFRunLoopSourceCreate(NULL, 0, &source_context);
-    CFRunLoopAddSource(q->runloop_ref, source, kCFRunLoopCommonModes);
-    CFRunLoopRun();
+  CFRunLoopRef rl = CFRunLoopGetCurrent();
+  /* This thread owns freeing q: destroy only signals (the destroyed flag
+   * for the window before the runloop is published, the queued stop once
+   * it is), so neither side ever runs the CAS or the flag check against
+   * freed memory. Destroy before the publish leaves no stop queued; the
+   * flag check after the publish catches exactly that case. */
+  if (q && atomic_compare_exchange_strong(&q->runloop_ref, &uninited, rl)) {
+    /* seq_cst pairs with destroy's flag-store/runloop-load: the handshake
+     * is the store-buffering litmus, and acquire/release alone permits
+     * both sides missing each other (this thread entering the loop while
+     * destroy saw no runloop to stop). */
+    if (!atomic_load_explicit(&q->destroyed, memory_order_seq_cst)) {
+      /* Add a dummy source so the runloop stays running; the loop holds
+       * its own reference once added. */
+      CFRunLoopSourceContext source_context = {0};
+      CFRunLoopSourceRef source = CFRunLoopSourceCreate(NULL, 0, &source_context);
+      CFRunLoopAddSource(rl, source, kCFRunLoopCommonModes);
+      CFRelease(source);
+      CFRunLoopRun();
+    }
+    free(q);
   }
   return STATUS_SUCCESS;
 }
@@ -4936,6 +4965,7 @@ _SharedEventListener_create(void *obj) {
   shared_event_listener_t q = malloc(sizeof(*q));
   if (q) {
     q->runloop_ref = NULL;
+    q->destroyed = false;
     q->shared_listener = [[MTLSharedEventListener alloc] init];
   }
   params->ret = (obj_handle_t)q;
@@ -4946,12 +4976,38 @@ static NTSTATUS
 _SharedEventListener_destroy(void *obj) {
   struct unixcall_generic_obj_noret *params = obj;
   shared_event_listener_t q = (shared_event_listener_t)params->handle;
-  if (q && q->runloop_ref) {
-    CFRunLoopStop(q->runloop_ref);
-    q->runloop_ref = NULL;
-    [q->shared_listener release];
-    q->shared_listener = nil;
-    free(q);
+  if (!q)
+    return STATUS_SUCCESS;
+  /* Notification blocks hold their own retained runloop reference and
+   * never touch q (see setWin32EventAtValue), and the LISTENER THREAD is
+   * the one that frees q, so destroy only signals it. The flag must be
+   * set before the runloop load: a thread that publishes after the load
+   * observes the flag and exits without running the loop. */
+  atomic_store_explicit(&q->destroyed, true, memory_order_seq_cst);
+  CFRunLoopRef runloop = atomic_load_explicit(&q->runloop_ref, memory_order_seq_cst);
+  /* The listener thread frees q and can exit (dropping its runloop) the
+   * moment the loop stops; hold our own reference for the signalling
+   * calls below, the same way setWin32EventAtValue does for its block. */
+  if (runloop)
+    CFRetain(runloop);
+  /* Release the listener BEFORE waking the loop: the wakeup must be
+   * destroy's last touch of q, because the listener thread frees q the
+   * moment CFRunLoopRun returns. Releasing with notifications still
+   * pending is safe; Metal keeps the listener alive until they drain,
+   * and the blocks never read q. */
+  [q->shared_listener release];
+  q->shared_listener = nil;
+  if (runloop) {
+    /* Queue the stop instead of calling it directly: CFRunLoopStop only
+     * affects a loop that is already running, and the listener thread may
+     * still be between publishing its runloop and entering CFRunLoopRun.
+     * A performed block survives that window; the loop processes it on
+     * entry and stops. */
+    CFRunLoopPerformBlock(runloop, kCFRunLoopCommonModes, ^{
+      CFRunLoopStop(CFRunLoopGetCurrent());
+    });
+    CFRunLoopWakeUp(runloop);
+    CFRelease(runloop);
   }
   return STATUS_SUCCESS;
 }
