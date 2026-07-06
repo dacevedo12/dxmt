@@ -7529,25 +7529,48 @@ MTLD3D9Device::ResolveBatchedDrawForChunk(
     // doesn't satisfy all three conditions, so the hot path stays on
     // the default variant cache.
     float vs_point_size_override = 0.0f;
-    if (!vs->metadata().writes_point_size && bd.primitive_type == D3DPT_POINTLIST) {
-      float rs_point_size;
-      static_assert(sizeof(rs_point_size) == sizeof(DWORD), "");
-      std::memcpy(&rs_point_size, &rs[D3DRS_POINTSIZE], sizeof(rs_point_size));
-      if (rs_point_size > 1.0f || rs_point_size < 1.0f) {
-        // Clamp to a sane upper bound. Apple Silicon validates point
-        // primitive size against the device's max (~511 typical) at
-        // encode time; an out-of-range value triggers encoder
-        // validation. Lower bound 1.0f matches the D3D9 default; a 0
-        // or sub-pixel size would render nothing and is most likely an
-        // uninitialized DWORD slot the app forgot to set.
+    float vs_point_size_min = 0.0f;
+    float vs_point_size_max = 0.0f;
+    if (bd.primitive_type == D3DPT_POINTLIST) {
+      // D3DRS_POINTSIZE_MIN / _MAX clamp both sources of the point size
+      // (wined3d state.c applies them uniformly): the render-state size
+      // is clamped host-side into the injected constant, a shader-written
+      // size gets the pair baked into the variant for an epilogue clamp.
+      float rs_min, rs_max;
+      static_assert(sizeof(rs_min) == sizeof(DWORD), "");
+      std::memcpy(&rs_min, &rs[D3DRS_POINTSIZE_MIN], sizeof(rs_min));
+      std::memcpy(&rs_max, &rs[D3DRS_POINTSIZE_MAX], sizeof(rs_max));
+      if (!(rs_min >= 0.0f))
+        rs_min = 0.0f;
+      // Apple Silicon validates point size against the device cap (~511)
+      // at encode time; a zero or negative max renders nothing anyway,
+      // floor it at 1 so the clamp pair stays ordered.
+      if (!(rs_max >= 1.0f))
+        rs_max = 1.0f;
+      if (rs_max > 511.0f)
+        rs_max = 511.0f;
+      if (rs_min > rs_max)
+        rs_min = rs_max;
+      if (!vs->metadata().writes_point_size) {
+        float rs_point_size;
+        std::memcpy(&rs_point_size, &rs[D3DRS_POINTSIZE], sizeof(rs_point_size));
+        if (!(rs_point_size >= rs_min))
+          rs_point_size = rs_min;
+        if (rs_point_size > rs_max)
+          rs_point_size = rs_max;
         if (rs_point_size < 1.0f)
           rs_point_size = 1.0f;
-        if (rs_point_size > 511.0f)
-          rs_point_size = 511.0f;
-        vs_point_size_override = rs_point_size;
+        // 1.0 is the hardware default; skip the variant when the final
+        // size lands there so the hot path keeps the default cache.
+        if (rs_point_size > 1.0f || rs_point_size < 1.0f)
+          vs_point_size_override = rs_point_size;
+      } else {
+        vs_point_size_min = rs_min;
+        vs_point_size_max = rs_max;
       }
     }
-    WMT::Function vs_function = vs->compileVariant(layout, vs_point_size_override);
+    WMT::Function vs_function =
+        vs->compileVariant(layout, vs_point_size_override, vs_point_size_min, vs_point_size_max);
     if (!vs_function)
       return false;
 

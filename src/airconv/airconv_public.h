@@ -529,6 +529,11 @@ struct DXSO_SHADER_VS_POINT_SIZE_DATA {
   void *next;
   enum DXSO_SHADER_COMPILATION_ARGUMENT_TYPE type;
   float value;
+  /* D3DRS_POINTSIZE_MIN / _MAX clamp, applied to a shader-written point
+     size in the output epilogue. maximum = 0 means no clamp (the
+     injected-constant path pre-clamps `value` host-side instead). */
+  float minimum;
+  float maximum;
 };
 
 /* PS-only specialisation: per-stage D3DTSS_BUMPENV* constants for

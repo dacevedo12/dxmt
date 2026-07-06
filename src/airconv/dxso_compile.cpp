@@ -38,8 +38,9 @@ void
 compile_dxso(
     DxsoShader *shader, const ::DXSO_SHADER_IA_INPUT_LAYOUT_DATA *ia_layout,
     const ::DXSO_SHADER_PSO_PIXEL_SHADER_DATA *ps_args, const ::DXSO_SHADER_PS_SAMPLER_LAYOUT_DATA *ps_samp_layout,
-    bool ps_point_sprite, float vs_point_size_override, const ::DXSO_SHADER_PS_BUMP_ENV_DATA *ps_bump_env,
-    int ps_fog_mode, const char *name, llvm::LLVMContext &context, llvm::Module &module
+    bool ps_point_sprite, float vs_point_size_override, float vs_point_size_min, float vs_point_size_max,
+    const ::DXSO_SHADER_PS_BUMP_ENV_DATA *ps_bump_env, int ps_fog_mode, const char *name, llvm::LLVMContext &context,
+    llvm::Module &module
 ) {
   using namespace llvm;
   const bool is_vertex = shader->header.kind == DxsoShaderKind::Vertex;
@@ -3753,6 +3754,17 @@ compile_dxso(
       // value to all four lanes for a scalar write like `mov oPts, c0.x`).
       auto *v4 = builder.CreateLoad(float4Ty, oPts_slot);
       Value *ps = builder.CreateExtractElement(v4, builder.getInt32(0));
+      if (vs_point_size_max > 0.0f) {
+        // D3DRS_POINTSIZE_MIN / _MAX clamp a shader-written size on
+        // native; the host bakes the pair into this variant (the
+        // injected-constant path arrives pre-clamped with max 0).
+        ps = air.CreateFPBinOp(
+            llvm::air::AIRBuilder::fmax, ps, ConstantFP::get(Type::getFloatTy(context), vs_point_size_min)
+        );
+        ps = air.CreateFPBinOp(
+            llvm::air::AIRBuilder::fmin, ps, ConstantFP::get(Type::getFloatTy(context), vs_point_size_max)
+        );
+      }
       retval = builder.CreateInsertValue(retval, ps, {(unsigned)oPts_arg_idx});
     }
     builder.CreateRet(retval);
@@ -3842,6 +3854,8 @@ DXSOCompile(
   bool ps_point_sprite = false;
   int ps_fog_mode = -1; // -1 = no fog arg in the chain
   float vs_point_size_override = 0.0f;
+  float vs_point_size_min = 0.0f;
+  float vs_point_size_max = 0.0f;
   for (auto *arg = pArgs; arg; arg = (DXSO_SHADER_COMPILATION_ARGUMENT_DATA *)arg->next) {
     switch (arg->type) {
     case DXSO_SHADER_IA_INPUT_LAYOUT:
@@ -3858,6 +3872,8 @@ DXSOCompile(
       break;
     case DXSO_SHADER_VS_POINT_SIZE:
       vs_point_size_override = ((DXSO_SHADER_VS_POINT_SIZE_DATA *)arg)->value;
+      vs_point_size_min = ((DXSO_SHADER_VS_POINT_SIZE_DATA *)arg)->minimum;
+      vs_point_size_max = ((DXSO_SHADER_VS_POINT_SIZE_DATA *)arg)->maximum;
       break;
     case DXSO_SHADER_PS_BUMP_ENV:
       ps_bump_env = (DXSO_SHADER_PS_BUMP_ENV_DATA *)arg;
@@ -3876,7 +3892,7 @@ DXSOCompile(
   dxmt::initializeModule(*module);
   dxmt::compile_dxso(
       (dxmt::DxsoShader *)pShader, ia_layout, ps_args, ps_samp_layout, ps_point_sprite, vs_point_size_override,
-      ps_bump_env, ps_fog_mode, FunctionName, context, *module
+      vs_point_size_min, vs_point_size_max, ps_bump_env, ps_fog_mode, FunctionName, context, *module
   );
 
   auto *compiled = new (std::nothrow) dxmt::DxsoBitcode();

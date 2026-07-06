@@ -70,7 +70,10 @@ public:
   metadata() const {
     return m_metadata;
   }
-  WMT::Function compileVariant(const ::DXSO_SHADER_IA_INPUT_LAYOUT_DATA &layout, float point_size_override = 0.0f);
+  WMT::Function compileVariant(
+      const ::DXSO_SHADER_IA_INPUT_LAYOUT_DATA &layout, float point_size_override = 0.0f, float point_size_min = 0.0f,
+      float point_size_max = 0.0f
+  );
 
 private:
   MTLD3D9Device *m_device;
@@ -179,8 +182,11 @@ public:
     return m_module->metadata();
   }
   WMT::Function
-  compileVariant(const ::DXSO_SHADER_IA_INPUT_LAYOUT_DATA &layout, float point_size_override = 0.0f) {
-    return m_module->compileVariant(layout, point_size_override);
+  compileVariant(
+      const ::DXSO_SHADER_IA_INPUT_LAYOUT_DATA &layout, float point_size_override = 0.0f, float point_size_min = 0.0f,
+      float point_size_max = 0.0f
+  ) {
+    return m_module->compileVariant(layout, point_size_override, point_size_min, point_size_max);
   }
 
 private:

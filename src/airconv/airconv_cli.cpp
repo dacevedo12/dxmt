@@ -266,15 +266,17 @@ int main(int argc, char **argv) {
       ps_args.alpha_test_func = 8; // D3DCMP_ALWAYS: no alpha-test snippet
       ps_args.dual_source_blending = 1;
     }
-    dxmt::compile_dxso(dxso,
-                       DxsoSkinningLayout ? &layout : nullptr,
-                       /*ps_args=*/DxsoDualSource ? &ps_args : nullptr,
-                       /*ps_samp_layout=*/nullptr,
-                       /*ps_point_sprite=*/false,
-                       /*vs_point_size_override=*/0.0f,
-                       /*ps_bump_env=*/nullptr,
-                       /*ps_fog_mode=*/DxsoFogMode,
-                       "shader_main", Context, M);
+    dxmt::compile_dxso(
+        dxso, DxsoSkinningLayout ? &layout : nullptr,
+        /*ps_args=*/DxsoDualSource ? &ps_args : nullptr,
+        /*ps_samp_layout=*/nullptr,
+        /*ps_point_sprite=*/false,
+        /*vs_point_size_override=*/0.0f,
+        /*vs_point_size_min=*/0.0f,
+        /*vs_point_size_max=*/0.0f,
+        /*ps_bump_env=*/nullptr,
+        /*ps_fog_mode=*/DxsoFogMode, "shader_main", Context, M
+    );
     dxmt::dxso_shader_destroy(dxso);
   } else {
 

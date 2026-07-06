@@ -4278,6 +4278,8 @@ struct DXSO_SHADER_VS_POINT_SIZE_DATA32 {
   uint32_t next;
   enum DXSO_SHADER_COMPILATION_ARGUMENT_TYPE type;
   float value;
+  float minimum;
+  float maximum;
 };
 
 struct DXSO_SHADER_PS_BUMP_ENV_DATA32 {
@@ -4352,6 +4354,8 @@ dxso_compilation_argument32_convert(
       last_arg->next = NULL;
       data->type = DXSO_SHADER_VS_POINT_SIZE;
       data->value = src->value;
+      data->minimum = src->minimum;
+      data->maximum = src->maximum;
       break;
     }
     case DXSO_SHADER_PS_BUMP_ENV: {

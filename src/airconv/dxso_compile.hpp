@@ -48,8 +48,9 @@ void dxso_shader_destroy(DxsoShader *shader);
 void compile_dxso(
     DxsoShader *shader, const ::DXSO_SHADER_IA_INPUT_LAYOUT_DATA *ia_layout,
     const ::DXSO_SHADER_PSO_PIXEL_SHADER_DATA *ps_args, const ::DXSO_SHADER_PS_SAMPLER_LAYOUT_DATA *ps_samp_layout,
-    bool ps_point_sprite, float vs_point_size_override, const ::DXSO_SHADER_PS_BUMP_ENV_DATA *ps_bump_env,
-    int ps_fog_mode, const char *name, llvm::LLVMContext &context, llvm::Module &module
+    bool ps_point_sprite, float vs_point_size_override, float vs_point_size_min, float vs_point_size_max,
+    const ::DXSO_SHADER_PS_BUMP_ENV_DATA *ps_bump_env, int ps_fog_mode, const char *name, llvm::LLVMContext &context,
+    llvm::Module &module
 );
 
 // Backing for dxso_bitcode_t: owns the AIR metallib bytes produced

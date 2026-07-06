@@ -327,11 +327,14 @@ layout_fingerprint(const DXSO_SHADER_IA_INPUT_LAYOUT_DATA &layout) {
 }
 
 WMT::Function
-MTLD3D9VertexShaderModule::compileVariant(const DXSO_SHADER_IA_INPUT_LAYOUT_DATA &layout, float point_size_override) {
+MTLD3D9VertexShaderModule::compileVariant(
+    const DXSO_SHADER_IA_INPUT_LAYOUT_DATA &layout, float point_size_override, float point_size_min,
+    float point_size_max
+) {
   // Cache hit on layout fingerprint. The MTLFunction lives on the
   // shader; the caller borrows the handle for the duration of the
   // PSO build, which never outlives the shader.
-  const bool inject_point_size = point_size_override > 0.0f;
+  const bool inject_point_size = point_size_override > 0.0f || point_size_max > 0.0f;
   uint64_t layout_key = layout_fingerprint(layout);
   if (!inject_point_size) {
     if (auto it = m_variantCache.find(layout_key); it != m_variantCache.end())
@@ -342,9 +345,12 @@ MTLD3D9VertexShaderModule::compileVariant(const DXSO_SHADER_IA_INPUT_LAYOUT_DATA
     // DWORD slot, so the bit pattern is whatever the app stored)
     // which keeps the cache bounded: apps that genuinely sweep
     // point size pay the compile cost they asked for.
-    uint32_t bits;
+    uint32_t bits, bmin, bmax;
     std::memcpy(&bits, &point_size_override, sizeof(bits));
-    uint64_t ps_key = layout_key ^ (static_cast<uint64_t>(bits) << 32);
+    std::memcpy(&bmin, &point_size_min, sizeof(bmin));
+    std::memcpy(&bmax, &point_size_max, sizeof(bmax));
+    uint64_t ps_key = layout_key ^ (static_cast<uint64_t>(bits) << 32) ^ (static_cast<uint64_t>(bmin) << 13) ^
+                      (static_cast<uint64_t>(bmax) << 45);
     if (auto it = m_pointSizeVariantCache.find(ps_key); it != m_pointSizeVariantCache.end())
       return it->second;
   }
@@ -381,6 +387,8 @@ MTLD3D9VertexShaderModule::compileVariant(const DXSO_SHADER_IA_INPUT_LAYOUT_DATA
     point_size_arg.next = nullptr;
     point_size_arg.type = DXSO_SHADER_VS_POINT_SIZE;
     point_size_arg.value = point_size_override;
+    point_size_arg.minimum = point_size_min;
+    point_size_arg.maximum = point_size_max;
     layout_arg.next = &point_size_arg;
   }
   auto *args = reinterpret_cast<DXSO_SHADER_COMPILATION_ARGUMENT_DATA *>(&layout_arg);
@@ -394,9 +402,12 @@ MTLD3D9VertexShaderModule::compileVariant(const DXSO_SHADER_IA_INPUT_LAYOUT_DATA
     auto [ins, _] = m_variantCache.emplace(layout_key, std::move(fn));
     return ins->second;
   }
-  uint32_t bits;
+  uint32_t bits, bmin, bmax;
   std::memcpy(&bits, &point_size_override, sizeof(bits));
-  uint64_t ps_key = layout_key ^ (static_cast<uint64_t>(bits) << 32);
+  std::memcpy(&bmin, &point_size_min, sizeof(bmin));
+  std::memcpy(&bmax, &point_size_max, sizeof(bmax));
+  uint64_t ps_key = layout_key ^ (static_cast<uint64_t>(bits) << 32) ^ (static_cast<uint64_t>(bmin) << 13) ^
+                    (static_cast<uint64_t>(bmax) << 45);
   auto [ins, _] = m_pointSizeVariantCache.emplace(ps_key, std::move(fn));
   return ins->second;
 }
