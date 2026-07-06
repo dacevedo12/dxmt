@@ -7375,8 +7375,9 @@ MTLD3D9Device::ResolveBatchedDrawForChunk(
   auto *ps = refs.pixel_shader.ptr();
   auto *decl = refs.vertex_declaration.ptr();
   auto *rt0 = refs.render_targets[0].ptr();
-  if (!vs || !ps || !decl || !rt0)
+  if (!vs || !ps || !decl || !rt0) {
     return false;
+  }
 
   // POD state lives on the per-draw pod_snapshot so POD
   // setters never need to FlushDrawBatch. Every call below reads
@@ -7453,6 +7454,14 @@ MTLD3D9Device::ResolveBatchedDrawForChunk(
       const D3DVERTEXELEMENT9 &e = decl->elements()[i];
       if (e.Stream == 0xFF)
         continue;
+      // An element on a stream with no bound vertex buffer drops out of
+      // the layout instead of failing the draw: wined3d derives stream
+      // liveness per draw (context.c wined3d_stream_info_from_declaration)
+      // and still renders, with the unfed shader input reading its
+      // zero-fill default. A declaration-only stream reference is common
+      // in runner-style harnesses that always declare a position element.
+      if (e.Stream < 16 && !refs.vertex_buffers[e.Stream].ptr() && !(e.Stream == 0 && bd.override_vb_buffer != 0))
+        continue;
       // A pre-transformed position element (D3DDECLUSAGE_POSITIONT) carries
       // window-space coordinates. D3D9 routes such a draw through the fixed-
       // function pre-transform (the bound vertex shader is, per spec, ignored).
@@ -7500,8 +7509,9 @@ MTLD3D9Device::ResolveBatchedDrawForChunk(
       }
       slot_mask |= (1u << e.Stream);
     }
-    if (element_count == 0)
-      return false;
+    // element_count of zero is a legal draw: a constant-output VS with a
+    // declaration whose only elements sit on unbound streams (filtered
+    // above) fetches nothing and every dcl'd input zero-fills.
     bd.resolved_slot_mask = slot_mask;
 
     DXSO_INDEX_BUFFER_FORMAT ib_fmt = DXSO_INDEX_BUFFER_FORMAT_NONE;
