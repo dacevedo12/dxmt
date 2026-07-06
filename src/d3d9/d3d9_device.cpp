@@ -6336,6 +6336,15 @@ MTLD3D9Device::SetSamplerState(DWORD Sampler, D3DSAMPLERSTATETYPE Type, DWORD Va
     m_recordingBlock->m_changes.sampler_states = true;
     return D3D_OK;
   }
+  // FETCH4 magic rides the LOD-bias state: 'GET4' arms the sampler's
+  // latch, 'GET1' disarms it, any other value leaves it alone and lands
+  // as a plain bias. Slots 16+ (vertex samplers) never fetch4.
+  if (Type == D3DSAMP_MIPMAPLODBIAS && slot < 16) {
+    if (Value == MAKEFOURCC('G', 'E', 'T', '4'))
+      m_fetch4Latch |= (uint16_t)(1u << slot);
+    else if (Value == MAKEFOURCC('G', 'E', 'T', '1'))
+      m_fetch4Latch &= (uint16_t)~(1u << slot);
+  }
   if (m_samplerStates[slot][Type] == Value)
     return D3D_OK;
   m_samplerStates[slot][Type] = Value;
@@ -7599,6 +7608,25 @@ MTLD3D9Device::ResolveBatchedDrawForChunk(
                                      : DXSO_PS_SAMPLER_KIND_TEXTURE_2D_DEPTH;
           break;
         default:
+          // FETCH4: armed latch + point magnification + a single-channel
+          // colour format gathers instead of sampling (DXVK gates on the
+          // same trio; its format list is the source of this one).
+          if (stage < 16 && (m_fetch4Latch & (1u << stage)) &&
+              m_samplerStates[stage][D3DSAMP_MAGFILTER] == D3DTEXF_POINT) {
+            switch (tex->d3dFormat()) {
+            case D3DFMT_R16F:
+            case D3DFMT_R32F:
+            case D3DFMT_A8:
+            case D3DFMT_L8:
+            case D3DFMT_L16:
+              ps_samp_kinds[stage] = DXSO_PS_SAMPLER_KIND_TEXTURE_2D_FETCH4;
+              break;
+            default:
+              ps_samp_kinds[stage] = DXSO_PS_SAMPLER_KIND_TEXTURE_2D;
+              break;
+            }
+            break;
+          }
           ps_samp_kinds[stage] = DXSO_PS_SAMPLER_KIND_TEXTURE_2D;
           break;
         }

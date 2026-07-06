@@ -368,6 +368,11 @@ enum DXSO_PS_SAMPLER_KIND {
   // compareFunction sampler. Same Metal depth2d kind as _TEXTURE_2D_DEPTH;
   // only the sample op + sampler compare func differ.
   DXSO_PS_SAMPLER_KIND_TEXTURE_2D_DEPTH_COMPARE = 6,
+  /* AMD FETCH4 (D3DSAMP_MIPMAPLODBIAS magic 'GET4'): point-sampling a
+     single-channel color format gathers the four neighbouring texels
+     into (B, R, G, A) order instead of filtering. The host resolves the
+     latch + format + point-filter gate and picks this kind. */
+  DXSO_PS_SAMPLER_KIND_TEXTURE_2D_FETCH4 = 7,
 };
 
 struct DXSO_SHADER_COMPILATION_ARGUMENT_DATA {

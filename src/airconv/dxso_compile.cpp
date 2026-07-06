@@ -463,6 +463,7 @@ compile_dxso(
   // Per-slot hardware-PCF flag: flips SM2+ sample to sample_compare.
   // SM1.x texm3x*/texbem sample depth2d raw (bound as env/bump maps).
   std::array<bool, 16> samp_compare{};
+  std::array<bool, 16> samp_fetch4{};
   // Texture/sampler bindings run for BOTH stages: vertex texture fetch (VTF,
   // SM3.0) lets a VS sample a texture (e.g. a displacement map driving vertex
   // deformation). The dcl carries the sampler kind on
@@ -549,6 +550,12 @@ compile_dxso(
           // compareFunction sampler.
           samp_kind[i] = DxsoTextureType::Texture2DDepth;
           samp_compare[i] = true;
+          break;
+        case DXSO_PS_SAMPLER_KIND_TEXTURE_2D_FETCH4:
+          // FETCH4: plain 2D bind, but the Tex arm gathers the red
+          // channel of the four neighbours instead of sampling.
+          samp_kind[i] = DxsoTextureType::Texture2D;
+          samp_fetch4[i] = true;
           break;
         default:
           // UNKNOWN; host didn't pin (e.g. stage with no bound
@@ -2315,7 +2322,36 @@ compile_dxso(
         coord = builder.CreateFDiv(coord, w_splat);
       }
       Value *texel = nullptr;
-      if (samp_compare[slot]) {
+      if (samp_fetch4[slot] && !samp_compare[slot] &&
+          (ins.opcode == DxsoOpcode::Tex || ins.opcode == DxsoOpcode::TexLdl || ins.opcode == DxsoOpcode::TexLdd)) {
+        // AMD FETCH4: gather the red channel of the four neighbours in
+        // the funny D3D9 order (B, R, G, A). Nudge the coordinate by
+        // half a texel so the gather footprint matches the point-sample
+        // texel the app addressed (DXVK dxso_compiler.cpp does the
+        // same). The explicit-LOD and gradient forms gather too, and
+        // like DXVK's the gather ignores the lod and gradient inputs:
+        // the hack is level-0 point sampling by construction.
+        Value *fw = air.CreateTextureQuery(tex_desc, tex_handle, llvm::air::Texture::Query::width, builder.getInt32(0));
+        Value *fh =
+            air.CreateTextureQuery(tex_desc, tex_handle, llvm::air::Texture::Query::height, builder.getInt32(0));
+        Value *inv_w = builder.CreateFDiv(
+            ConstantFP::get(Type::getFloatTy(context), 0.5f), builder.CreateUIToFP(fw, Type::getFloatTy(context))
+        );
+        Value *inv_h = builder.CreateFDiv(
+            ConstantFP::get(Type::getFloatTy(context), 0.5f), builder.CreateUIToFP(fh, Type::getFloatTy(context))
+        );
+        Value *nudge = UndefValue::get(coord->getType());
+        nudge = builder.CreateInsertElement(nudge, inv_w, builder.getInt32(0));
+        nudge = builder.CreateInsertElement(nudge, inv_h, builder.getInt32(1));
+        Value *g_coord = builder.CreateFAdd(coord, nudge);
+        const int32_t g_off[3] = {0, 0, 0};
+        auto [g, g_res] = air.CreateGather(
+            tex_desc, tex_handle, samp_handle, g_coord, /*ArrayIndex=*/nullptr, g_off, builder.getInt32(0)
+        );
+        (void)g_res;
+        int swz[4] = {2, 0, 1, 3};
+        texel = builder.CreateShuffleVector(g, g, ArrayRef<int>(swz, 4));
+      } else if (samp_compare[slot]) {
         // Hardware PCF: sample_compare(coord.xy, ref) returns the filtered
         // 0/1 comparison of ref vs the stored depth. The reference is the
         // projected depth: coord.z, divided by w for a projective texldp

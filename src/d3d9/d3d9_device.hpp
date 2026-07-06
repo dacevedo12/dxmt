@@ -1353,6 +1353,12 @@ private:
     uint64_t gpu_address;
     size_t capacity;
   };
+  // AMD FETCH4 latch, one bit per sampler slot 0..15: set by the
+  // D3DSAMP_MIPMAPLODBIAS magic 'GET4', cleared by 'GET1'; other bias
+  // writes leave it alone (DXVK d3d9_device.cpp keeps the same sticky
+  // shape). A state-block Apply bypasses the setter and misses the
+  // latch, matching that reference's limitation.
+  uint16_t m_fetch4Latch = 0;
   // Set at destructor entry; flips releaseBufferBacking to direct-free so
   // late donors (members destructing after the pool) never touch it.
   bool m_tearingDown = false;
