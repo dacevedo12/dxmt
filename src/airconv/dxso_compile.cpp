@@ -86,6 +86,11 @@ compile_dxso(
   // route by register file directly.
   std::array<int, 16> input_arg_idx;
   input_arg_idx.fill(-1);
+  // Per-v# dcl write mask. A partial mask (dcl_texcoord0 v0.xyz) makes
+  // the undeclared components read the input-register defaults, 0 for
+  // x/y/z and 1 for w, rather than whatever the interpolant carries.
+  std::array<uint8_t, 16> ps_input_mask;
+  ps_input_mask.fill(0xF);
   // Parallel to input_arg_idx: true when v<N> was dcl'd as TEXCOORD.
   // Drives the POINTSPRITEENABLE per-input substitution at tex_inputs
   // load time; SM3 PS reads texcoords via v# (input_arg_idx) rather
@@ -245,6 +250,7 @@ compile_dxso(
     );
     if (is_v) {
       input_arg_idx[d.bound_to.num] = arg_idx;
+      ps_input_mask[d.bound_to.num] = d.mask.raw();
       if (effective_usage == DxsoUsage::Texcoord)
         ps_v_is_texcoord[d.bound_to.num] = true;
     } else
@@ -1156,8 +1162,20 @@ compile_dxso(
       // point-sprite UV vec4. v<N> dcl'd as COLOR is left alone.
       if (point_sprite_v && i < ps_v_is_texcoord.size() && ps_v_is_texcoord[i])
         src = point_sprite_v;
-      else
+      else {
         src = fn->getArg(input_arg_idx[i]);
+        // Partial dcl mask: overwrite undeclared lanes with the input
+        // register defaults instead of the raw interpolant.
+        if (!is_vertex && i < ps_input_mask.size() && ps_input_mask[i] != 0xF) {
+          for (uint32_t lane = 0; lane < 4; ++lane) {
+            if (ps_input_mask[i] & (1u << lane))
+              continue;
+            src = builder.CreateInsertElement(
+                src, ConstantFP::get(Type::getFloatTy(context), lane == 3 ? 1.0f : 0.0f), builder.getInt32(lane)
+            );
+          }
+        }
+      }
     } else {
       src = ConstantAggregateZero::get(float4Ty);
     }

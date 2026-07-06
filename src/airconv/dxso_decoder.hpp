@@ -827,6 +827,11 @@ private:
 struct DxsoBoundDcl {
   DxsoDeclaration dcl;
   DxsoBaseRegister bound_to;
+  // The dcl dst token's write mask. A partial mask on a PS input
+  // (dcl_texcoord0 v0.xyz) means the undeclared components read the
+  // input-register defaults (0 for x/y/z, 1 for w) instead of the
+  // interpolated value.
+  DxsoRegMask mask;
 };
 
 // def / defi / defb entry collected at create time: the typed
@@ -939,7 +944,7 @@ walk_dxso_shader(const uint32_t *byte_code, uint32_t dword_count, const DxsoHead
       continue;
     md.instruction_count += 1;
     if (ins.has_dcl && ins.has_dst)
-      md.dcls.push_back({ins.dcl, ins.dst.base});
+      md.dcls.push_back({ins.dcl, ins.dst.base, ins.dst.mask});
     if (ins.has_def && ins.has_dst) {
       // Reject a constant-register index past the shader-model limit; wine
       // d3d9 fails Create{Vertex,Pixel}Shader for these and the host
