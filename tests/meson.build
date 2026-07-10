@@ -188,3 +188,6 @@ alias_target(
   d3d12_differential_oracle,
   d3d12_submission_model_native_test,
 )
+
+# d3d9 host-native, wine-free tests (the 'host' suite CI gate).
+subdir('dx9')

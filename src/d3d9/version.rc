@@ -1,0 +1,35 @@
+#include <windows.h>
+
+// The revision field is the DirectX release number (902 is 9.0b, 904 is 9.0c).
+// Titles resolve Direct3DCreate9, call GetModuleFileName on the module they
+// resolved it from, and read the revision back out of this resource to decide
+// whether the runtime is new enough, so these describe the D3D9 runtime being
+// implemented rather than the implementation.
+VS_VERSION_INFO    VERSIONINFO
+FILEVERSION        5,3,1,904
+PRODUCTVERSION     5,3,1,904
+FILEFLAGSMASK      VS_FFI_FILEFLAGSMASK
+FILEFLAGS          0
+FILEOS VOS_NT_WINDOWS32
+FILETYPE VFT_DLL
+FILESUBTYPE VFT2_UNKNOWN
+BEGIN
+  BLOCK "StringFileInfo"
+  BEGIN
+    BLOCK "080904b0"
+    BEGIN
+      VALUE "CompanyName",      "DXMT"
+      VALUE "FileDescription",  "Direct3D 9 Runtime"
+      VALUE "FileVersion",      "5.3.1.904"
+      VALUE "InternalName",     "d3d9.dll"
+      VALUE "LegalCopyright",   "MIT License"
+      VALUE "OriginalFilename", "d3d9.dll"
+      VALUE "ProductName",      "DXMT"
+      VALUE "ProductVersion",   "5.3.1.904"
+    END
+  END
+  BLOCK "VarFileInfo"
+  BEGIN
+    VALUE "Translation", 0x0809, 1200
+  END
+END
