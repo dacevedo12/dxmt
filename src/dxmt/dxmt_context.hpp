@@ -546,6 +546,10 @@ struct ResolveEncoderData : EncoderData {
   std::optional<WMTScissorRect> src_rect;
   WMTOrigin dst_origin;
   WMTSize resolve_size;
+  // Destination is a single-sample depth target reached through a depth
+  // attachment + depth-write pipeline rather than a colour one (see the
+  // Resolve case in the encoder executor).
+  bool is_depth = false;
 };
 
 class Presenter;
@@ -1177,6 +1181,15 @@ public:
       WMT::RenderPipelineState pso = {}, std::optional<WMTScissorRect> src_rect = std::nullopt,
       WMTOrigin dst_origin = {}, WMTSize resolve_size = {}
   );
+  // Depth variant of the shader resolve: the destination is a single-sample depth
+  // target driven through a depth attachment and a depth-write pipeline (the
+  // multisampled source binds as a fragment depth texture), so it needs its own
+  // render-pass shape rather than the colour path above.
+  void resolveDepthTexture(
+      Rc<Texture> &&src, TextureViewKey src_view, Rc<Texture> &&dst, TextureViewKey dst_view,
+      WMT::RenderPipelineState pso, std::optional<WMTScissorRect> src_rect, WMTOrigin dst_origin,
+      WMTSize resolve_size
+  );
 
   RenderEncoderData *startRenderPass(
       uint8_t dsv_planar_flags, uint8_t dsv_readonly_flags, uint8_t render_target_count, uint64_t argument_buffer_size
@@ -1583,6 +1596,8 @@ private:
 
   WMT::Device device_;
   CommandQueue& queue_;
+  // Depth-write-always state for the depth resolve pass; created on first use.
+  WMT::Reference<WMT::DepthStencilState> depth_resolve_dss_;
 };
 
 template <>

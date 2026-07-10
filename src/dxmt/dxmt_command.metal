@@ -281,6 +281,54 @@ struct DXMTResolveMetadata {
   return output;
 }
 
+struct resolve_depth_output {
+  float depth [[depth(any)]];
+};
+
+// D3D9 StretchRect of a multisampled depth surface to a single-sample one is a
+// point resolve: sample 0 of the source, which is what D3DTEXF_POINT selects. The
+// source binds as a multisampled depth texture; the fragment writes the picked
+// sample straight to the destination depth attachment.
+[[fragment]] resolve_depth_output fs_resolve_msaa_depth(resolve_data input [[stage_in]],
+                                                        depth2d_ms<float, access::read> source [[texture(0)]],
+                                                        constant DXMTResolveMetadata& meta [[buffer(0)]]) {
+  resolve_depth_output output;
+  const uint2 coord = meta.src_origin + uint2(input.position.xy) - meta.dst_origin;
+  output.depth = source.read(coord, 0);
+  return output;
+}
+
+struct blit_data {
+  float4 position [[position]];
+  float2 uv [[user(coord)]];
+};
+
+struct DXMTStretchBlitMetadata {
+  float2 src_uv_origin;
+  float2 src_uv_size;
+};
+
+// Fullscreen quad in NDC; uv is [0,1]² that the fragment stage maps
+// onto the metadata sub-rect. Computing the sub-rect mapping in the
+// fragment stage avoids needing setVertexBytes (which winemetal's
+// encoder API doesn't expose; only setFragmentBytes), so the
+// metadata buffer only has to be bound to the fragment stage.
+[[vertex]] blit_data vs_blit_quad(ushort id [[vertex_id]]) {
+  blit_data output;
+  float2 uv = float2((id << 1) & 2, id & 2);
+  output.position = float4(uv * float2(2, -2) + float2(-1, 1), 0, 1);
+  output.uv = uv;
+  return output;
+}
+
+[[fragment]] float4 fs_blit_quad(blit_data input [[stage_in]],
+                                 texture2d<float, access::sample> source [[texture(0)]],
+                                 sampler smp [[sampler(0)]],
+                                 constant DXMTStretchBlitMetadata& meta [[buffer(0)]]) {
+  float2 src_uv = meta.src_uv_origin + input.uv * meta.src_uv_size;
+  return source.sample(smp, src_uv);
+}
+
 constant constexpr float PQ_M1 = 0.1593017578125;
 constant constexpr float PQ_M2 = 78.84375;
 constant constexpr float PQ_C1 = 0.8359375;

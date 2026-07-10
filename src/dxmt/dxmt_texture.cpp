@@ -140,12 +140,13 @@ TextureView::TextureView(TextureAllocation *allocation, unsigned index, TextureV
 
 TextureAllocation::TextureAllocation(
     Texture *descriptor, WMT::Reference<WMT::Buffer> &&buffer, void *mapped_buffer, const WMTTextureInfo &info,
-    unsigned bytes_per_row, Flags<TextureAllocationFlag> flags
+    unsigned bytes_per_row, Flags<TextureAllocationFlag> flags, bool externally_owned_memory
 ) :
     descriptor(descriptor),
     mappedMemory(mapped_buffer),
     buffer_(std::move(buffer)),
-    flags_(flags) {
+    flags_(flags),
+    externally_owned_memory_(externally_owned_memory) {
   auto info_copy = info;
   obj_ = buffer_.newTexture(info_copy, 0, bytes_per_row);
 
@@ -180,9 +181,19 @@ TextureAllocation::TextureAllocation(
 };
 
 TextureAllocation::~TextureAllocation(){
-#ifdef __i386__
-  wsi::aligned_free(mappedMemory);
-#endif
+  // Free the caller-supplied host backing on both archs: wrapBuffer's
+  // caller (d3d9 buffer-backed) does wsi::aligned_malloc unconditionally
+  // and hands the page to us as owner-of-record. The legacy "skip free
+  // unless __i386__" guard was correct for allocate(): there x86_64
+  // leaves buffer_info.memory null and Metal owns the host backing, so
+  // mappedMemory is null and free is a no-op; but it leaks the page
+  // for the wrapBuffer path on x86_64 builds. aligned_free(nullptr)
+  // is a no-op (both _aligned_free and free), so it's safe to drop the
+  // guard entirely. The externally_owned_memory_ branch stays as
+  // scaffolding for a future pool-donation hook (caller reclaims the
+  // page): no caller flips it today.
+  if (!externally_owned_memory_)
+    wsi::aligned_free(mappedMemory);
 };
 
 void
@@ -243,6 +254,15 @@ Texture::Texture(const WMTTextureInfo &descriptor, WMT::Device device) :
       .miplevelCount = info_.mipmap_level_count,
       .firstArraySlice = 0,
       .arraySize = arrayLength(),
+      // The default fullView inherits the parent texture's intended
+      // usage. Metal's newTextureView with a swizzle parameter can
+      // silently strip usage flags (e.g. RenderTarget) from the view's
+      // MTLTexture; TextureView's ctor has a workaround that substitutes
+      // the parent texture when (intendedUsage & RT) and the view lost
+      // RT, but that workaround only fires when intendedUsage carries
+      // the bit. Without this default, d3d9's `fullView` produces a view
+      // missing RT usage and the RenderPass guard correctly rejects it.
+      .intendedUsage = info_.usage,
   });
   fullView = TextureViewKey(viewDescriptors_[0], 0, info_.mipmap_level_count);
 }
@@ -267,13 +287,24 @@ Texture::Texture(
       .miplevelCount = 1,
       .firstArraySlice = 0,
       .arraySize = 1,
+      // Buffer-backed textures inherit the parent's intended usage on
+      // the default view for the same reason as the GPU-backed ctor
+      // above: TextureView's RT-workaround branch only fires when
+      // intendedUsage carries the bit.
+      .intendedUsage = info_.usage,
   });
   fullView = TextureViewKey(viewDescriptors_[0], 0, info_.mipmap_level_count);
 }
 
 Rc<TextureAllocation>
 Texture::allocate(Flags<TextureAllocationFlag> flags) {
-  WMTResourceOptions options = WMTResourceHazardTrackingModeUntracked;
+  // Default hazard tracking (was forced Untracked). Render-to-texture
+  // followed by sample-from-texture in a later encoder requires a
+  // barrier that Untracked mode doesn't insert; MTL_SHADER_VALIDATION=1
+  // masks the symptom because the validation layer's instrumentation
+  // implicitly forces synchronization. Auto-tracking resolves it without
+  // per-call barriers.
+  WMTResourceOptions options = (WMTResourceOptions)0;
   WMTTextureInfo info = info_; // copy
   info.mach_port = 0;
   if (flags.test(TextureAllocationFlag::CpuWriteCombined)) {
@@ -287,6 +318,19 @@ Texture::allocate(Flags<TextureAllocationFlag> flags) {
   }
   if (flags.test(TextureAllocationFlag::PlacementSparse)) {
     info.reserved |= WMTTextureInfoFlagPlacementSparse;
+  }
+  // Memoryless wins on transient render-targets: never spills to DRAM,
+  // contents only live on the tile while the encoder owns it. Apple TBDR
+  // best practice for Discard depth/stencil + MSAA color. Overrides the
+  // CpuInvisible Private if both happen to be set (callers shouldn't mix,
+  // but Memoryless is the stricter mode that subsumes the no-CPU-mapping
+  // intent of Private).
+  if (flags.test(TextureAllocationFlag::Memoryless)) {
+    options = static_cast<WMTResourceOptions>(
+        (static_cast<uint64_t>(options) &
+         ~static_cast<uint64_t>(WMTResourceStorageModePrivate | WMTResourceStorageModeManaged)) |
+        static_cast<uint64_t>(WMTResourceStorageModeMemoryless)
+    );
   }
   info.options = options;
   if (bytes_per_image_) {
@@ -342,6 +386,41 @@ Texture::allocatePlaced(WMT::Heap heap, uint64_t offset,
   if (!texture)
     return nullptr;
   return new TextureAllocation(this, std::move(texture), info, flags);
+}
+
+Rc<TextureAllocation>
+Texture::wrapBuffer(
+    WMT::Reference<WMT::Buffer> buffer, void *mapped, Flags<TextureAllocationFlag> flags
+) {
+  // Only valid for buffer-backed Textures (constructed with the
+  // bytes_per_image/bytes_per_row ctor): the bytes_per_row is what
+  // newTexture-on-buffer uses to lay out the texture view.
+  assert(bytes_per_image_ != 0);
+  // Mirror allocate()'s flag→options mapping so the WMTTextureInfo we
+  // pass to TextureAllocation matches the WMTResourceOptions the
+  // caller's newBuffer was already configured with. Untracked is not
+  // exposed here for the same reason as allocate(): d3d9's buffer-
+  // backed path samples after blit-encoder generateMipmaps /
+  // replaceRegion, which needs the Tracked default barrier.
+  WMTResourceOptions options = (WMTResourceOptions)0;
+  if (flags.test(TextureAllocationFlag::CpuWriteCombined))
+    options |= WMTResourceOptionCPUCacheModeWriteCombined;
+  if (flags.test(TextureAllocationFlag::CpuInvisible))
+    options |= WMTResourceStorageModePrivate;
+  if (flags.test(TextureAllocationFlag::GpuManaged))
+    options |= WMTResourceStorageModeManaged;
+  WMTTextureInfo info = info_;
+  info.mach_port = 0;
+  info.options = options;
+  // externally_owned_memory_ stays false (default): the allocation
+  // takes ownership of `mapped` and frees it unconditionally in the dtor.
+  // Pool-style donation back to the caller is unsafe so long as
+  // in-flight chunks may still retain this allocation via the chunk
+  // ref_tracker: that's precisely the lifetime gap this whole
+  // refactor closes. A future hook on TextureAllocation destruction
+  // (which fires after the last ref_tracker release) can re-introduce
+  // donation safely; doing it from MTLD3D9Texture's dtor cannot.
+  return new TextureAllocation(this, std::move(buffer), mapped, info, bytes_per_row_, flags);
 }
 
 Rc<TextureAllocation>
@@ -499,6 +578,38 @@ TextureViewKey Texture::checkViewUseFormat(TextureViewKey key, WMTPixelFormat fo
   if (unlikely(view.format != format)) {
     auto new_view_desc = view;
     new_view_desc.format = format;
+    return createView(new_view_desc);
+  }
+  return key;
+}
+
+TextureViewKey Texture::checkViewUseSwizzle(TextureViewKey key, WMTTextureSwizzleChannels swizzle) {
+  std::shared_lock<dxmt::shared_mutex> shared_lock(mutex_);
+  auto view = viewDescriptors_[key.index];
+  shared_lock = {};
+  if (unlikely(
+          view.swizzle.r != swizzle.r || view.swizzle.g != swizzle.g || view.swizzle.b != swizzle.b ||
+          view.swizzle.a != swizzle.a
+      )) {
+    auto new_view_desc = view;
+    new_view_desc.swizzle = swizzle;
+    // A swizzled view exists to be sampled; drop the render-target intent
+    // so TextureView's lost-RT workaround never substitutes the parent
+    // texture (which would silently discard the swizzle).
+    new_view_desc.intendedUsage = WMTTextureUsage(new_view_desc.intendedUsage & ~WMTTextureUsageRenderTarget);
+    return createView(new_view_desc);
+  }
+  return key;
+}
+
+TextureViewKey Texture::checkViewUseMipRange(TextureViewKey key, uint32_t firstMiplevel, uint32_t miplevelCount) {
+  std::shared_lock<dxmt::shared_mutex> shared_lock(mutex_);
+  auto view = viewDescriptors_[key.index];
+  shared_lock = {};
+  if (unlikely(view.firstMiplevel != firstMiplevel || view.miplevelCount != miplevelCount)) {
+    auto new_view_desc = view;
+    new_view_desc.firstMiplevel = firstMiplevel;
+    new_view_desc.miplevelCount = miplevelCount;
     return createView(new_view_desc);
   }
   return key;
