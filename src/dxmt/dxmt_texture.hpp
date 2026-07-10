@@ -21,6 +21,12 @@ enum class TextureAllocationFlag : uint32_t {
   Shared = 5,
   ShaderReadonly = 6,
   PlacementSparse = 7,
+  // Apple TBDR tile-local storage: render-target contents live only on
+  // the GPU tile, never in DRAM. Wins on transient depth/stencil + MSAA
+  // color where the contents are produced and consumed within one
+  // render pass and don't need to survive past it. Caller must use
+  // DontCare load/store actions at the render-pass layer.
+  Memoryless = 8,
 };
 
 struct TextureViewDescriptor {
@@ -129,6 +135,17 @@ public:
     return obj_;
   }
 
+  // Underlying linear MTLBuffer for buffer-backed allocations (the
+  // bytes_per_image / bytes_per_row Texture ctor produces these). The
+  // d3d9 path needs the buffer handle so its level-0 surface can keep
+  // a separate retain on it for the LockRect contract; Lock returns
+  // the buffer's mapped bytes as pBits and Unlock is a no-op (UMA).
+  // Returns a default-constructed (null) WMT::Buffer for non-buffer-
+  // backed allocations.
+  WMT::Buffer buffer() const {
+    return buffer_;
+  }
+
   Flags<TextureAllocationFlag>
   flags() const {
     return flags_;
@@ -143,7 +160,7 @@ public:
 private:
   TextureAllocation(
       Texture *descriptor, WMT::Reference<WMT::Buffer> &&buffer, void *mapped_buffer, const WMTTextureInfo &info,
-      unsigned bytes_per_row, Flags<TextureAllocationFlag> flags
+      unsigned bytes_per_row, Flags<TextureAllocationFlag> flags, bool externally_owned_memory = false
   );
   TextureAllocation(
       Texture *descriptor, WMT::Reference<WMT::Texture> &&texture, const WMTTextureInfo &textureDescriptor,
@@ -159,6 +176,16 @@ private:
   uint32_t version_ = 0;
   Flags<TextureAllocationFlag> flags_;
   small_vector<TextureViewRef, 4> cached_view_;
+  // Scaffolding for a future pool-donation hook. When true, the dtor
+  // skips wsi::aligned_free on mappedMemory because the caller has
+  // reclaimed the page (e.g. for re-vending through a device-level
+  // reuse pool). No call site sets this today; wrapBuffer always
+  // hands ownership to the allocation, which frees on drop. Donating
+  // safely needs the donation to fire AFTER the last ref_tracker
+  // release. Donating from a texture wrapper destructor is unsafe
+  // under the unified path because the ref_tracker may still hold
+  // views into the allocation at that point.
+  bool externally_owned_memory_ = false;
 };
 
 class Texture {
@@ -207,6 +234,17 @@ public:
   WMTTextureUsage
   usage() const {
     return info_.usage;
+  }
+
+  // Fix 5 (d3d9 one-shot render-target guard): a process-monotonic,
+  // never-reused creation serial. The d3d9 encode-thread RT-recency sets key
+  // on this rather than the raw Texture* so a freed-then-realloced Texture at
+  // the same address gets a fresh serial and cannot alias into a false
+  // "recently drawn" match (which would re-open the very one-shot-RTT hole the
+  // guard closes). Inert for non-d3d9 callers.
+  uint64_t
+  serial() const {
+    return creation_serial_;
   }
 
   unsigned
@@ -271,6 +309,21 @@ public:
                                        Flags<TextureAllocationFlag> flags);
   Rc<TextureAllocation> import(mach_port_t mach_port);
 
+  // Buffer-backed allocation that adopts a caller-supplied (buffer,
+  // mapped) pair instead of calling device_.newBuffer(). Only valid on
+  // a Texture constructed via the buffer-backed ctor below (i.e. where
+  // bytes_per_image was supplied). The returned allocation owns both
+  // the buffer (its WMT::Reference is moved in) and the mapped page
+  // (freed via wsi::aligned_free on drop), and stays alive across
+  // chunk encode → GPU completion via the chunk ref_tracker. Used by
+  // d3d9's buffer-backed CreateTexture where LockRect must hand the
+  // i386 game its 32-bit-addressable pBits; the caller does the
+  // wsi::aligned_malloc + newBuffer itself (it may pool-acquire
+  // instead of malloc) and passes the pair through here.
+  Rc<TextureAllocation> wrapBuffer(
+      WMT::Reference<WMT::Buffer> buffer, void *mapped, Flags<TextureAllocationFlag> flags
+  );
+
   TextureView &view(TextureViewKey key);
   TextureView &view(TextureViewKey key, TextureAllocation *allocation);
   uint64_t setViewPoolSlot(WMT::TextureViewPool pool, TextureViewKey key,
@@ -278,6 +331,14 @@ public:
 
   TextureViewKey checkViewUseArray(TextureViewKey key, bool isArray);
   TextureViewKey checkViewUseFormat(TextureViewKey key, WMTPixelFormat format);
+  // Derive a view that applies a per-channel sample swizzle (d3d9
+  // X-channel / luminance / depth-replicate formats). Returns `key`
+  // unchanged when the swizzle already matches. See checkViewUseFormat.
+  TextureViewKey checkViewUseSwizzle(TextureViewKey key, WMTTextureSwizzleChannels swizzle);
+  // Derive a view clamped to mips [firstMiplevel, firstMiplevel+count).
+  // d3d9 SetLOD(N) clamps sampling to mips N..(level_count-1). Returns
+  // `key` unchanged when the range already matches.
+  TextureViewKey checkViewUseMipRange(TextureViewKey key, uint32_t firstMiplevel, uint32_t miplevelCount);
 
   Rc<TextureAllocation> rename(Rc<TextureAllocation> &&newAllocation);
 
@@ -290,9 +351,20 @@ private:
   uint64_t diagnostic_identity_ = 0;
   void prepareAllocationViews(TextureAllocation* allocation);
 
+  // See serial(). Assigned once at construction from a process-wide monotonic
+  // counter; relaxed fetch_add is enough since the recency key needs
+  // uniqueness, not ordering. Both ctors pick it up via the member's default
+  // initializer below.
+  static uint64_t
+  nextCreationSerial() {
+    static std::atomic<uint64_t> counter{1};
+    return counter.fetch_add(1, std::memory_order_relaxed);
+  }
+
   WMTTextureInfo info_;
   uint64_t bytes_per_image_ = 0;
   uint32_t bytes_per_row_ = 0;
+  uint64_t creation_serial_ = nextCreationSerial();
 
   Rc<TextureAllocation> current_;
   std::atomic<uint32_t> refcount_ = {0u};
