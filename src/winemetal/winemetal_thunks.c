@@ -1041,6 +1041,22 @@ SharedEventListener_destroy(obj_handle_t event_queue) {
 }
 
 WINEMETAL_API void
+WMTQueryThreadCounters(struct WMTThreadCounters *out) {
+  struct unixcall_query_thread_counters params;
+  UNIX_CALL(156, &params);
+  if (!out)
+    return;
+  out->thread_user_us = params.ret_thread_user_us;
+  out->thread_system_us = params.ret_thread_system_us;
+  out->task_faults = params.ret_task_faults;
+  out->task_pageins = params.ret_task_pageins;
+  out->task_cow_faults = params.ret_task_cow_faults;
+  out->vm_zero_fill_count = params.ret_vm_zero_fill_count;
+  out->vm_reactivations = params.ret_vm_reactivations;
+  out->valid = params.ret_valid;
+}
+
+WINEMETAL_API void
 WMTGetOSVersion(uint64_t *major, uint64_t *minor, uint64_t *patch) {
   struct unixcall_get_os_version params;
   UNIX_CALL(115, &params);

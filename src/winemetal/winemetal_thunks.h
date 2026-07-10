@@ -428,6 +428,21 @@ struct unixcall_mtlcommandbuffer_blitcommandencoderwithsamplebuffers {
   obj_handle_t ret;
 };
 
+// All fields fixed width, so the layout is identical for the 32 and 64 bit
+// callers that share this header.
+struct unixcall_query_thread_counters {
+  uint64_t ret_thread_user_us;
+  uint64_t ret_thread_system_us;
+  uint64_t ret_task_faults;
+  uint64_t ret_task_pageins;
+  uint64_t ret_task_cow_faults;
+  uint64_t ret_vm_zero_fill_count;
+  uint64_t ret_vm_reactivations;
+  // Bit per source that answered: thread, task, host. A zero bit means the
+  // corresponding fields are untouched rather than genuinely zero.
+  uint64_t ret_valid;
+};
+
 #pragma pack(pop)
 
 #endif
