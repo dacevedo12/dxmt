@@ -688,6 +688,22 @@ public:
 
   void SetMaxLatency(uint32_t value) { max_latency_ = value; };
 
+  // Highest frame seq whose present chunk has retired, signaled on the frame
+  // latency fence. d3d9's D3DPRESENT_DONOTWAIT probe peeks this to decide
+  // whether the end-of-Present frame-latency throttle would block, and returns
+  // D3DERR_WASSTILLDRAWING instead of entering the wait.
+  uint64_t FrameLatencySignaled() { return frame_latency_fence_.signaledValue(); }
+
+  // Block until the present chunk from max_latency frames back has retired,
+  // capping how far the calling thread runs ahead of the GPU. Present pacing is
+  // applied per frontend rather than in PresentBoundary; the other back ends
+  // pace through their own swapchain fence or present semaphore, so d3d9 rides
+  // the frame-latency fence it stamps on each present chunk.
+  void WaitFrameLatency(uint64_t frame_seq) {
+    if (frame_seq > max_latency_)
+      frame_latency_fence_.wait(frame_seq - max_latency_);
+  }
+
   void
   WaitCPUFence(uint64_t seq);
 

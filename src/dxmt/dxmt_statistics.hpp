@@ -545,6 +545,83 @@ struct FrameStatistics {
   uint64_t frame_descriptor_content_write_copy = 0;
   uint64_t frame_descriptor_content_write_feedback_uav = 0;
   ScalerInfo last_scaler_info{};
+  // Appended after last_scaler_info: FrameStatistics lives in the shared dxmt
+  // static library and d3d11/d3d12 read the fields above across the link
+  // boundary, so a new field must not shift an existing field's offset.
+  clock::duration frame_wall_interval{};
+  // Frontend cost, appended under the same ABI rule. The counters above are
+  // encoder-level: they begin once a chunk exists. These cover what a D3D entry
+  // point charges the calling thread before that point (a Lock that must wait
+  // out the GPU, a staging upload, sealing the per-frame rings at the chunk
+  // boundary, per-draw capture) and the encode thread's per-draw cost of
+  // turning a captured draw into commands. Without them a frame's wall time is
+  // only attributable from the chunk boundary onward, so a stall in an entry
+  // point reads as unaccounted. Note frame_chunk_commit_interval covers the
+  // whole commit entry point, of which the older commit_interval times only the
+  // ring backpressure wait. Both are reported: on a d3d9 workload the wait is a
+  // rounding error next to the entry point total, so collapsing them would hide
+  // wherever the rest of that time goes.
+  // The two groups are written by different threads and are kept disjoint for
+  // that reason: the calling thread owns everything down to the poll counters,
+  // the encode thread owns only the draw resolve and emit intervals (and the
+  // pipeline compile wait above). No field takes writes from both, so these
+  // stay plain like the rest of the struct.
+  clock::duration frame_resource_lock_interval{};
+  clock::duration frame_staging_upload_interval{};
+  clock::duration frame_chunk_commit_interval{};
+  clock::duration frame_draw_record_interval{};
+  clock::duration frame_draw_resolve_interval{};
+  clock::duration frame_draw_emit_interval{};
+  uint64_t frame_resource_lock_count = 0;
+  uint64_t frame_staging_upload_bytes = 0;
+  uint64_t frame_chunk_commit_count = 0;
+  uint64_t frame_draw_resolve_count = 0;
+  // Entry counts for two intervals that predate these fields. An interval
+  // alone cannot tell one expensive event from a churn of cheap ones, which
+  // is the distinction that decides whether to optimize the operation or the
+  // call rate. The compile wait counts only draws that actually blocked, not
+  // the readiness probe every draw pays.
+  uint64_t frame_create_resource_count = 0;
+  uint64_t frame_pso_compile_wait_count = 0;
+  // Draws counted where the app issues them, which is a different population
+  // from render_draw_count above: that one counts the Metal draw commands the
+  // encode thread emits, so it excludes draws that batching merged and draws
+  // dropped for a failed pipeline link. Being written on the calling thread it
+  // also lands on the present-boundary report, where the encode-thread counts
+  // are not written yet, so a per-draw cost for the frame is computable from a
+  // single record instead of joining two.
+  uint64_t frame_draw_issue_count = 0;
+  // CPU the calling thread actually consumed over the frame, against which the
+  // frame wall can be split three ways. Wall far above user+kernel means the
+  // thread was not running at all, so the cost is a block and not work, and the
+  // thread is parked in a syscall where its stack can still be walked. Wall
+  // tracking kernel means time in fault handling; wall tracking user means
+  // execution. An interval alone cannot tell those apart, and every bucket
+  // above measures wall. The source is the platform's per-thread CPU clock,
+  // which quantizes to about 10ms, so these say nothing about a frame that ran
+  // to schedule and are meant for the multi-hundred-millisecond outliers where
+  // the split is the whole question.
+  clock::duration frame_thread_user_interval{};
+  clock::duration frame_thread_kernel_interval{};
+  // Faults taken over the frame. Kernel time on its own says the thread was in
+  // the kernel but not why; a fault count that moves with it says the kernel
+  // time is fault handling. The zero fill share is the discriminator that
+  // matters: faults that zero a page are commit or first touch, faults that do
+  // not are protection faults on pages that were already resident, and those
+  // two want completely different fixes. Host zero fill counts other processes
+  // too, so read its rate within a burst rather than its absolute value.
+  uint64_t frame_task_fault_count = 0;
+  uint64_t frame_task_pagein_count = 0;
+  uint64_t frame_task_cow_fault_count = 0;
+  uint64_t frame_host_zero_fill_count = 0;
+  // Entry points an app polls rather than does work in. A frame that spends its
+  // wall clock here is waiting on us, so a high poll count next to a low draw
+  // count separates app spin from translation cost.
+  uint64_t frame_query_get_data_count = 0;
+  uint64_t frame_query_get_data_pending_count = 0;
+  uint64_t frame_query_issue_count = 0;
+  uint64_t frame_raster_status_poll_count = 0;
+  uint64_t frame_device_status_poll_count = 0;
 
   void
   reset() {
@@ -892,6 +969,31 @@ struct FrameStatistics {
     frame_descriptor_content_write_copy = 0;
     frame_descriptor_content_write_feedback_uav = 0;
     last_scaler_info.type = {};
+    frame_wall_interval = {};
+    frame_resource_lock_interval = {};
+    frame_staging_upload_interval = {};
+    frame_chunk_commit_interval = {};
+    frame_draw_record_interval = {};
+    frame_draw_resolve_interval = {};
+    frame_draw_emit_interval = {};
+    frame_resource_lock_count = 0;
+    frame_staging_upload_bytes = 0;
+    frame_chunk_commit_count = 0;
+    frame_draw_resolve_count = 0;
+    frame_create_resource_count = 0;
+    frame_pso_compile_wait_count = 0;
+    frame_draw_issue_count = 0;
+    frame_thread_user_interval = {};
+    frame_thread_kernel_interval = {};
+    frame_task_fault_count = 0;
+    frame_task_pagein_count = 0;
+    frame_task_cow_fault_count = 0;
+    frame_host_zero_fill_count = 0;
+    frame_query_get_data_count = 0;
+    frame_query_get_data_pending_count = 0;
+    frame_query_issue_count = 0;
+    frame_raster_status_poll_count = 0;
+    frame_device_status_poll_count = 0;
   };
 };
 
@@ -1327,6 +1429,31 @@ public:
       average_.frame_descriptor_content_write_sampler += frames_[i].frame_descriptor_content_write_sampler;
       average_.frame_descriptor_content_write_copy += frames_[i].frame_descriptor_content_write_copy;
       average_.frame_descriptor_content_write_feedback_uav += frames_[i].frame_descriptor_content_write_feedback_uav;
+      average_.frame_wall_interval += frames_[i].frame_wall_interval;
+      average_.frame_resource_lock_interval += frames_[i].frame_resource_lock_interval;
+      average_.frame_staging_upload_interval += frames_[i].frame_staging_upload_interval;
+      average_.frame_chunk_commit_interval += frames_[i].frame_chunk_commit_interval;
+      average_.frame_draw_record_interval += frames_[i].frame_draw_record_interval;
+      average_.frame_draw_resolve_interval += frames_[i].frame_draw_resolve_interval;
+      average_.frame_draw_emit_interval += frames_[i].frame_draw_emit_interval;
+      average_.frame_resource_lock_count += frames_[i].frame_resource_lock_count;
+      average_.frame_staging_upload_bytes += frames_[i].frame_staging_upload_bytes;
+      average_.frame_chunk_commit_count += frames_[i].frame_chunk_commit_count;
+      average_.frame_draw_resolve_count += frames_[i].frame_draw_resolve_count;
+      average_.frame_create_resource_count += frames_[i].frame_create_resource_count;
+      average_.frame_pso_compile_wait_count += frames_[i].frame_pso_compile_wait_count;
+      average_.frame_draw_issue_count += frames_[i].frame_draw_issue_count;
+      average_.frame_thread_user_interval += frames_[i].frame_thread_user_interval;
+      average_.frame_thread_kernel_interval += frames_[i].frame_thread_kernel_interval;
+      average_.frame_task_fault_count += frames_[i].frame_task_fault_count;
+      average_.frame_task_pagein_count += frames_[i].frame_task_pagein_count;
+      average_.frame_task_cow_fault_count += frames_[i].frame_task_cow_fault_count;
+      average_.frame_host_zero_fill_count += frames_[i].frame_host_zero_fill_count;
+      average_.frame_query_get_data_count += frames_[i].frame_query_get_data_count;
+      average_.frame_query_get_data_pending_count += frames_[i].frame_query_get_data_pending_count;
+      average_.frame_query_issue_count += frames_[i].frame_query_issue_count;
+      average_.frame_raster_status_poll_count += frames_[i].frame_raster_status_poll_count;
+      average_.frame_device_status_poll_count += frames_[i].frame_device_status_poll_count;
     }
     average_.command_buffer_count /= (kFrameStatisticsCount - 1);
     average_.render_pass_count /= (kFrameStatisticsCount - 1);
@@ -1678,6 +1805,31 @@ public:
     average_.frame_descriptor_content_write_sampler /= (kFrameStatisticsCount - 1);
     average_.frame_descriptor_content_write_copy /= (kFrameStatisticsCount - 1);
     average_.frame_descriptor_content_write_feedback_uav /= (kFrameStatisticsCount - 1);
+    average_.frame_wall_interval /= (kFrameStatisticsCount - 1);
+    average_.frame_resource_lock_interval /= (kFrameStatisticsCount - 1);
+    average_.frame_staging_upload_interval /= (kFrameStatisticsCount - 1);
+    average_.frame_chunk_commit_interval /= (kFrameStatisticsCount - 1);
+    average_.frame_draw_record_interval /= (kFrameStatisticsCount - 1);
+    average_.frame_draw_resolve_interval /= (kFrameStatisticsCount - 1);
+    average_.frame_draw_emit_interval /= (kFrameStatisticsCount - 1);
+    average_.frame_resource_lock_count /= (kFrameStatisticsCount - 1);
+    average_.frame_staging_upload_bytes /= (kFrameStatisticsCount - 1);
+    average_.frame_chunk_commit_count /= (kFrameStatisticsCount - 1);
+    average_.frame_draw_resolve_count /= (kFrameStatisticsCount - 1);
+    average_.frame_create_resource_count /= (kFrameStatisticsCount - 1);
+    average_.frame_pso_compile_wait_count /= (kFrameStatisticsCount - 1);
+    average_.frame_draw_issue_count /= (kFrameStatisticsCount - 1);
+    average_.frame_thread_user_interval /= (kFrameStatisticsCount - 1);
+    average_.frame_thread_kernel_interval /= (kFrameStatisticsCount - 1);
+    average_.frame_task_fault_count /= (kFrameStatisticsCount - 1);
+    average_.frame_task_pagein_count /= (kFrameStatisticsCount - 1);
+    average_.frame_task_cow_fault_count /= (kFrameStatisticsCount - 1);
+    average_.frame_host_zero_fill_count /= (kFrameStatisticsCount - 1);
+    average_.frame_query_get_data_count /= (kFrameStatisticsCount - 1);
+    average_.frame_query_get_data_pending_count /= (kFrameStatisticsCount - 1);
+    average_.frame_query_issue_count /= (kFrameStatisticsCount - 1);
+    average_.frame_raster_status_poll_count /= (kFrameStatisticsCount - 1);
+    average_.frame_device_status_poll_count /= (kFrameStatisticsCount - 1);
   };
 };
 

@@ -144,6 +144,9 @@ struct Counters {
   std::atomic<uint64_t> avg_encoder_switches = {0};
   std::atomic<uint64_t> avg_flush_us = {0};
   std::atomic<uint64_t> avg_commit_us = {0};
+  std::atomic<uint64_t> avg_frame_wall_us = {0};
+  std::atomic<uint64_t> avg_drawable_block_us = {0};
+  std::atomic<uint64_t> avg_present_latency_us = {0};
 };
 
 Counters g_counters;
@@ -510,6 +513,8 @@ void flushCounters(uint64_t frame, bool final) {
                   " frameWallUs=", sample(g_counters.frame_wall_us),
                   " frameWallMaxUs=",
                   sample(g_counters.frame_wall_max_us),
+                  " frameWallAvgUs=",
+                  sample(g_counters.avg_frame_wall_us),
                   " frameCmdBufs=",
                   sample(g_counters.frame_command_buffers),
                   " frameCmdBufsMax=",
@@ -631,7 +636,11 @@ void flushCounters(uint64_t frame, bool final) {
                   " avgEncoderSwitches=",
                   sample(g_counters.avg_encoder_switches),
                   " avgFlushUs=", sample(g_counters.avg_flush_us),
-                  " avgCommitUs=", sample(g_counters.avg_commit_us)));
+                  " avgCommitUs=", sample(g_counters.avg_commit_us),
+                  " avgDrawableBlockUs=",
+                  sample(g_counters.avg_drawable_block_us),
+                  " avgPresentLatencyUs=",
+                  sample(g_counters.avg_present_latency_us)));
 }
 
 void maybeFlush(uint64_t frame) {
@@ -929,6 +938,23 @@ void recordFrameBoundary(uint64_t frame, const FrameStatistics &frame_stats,
       durationUs(frame_stats.frame_tile_mapping_interval);
   const auto cmdlist_record_us =
       durationUs(frame_stats.frame_cmdlist_record_interval);
+  const auto resource_lock_us =
+      durationUs(frame_stats.frame_resource_lock_interval);
+  const auto staging_upload_us =
+      durationUs(frame_stats.frame_staging_upload_interval);
+  const auto chunk_commit_us =
+      durationUs(frame_stats.frame_chunk_commit_interval);
+  const auto draw_record_us =
+      durationUs(frame_stats.frame_draw_record_interval);
+  const auto draw_resolve_us =
+      durationUs(frame_stats.frame_draw_resolve_interval);
+  const auto draw_emit_us = durationUs(frame_stats.frame_draw_emit_interval);
+  // Calling-thread frontend cost only. The encode-thread halves (resolve,
+  // emit) run off the app's thread, so folding them in would double-count
+  // against the frame wall.
+  const auto frontend_known_us = resource_lock_us + staging_upload_us +
+                                 chunk_commit_us + draw_record_us +
+                                 create_resource_us + cmdlist_record_us;
   const auto present_latency_wait_us =
       durationUs(frame_stats.present_latency_interval);
   const auto drawable_blocking_us =
@@ -1275,6 +1301,14 @@ void recordFrameBoundary(uint64_t frame, const FrameStatistics &frame_stats,
                                 std::memory_order_relaxed);
   g_counters.avg_commit_us.store(durationUs(average_stats.commit_interval),
                                  std::memory_order_relaxed);
+  g_counters.avg_frame_wall_us.store(
+      durationUs(average_stats.frame_wall_interval), std::memory_order_relaxed);
+  g_counters.avg_drawable_block_us.store(
+      durationUs(average_stats.drawable_blocking_interval),
+      std::memory_order_relaxed);
+  g_counters.avg_present_latency_us.store(
+      durationUs(average_stats.present_latency_interval),
+      std::memory_order_relaxed);
 
   Logger::logFileOnly(
       LogLevel::Info,
@@ -1794,6 +1828,53 @@ void recordFrameBoundary(uint64_t frame, const FrameStatistics &frame_stats,
                   " createPipelineUs=", create_pipeline_us,
                   " tileMappingUs=", tile_mapping_us,
                   " cmdlistRecordVectorAppendUs=", cmdlist_record_us,
+                  " resourceLockUs=", resource_lock_us,
+                  " resourceLockCount=",
+                  frame_stats.frame_resource_lock_count,
+                  " stagingUploadUs=", staging_upload_us,
+                  " stagingUploadBytes=",
+                  frame_stats.frame_staging_upload_bytes,
+                  " chunkCommitUs=", chunk_commit_us,
+                  " chunkCommitCount=", frame_stats.frame_chunk_commit_count,
+                  " drawRecordUs=", draw_record_us,
+                  " drawIssueCount=", frame_stats.frame_draw_issue_count,
+                  " taskFaults=", frame_stats.frame_task_fault_count,
+                  " taskPageins=", frame_stats.frame_task_pagein_count,
+                  " taskCowFaults=", frame_stats.frame_task_cow_fault_count,
+                  " hostZeroFills=", frame_stats.frame_host_zero_fill_count,
+                  " threadUserUs=",
+                  durationUs(frame_stats.frame_thread_user_interval),
+                  " threadKernelUs=",
+                  durationUs(frame_stats.frame_thread_kernel_interval),
+                  " threadOffCpuUs=",
+                  pre_present_wall_us >
+                          durationUs(frame_stats.frame_thread_user_interval) +
+                              durationUs(frame_stats.frame_thread_kernel_interval)
+                      ? pre_present_wall_us -
+                            durationUs(frame_stats.frame_thread_user_interval) -
+                            durationUs(frame_stats.frame_thread_kernel_interval)
+                      : 0,
+                  " drawResolveUs=", draw_resolve_us,
+                  " drawResolveCount=", frame_stats.frame_draw_resolve_count,
+                  " createResourceCount=",
+                  frame_stats.frame_create_resource_count,
+                  " psoCompileWaitCount=",
+                  frame_stats.frame_pso_compile_wait_count,
+                  " drawEmitUs=", draw_emit_us,
+                  " frontendKnownUs=", frontend_known_us,
+                  " frontendUnattributedUs=",
+                  pre_present_wall_us > frontend_known_us
+                      ? pre_present_wall_us - frontend_known_us
+                      : 0,
+                  " queryGetDataCount=",
+                  frame_stats.frame_query_get_data_count,
+                  " queryGetDataPendingCount=",
+                  frame_stats.frame_query_get_data_pending_count,
+                  " queryIssueCount=", frame_stats.frame_query_issue_count,
+                  " rasterStatusPollCount=",
+                  frame_stats.frame_raster_status_poll_count,
+                  " deviceStatusPollCount=",
+                  frame_stats.frame_device_status_poll_count,
                   " presentLatencyWaitUs=", present_latency_wait_us,
                   " asyncDrawableBlockingUs=", drawable_blocking_us,
                   " asyncFlushUs=", flush_us,
@@ -2500,7 +2581,16 @@ void recordGpuFrameEncodeBreakdown(uint64_t frame,
           " computeDispatches=", stats.compute_dispatch_count,
           " blitPasses=", stats.blit_pass_count,
           " flushEncoders=", stats.flush_encoder_count,
-          " encodedEncoders=", stats.flush_encoded_encoder_count));
+          " encodedEncoders=", stats.flush_encoded_encoder_count,
+          // Per-draw encode cost. Also present on the frame line, but that
+          // one is emitted at the present boundary, which the encode thread
+          // has usually not reached yet; read these here.
+          " drawResolveUs=", durationUs(stats.frame_draw_resolve_interval),
+          " drawResolveCount=", stats.frame_draw_resolve_count,
+          " drawEmitUs=", durationUs(stats.frame_draw_emit_interval),
+          " psoCompileWaitUs=",
+          durationUs(stats.frame_pso_compile_wait_interval),
+          " psoCompileWaitCount=", stats.frame_pso_compile_wait_count));
 }
 
 void recordDrawableAcquire(uint64_t duration_us) {

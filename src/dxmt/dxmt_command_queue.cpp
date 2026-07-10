@@ -106,11 +106,16 @@ DxmtQueueDiagDurationUs(clock::duration duration) {
   return std::chrono::duration_cast<std::chrono::microseconds>(duration).count();
 }
 
+static clock::duration
+DxmtQueueDiagElapsed(clock::time_point start, clock::time_point end) {
+  if (start == clock::time_point{} || end == clock::time_point{} || end < start)
+    return clock::duration{};
+  return end - start;
+}
+
 static double
 DxmtQueueDiagElapsedMs(clock::time_point start, clock::time_point end) {
-  if (start == clock::time_point{} || end == clock::time_point{} || end < start)
-    return 0.0;
-  return DxmtQueueDiagDurationMs(end - start);
+  return DxmtQueueDiagDurationMs(DxmtQueueDiagElapsed(start, end));
 }
 
 static double
@@ -844,6 +849,7 @@ CommandQueue::FlushFinalFrameStatistics() {
     return;
 
   const auto boundary_time = clock::now();
+  frame.frame_wall_interval = DxmtQueueDiagElapsed(frame.begin_time, boundary_time);
   statistics.compute(frame_count);
   const auto frame_wall_us = frame.begin_time == clock::time_point{}
                                  ? 0
@@ -953,6 +959,12 @@ void
 CommandQueue::PresentBoundary() {
   const auto frame_begin_time = statistics.at(frame_count).begin_time;
   const auto boundary_time = clock::now();
+  // Present-to-Present wall time of the frame that just ended. Guarded because
+  // begin_time is only stamped after the first boundary, so frame 1 would
+  // otherwise contribute time-since-boot. Recorded into the ending frame's ring
+  // slot so it feeds the windowed average like the other per-frame intervals.
+  const auto frame_wall = DxmtQueueDiagElapsed(frame_begin_time, boundary_time);
+  statistics.at(frame_count).frame_wall_interval = frame_wall;
   statistics.compute(frame_count);
   if (DxmtQueueDiagEnabled()) {
     const auto &frame = statistics.at(frame_count);
