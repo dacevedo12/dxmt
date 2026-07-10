@@ -61,7 +61,9 @@ static void apply_fh4_bad_fiber_data_bypass(void) {
     write_gs_qword(0x20, 0);
 }
 
-BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, LPVOID reserved) {
+
+BOOL WINAPI
+DllMain(HINSTANCE instance, DWORD reason, LPVOID reserved) {
   if (reason != DLL_PROCESS_ATTACH)
     return TRUE;
 
@@ -70,5 +72,4 @@ BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, LPVOID reserved) {
   return !__wine_init_unix_call();
 }
 
-extern BOOL WINAPI DllMainCRTStartup(HANDLE hDllHandle, DWORD dwReason,
-                                       LPVOID lpreserved);
+extern BOOL WINAPI DllMainCRTStartup(HANDLE hDllHandle, DWORD dwReason, LPVOID lpreserved);
