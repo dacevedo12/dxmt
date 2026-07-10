@@ -125,6 +125,8 @@ typedef uint32_t UINT_PTR;
 #endif
 typedef INT_PTR*  PINT_PTR;
 typedef UINT_PTR* PUINT_PTR;
+typedef ULONG_PTR DWORD_PTR;
+typedef DWORD_PTR* PDWORD_PTR;
 
 #ifdef STRICT
 #define DECLARE_HANDLE(a) typedef struct a##__ { int unused; } *a

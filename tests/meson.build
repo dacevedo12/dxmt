@@ -186,3 +186,6 @@ alias_target(
   dxmt_wine_d3d12_tests,
   d3d12_differential_oracle,
 )
+
+# d3d9 host-native, wine-free tests (the 'host' suite CI gate).
+subdir('dx9')
