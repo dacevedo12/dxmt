@@ -28,6 +28,14 @@ enum class BufferAllocationFlag : uint32_t {
   ExternalCpuPlaced = 8,
 };
 
+// Process-wide high-water of live CpuPlaced buffer-allocation bytes. A
+// CpuPlaced allocation registers its app-owned backing with Metal, so on a
+// 32-bit host each live one holds low-4GB address space until its command
+// buffer retires and the last reference drops. Maintained by the allocation
+// ctor/dtor (a relaxed atomic add and sub); read only for diagnostics, and
+// never reset so it survives to device teardown.
+uint64_t cpu_placed_peak_bytes();
+
 typedef uint64_t BufferViewKey;
 
 struct BufferViewDescriptor {

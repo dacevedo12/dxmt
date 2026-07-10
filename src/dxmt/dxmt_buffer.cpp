@@ -12,6 +12,31 @@ namespace dxmt {
 
 std::atomic_uint64_t global_buffer_seq = {0};
 
+// See cpu_placed_peak_bytes (dxmt_buffer.hpp). Live is the sum of the backing
+// bytes of every CpuPlaced allocation currently constructed; peak is its
+// high-water. Both relaxed: the values are advisory diagnostics, not a
+// synchronization edge.
+static std::atomic<uint64_t> g_cpu_placed_live_bytes = {0};
+static std::atomic<uint64_t> g_cpu_placed_peak_bytes = {0};
+
+static void
+noteCpuPlacedAlloc(uint64_t bytes) {
+  uint64_t live = g_cpu_placed_live_bytes.fetch_add(bytes, std::memory_order_relaxed) + bytes;
+  uint64_t peak = g_cpu_placed_peak_bytes.load(std::memory_order_relaxed);
+  while (live > peak && !g_cpu_placed_peak_bytes.compare_exchange_weak(peak, live, std::memory_order_relaxed)) {
+  }
+}
+
+static void
+noteCpuPlacedFree(uint64_t bytes) {
+  g_cpu_placed_live_bytes.fetch_sub(bytes, std::memory_order_relaxed);
+}
+
+uint64_t
+cpu_placed_peak_bytes() {
+  return g_cpu_placed_peak_bytes.load(std::memory_order_relaxed);
+}
+
 static bool
 ShouldLogBufferTextureViewFailure() {
   static std::atomic<uint32_t> count = 0;
@@ -57,6 +82,10 @@ BufferAllocation::BufferAllocation(WMT::Device device, const WMTBufferInfo &info
   mappedMemory_ = flags_.test(BufferAllocationFlag::CpuShadow)
                     ? placed_buffer
                     : info_.memory.get_accessible_or_null();
+  // CpuPlaced registers an app-owned host backing with Metal and so charges
+  // low-4GB address space; count it against the process high-water.
+  if (flags_.test(BufferAllocationFlag::CpuPlaced))
+    noteCpuPlacedAlloc(info_.length);
 };
 
 BufferAllocation::BufferAllocation(
@@ -69,6 +98,8 @@ BufferAllocation::BufferAllocation(
 }
 
 BufferAllocation::~BufferAllocation() {
+  if (flags_.test(BufferAllocationFlag::CpuPlaced))
+    noteCpuPlacedFree(info_.length);
   if (placed_buffer && !flags_.test(BufferAllocationFlag::ExternalCpuPlaced)) {
     wsi::aligned_free(placed_buffer);
     placed_buffer = nullptr;

@@ -5,6 +5,7 @@
 #include "thread.hpp"
 #include "util_env.hpp"
 #include "util_math.hpp"
+#include <cassert>
 #include <cstring>
 #include <functional>
 #include <limits>
@@ -14,7 +15,19 @@
 
 namespace dxmt {
 
+// Default staging block size. 32 MB suits x86_64 / arm64 where the
+// virtual-address space is effectively unbounded; the d3d9 build under
+// Rosetta x86_32 + WoW64 lives inside a 2-3 GB user VA ceiling that a
+// memory-heavy title can approach. Each block is host RAM + Metal
+// address-space registration + a pre-fault memset,
+// so 32 MB per block magnifies VA pressure quickly once the ring grows
+// past a couple of blocks. Drop to 8 MB on i386: rings hold more,
+// smaller blocks; pre-fault cost shrinks proportionally.
+#ifdef __i386__
+constexpr size_t kStagingBlockSize = 0x800000; // 8MB
+#else
 constexpr size_t kStagingBlockSize = 0x2000000; // 32MB
+#endif
 constexpr size_t kStagingBlockSizeForDeferredContext = 0x200000; // 2MB
 constexpr size_t kStagingBlockLifetime = 300;
 constexpr size_t kRingBumpGuardBytes = 64;
@@ -36,7 +49,23 @@ public:
 
   static constexpr size_t block_size = BlockSize;
 
-  RingBumpState(Allocator &&allocator) : allocator_(std::move(allocator)) {}
+  // single_writer engages a DXMT_DEBUG-only assertion that every allocate() /
+  // seal_latest() runs on one fixed thread. Set it only for a ring whose
+  // writer is a single persistent thread (the queue encode thread, e.g.
+  // d3d9's m_constRingResolve). Leave it false otherwise: the d3d9
+  // calling-thread rings (m_constRing / m_uploadRing) are written by whichever
+  // thread drives the API, whose OS id can change across calls under
+  // D3DCREATE_MULTITHREADED (the device lock serialises them), and the shared
+  // queue rings make no single-thread guarantee. free_blocks() and
+  // preallocate() stay outside the check: they may run off the writer thread
+  // under mutex_.
+  RingBumpState(Allocator &&allocator, bool single_writer = false) : allocator_(std::move(allocator)) {
+#ifdef DXMT_DEBUG
+    single_writer_ = single_writer;
+#else
+    (void)single_writer;
+#endif
+  }
 
   std::pair<typename Allocator::Block &, uint64_t>
   allocate(uint64_t seq_id, uint64_t coherent_id, size_t size, size_t alignment);
@@ -48,6 +77,59 @@ public:
           callback) {
     std::lock_guard<mutex> lock(mutex_);
     release_callback_ = std::move(callback);
+  }
+
+  // Pre-allocate `count` blocks of the ring's natural BlockSize and push
+  // them onto the FIFO with last_used_seq_id=0 so the first call to
+  // `allocate` reuses them rather than allocating fresh on the calling
+  // thread. The Rosetta x86_32 first-touch cliff for a 32 MB Metal-
+  // registered buffer is ~1.2 s; without this, that cost lands on a
+  // d3d9 hot-path call (CreateVertexBuffer / DrawIndexedPrimitive) as
+  // a visible stutter. With 2 blocks pre-allocated and GPU completion
+  // recycling them, gameplay never allocates a fresh block.
+  // Call from device construction time, where the cost hides inside
+  // overall game startup. No locks: caller must serialize against
+  // any concurrent `allocate` (typically the device isn't published
+  // yet during ctor).
+  void
+  preallocate(unsigned count) {
+    for (unsigned i = 0; i < count; ++i) {
+      fifo.push({
+          .allocated_size  = 0,
+          .total_size      = BlockSize,
+          .last_used_seq_id = 0,
+          .inc_time_to_live = 0,
+          .block            = allocator_.allocate(BlockSize),
+      });
+    }
+  }
+
+  // Retire the current back block so the next allocate() rotates onto a
+  // different one instead of suballocating more of it. Under x86
+  // translation on macOS 27 Beta 3, a CPU store into a placed Metal
+  // buffer that an in-flight command buffer references faults on every
+  // store (measured ~0.37 ms per byte copied). The rings hand out one
+  // shared "latest" block across many command buffers, so without a
+  // boundary the next submission's CPU writes land in a block the prior
+  // submission's GPU work is still reading, and every one of those writes
+  // faults.
+  // Bumping allocated_size to total_size forces the reuse check in
+  // allocate() to fall through, so the next suballocation rotates to a
+  // reused-retired or fresh block; calling this at each submission
+  // boundary keeps every block referenced by a single submission, so no
+  // store ever hits an in-flight block. Append-only: it never repurposes
+  // a block or touches any pointer already handed out, so the live
+  // suballocations the sealed block issued stay valid. Call from the
+  // ring's single writer thread; the lock only guards against the trim
+  // path's concurrent free_blocks.
+  void
+  seal_latest() {
+    std::lock_guard<mutex> lock(mutex_);
+    note_single_writer();
+    if (fifo.empty())
+      return;
+    auto &latest = fifo.back();
+    latest.allocated_size = latest.total_size;
   }
 
 private:
@@ -71,6 +153,25 @@ private:
     allocation.allocated_size = offset + size;
     return {allocation.block, offset};
   };
+
+#ifdef DXMT_DEBUG
+  // Records the first allocate() / seal_latest() thread and asserts every
+  // later call runs on it. A no-op unless single_writer_ was set at
+  // construction. Callers already hold mutex_.
+  void
+  note_single_writer() {
+    if (!single_writer_)
+      return;
+    uint32_t tid = this_thread::get_id();
+    if (!writer_tid_)
+      writer_tid_ = tid;
+    assert(writer_tid_ == tid && "RingBumpState single-writer invariant violated");
+  }
+  bool single_writer_ = false;
+  uint32_t writer_tid_ = 0;
+#else
+  void note_single_writer() {}
+#endif
 
   std::queue<Allocation> fifo;
   mutex mutex_;
@@ -159,6 +260,17 @@ public:
     block.gpu_address = info.gpu_address;
     if (!placed_buffer_)
       block.mapped_address = info.memory.get_accessible_or_null();
+    // Pre-fault all pages of the malloc'd backing so subsequent CPU
+    // writes from the d3d9 calling thread don't pay per-page first-
+    // touch cost. On Apple Silicon + Rosetta x86_32, first-touch faults
+    // on Metal-registered host buffers can cost 100+ ms each: a
+    // consumer (e.g. BuildDrawCapture) that walks ~10 KB per call
+    // through a fresh ring block stalls for seconds on the first
+    // page of each call. Eager memset pays the cost once at block
+    // allocation (~50 ms for a 32 MB block at native ARM speed)
+    // instead of streaming it across every consumer.
+    if (placed_buffer_ && block.mapped_address)
+      std::memset(block.mapped_address, 0, block_size);
     return block;
   };
 
@@ -281,6 +393,7 @@ RingBumpState<Allocator, BlockSize, mutex>::allocate(
     throw std::invalid_argument("RingBumpState alignment must be a power of two");
 
   std::lock_guard<mutex> lock(mutex_);
+  note_single_writer();
   const auto guard_bytes =
       RingBumpGuardEnabled() && RingBumpAllocatorSupportsGuard<Allocator>()
           ? kRingBumpGuardBytes
@@ -301,7 +414,11 @@ RingBumpState<Allocator, BlockSize, mutex>::allocate(
     if (offset > available || size > available - offset)
       break;
 
-    latest.last_used_seq_id = seq_id;
+    // Only ever advance last_used_seq_id, never regress: free_blocks() uses it
+    // to decide when a block is safe to free, so regressing to an older seq
+    // could free a block a later chunk still pins (a placed-buffer UAF).
+    if (seq_id > latest.last_used_seq_id)
+      latest.last_used_seq_id = seq_id;
     return suballocate(latest, size, alignment);
   }
   return suballocate(
