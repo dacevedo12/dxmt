@@ -200,8 +200,13 @@ bool leaveFullscreenMode(HWND hWindow, DXMTWindowState *pState,
 
 bool restoreDisplayMode(HMONITOR hMonitor) {
   WCHAR device_name[32];
-  DEVMODEW current_mode, registry_mode;
-  getDisplayName(hMonitor, device_name);
+  // dmSize tells EnumDisplaySettingsEx how much of the structure it may fill,
+  // so it has to be set before the query rather than left as stack garbage.
+  DEVMODEW current_mode = {}, registry_mode = {};
+  current_mode.dmSize = sizeof(current_mode);
+  registry_mode.dmSize = sizeof(registry_mode);
+  if (!getDisplayName(hMonitor, device_name))
+    return false;
   if (!EnumDisplaySettingsExW(device_name, ENUM_CURRENT_SETTINGS, &current_mode, 0))
     return false;
   if (!EnumDisplaySettingsExW(device_name, ENUM_REGISTRY_SETTINGS, &registry_mode, 0))
