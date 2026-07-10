@@ -1,0 +1,175 @@
+#include "d3d9_state_defaults.hpp"
+
+#include <bit>
+#include <cstring>
+
+namespace dxmt {
+
+void
+init_default_render_states(DWORD (&rs)[256], bool enableAutoDepthStencil) {
+  auto dword_of = [](float f) { return std::bit_cast<DWORD>(f); };
+
+  rs[D3DRS_SEPARATEALPHABLENDENABLE] = FALSE;
+  rs[D3DRS_ALPHABLENDENABLE] = FALSE;
+  rs[D3DRS_BLENDOP] = D3DBLENDOP_ADD;
+  rs[D3DRS_BLENDOPALPHA] = D3DBLENDOP_ADD;
+  rs[D3DRS_DESTBLEND] = D3DBLEND_ZERO;
+  rs[D3DRS_DESTBLENDALPHA] = D3DBLEND_ZERO;
+  rs[D3DRS_COLORWRITEENABLE] = 0x0000000f;
+  rs[D3DRS_COLORWRITEENABLE1] = 0x0000000f;
+  rs[D3DRS_COLORWRITEENABLE2] = 0x0000000f;
+  rs[D3DRS_COLORWRITEENABLE3] = 0x0000000f;
+  rs[D3DRS_SRCBLEND] = D3DBLEND_ONE;
+  rs[D3DRS_SRCBLENDALPHA] = D3DBLEND_ONE;
+  rs[D3DRS_BLENDFACTOR] = 0xffffffff;
+
+  rs[D3DRS_ZENABLE] = enableAutoDepthStencil ? D3DZB_TRUE : D3DZB_FALSE;
+  rs[D3DRS_ZFUNC] = D3DCMP_LESSEQUAL;
+  rs[D3DRS_TWOSIDEDSTENCILMODE] = FALSE;
+  rs[D3DRS_ZWRITEENABLE] = TRUE;
+  rs[D3DRS_STENCILENABLE] = FALSE;
+  rs[D3DRS_STENCILFAIL] = D3DSTENCILOP_KEEP;
+  rs[D3DRS_STENCILZFAIL] = D3DSTENCILOP_KEEP;
+  rs[D3DRS_STENCILPASS] = D3DSTENCILOP_KEEP;
+  rs[D3DRS_STENCILFUNC] = D3DCMP_ALWAYS;
+  rs[D3DRS_CCW_STENCILFAIL] = D3DSTENCILOP_KEEP;
+  rs[D3DRS_CCW_STENCILZFAIL] = D3DSTENCILOP_KEEP;
+  rs[D3DRS_CCW_STENCILPASS] = D3DSTENCILOP_KEEP;
+  rs[D3DRS_CCW_STENCILFUNC] = D3DCMP_ALWAYS;
+  rs[D3DRS_STENCILMASK] = 0xFFFFFFFF;
+  rs[D3DRS_STENCILWRITEMASK] = 0xFFFFFFFF;
+  rs[D3DRS_STENCILREF] = 0;
+
+  rs[D3DRS_FILLMODE] = D3DFILL_SOLID;
+  rs[D3DRS_CULLMODE] = D3DCULL_CCW;
+  rs[D3DRS_DEPTHBIAS] = dword_of(0.0f);
+  rs[D3DRS_SLOPESCALEDEPTHBIAS] = dword_of(0.0f);
+  rs[D3DRS_SCISSORTESTENABLE] = FALSE;
+
+  rs[D3DRS_ALPHATESTENABLE] = FALSE;
+  rs[D3DRS_ALPHAFUNC] = D3DCMP_ALWAYS;
+  rs[D3DRS_ALPHAREF] = 0;
+
+  rs[D3DRS_MULTISAMPLEMASK] = 0xffffffff;
+  rs[D3DRS_TEXTUREFACTOR] = 0xffffffff;
+
+  rs[D3DRS_DIFFUSEMATERIALSOURCE] = D3DMCS_COLOR1;
+  rs[D3DRS_SPECULARMATERIALSOURCE] = D3DMCS_COLOR2;
+  rs[D3DRS_AMBIENTMATERIALSOURCE] = D3DMCS_MATERIAL;
+  rs[D3DRS_EMISSIVEMATERIALSOURCE] = D3DMCS_MATERIAL;
+  rs[D3DRS_LIGHTING] = TRUE;
+  rs[D3DRS_COLORVERTEX] = TRUE;
+  rs[D3DRS_LOCALVIEWER] = TRUE;
+  rs[D3DRS_RANGEFOGENABLE] = FALSE;
+  rs[D3DRS_NORMALIZENORMALS] = FALSE;
+
+  rs[D3DRS_SPECULARENABLE] = FALSE;
+  rs[D3DRS_AMBIENT] = 0;
+
+  rs[D3DRS_FOGENABLE] = FALSE;
+  rs[D3DRS_FOGCOLOR] = 0;
+  rs[D3DRS_FOGTABLEMODE] = D3DFOG_NONE;
+  rs[D3DRS_FOGSTART] = dword_of(0.0f);
+  rs[D3DRS_FOGEND] = dword_of(1.0f);
+  rs[D3DRS_FOGDENSITY] = dword_of(1.0f);
+  rs[D3DRS_FOGVERTEXMODE] = D3DFOG_NONE;
+
+  rs[D3DRS_CLIPPLANEENABLE] = 0;
+
+  rs[D3DRS_POINTSPRITEENABLE] = FALSE;
+  rs[D3DRS_POINTSCALEENABLE] = FALSE;
+  rs[D3DRS_POINTSCALE_A] = dword_of(1.0f);
+  rs[D3DRS_POINTSCALE_B] = dword_of(0.0f);
+  rs[D3DRS_POINTSCALE_C] = dword_of(0.0f);
+  rs[D3DRS_POINTSIZE] = dword_of(1.0f);
+  rs[D3DRS_POINTSIZE_MIN] = dword_of(1.0f);
+  // Apple Silicon limits point size to 511; cap there until we plumb
+  // a real query through the Metal feature set. wined3d uses
+  // d3d_info->limits.pointsize_max (driver-derived); DXVK reads
+  // VkPhysicalDeviceLimits.pointSizeRange[1].
+  rs[D3DRS_POINTSIZE_MAX] = dword_of(511.0f);
+
+  rs[D3DRS_SRGBWRITEENABLE] = 0;
+  rs[D3DRS_SHADEMODE] = D3DSHADE_GOURAUD;
+
+  rs[D3DRS_VERTEXBLEND] = D3DVBF_DISABLE;
+  rs[D3DRS_INDEXEDVERTEXBLENDENABLE] = FALSE;
+  rs[D3DRS_TWEENFACTOR] = dword_of(0.0f);
+
+  rs[D3DRS_LASTPIXEL] = TRUE;
+  rs[D3DRS_DITHERENABLE] = FALSE;
+  rs[D3DRS_WRAP0] = 0;
+  rs[D3DRS_WRAP1] = 0;
+  rs[D3DRS_WRAP2] = 0;
+  rs[D3DRS_WRAP3] = 0;
+  rs[D3DRS_WRAP4] = 0;
+  rs[D3DRS_WRAP5] = 0;
+  rs[D3DRS_WRAP6] = 0;
+  rs[D3DRS_WRAP7] = 0;
+  rs[D3DRS_WRAP8] = 0;
+  rs[D3DRS_WRAP9] = 0;
+  rs[D3DRS_WRAP10] = 0;
+  rs[D3DRS_WRAP11] = 0;
+  rs[D3DRS_WRAP12] = 0;
+  rs[D3DRS_WRAP13] = 0;
+  rs[D3DRS_WRAP14] = 0;
+  rs[D3DRS_WRAP15] = 0;
+  rs[D3DRS_CLIPPING] = TRUE;
+  rs[D3DRS_MULTISAMPLEANTIALIAS] = TRUE;
+  rs[D3DRS_PATCHEDGESTYLE] = D3DPATCHEDGE_DISCRETE;
+  rs[D3DRS_DEBUGMONITORTOKEN] = D3DDMT_ENABLE;
+  rs[D3DRS_POSITIONDEGREE] = D3DDEGREE_CUBIC;
+  rs[D3DRS_NORMALDEGREE] = D3DDEGREE_LINEAR;
+  rs[D3DRS_ANTIALIASEDLINEENABLE] = FALSE;
+  rs[D3DRS_MINTESSELLATIONLEVEL] = dword_of(1.0f);
+  rs[D3DRS_MAXTESSELLATIONLEVEL] = dword_of(1.0f);
+  rs[D3DRS_ADAPTIVETESS_X] = dword_of(0.0f);
+  rs[D3DRS_ADAPTIVETESS_Y] = dword_of(0.0f);
+  rs[D3DRS_ADAPTIVETESS_Z] = dword_of(1.0f);
+  rs[D3DRS_ADAPTIVETESS_W] = dword_of(0.0f);
+  rs[D3DRS_ENABLEADAPTIVETESSELLATION] = FALSE;
+}
+
+void
+init_default_sampler_states(DWORD (*samp)[D3DSAMP_DMAPOFFSET + 1], unsigned int count) {
+  for (unsigned int i = 0; i < count; ++i) {
+    samp[i][D3DSAMP_ADDRESSU] = D3DTADDRESS_WRAP;
+    samp[i][D3DSAMP_ADDRESSV] = D3DTADDRESS_WRAP;
+    samp[i][D3DSAMP_ADDRESSW] = D3DTADDRESS_WRAP;
+    samp[i][D3DSAMP_BORDERCOLOR] = 0;
+    samp[i][D3DSAMP_MAGFILTER] = D3DTEXF_POINT;
+    samp[i][D3DSAMP_MINFILTER] = D3DTEXF_POINT;
+    samp[i][D3DSAMP_MIPFILTER] = D3DTEXF_NONE;
+    samp[i][D3DSAMP_MIPMAPLODBIAS] = 0;
+    samp[i][D3DSAMP_MAXMIPLEVEL] = 0;
+    samp[i][D3DSAMP_MAXANISOTROPY] = 1;
+    samp[i][D3DSAMP_SRGBTEXTURE] = 0;
+    samp[i][D3DSAMP_ELEMENTINDEX] = 0;
+    samp[i][D3DSAMP_DMAPOFFSET] = 0;
+  }
+}
+
+void
+init_default_texture_stage_states(DWORD (*tss)[D3DTSS_CONSTANT + 1], unsigned int stages) {
+  // Most stage states default to zero; clear first, then seed the
+  // non-zero FFP-blend OPs / ARGs / TEXCOORDINDEX (which any app calling
+  // GetTextureStageState before SetTextureStageState would otherwise
+  // read incorrectly).
+  std::memset(tss, 0, stages * sizeof(tss[0]));
+  for (unsigned int stage = 0; stage < stages; ++stage) {
+    DWORD *t = tss[stage];
+    t[D3DTSS_COLOROP] = stage == 0 ? D3DTOP_MODULATE : D3DTOP_DISABLE;
+    t[D3DTSS_COLORARG1] = D3DTA_TEXTURE;
+    t[D3DTSS_COLORARG2] = D3DTA_CURRENT;
+    t[D3DTSS_ALPHAOP] = stage == 0 ? D3DTOP_SELECTARG1 : D3DTOP_DISABLE;
+    t[D3DTSS_ALPHAARG1] = D3DTA_TEXTURE;
+    t[D3DTSS_ALPHAARG2] = D3DTA_CURRENT;
+    t[D3DTSS_TEXCOORDINDEX] = stage;
+    t[D3DTSS_TEXTURETRANSFORMFLAGS] = D3DTTFF_DISABLE;
+    t[D3DTSS_COLORARG0] = D3DTA_CURRENT;
+    t[D3DTSS_ALPHAARG0] = D3DTA_CURRENT;
+    t[D3DTSS_RESULTARG] = D3DTA_CURRENT;
+  }
+}
+
+} // namespace dxmt
