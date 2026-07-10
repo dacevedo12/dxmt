@@ -182,6 +182,27 @@ inline void addFrameCounter(FrameStatistics *stats, FrameCounterMember target,
     (stats->*target) += count;
 }
 
+// Times a scope into a duration field and counts the entry. An interval on its
+// own cannot tell one expensive call from a churn of cheap ones, and that is
+// the distinction that decides whether to optimize the operation or the call
+// rate, so an entry point measuring both should not have to spell out the pair.
+// Inert when the sink is null, like the two primitives it composes.
+class ScopedFrameDurationCounted {
+public:
+  ScopedFrameDurationCounted(FrameStatistics *stats, FrameDurationMember target,
+                             FrameCounterMember counter)
+      : duration_(stats, target) {
+    addFrameCounter(stats, counter);
+  }
+
+  ScopedFrameDurationCounted(const ScopedFrameDurationCounted &) = delete;
+  ScopedFrameDurationCounted &
+  operator=(const ScopedFrameDurationCounted &) = delete;
+
+private:
+  ScopedFrameDuration duration_;
+};
+
 void recordExecuteTime(FrameStatistics *stats, ExecuteTimeBucket bucket,
                        dxmt::clock::duration duration);
 void recordReplayBreakdown(FrameStatistics *stats,
