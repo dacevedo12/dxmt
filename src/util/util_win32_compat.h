@@ -6,6 +6,9 @@
 
 #include "log/log.hpp"
 
+#define THREAD_PRIORITY_LOWEST (-2)
+#define THREAD_PRIORITY_BELOW_NORMAL (-1)
+#define THREAD_PRIORITY_NORMAL 0
 #define THREAD_PRIORITY_TIME_CRITICAL 15
 #define INFINITE 0xffffffffu
 
