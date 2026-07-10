@@ -264,6 +264,8 @@ bool isForeground(HWND hWindow) {
   return ::GetForegroundWindow() == hWindow;
 }
 
+HWND foregroundWindow() { return ::GetForegroundWindow(); }
+
 bool isMinimized(HWND hWindow) {
   return ::IsIconic(hWindow);
 }

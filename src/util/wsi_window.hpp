@@ -105,6 +105,10 @@ void updateFullscreenWindow(HMONITOR hMonitor, HWND hWindow, bool forceTopmost);
 
 bool isForeground(HWND hWindow);
 
+// The current foreground window itself, for edge detection on activation
+// changes (isForeground only answers a point comparison).
+HWND foregroundWindow();
+
 bool isMinimized(HWND hWindow);
 
 } // namespace dxmt::wsi
