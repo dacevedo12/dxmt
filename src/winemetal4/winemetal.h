@@ -2006,6 +2006,14 @@ struct WMTLayerProps {
   bool display_sync_enabled;
   bool framebuffer_only;
   enum WMTPixelFormat pixel_format;
+  // CAMetalLayer.maximumDrawableCount: caps how many drawables can
+  // be in flight. Default Apple value is 3, which is over-deep for
+  // 60fps games: presents pile up in the queue and Present Delay
+  // grows to 2-3 vsync intervals. 2 is the standard for low-latency
+  // games on Apple Silicon (matches MoltenVK / Game Porting Toolkit
+  // defaults). Value of 0 leaves Apple's default in place; used by
+  // callers that don't want to opt in to the property surface.
+  uint32_t maximum_drawable_count;
 };
 
 WINEMETAL_API void MetalLayer_setProps(obj_handle_t layer, const struct WMTLayerProps *props);

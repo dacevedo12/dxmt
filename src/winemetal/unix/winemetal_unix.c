@@ -1392,6 +1392,7 @@ dxmt_apitrace_record_blit_commands(apitrace_metal_session_t *session, obj_handle
     }
     case WMTBlitCommandCopyFromTextureToBuffer:
     case WMTBlitCommandGenerateMipmaps:
+    case WMTBlitCommandOptimizeContentsForGPUAccess:
     case WMTBlitCommandResolveCounters:
     case WMTBlitCommandResourceStateBarrier:
       dxmt_apitrace_begin_blit_encoder_if_needed(session, encoder, state);
@@ -1833,6 +1834,10 @@ fill_texture_descriptor(MTLTextureDescriptor *desc, struct WMTTextureInfo *info)
       desc.placementSparsePageSize = MTLSparsePageSize64;
     }
   }
+  // No descriptor-baked swizzle. Per-bind format/swizzle aliasing
+  // happens through newTextureView (see _MTLTexture_newTextureView +
+  // to_metal_swizzle below) so the base texture stays a clean
+  // identity-swizzle Metal object.
 };
 
 void
@@ -2315,12 +2320,32 @@ _MTLCommandBuffer_computeCommandEncoder(void *obj) {
   return STATUS_SUCCESS;
 }
 
+// Current render pass's render-target extent, captured when the encoder is
+// created and read when a scissor rect is applied to clamp it into bounds.
+// The encode thread creates an encoder then replays that pass's commands in
+// order before the next, so a file-static is sufficient (no interleaving).
+static uint32_t g_dxmt_pass_rt_w = 0;
+static uint32_t g_dxmt_pass_rt_h = 0;
+
 static NTSTATUS
 _MTLCommandBuffer_renderCommandEncoder(void *obj) {
   struct unixcall_generic_obj_uint64_obj_ret *params = obj;
   struct WMTRenderPassInfo *info = (struct WMTRenderPassInfo *)params->arg;
   MTLRenderPassDescriptor *descriptor = [[MTLRenderPassDescriptor alloc] init];
   for (unsigned i = 0; i < 8; i++) {
+    // Skip color slots with no texture. D3D9 (and D3D11) permit binding
+    // render targets at non-contiguous indices (e.g. RT0 + RT2 with RT1
+    // unbound); the caller reports render_target_count as highest_bound+1,
+    // so the unbound gap slot reaches here with a nil texture. Leaving it
+    // at the MTLRenderPassDescriptor default (nil texture, DontCare load
+    // and store) keeps it an inert/unused attachment that Metal ignores.
+    // Configuring it from the blanket WMTRenderPassInfo defaults instead
+    // stamps storeAction=Store onto a textureless slot, which makes
+    // MTL_DEBUG_LAYER_VALIDATE_LOAD_ACTIONS treat it as a live attachment
+    // with an undefined load and assert. Matches the texture-guarded
+    // depth/stencil blocks below.
+    if (!info->colors[i].texture)
+      continue;
     descriptor.colorAttachments[i].clearColor = MTLClearColorMake(
         info->colors[i].clear_color.r, info->colors[i].clear_color.g, info->colors[i].clear_color.b,
         info->colors[i].clear_color.a
@@ -2362,6 +2387,22 @@ _MTLCommandBuffer_renderCommandEncoder(void *obj) {
   descriptor.renderTargetHeight = info->render_target_height;
   descriptor.renderTargetWidth = info->render_target_width;
   descriptor.visibilityResultBuffer = (id<MTLBuffer>)info->visibility_buffer;
+
+  // Capture this pass's render-target extent so scissor commands can be clamped
+  // to it at apply time (see WMTRenderCommandSetScissorRect). D3D9 blit / resolve
+  // / mip-downsample paths can hand Metal a scissor sized for the source while
+  // the destination is a smaller mip level; Vulkan auto-clamps so DXVK never
+  // needs this, but Metal's debug layer aborts on an out-of-bounds scissor.
+  {
+    id<MTLTexture> c0 = (id<MTLTexture>)info->colors[0].texture;
+    id<MTLTexture> dt = (id<MTLTexture>)info->depth.texture;
+    unsigned eff_w = c0 ? (unsigned)([c0 width] >> info->colors[0].level)
+                        : (dt ? (unsigned)([dt width] >> info->depth.level) : 0);
+    unsigned eff_h = c0 ? (unsigned)([c0 height] >> info->colors[0].level)
+                        : (dt ? (unsigned)([dt height] >> info->depth.level) : 0);
+    g_dxmt_pass_rt_w = info->render_target_width ? info->render_target_width : eff_w;
+    g_dxmt_pass_rt_h = info->render_target_height ? info->render_target_height : eff_h;
+  }
 
   if (info->tile_height && info->tile_width) {
     descriptor.tileWidth = info->tile_width;
@@ -2753,6 +2794,11 @@ _MTLBlitCommandEncoder_encodeCommands(void *obj) {
     case WMTBlitCommandGenerateMipmaps: {
       struct wmtcmd_blit_generate_mipmaps *body = (struct wmtcmd_blit_generate_mipmaps *)next;
       [encoder generateMipmapsForTexture:(id<MTLTexture>)body->texture];
+      break;
+    }
+    case WMTBlitCommandOptimizeContentsForGPUAccess: {
+      struct wmtcmd_blit_optimize_contents *body = (struct wmtcmd_blit_optimize_contents *)next;
+      [encoder optimizeContentsForGPUAccess:(id<MTLTexture>)body->texture slice:body->slice level:body->level];
       break;
     }
     case WMTBlitCommandUpdateFence: {
@@ -3249,16 +3295,52 @@ _MTLRenderCommandEncoder_encodeCommands(void *obj) {
     }
     case WMTRenderCommandSetScissorRect: {
       struct wmtcmd_render_setscissorrect *body = (struct wmtcmd_render_setscissorrect *)next;
+      struct WMTScissorRect r = body->scissor_rect;
+      // Clamp into the render-pass bounds. Metal treats an out-of-bounds
+      // scissor as undefined and the debug layer aborts; the d3d9 blit / mip
+      // paths can exceed a smaller mip-level target. MoltenVK clips every
+      // scissor at this same point (MVKCommandEncoder::clipToRenderArea).
+      // No-op for in-bounds rects.
+      if (g_dxmt_pass_rt_w && g_dxmt_pass_rt_h) {
+        if (r.x > g_dxmt_pass_rt_w)
+          r.x = g_dxmt_pass_rt_w;
+        if (r.y > g_dxmt_pass_rt_h)
+          r.y = g_dxmt_pass_rt_h;
+        if (r.x + r.width > g_dxmt_pass_rt_w)
+          r.width = g_dxmt_pass_rt_w - r.x;
+        if (r.y + r.height > g_dxmt_pass_rt_h)
+          r.height = g_dxmt_pass_rt_h - r.y;
+      }
       union {
         struct WMTScissorRect src;
         MTLScissorRect dst;
-      } u = {.src = body->scissor_rect};
+      } u = {.src = r};
       [encoder setScissorRect:u.dst];
       break;
     }
     case WMTRenderCommandDispatchThreadsPerTile: {
       struct wmtcmd_render_dispatch_threads_per_tile *body = (struct wmtcmd_render_dispatch_threads_per_tile *)next;
       [encoder dispatchThreadsPerTile:MTLSizeMake(body->width, body->height, 1)];
+      break;
+    }
+    case WMTRenderCommandSetFragmentSamplerState: {
+      struct wmtcmd_render_setsamplerstate *body = (struct wmtcmd_render_setsamplerstate *)next;
+      [encoder setFragmentSamplerState:(id<MTLSamplerState>)body->sampler atIndex:body->index];
+      break;
+    }
+    case WMTRenderCommandSetVertexTexture: {
+      struct wmtcmd_render_settexture *body = (struct wmtcmd_render_settexture *)next;
+      [encoder setVertexTexture:(id<MTLTexture>)body->texture atIndex:body->index];
+      break;
+    }
+    case WMTRenderCommandSetVertexSamplerState: {
+      struct wmtcmd_render_setsamplerstate *body = (struct wmtcmd_render_setsamplerstate *)next;
+      [encoder setVertexSamplerState:(id<MTLSamplerState>)body->sampler atIndex:body->index];
+      break;
+    }
+    case WMTRenderCommandSetBlendColor: {
+      struct wmtcmd_render_setblendcolor_only *body = (struct wmtcmd_render_setblendcolor_only *)next;
+      [encoder setBlendColorRed:body->red green:body->green blue:body->blue alpha:body->alpha];
       break;
     }
     }
@@ -3714,6 +3796,8 @@ _MetalLayer_setProps(void *obj) {
     layer.displaySyncEnabled = props->display_sync_enabled;
     layer.drawableSize = CGSizeMake(props->drawable_width, props->drawable_height);
     layer.pixelFormat = to_metal_pixel_format(props->pixel_format);
+    if (props->maximum_drawable_count != 0)
+      layer.maximumDrawableCount = props->maximum_drawable_count;
   });
   return STATUS_SUCCESS;
 }
@@ -3731,6 +3815,7 @@ _MetalLayer_getProps(void *obj) {
   props->drawable_height = layer.drawableSize.height;
   props->drawable_width = layer.drawableSize.width;
   props->pixel_format = layer.pixelFormat;
+  props->maximum_drawable_count = (uint32_t)layer.maximumDrawableCount;
   return STATUS_SUCCESS;
 }
 
@@ -3815,19 +3900,32 @@ _CreateMetalViewFromHWND(void *obj) {
     pfn_macdrv_view_get_metal_layer = dlsym(RTLD_DEFAULT, "macdrv_view_get_metal_layer");
   }
 
+  /* Write the outputs before any failure path: the wow64 dispatch hands
+   * this call a reused scratch buffer, so an unwritten field reads back
+   * as stale garbage from an earlier call, and a nonzero garbage layer
+   * handle passes the caller's null check and gets messaged (an
+   * NSInvalidArgumentException in getProps was the symptom). */
+  params->ret_view = 0;
+  params->ret_layer = 0;
+
   if (pfn_get_win_data && pfn_release_win_data && pfn_macdrv_view_create_metal_view &&
       pfn_macdrv_view_get_metal_layer) {
     struct macdrv_win_data *win_data = pfn_get_win_data((HWND)params->hwnd);
-    macdrv_metal_view view =
-        pfn_macdrv_view_create_metal_view(win_data->client_cocoa_view, (macdrv_metal_device)params->device);
-    params->ret_view = (obj_handle_t)view;
-    if (view) {
-      params->ret_layer = (obj_handle_t)pfn_macdrv_view_get_metal_layer(view);
-      execute_on_main(^{
-        dxmt_set_layer_background_black((CAMetalLayer *)params->ret_layer);
-      });
+    /* A window the mac driver does not own (message-only, foreign,
+     * not yet realised) has no win_data; report no view rather than
+     * dereferencing null. */
+    if (win_data) {
+      macdrv_metal_view view =
+          pfn_macdrv_view_create_metal_view(win_data->client_cocoa_view, (macdrv_metal_device)params->device);
+      params->ret_view = (obj_handle_t)view;
+      if (view) {
+        params->ret_layer = (obj_handle_t)pfn_macdrv_view_get_metal_layer(view);
+        execute_on_main(^{
+          dxmt_set_layer_background_black((CAMetalLayer *)params->ret_layer);
+        });
+      }
+      pfn_release_win_data(win_data);
     }
-    pfn_release_win_data(win_data);
   }
 
   return STATUS_SUCCESS;
@@ -3867,6 +3965,51 @@ thunk_SM50Destroy(void *args) {
   struct sm50_destroy_params *params = args;
 
   SM50Destroy(params->shader);
+
+  return STATUS_SUCCESS;
+}
+
+static NTSTATUS
+thunk_DXSOInitialize(void *args) {
+  struct dxso_initialize_params *params = args;
+
+  params->ret = DXSOInitialize(params->bytecode, params->bytecode_size, params->shader);
+
+  return STATUS_SUCCESS;
+}
+
+static NTSTATUS
+thunk_DXSODestroy(void *args) {
+  struct dxso_destroy_params *params = args;
+
+  DXSODestroy(params->shader);
+
+  return STATUS_SUCCESS;
+}
+
+static NTSTATUS
+thunk_DXSOCompile(void *args) {
+  struct dxso_compile_params *params = args;
+
+  params->ret = DXSOCompile(params->shader, params->args, params->func_name, params->bitcode);
+
+  return STATUS_SUCCESS;
+}
+
+static NTSTATUS
+thunk_DXSOGetCompiledBitcode(void *args) {
+  struct dxso_get_compiled_bitcode_params *params = args;
+
+  DXSOGetCompiledBitcode(params->bitcode, params->data_out);
+
+  return STATUS_SUCCESS;
+}
+
+static NTSTATUS
+thunk_DXSODestroyBitcode(void *args) {
+  struct dxso_destroy_bitcode_params *params = args;
+
+  DXSODestroyBitcode(params->bitcode);
 
   return STATUS_SUCCESS;
 }
@@ -4030,6 +4173,26 @@ thunk32_SM50Initialize(void *args) {
       UInt32ToPtr(params->bytecode), params->bytecode_size, UInt32ToPtr(params->shader),
       UInt32ToPtr(params->reflection), UInt32ToPtr(params->error)
   );
+
+  return STATUS_SUCCESS;
+}
+
+static NTSTATUS
+thunk32_DXSOInitialize(void *args) {
+  struct dxso_initialize_params32 *params = args;
+
+  params->ret = DXSOInitialize(
+      UInt32ToPtr(params->bytecode), params->bytecode_size, UInt32ToPtr(params->shader)
+  );
+
+  return STATUS_SUCCESS;
+}
+
+static NTSTATUS
+thunk32_DXSOGetCompiledBitcode(void *args) {
+  struct dxso_get_compiled_bitcode_params32 *params = args;
+
+  DXSOGetCompiledBitcode(params->bitcode, UInt32ToPtr(params->data_out));
 
   return STATUS_SUCCESS;
 }
@@ -4252,6 +4415,247 @@ sm50_compilation_argument32_free(struct SM50_SHADER_COMPILATION_ARGUMENT_DATA *f
     free(arg);
     arg = next;
   }
+}
+
+/* DXSO compilation argument chain: same shape as SM50's 32-bit
+   chain conversion (sm50_compilation_argument32_convert). DXSO has
+   its own enum + struct family so the d3d9 caller picks the right
+   types at compile time, but the wire-form is byte-identical to
+   SM50's so we reuse the same UInt32ToPtr unpack pattern. The IA
+   layout's `elements` pointer points at app-side memory: already
+   in the wow64 32-bit address space: so it round-trips through
+   UInt32ToPtr without further translation. */
+struct DXSO_SHADER_COMPILATION_ARGUMENT_DATA32 {
+  uint32_t next;
+  enum DXSO_SHADER_COMPILATION_ARGUMENT_TYPE type;
+};
+
+struct DXSO_SHADER_IA_INPUT_LAYOUT_DATA32 {
+  uint32_t next;
+  enum DXSO_SHADER_COMPILATION_ARGUMENT_TYPE type;
+  enum DXSO_INDEX_BUFFER_FORMAT index_buffer_format;
+  uint32_t slot_mask;
+  uint32_t num_elements;
+  uint32_t elements;
+  uint32_t position_transformed;
+  uint32_t vs_float_const_count;
+};
+
+struct DXSO_SHADER_PSO_PIXEL_SHADER_DATA32 {
+  uint32_t next;
+  enum DXSO_SHADER_COMPILATION_ARGUMENT_TYPE type;
+  uint32_t alpha_test_func;
+  uint32_t dual_source_blending;
+  uint32_t flat_shading;
+  uint32_t emit_sample_mask;
+  uint32_t unorm_output_reg_mask;
+};
+
+struct DXSO_SHADER_PS_SAMPLER_LAYOUT_DATA32 {
+  uint32_t next;
+  enum DXSO_SHADER_COMPILATION_ARGUMENT_TYPE type;
+  uint8_t kinds[16];
+};
+
+struct DXSO_SHADER_PS_POINT_SPRITE_DATA32 {
+  uint32_t next;
+  enum DXSO_SHADER_COMPILATION_ARGUMENT_TYPE type;
+};
+
+struct DXSO_SHADER_PS_FOG_DATA32 {
+  uint32_t next;
+  enum DXSO_SHADER_COMPILATION_ARGUMENT_TYPE type;
+  uint32_t mode;
+  uint32_t coord_is_w;
+};
+
+struct DXSO_SHADER_FFP_KEY_DATA32 {
+  uint32_t next;
+  enum DXSO_SHADER_COMPILATION_ARGUMENT_TYPE type;
+  uint32_t kind;
+  uint32_t has_diffuse;
+  uint32_t has_texcoord0;
+  uint32_t has_specular;
+  uint32_t tex0_mode;
+  uint32_t stages[8][3];
+  uint32_t point_size;
+  uint32_t point_sprite;
+  uint32_t point_scale;
+  uint32_t texcoord_mask;
+  uint32_t texcoord_transform_key;
+  uint32_t lighting_key;
+  uint32_t fog_vertex_mode;
+  uint32_t vertex_blend;
+  uint32_t texgen_key;
+  uint32_t texcoord_index_key;
+  uint32_t sampler_kind_key;
+  uint32_t flat_shading;
+  uint32_t point_size_per_vertex;
+  uint32_t decl_has_diffuse;
+  uint32_t range_fog;
+  uint32_t emit_sample_mask;
+};
+
+struct DXSO_SHADER_VS_POINT_SIZE_DATA32 {
+  uint32_t next;
+  enum DXSO_SHADER_COMPILATION_ARGUMENT_TYPE type;
+};
+
+
+void
+dxso_compilation_argument32_convert(
+    struct DXSO_SHADER_COMPILATION_ARGUMENT_DATA *first_arg, struct DXSO_SHADER_COMPILATION_ARGUMENT_DATA32 *args32
+) {
+  struct DXSO_SHADER_COMPILATION_ARGUMENT_DATA *last_arg = first_arg;
+
+  first_arg->type = DXSO_SHADER_ARGUMENT_TYPE_MAX;
+  first_arg->next = NULL;
+
+  while (args32) {
+    /* Make an unhandled arg type a hard error, not a silent drop: a new
+       DXSO_SHADER_* value added to the enum and the 64-bit caller but not to
+       this 32-bit converter would otherwise vanish on WoW64 only (the exact
+       shape of the historical alpha-test arg-drop). -Wswitch already flags it;
+       promote just this switch to an error so the build catches it. */
+#pragma GCC diagnostic push
+#pragma GCC diagnostic error "-Wswitch"
+    switch (args32->type) {
+    case DXSO_SHADER_IA_INPUT_LAYOUT: {
+      struct DXSO_SHADER_IA_INPUT_LAYOUT_DATA32 *src = (void *)args32;
+      struct DXSO_SHADER_IA_INPUT_LAYOUT_DATA *data = malloc(sizeof(struct DXSO_SHADER_IA_INPUT_LAYOUT_DATA));
+      last_arg->next = data;
+      last_arg = (void *)data;
+      last_arg->next = NULL;
+      data->type = src->type;
+      data->index_buffer_format = src->index_buffer_format;
+      data->slot_mask = src->slot_mask;
+      data->num_elements = src->num_elements;
+      data->elements = UInt32ToPtr(src->elements);
+      data->position_transformed = src->position_transformed;
+      data->vs_float_const_count = src->vs_float_const_count;
+      break;
+    }
+    case DXSO_SHADER_PSO_PIXEL_SHADER: {
+      struct DXSO_SHADER_PSO_PIXEL_SHADER_DATA32 *src = (void *)args32;
+      struct DXSO_SHADER_PSO_PIXEL_SHADER_DATA *data = malloc(sizeof(struct DXSO_SHADER_PSO_PIXEL_SHADER_DATA));
+      last_arg->next = data;
+      last_arg = (void *)data;
+      last_arg->next = NULL;
+      data->type = src->type;
+      data->alpha_test_func = src->alpha_test_func;
+      data->dual_source_blending = src->dual_source_blending;
+      data->flat_shading = src->flat_shading;
+      data->emit_sample_mask = src->emit_sample_mask;
+      data->unorm_output_reg_mask = src->unorm_output_reg_mask;
+      break;
+    }
+    case DXSO_SHADER_PS_SAMPLER_LAYOUT: {
+      struct DXSO_SHADER_PS_SAMPLER_LAYOUT_DATA32 *src = (void *)args32;
+      struct DXSO_SHADER_PS_SAMPLER_LAYOUT_DATA *data = malloc(sizeof(struct DXSO_SHADER_PS_SAMPLER_LAYOUT_DATA));
+      last_arg->next = data;
+      last_arg = (void *)data;
+      last_arg->next = NULL;
+      data->type = src->type;
+      memcpy(data->kinds, src->kinds, sizeof(data->kinds));
+      break;
+    }
+    case DXSO_SHADER_PS_POINT_SPRITE: {
+      struct DXSO_SHADER_PS_POINT_SPRITE_DATA *data = malloc(sizeof(struct DXSO_SHADER_PS_POINT_SPRITE_DATA));
+      last_arg->next = data;
+      last_arg = (void *)data;
+      last_arg->next = NULL;
+      data->type = DXSO_SHADER_PS_POINT_SPRITE;
+      break;
+    }
+    case DXSO_SHADER_FFP_KEY: {
+      struct DXSO_SHADER_FFP_KEY_DATA32 *src = (void *)args32;
+      struct DXSO_SHADER_FFP_KEY_DATA *data = malloc(sizeof(struct DXSO_SHADER_FFP_KEY_DATA));
+      last_arg->next = data;
+      last_arg = (void *)data;
+      last_arg->next = NULL;
+      data->type = DXSO_SHADER_FFP_KEY;
+      data->kind = src->kind;
+      data->has_diffuse = src->has_diffuse;
+      data->has_texcoord0 = src->has_texcoord0;
+      data->has_specular = src->has_specular;
+      data->tex0_mode = src->tex0_mode;
+      memcpy(data->stages, src->stages, sizeof(data->stages));
+      data->point_size = src->point_size;
+      data->point_sprite = src->point_sprite;
+      data->point_scale = src->point_scale;
+      data->texcoord_mask = src->texcoord_mask;
+      data->texcoord_transform_key = src->texcoord_transform_key;
+      data->lighting_key = src->lighting_key;
+      data->fog_vertex_mode = src->fog_vertex_mode;
+      data->vertex_blend = src->vertex_blend;
+      data->texgen_key = src->texgen_key;
+      data->texcoord_index_key = src->texcoord_index_key;
+      data->sampler_kind_key = src->sampler_kind_key;
+      data->flat_shading = src->flat_shading;
+      data->point_size_per_vertex = src->point_size_per_vertex;
+      data->decl_has_diffuse = src->decl_has_diffuse;
+      data->range_fog = src->range_fog;
+      data->emit_sample_mask = src->emit_sample_mask;
+      break;
+    }
+    case DXSO_SHADER_VS_POINT_SIZE: {
+      struct DXSO_SHADER_VS_POINT_SIZE_DATA32 *src = (void *)args32;
+      struct DXSO_SHADER_VS_POINT_SIZE_DATA *data = malloc(sizeof(struct DXSO_SHADER_VS_POINT_SIZE_DATA));
+      last_arg->next = data;
+      last_arg = (void *)data;
+      last_arg->next = NULL;
+      data->type = DXSO_SHADER_VS_POINT_SIZE;
+      (void)src;
+      break;
+    }
+    case DXSO_SHADER_PS_BUMP_ENV:
+      /* Reserved: bump-env now rides the shared PS uniform tail, so the
+         host never emits this arg. Skip it if an older caller does. */
+      break;
+    case DXSO_SHADER_PS_FOG: {
+      struct DXSO_SHADER_PS_FOG_DATA32 *src = (void *)args32;
+      struct DXSO_SHADER_PS_FOG_DATA *data = malloc(sizeof(struct DXSO_SHADER_PS_FOG_DATA));
+      last_arg->next = data;
+      last_arg = (void *)data;
+      last_arg->next = NULL;
+      data->type = DXSO_SHADER_PS_FOG;
+      data->mode = src->mode;
+      data->coord_is_w = src->coord_is_w;
+      break;
+    }
+    case DXSO_SHADER_ARGUMENT_TYPE_MAX:
+      break;
+    }
+#pragma GCC diagnostic pop
+    args32 = UInt32ToPtr(args32->next);
+  }
+}
+
+void
+dxso_compilation_argument32_free(struct DXSO_SHADER_COMPILATION_ARGUMENT_DATA *first_arg) {
+  struct DXSO_SHADER_COMPILATION_ARGUMENT_DATA *arg = first_arg->next;
+
+  while (arg) {
+    struct DXSO_SHADER_COMPILATION_ARGUMENT_DATA *next = arg->next;
+    free(arg);
+    arg = next;
+  }
+}
+
+static NTSTATUS
+thunk32_DXSOCompile(void *args) {
+  struct dxso_compile_params32 *params = args;
+  struct DXSO_SHADER_COMPILATION_ARGUMENT_DATA first_arg;
+  struct DXSO_SHADER_COMPILATION_ARGUMENT_DATA32 *args32 = UInt32ToPtr(params->args);
+  dxso_compilation_argument32_convert(&first_arg, args32);
+
+  params->ret = DXSOCompile(
+      params->shader, &first_arg, UInt32ToPtr(params->func_name), UInt32ToPtr(params->bitcode)
+  );
+
+  dxso_compilation_argument32_free(&first_arg);
+
+  return STATUS_SUCCESS;
 }
 
 static NTSTATUS
@@ -4742,6 +5146,7 @@ _MTLSharedEvent_signalValue(void *obj) {
 
 typedef struct {
   _Atomic(CFRunLoopRef) runloop_ref;
+  _Atomic(bool) destroyed;
   MTLSharedEventListener *shared_listener;
 } *shared_event_listener_t;
 
@@ -4752,22 +5157,35 @@ _MTLSharedEvent_setWin32EventAtValue(void *obj) {
   struct unixcall_mtlsharedevent_setevent *params = obj;
   void *nt_event_handle = (shared_event_listener_t)params->event_handle;
   shared_event_listener_t q = (shared_event_listener_t)params->shared_event_listener;
+  /* Resolve the runloop HERE, on the calling wine thread, and hand the
+   * notification block a retained reference plus the plain event handle:
+   * the block must not capture q. Metal copies the block and can run it
+   * after the listener owner has been destroyed (a late notification on
+   * device teardown), and a captured q would then be freed memory: the
+   * historical intermittent objc_retain crash and spin-hang here. The
+   * spin below only covers creation-time ordering (a notification
+   * registered before the listener thread has published its runloop),
+   * and the calling thread can wait for that safely. A retained runloop
+   * outlives its thread; performing on an exited runloop is a no-op,
+   * which is the correct fate for a notification nobody waits on. */
+  while (!atomic_load_explicit(&q->runloop_ref, memory_order_acquire)) {
+#if defined(__x86_64__)
+    _mm_pause();
+#elif defined(__aarch64__)
+    __asm__ __volatile__("yield");
+#endif
+  }
+  CFRunLoopRef runloop = atomic_load_explicit(&q->runloop_ref, memory_order_acquire);
+  CFRetain(runloop);
   [(id<MTLSharedEvent>)params->shared_event
       notifyListener:q->shared_listener
              atValue:params->value
                block:^(id<MTLSharedEvent> _e, uint64_t _v) {
-                 // NOTE: must ensure no more notification comes after listener been destroyed.
-                 while (!atomic_load_explicit(&q->runloop_ref, memory_order_acquire)) {
-#if defined(__x86_64__)
-                   _mm_pause();
-#elif defined(__aarch64__)
-          __asm__ __volatile__("yield");
-#endif
-                 }
-                 CFRunLoopPerformBlock(q->runloop_ref, kCFRunLoopCommonModes, ^{
+                 CFRunLoopPerformBlock(runloop, kCFRunLoopCommonModes, ^{
                    NtSetEvent(nt_event_handle, NULL);
                  });
-                 CFRunLoopWakeUp(q->runloop_ref);
+                 CFRunLoopWakeUp(runloop);
+                 CFRelease(runloop);
                }];
   return STATUS_SUCCESS;
 }
@@ -4777,12 +5195,27 @@ _SharedEventListener_start(void *obj) {
   struct unixcall_generic_obj_noret *params = obj;
   shared_event_listener_t q = (shared_event_listener_t)params->handle;
   CFRunLoopRef uninited = NULL;
-  if (q && atomic_compare_exchange_strong(&q->runloop_ref, &uninited, CFRunLoopGetCurrent())) {
-    /* Add a dummy source so the runloop stays running */
-    CFRunLoopSourceContext source_context = {0};
-    CFRunLoopSourceRef source = CFRunLoopSourceCreate(NULL, 0, &source_context);
-    CFRunLoopAddSource(q->runloop_ref, source, kCFRunLoopCommonModes);
-    CFRunLoopRun();
+  CFRunLoopRef rl = CFRunLoopGetCurrent();
+  /* This thread owns freeing q: destroy only signals (the destroyed flag
+   * for the window before the runloop is published, the queued stop once
+   * it is), so neither side ever runs the CAS or the flag check against
+   * freed memory. Destroy before the publish leaves no stop queued; the
+   * flag check after the publish catches exactly that case. */
+  if (q && atomic_compare_exchange_strong(&q->runloop_ref, &uninited, rl)) {
+    /* seq_cst pairs with destroy's flag-store/runloop-load: the handshake
+     * is the store-buffering litmus, and acquire/release alone permits
+     * both sides missing each other (this thread entering the loop while
+     * destroy saw no runloop to stop). */
+    if (!atomic_load_explicit(&q->destroyed, memory_order_seq_cst)) {
+      /* Add a dummy source so the runloop stays running; the loop holds
+       * its own reference once added. */
+      CFRunLoopSourceContext source_context = {0};
+      CFRunLoopSourceRef source = CFRunLoopSourceCreate(NULL, 0, &source_context);
+      CFRunLoopAddSource(rl, source, kCFRunLoopCommonModes);
+      CFRelease(source);
+      CFRunLoopRun();
+    }
+    free(q);
   }
   return STATUS_SUCCESS;
 }
@@ -4793,6 +5226,7 @@ _SharedEventListener_create(void *obj) {
   shared_event_listener_t q = malloc(sizeof(*q));
   if (q) {
     q->runloop_ref = NULL;
+    q->destroyed = false;
     q->shared_listener = [[MTLSharedEventListener alloc] init];
   }
   params->ret = (obj_handle_t)q;
@@ -4803,12 +5237,38 @@ static NTSTATUS
 _SharedEventListener_destroy(void *obj) {
   struct unixcall_generic_obj_noret *params = obj;
   shared_event_listener_t q = (shared_event_listener_t)params->handle;
-  if (q && q->runloop_ref) {
-    CFRunLoopStop(q->runloop_ref);
-    q->runloop_ref = NULL;
-    [q->shared_listener release];
-    q->shared_listener = nil;
-    free(q);
+  if (!q)
+    return STATUS_SUCCESS;
+  /* Notification blocks hold their own retained runloop reference and
+   * never touch q (see setWin32EventAtValue), and the LISTENER THREAD is
+   * the one that frees q, so destroy only signals it. The flag must be
+   * set before the runloop load: a thread that publishes after the load
+   * observes the flag and exits without running the loop. */
+  atomic_store_explicit(&q->destroyed, true, memory_order_seq_cst);
+  CFRunLoopRef runloop = atomic_load_explicit(&q->runloop_ref, memory_order_seq_cst);
+  /* The listener thread frees q and can exit (dropping its runloop) the
+   * moment the loop stops; hold our own reference for the signalling
+   * calls below, the same way setWin32EventAtValue does for its block. */
+  if (runloop)
+    CFRetain(runloop);
+  /* Release the listener BEFORE waking the loop: the wakeup must be
+   * destroy's last touch of q, because the listener thread frees q the
+   * moment CFRunLoopRun returns. Releasing with notifications still
+   * pending is safe; Metal keeps the listener alive until they drain,
+   * and the blocks never read q. */
+  [q->shared_listener release];
+  q->shared_listener = nil;
+  if (runloop) {
+    /* Queue the stop instead of calling it directly: CFRunLoopStop only
+     * affects a loop that is already running, and the listener thread may
+     * still be between publishing its runloop and entering CFRunLoopRun.
+     * A performed block survives that window; the loop processes it on
+     * entry and stops. */
+    CFRunLoopPerformBlock(runloop, kCFRunLoopCommonModes, ^{
+      CFRunLoopStop(CFRunLoopGetCurrent());
+    });
+    CFRunLoopWakeUp(runloop);
+    CFRelease(runloop);
   }
   return STATUS_SUCCESS;
 }
@@ -4924,7 +5384,21 @@ _MTLBinaryArchive_serialize(void *obj) {
 static NTSTATUS
 _DispatchData_alloc_init(void *obj) {
   struct unixcall_generic_obj_uint64_obj_ret *params = obj;
-  params->ret = (obj_handle_t)dispatch_data_create((void *)params->handle, params->arg, NULL, NULL);
+  // dispatch_data_create with destructor=NULL is documented as
+  // "DISPATCH_DATA_DESTRUCTOR_DEFAULT" and copies the bytes, but the
+  // copy semantics across libdispatch versions and wine's loader
+  // surface have given us flaky AGX XPC failures at PSO link time on
+  // the d3d9 path. Explicitly malloc + memcpy + DISPATCH_DATA_DESTRUCTOR_FREE
+  // makes ownership unambiguous: the dispatch_data owns the buffer
+  // outright and frees via free(3) on last release.
+  void *copy = malloc(params->arg);
+  if (!copy) {
+    params->ret = 0;
+    return STATUS_UNSUCCESSFUL;
+  }
+  memcpy(copy, (void *)params->handle, params->arg);
+  params->ret = (obj_handle_t)dispatch_data_create(
+      copy, params->arg, NULL, DISPATCH_DATA_DESTRUCTOR_FREE);
   return STATUS_SUCCESS;
 }
 
@@ -5472,6 +5946,8 @@ const void *__wine_unix_call_funcs[] = {
     &_MTLCommandBuffer_blitCommandEncoderWithSampleBuffers,
     &_MTLCommandBuffer_property,
     &_MTLDevice_newTileRenderPipelineState,
+    // Upstream apitrace block: indices 136..142 (UNIX_CALL hard-codes
+    // these in winemetal_thunks.c WMTApitrace*).
     &_WMTApitraceSessionEnsureOpen,
     &_WMTApitraceSessionClose,
     &_WMTApitraceSetCurrentD3DSequence,
@@ -5487,6 +5963,15 @@ const void *__wine_unix_call_funcs[] = {
     &_MTLHeap_newBuffer,
     &_MTLHeap_newTexture,
     &_MTLDevice_heapTextureSizeAndAlign,
+    // DXSO block: indices 151..155, must match unix_dxso_* in
+    // airconv_thunks.h. It sits immediately after upstream's apitrace +
+    // sparse + heap entries; if upstream inserts more above this line, move both
+    // this block and the airconv_thunks.h anchor forward in lock-step.
+    &thunk_DXSOInitialize,
+    &thunk_DXSODestroy,
+    &thunk_DXSOCompile,
+    &thunk_DXSOGetCompiledBitcode,
+    &thunk_DXSODestroyBitcode,
 };
 
 #ifndef DXMT_NATIVE
@@ -5627,6 +6112,8 @@ const void *__wine_unix_call_wow64_funcs[] = {
     &_MTLCommandBuffer_blitCommandEncoderWithSampleBuffers,
     &_MTLCommandBuffer_property,
     &_MTLDevice_newTileRenderPipelineState,
+    // Upstream apitrace block: indices 136..142, lock-step with the
+    // 64-bit table above.
     &_WMTApitraceSessionEnsureOpen,
     &_WMTApitraceSessionClose,
     &_WMTApitraceSetCurrentD3DSequence,
@@ -5642,5 +6129,17 @@ const void *__wine_unix_call_wow64_funcs[] = {
     &_MTLHeap_newBuffer,
     &_MTLHeap_newTexture,
     &_MTLDevice_heapTextureSizeAndAlign,
+    // DXSO block: indices 151..155, lock-step with __wine_unix_call_funcs
+    // above and with unix_dxso_* in airconv_thunks.h. Sits immediately
+    // after the apitrace + sparse + heap entries (136..150).
+    &thunk32_DXSOInitialize,
+    /* dxso_destroy_params holds only sm50_ptr64_t (always 8 bytes), so
+       the 64-bit thunk is byte-compatible: no thunk32 needed. */
+    &thunk_DXSODestroy,
+    &thunk32_DXSOCompile,
+    &thunk32_DXSOGetCompiledBitcode,
+    /* dxso_destroy_bitcode_params is sm50_ptr64_t-only, see DXSODestroy
+       comment above. */
+    &thunk_DXSODestroyBitcode,
 };
 #endif
