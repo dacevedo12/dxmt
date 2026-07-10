@@ -545,6 +545,10 @@ struct FrameStatistics {
   uint64_t frame_descriptor_content_write_copy = 0;
   uint64_t frame_descriptor_content_write_feedback_uav = 0;
   ScalerInfo last_scaler_info{};
+  // Appended after last_scaler_info: FrameStatistics lives in the shared dxmt
+  // static library and d3d11/d3d12 read the fields above across the link
+  // boundary, so a new field must not shift an existing field's offset.
+  clock::duration frame_wall_interval{};
 
   void
   reset() {
@@ -892,6 +896,7 @@ struct FrameStatistics {
     frame_descriptor_content_write_copy = 0;
     frame_descriptor_content_write_feedback_uav = 0;
     last_scaler_info.type = {};
+    frame_wall_interval = {};
   };
 };
 
@@ -1327,6 +1332,7 @@ public:
       average_.frame_descriptor_content_write_sampler += frames_[i].frame_descriptor_content_write_sampler;
       average_.frame_descriptor_content_write_copy += frames_[i].frame_descriptor_content_write_copy;
       average_.frame_descriptor_content_write_feedback_uav += frames_[i].frame_descriptor_content_write_feedback_uav;
+      average_.frame_wall_interval += frames_[i].frame_wall_interval;
     }
     average_.command_buffer_count /= (kFrameStatisticsCount - 1);
     average_.render_pass_count /= (kFrameStatisticsCount - 1);
@@ -1678,6 +1684,7 @@ public:
     average_.frame_descriptor_content_write_sampler /= (kFrameStatisticsCount - 1);
     average_.frame_descriptor_content_write_copy /= (kFrameStatisticsCount - 1);
     average_.frame_descriptor_content_write_feedback_uav /= (kFrameStatisticsCount - 1);
+    average_.frame_wall_interval /= (kFrameStatisticsCount - 1);
   };
 };
 

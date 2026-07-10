@@ -144,6 +144,9 @@ struct Counters {
   std::atomic<uint64_t> avg_encoder_switches = {0};
   std::atomic<uint64_t> avg_flush_us = {0};
   std::atomic<uint64_t> avg_commit_us = {0};
+  std::atomic<uint64_t> avg_frame_wall_us = {0};
+  std::atomic<uint64_t> avg_drawable_block_us = {0};
+  std::atomic<uint64_t> avg_present_latency_us = {0};
 };
 
 Counters g_counters;
@@ -510,6 +513,8 @@ void flushCounters(uint64_t frame, bool final) {
                   " frameWallUs=", sample(g_counters.frame_wall_us),
                   " frameWallMaxUs=",
                   sample(g_counters.frame_wall_max_us),
+                  " frameWallAvgUs=",
+                  sample(g_counters.avg_frame_wall_us),
                   " frameCmdBufs=",
                   sample(g_counters.frame_command_buffers),
                   " frameCmdBufsMax=",
@@ -631,7 +636,11 @@ void flushCounters(uint64_t frame, bool final) {
                   " avgEncoderSwitches=",
                   sample(g_counters.avg_encoder_switches),
                   " avgFlushUs=", sample(g_counters.avg_flush_us),
-                  " avgCommitUs=", sample(g_counters.avg_commit_us)));
+                  " avgCommitUs=", sample(g_counters.avg_commit_us),
+                  " avgDrawableBlockUs=",
+                  sample(g_counters.avg_drawable_block_us),
+                  " avgPresentLatencyUs=",
+                  sample(g_counters.avg_present_latency_us)));
 }
 
 void maybeFlush(uint64_t frame) {
@@ -1275,6 +1284,14 @@ void recordFrameBoundary(uint64_t frame, const FrameStatistics &frame_stats,
                                 std::memory_order_relaxed);
   g_counters.avg_commit_us.store(durationUs(average_stats.commit_interval),
                                  std::memory_order_relaxed);
+  g_counters.avg_frame_wall_us.store(
+      durationUs(average_stats.frame_wall_interval), std::memory_order_relaxed);
+  g_counters.avg_drawable_block_us.store(
+      durationUs(average_stats.drawable_blocking_interval),
+      std::memory_order_relaxed);
+  g_counters.avg_present_latency_us.store(
+      durationUs(average_stats.present_latency_interval),
+      std::memory_order_relaxed);
 
   Logger::logFileOnly(
       LogLevel::Info,
