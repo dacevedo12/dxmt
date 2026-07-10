@@ -47,6 +47,9 @@ airconv_dx12_metal4_dep_darwin = declare_dependency(
   link_args           : [ llvm_ld_flags_darwin, llvm_deps ]
 )
 
+# Exposed as a global so both the upstream airconv unit tests and the
+# wine-free d3d9 shader-translation goldens (tests/dx9/unit/airconv_golden.py)
+# can drive this build-machine binary.
 airconv_cli_darwin = executable('airconv', airconv_src + airconv_cli_src,
   include_directories : [ dxmt_include_path ],
   cpp_args            : [ airconv_args, llvm_include_arg_darwin ],

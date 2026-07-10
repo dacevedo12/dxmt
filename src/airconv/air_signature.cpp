@@ -699,6 +699,14 @@ auto FunctionSignatureBuilder::CreateFunction(
             ->string("mtl_frontface");
           return msl_bool.get_llvm_type(context);
         },
+        [&](const InputPointCoord &) {
+          metadata_field.string("air.point_coord")
+            ->string("air.arg_type_name")
+            ->string("float2")
+            ->string("air.arg_name")
+            ->string("mtl_point_coord");
+          return msl_float2.get_llvm_type(context);
+        },
         [&](const InputSampleIndex &) {
           metadata_field.string("air.sample_id")
             ->string("air.arg_type_name")
@@ -950,6 +958,14 @@ auto FunctionSignatureBuilder::CreateFunction(
           return (llvm::Type *)ArrayType::get(
             Type::getFloatTy(context), clip_distance.count
           );
+        },
+        [&](const OutputPointSize) {
+          md.string("air.point_size")
+            ->string("air.arg_type_name")
+            ->string("float")
+            ->string("air.arg_name")
+            ->string("mtl_point_size");
+          return (llvm::Type *)Type::getFloatTy(context);
         },
         [&](const OutputRenderTargetArrayIndex) {
           md.string("air.render_target_array_index")

@@ -342,6 +342,7 @@ public:
   enum FPBinOp {
     fmax,
     fmin,
+    pow,
   };
 
   Value *CreateFPBinOp(FPBinOp Op, Value *LHS, Value *RHS, bool FastVariant = true);
