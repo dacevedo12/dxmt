@@ -10,6 +10,8 @@ airconv_src = files([
  'dxbc_converter_cfg.cpp',
  'dxbc_instructions.cpp',
  'dxbc_signature.cpp',
+ 'dxso_compile.cpp',
+ 'ffp_compile.cpp',
  'metallib_writer.cpp',
  'nt/air_builder.cpp',
  'nt/dxbc_converter_base.cpp',

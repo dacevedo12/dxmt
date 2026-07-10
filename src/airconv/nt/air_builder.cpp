@@ -1763,6 +1763,7 @@ AIRBuilder::CreateFPBinOp(FPBinOp Op, Value *LHS, Value *RHS, bool FastVariant) 
   static char const *FnNames[] = {
       "fmax",
       "fmin",
+      "pow",
   };
 
   if (uint32_t(Op) >= std::size(FnNames)) {
