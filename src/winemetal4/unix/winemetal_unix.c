@@ -11008,6 +11008,8 @@ _MetalLayer_setProps(void *obj) {
     layer.displaySyncEnabled = props->display_sync_enabled;
     layer.drawableSize = CGSizeMake(props->drawable_width, props->drawable_height);
     layer.pixelFormat = to_metal_pixel_format(props->pixel_format);
+    if (props->maximum_drawable_count != 0)
+      layer.maximumDrawableCount = props->maximum_drawable_count;
   });
   return STATUS_SUCCESS;
 }
@@ -11025,6 +11027,7 @@ _MetalLayer_getProps(void *obj) {
   props->drawable_height = layer.drawableSize.height;
   props->drawable_width = layer.drawableSize.width;
   props->pixel_format = layer.pixelFormat;
+  props->maximum_drawable_count = (uint32_t)layer.maximumDrawableCount;
   return STATUS_SUCCESS;
 }
 
