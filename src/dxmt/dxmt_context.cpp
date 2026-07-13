@@ -3910,6 +3910,30 @@ ArgumentEncodingContext::resolveTexture(
 };
 
 void
+ArgumentEncodingContext::resolveDepthTexture(
+    Rc<Texture> &&src, TextureViewKey src_view, Rc<Texture> &&dst, TextureViewKey dst_view,
+    WMT::RenderPipelineState pso, std::optional<WMTScissorRect> src_rect, WMTOrigin dst_origin, WMTSize resolve_size
+) {
+  assert(!encoder_current);
+  auto encoder_info = allocate<ResolveEncoderData>();
+  encoder_info->type = EncoderType::Resolve;
+  encoder_info->id = nextEncoderId();
+  encoder_info->fence_wait = {};
+  encoder_info->fence_update = {encoder_info->id};
+  encoder_current = encoder_info;
+
+  encoder_info->src = access(src, src_view, ResourceAccess::Read);
+  encoder_info->dst = access(dst, dst_view, ResourceAccess::Write);
+  encoder_info->pso = pso;
+  encoder_info->src_rect = src_rect;
+  encoder_info->dst_origin = dst_origin;
+  encoder_info->resolve_size = resolve_size;
+  encoder_info->is_depth = true;
+
+  endPass();
+};
+
+void
 ArgumentEncodingContext::present(Rc<Texture> &texture, Rc<Presenter> &presenter,
                                  double after, DXMTPresentMetadata metadata,
                                  uint64_t apitrace_frame_index,
@@ -4859,9 +4883,10 @@ ArgumentEncodingContext::flushCommands(
 
   {
     const auto t0 = clock::now();
-  if (auto count = vro_state_.reset()) {
+  uint64_t visibility_count = vro_state_.reset();
+  if (visibility_count) {
     readbacks.visibility = std::make_unique<VisibilityResultReadback>(
-        device_, seqId, count, pending_queries_
+        device_, seqId, visibility_count, pending_queries_
     );
     auto visibility_buffer = readbacks.visibility->visibility_result_heap;
     queue_.AddPersistentResidency(visibility_buffer);
@@ -4871,7 +4896,19 @@ ArgumentEncodingContext::flushCommands(
               visibility_buffer, seqId);
         });
   }
-  std::erase_if(pending_queries_, [=](auto &query) -> bool { return query->queryEndAt() == seqId; });
+  std::erase_if(pending_queries_, [&](auto &query) -> bool {
+    if (query->queryEndAt() != seqId)
+      return false;
+    // A query whose end chunk carried no visibility results gets no readback to
+    // resolve it (none was created above), yet it must still resolve or GetData
+    // spins forever. Hand it to the finish thread instead of stamping here:
+    // an encode-time stamp would be clobbered backward by the later
+    // finish-thread issue() of an earlier still-in-flight count>0 chunk. When
+    // count>0 the readback (which copied these queries) resolves it at finish.
+    if (!visibility_count)
+      readbacks.visibility_empty_ends.push_back(query);
+    return true;
+  });
     perf.queries += clock::now() - t0;
   }
 
@@ -5425,6 +5462,86 @@ ArgumentEncodingContext::flushCommands(
     }
     case EncoderType::Resolve: {
       auto data = static_cast<ResolveEncoderData *>(current);
+      if (data->is_depth) {
+        // Point resolve of a multisampled depth surface: a depth-only render pass
+        // whose fragment shader reads sample 0 of the source (bound as a fragment
+        // depth texture) and writes the destination depth attachment. The source
+        // is a multisampled depth-stencil surface, allocated with ShaderRead for
+        // exactly this sampled bind (CreateDepthStencilSurface). Only the depth
+        // aspect is resolved; a depth-stencil source's stencil is not carried,
+        // matching wined3d and DXVK, which resolve depth only.
+        WMT::Texture src_texture;
+        WMT::Texture dst_texture;
+        if (!ResolveRenderPassColorAttachment("DepthResolve guard: source missing", 0, data->src, src_texture) ||
+            !ResolveRenderPassColorAttachment("DepthResolve guard: destination missing", 0, data->dst, dst_texture)) {
+          WARN("DepthResolve guard: skipped unsafe depth resolve encoder=", data->id);
+          data->~ResolveEncoderData();
+          perf.skippedResolve++;
+          break;
+        }
+        auto *dst_allocation = data->dst ? data->dst->allocation : nullptr;
+        auto *dst_descriptor = dst_allocation ? dst_allocation->descriptor : nullptr;
+
+        WMTRenderPassInfo info;
+        WMT::InitializeRenderPassInfo(info);
+        info.depth.texture = dst_texture;
+        info.depth.load_action = WMTLoadActionDontCare;
+        info.depth.store_action = WMTStoreActionStore;
+        if (dst_descriptor) {
+          info.render_target_width = dst_descriptor->width(data->dst->key);
+          info.render_target_height = dst_descriptor->height(data->dst->key);
+        }
+        info.render_target_array_length = 1;
+        info.default_raster_sample_count = 1;
+        NormalizeRenderPassInfo(info);
+
+#if !DXMT_DX12_METAL4
+        // The depth resolve is a d3d9 (Metal 3) path; the Metal 4 render encoder
+        // sets depth-stencil state through the pipeline, not setDepthStencilState,
+        // and this branch never runs on the Metal 4 backend, so keep it out of it.
+        if (!depth_resolve_dss_) {
+          WMTDepthStencilInfo ds_info = {};
+          ds_info.depth_compare_function = WMTCompareFunctionAlways;
+          ds_info.depth_write_enabled = true;
+          depth_resolve_dss_ = device_.newDepthStencilState(ds_info);
+        }
+#endif
+
+        auto encoder = cmdbuf.renderCommandEncoder(info);
+        encoder.setLabel(WMT::String::string("DepthResolvePass", WMTUTF8StringEncoding));
+        data->fence_wait.forEach([&](auto id) {
+          withFence(id, [&](auto fence) { encoder.waitForFence(fence, WMTRenderStageFragment); });
+        });
+        struct ResolveMetadata {
+          uint32_t src_origin[2];
+          uint32_t dst_origin[2];
+          uint32_t size[2];
+        } metadata = {};
+        metadata.src_origin[0] = data->src_rect ? data->src_rect->x : 0;
+        metadata.src_origin[1] = data->src_rect ? data->src_rect->y : 0;
+        metadata.dst_origin[0] = data->dst_origin.x;
+        metadata.dst_origin[1] = data->dst_origin.y;
+        metadata.size[0] = data->resolve_size.width ? data->resolve_size.width : info.render_target_width;
+        metadata.size[1] = data->resolve_size.height ? data->resolve_size.height : info.render_target_height;
+        encoder.setRenderPipelineState(data->pso);
+#if !DXMT_DX12_METAL4
+        encoder.setDepthStencilState(depth_resolve_dss_);
+#endif
+        encoder.setFragmentTexture(src_texture, 0);
+        encoder.setFragmentBytes(&metadata, sizeof(metadata), 0);
+        encoder.setViewport(
+            {double(metadata.dst_origin[0]), double(metadata.dst_origin[1]), double(metadata.size[0]),
+             double(metadata.size[1]), 0.0, 1.0}
+        );
+        encoder.drawPrimitives(WMTPrimitiveTypeTriangle, 0, 3);
+        data->fence_update.forEach([&](auto id) {
+          withFence(id, [&](auto fence) { encoder.updateFence(fence, WMTRenderStageFragment); });
+        });
+        encoder.endEncoding();
+        data->~ResolveEncoderData();
+        perf.encodedResolve++;
+        break;
+      }
       {
         WMT::Texture src_texture;
         WMT::Texture dst_texture;
