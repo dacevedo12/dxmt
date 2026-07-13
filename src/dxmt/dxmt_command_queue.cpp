@@ -1818,6 +1818,13 @@ CommandQueue::WaitForFinishThread() {
 
     chunk.readback.visibility = {};
     chunk.readback.timestamp = {};
+    // Resolve occlusion queries whose end chunk carried no visibility results.
+    // This runs on the finish thread in seq order, so earlier chunks' readbacks
+    // (destroyed above in prior iterations) have already accumulated their
+    // slices; stamping here, not at encode time, avoids a backward clobber.
+    for (auto &query : chunk.readback.visibility_empty_ends)
+      query->markIssuedEmpty();
+    chunk.readback.visibility_empty_ends.clear();
 
     std::vector<std::shared_ptr<GpuCompletionTarget>> completion_targets;
     {

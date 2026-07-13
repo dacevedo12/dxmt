@@ -5394,9 +5394,10 @@ ArgumentEncodingContext::flushCommands(
 
   {
     const auto t0 = clock::now();
-  if (auto count = vro_state_.reset()) {
+  uint64_t visibility_count = vro_state_.reset();
+  if (visibility_count) {
     readbacks.visibility = std::make_unique<VisibilityResultReadback>(
-        device_, seqId, count, pending_queries_
+        device_, seqId, visibility_count, pending_queries_
     );
     auto visibility_buffer = readbacks.visibility->visibility_result_heap;
     auto visibility_residency =
@@ -5405,7 +5406,19 @@ ArgumentEncodingContext::flushCommands(
     readbacks.visibility->setResidencyRetirement(
         std::move(visibility_residency));
   }
-  std::erase_if(pending_queries_, [=](auto &query) -> bool { return query->queryEndAt() == seqId; });
+  std::erase_if(pending_queries_, [&](auto &query) -> bool {
+    if (query->queryEndAt() != seqId)
+      return false;
+    // A query whose end chunk carried no visibility results gets no readback to
+    // resolve it (none was created above), yet it must still resolve or GetData
+    // spins forever. Hand it to the finish thread instead of stamping here:
+    // an encode-time stamp would be clobbered backward by the later
+    // finish-thread issue() of an earlier still-in-flight count>0 chunk. When
+    // count>0 the readback (which copied these queries) resolves it at finish.
+    if (!visibility_count)
+      readbacks.visibility_empty_ends.push_back(query);
+    return true;
+  });
     perf.queries += clock::now() - t0;
   }
 
