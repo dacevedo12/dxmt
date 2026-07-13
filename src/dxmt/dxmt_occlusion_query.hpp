@@ -130,6 +130,17 @@ public:
     seq_id_issued.store(seqId, std::memory_order_release);
   }
 
+  // Resolve a query whose end chunk carried no visibility results (no readback
+  // was created to issue it): nothing to accumulate, so stamp the issued
+  // watermark to the query's own end. MUST run at finish time in seq order: an
+  // encode-time stamp would be clobbered backward by the later finish-thread
+  // issue() of an earlier, still-in-flight count>0 chunk. Same-chunk empty
+  // windows are already stamped in end(); this covers the cross-chunk case.
+  void
+  markIssuedEmpty() {
+    seq_id_issued = seq_id_end;
+  }
+
   bool
   getValue(uint64_t *value) {
     if (seq_id_end <= seq_id_issued.load(std::memory_order_acquire)) {
@@ -495,6 +506,11 @@ private:
 struct QueryReadbacks {
   std::unique_ptr<VisibilityResultReadback> visibility;
   std::unique_ptr<TimestampReadback> timestamp;
+  // Occlusion queries whose end chunk carried no visibility results, so no
+  // VisibilityResultReadback exists to resolve them. The queue's finish-thread
+  // completion handler stamps these in seq order, after earlier chunks'
+  // readbacks have accumulated their slices.
+  std::vector<Rc<VisibilityResultQuery>> visibility_empty_ends;
   std::vector<std::function<void()>> diagnostics;
 };
 
