@@ -15,14 +15,22 @@ ArgumentBufferByteSize(std::size_t count, std::size_t &size) {
   return true;
 }
 
+/**
+ * Bounds-checked view of a generation-pinned argument-buffer slice.
+ * Prefer slice.map<T>() when the slice type exposes it.
+ */
 template <typename T, typename Slice>
 T *MappedArgumentBufferSlice(Slice &slice, std::size_t count) {
   std::size_t required_size = 0;
-  if (!ArgumentBufferByteSize<T>(count, required_size) ||
-      !slice.mapped || !slice.gpu_buffer || slice.length < required_size)
+  if (!ArgumentBufferByteSize<T>(count, required_size))
     return nullptr;
-
-  return static_cast<T *>(slice.mapped);
+  if constexpr (requires { slice.template map<T>(0, count); }) {
+    return slice.template map<T>(0, count);
+  } else {
+    if (!slice.mapped || !slice.gpu_buffer || slice.length < required_size)
+      return nullptr;
+    return static_cast<T *>(slice.mapped);
+  }
 }
 
 template <typename T, bool ComputeCommandEncoder = false, typename Context,
