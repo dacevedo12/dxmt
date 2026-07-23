@@ -2,6 +2,7 @@
 #include <dlfcn.h>
 #include <inttypes.h>
 #include <limits.h>
+#include <stdarg.h>
 #include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -76,19 +77,29 @@ struct DXMTSparseTextureTileKey {
 static NSLock *dxmt_sparse_texture_residency_lock;
 static NSMapTable *dxmt_sparse_texture_residency;
 static pthread_once_t dxmt_sparse_texture_residency_once = PTHREAD_ONCE_INIT;
-static NSLock *dxmt_residency_membership_lock;
-static pthread_once_t dxmt_residency_membership_once = PTHREAD_ONCE_INIT;
+/* Serializes ALL Metal MTLResidencySet userspace mutations (add/remove/commit
+ * and the externalPersistentResidencySets list). Metal residency sets are not
+ * thread-safe; one global ops lock matches GPTK "single mutex around set ops"
+ * and avoids lock-order inversion with encode/register paths.
+ */
+static NSLock *dxmt_residency_set_ops_lock;
+static pthread_once_t dxmt_residency_set_ops_once = PTHREAD_ONCE_INIT;
 
 static void
-dxmt_residency_membership_init(void) {
-  dxmt_residency_membership_lock = [[NSLock alloc] init];
+dxmt_residency_set_ops_init(void) {
+  dxmt_residency_set_ops_lock = [[NSLock alloc] init];
 }
 
 static NSLock *
+dxmt_residency_set_ops_lock_get(void) {
+  pthread_once(&dxmt_residency_set_ops_once, dxmt_residency_set_ops_init);
+  return dxmt_residency_set_ops_lock;
+}
+
+/* Back-compat name used by older call sites in this file. */
+static NSLock *
 dxmt_residency_membership_lock_get(void) {
-  pthread_once(&dxmt_residency_membership_once,
-               dxmt_residency_membership_init);
-  return dxmt_residency_membership_lock;
+  return dxmt_residency_set_ops_lock_get();
 }
 
 static void
@@ -213,6 +224,107 @@ dxmt_env_enabled_default(const char *name, bool default_value) {
   return default_value;
 }
 
+// Heap placement storage-mode diagnostics. Cheap on the happy path (a few
+// integer comparisons per placed allocation). Mismatch logs are rate-limited;
+// verbose success samples require DXMT_DIAG_HEAP_STORAGE=1.
+static bool
+dxmt_metal4_heap_storage_diag_verbose(void) {
+  static bool initialized = false;
+  static bool enabled = false;
+  if (!initialized) {
+    enabled = dxmt_truthy_env_value(getenv("DXMT_DIAG_HEAP_STORAGE")) ||
+              dxmt_truthy_env_value(getenv("DXMT_DIAG_ROOT_CAUSE_DENSE"));
+    initialized = true;
+  }
+  return enabled;
+}
+
+static MTLStorageMode
+dxmt_storage_mode_from_resource_options(MTLResourceOptions options) {
+  return (MTLStorageMode)((options & MTLResourceStorageModeMask) >>
+                          MTLResourceStorageModeShift);
+}
+
+static const char *
+dxmt_storage_mode_name(MTLStorageMode mode) {
+  switch (mode) {
+  case MTLStorageModeShared:
+    return "Shared";
+  case MTLStorageModePrivate:
+    return "Private";
+#if defined(MTLStorageModeManaged)
+  case MTLStorageModeManaged:
+    return "Managed";
+#endif
+#if defined(MTLStorageModeMemoryless)
+  case MTLStorageModeMemoryless:
+    return "Memoryless";
+#endif
+  default:
+    return "Unknown";
+  }
+}
+
+static void
+dxmt_diag_heap_placement(const char *kind, id<MTLHeap> heap, uint64_t offset,
+                         uint64_t length, MTLResourceOptions options,
+                         const struct WMTTextureInfo *texture_info,
+                         BOOL about_to_call_metal) {
+  if (!heap)
+    return;
+
+  const MTLStorageMode heap_mode = heap.storageMode;
+  const MTLStorageMode req_mode = dxmt_storage_mode_from_resource_options(options);
+  const BOOL mismatch = heap_mode != req_mode;
+  if (!mismatch && !dxmt_metal4_heap_storage_diag_verbose())
+    return;
+
+  static _Atomic uint32_t mismatch_count = 0;
+  static _Atomic uint32_t sample_count = 0;
+  uint32_t n = 0;
+  if (mismatch) {
+    n = atomic_fetch_add_explicit(&mismatch_count, 1, memory_order_relaxed) + 1;
+    // Always keep early mismatches; then every 16th so a flood cannot dominate.
+    if (n > 32 && (n % 16) != 0)
+      return;
+  } else {
+    n = atomic_fetch_add_explicit(&sample_count, 1, memory_order_relaxed) + 1;
+    if (n > 8 && (n % 256) != 0)
+      return;
+  }
+
+  fprintf(stderr,
+          "%s:  DXMT Metal4 heap placement %s: kind=%s heap=%p type=%lu "
+          "heapSize=%llu heapStorage=%s(%lu) heapHazard=%lu "
+          "reqOptions=0x%llx reqStorage=%s(%lu) offset=%llu length=%llu "
+          "cpuCacheMode=%lu aboutToCallMetal=%u count=%u",
+          mismatch ? "err" : "info",
+          mismatch ? "STORAGE_MODE_MISMATCH" : "sample", kind, heap,
+          (unsigned long)heap.type, (unsigned long long)heap.size,
+          dxmt_storage_mode_name(heap_mode), (unsigned long)heap_mode,
+          (unsigned long)heap.hazardTrackingMode,
+          (unsigned long long)options, dxmt_storage_mode_name(req_mode),
+          (unsigned long)req_mode, (unsigned long long)offset,
+          (unsigned long long)length,
+          (unsigned long)((options & MTLResourceCPUCacheModeMask) >>
+                          MTLResourceCPUCacheModeShift),
+          about_to_call_metal ? 1u : 0u, n);
+  if (texture_info) {
+    fprintf(stderr,
+            " texType=%u format=%u size=%ux%ux%u mips=%u array=%u samples=%u "
+            "usage=0x%x reserved=0x%x",
+            (unsigned)texture_info->type, (unsigned)texture_info->pixel_format,
+            (unsigned)texture_info->width, (unsigned)texture_info->height,
+            (unsigned)texture_info->depth,
+            (unsigned)texture_info->mipmap_level_count,
+            (unsigned)texture_info->array_length,
+            (unsigned)texture_info->sample_count, (unsigned)texture_info->usage,
+            (unsigned)texture_info->reserved);
+  }
+  fputc('\n', stderr);
+  fflush(stderr);
+}
+
 static uint64_t
 dxmt_parse_u64_env(const char *name, uint64_t default_value) {
   const char *value = getenv(name);
@@ -328,6 +440,66 @@ dxmt_metal4_dense_hang_diagnostics_enabled(void) {
   return enabled;
 }
 
+/*
+ * Hang / commit diagnostics.  PE-side WARN often never sees native fprintf
+ * output when the wine-launch stream stalls; mirror critical lines into
+ * $DXMT_LOG_PATH/dxmt-metal4-native.log so post-mortem always has a copy.
+ */
+enum {
+  DXMT_METAL4_HANG_LOG_STDERR = 1u << 0,
+  DXMT_METAL4_HANG_LOG_FILE = 1u << 1,
+  DXMT_METAL4_HANG_LOG_BOTH =
+      DXMT_METAL4_HANG_LOG_STDERR | DXMT_METAL4_HANG_LOG_FILE,
+};
+
+static FILE *dxmt_metal4_hang_log_file_handle = NULL;
+
+static void
+dxmt_metal4_hang_log_file_open(void) {
+  const char *dir = getenv("DXMT_LOG_PATH");
+  if (!dir || !dir[0])
+    return;
+  char path[PATH_MAX];
+  if (snprintf(path, sizeof(path), "%s/dxmt-metal4-native.log", dir) >=
+      (int)sizeof(path))
+    return;
+  dxmt_metal4_hang_log_file_handle = fopen(path, "a");
+  if (dxmt_metal4_hang_log_file_handle) {
+    setvbuf(dxmt_metal4_hang_log_file_handle, NULL, _IOLBF, 0);
+    fprintf(dxmt_metal4_hang_log_file_handle,
+            "info:  DXMT Metal4 native hang log opened path=%s pid=%d\n", path,
+            (int)getpid());
+    fflush(dxmt_metal4_hang_log_file_handle);
+  }
+}
+
+static FILE *
+dxmt_metal4_hang_log_file(void) {
+  static pthread_once_t once = PTHREAD_ONCE_INIT;
+  pthread_once(&once, dxmt_metal4_hang_log_file_open);
+  return dxmt_metal4_hang_log_file_handle;
+}
+
+static void
+dxmt_metal4_hang_log(unsigned sinks, const char *fmt, ...) {
+  va_list ap;
+  if (sinks & DXMT_METAL4_HANG_LOG_STDERR) {
+    va_start(ap, fmt);
+    vfprintf(stderr, fmt, ap);
+    va_end(ap);
+    fflush(stderr);
+  }
+  if (sinks & DXMT_METAL4_HANG_LOG_FILE) {
+    FILE *file = dxmt_metal4_hang_log_file();
+    if (file) {
+      va_start(ap, fmt);
+      vfprintf(file, fmt, ap);
+      va_end(ap);
+      fflush(file);
+    }
+  }
+}
+
 static bool
 dxmt_metal4_queue_monitor_enabled(void) {
   static bool initialized = false;
@@ -366,6 +538,13 @@ typedef NS_ENUM(uint32_t, DXMTMetal4QueueMonitorPhase) {
   DXMTMetal4QueueMonitorPhaseWaitForDrawable,
   DXMTMetal4QueueMonitorPhasePresentOrderingWait,
   DXMTMetal4QueueMonitorPhasePrepareResidency,
+  /* Sub-phases of prepareCommandResidencyForAllocations (submissionLock held). */
+  DXMTMetal4QueueMonitorPhasePrepareResidencyLock,
+  DXMTMetal4QueueMonitorPhasePrepareResidencyRetire,
+  DXMTMetal4QueueMonitorPhasePrepareResidencyAdd,
+  DXMTMetal4QueueMonitorPhasePrepareResidencySparseCommit,
+  DXMTMetal4QueueMonitorPhasePrepareResidencyCommandCommit,
+  DXMTMetal4QueueMonitorPhasePrepareResidencyUnlock,
   DXMTMetal4QueueMonitorPhaseCommitResidencySet,
   DXMTMetal4QueueMonitorPhaseRequestResidency,
   DXMTMetal4QueueMonitorPhaseUseResidencySet,
@@ -387,6 +566,18 @@ typedef NS_ENUM(uint32_t, DXMTMetal4QueueMonitorPhase) {
   DXMTMetal4QueueMonitorPhaseSparseMappingResidencyCommit,
   DXMTMetal4QueueMonitorPhaseSparseMappingMetalUpdate,
   DXMTMetal4QueueMonitorPhaseSparseMappingApply,
+};
+
+/* subjectFlags bits for prepare-residency hang diagnostics. */
+enum {
+  DXMT_PREPARE_RESIDENCY_FLAG_SPARSE_CHANGED = 1u << 0,
+  DXMT_PREPARE_RESIDENCY_FLAG_COMMAND_CHANGED = 1u << 1,
+  DXMT_PREPARE_RESIDENCY_FLAG_STEP_LOCK = 1u << 8,
+  DXMT_PREPARE_RESIDENCY_FLAG_STEP_RETIRE = 1u << 9,
+  DXMT_PREPARE_RESIDENCY_FLAG_STEP_ADD = 1u << 10,
+  DXMT_PREPARE_RESIDENCY_FLAG_STEP_SPARSE_COMMIT = 1u << 11,
+  DXMT_PREPARE_RESIDENCY_FLAG_STEP_COMMAND_COMMIT = 1u << 12,
+  DXMT_PREPARE_RESIDENCY_FLAG_STEP_UNLOCK = 1u << 13,
 };
 
 typedef NS_ENUM(uint32_t, DXMTMetal4QueueMonitorSource) {
@@ -471,6 +662,18 @@ dxmt_metal4_queue_monitor_phase_name(uint32_t phase) {
     return "present-ordering-wait";
   case DXMTMetal4QueueMonitorPhasePrepareResidency:
     return "prepare-residency";
+  case DXMTMetal4QueueMonitorPhasePrepareResidencyLock:
+    return "prepare-residency-lock";
+  case DXMTMetal4QueueMonitorPhasePrepareResidencyRetire:
+    return "prepare-residency-retire";
+  case DXMTMetal4QueueMonitorPhasePrepareResidencyAdd:
+    return "prepare-residency-add";
+  case DXMTMetal4QueueMonitorPhasePrepareResidencySparseCommit:
+    return "prepare-residency-sparse-commit";
+  case DXMTMetal4QueueMonitorPhasePrepareResidencyCommandCommit:
+    return "prepare-residency-command-commit";
+  case DXMTMetal4QueueMonitorPhasePrepareResidencyUnlock:
+    return "prepare-residency-unlock";
   case DXMTMetal4QueueMonitorPhaseCommitResidencySet:
     return "commit-residency-set";
   case DXMTMetal4QueueMonitorPhaseRequestResidency:
@@ -908,6 +1111,11 @@ struct DXMTMetal4PresentDiagnostic {
 @property(nonatomic, retain) NSMutableArray *pendingWaitEvents;
 @property(nonatomic, retain) NSMutableArray *pendingSignalEvents;
 @property(nonatomic, retain) NSMutableArray *retainedTemporaryResources;
+// Lifetime snapshot handed off by the Metal completion callback and drained by
+// the waiter (dxmt-finish-thr). Never released on com.Metal4.CompletionQueue:
+// that GCD thread has no Wine TEB, and ObjC free of GPU resources there has
+// caused EXC_BAD_ACCESS + ntdll save_context faults.
+@property(nonatomic, retain) NSArray *pendingLifetimeSnapshot;
 @property(nonatomic, retain) NSMutableArray *queueResidencyAllocations;
 @property(nonatomic, retain) NSMutableSet *queueResidencyAllocationSet;
 @property(nonatomic, retain) NSCondition *feedbackCondition;
@@ -922,13 +1130,16 @@ struct DXMTMetal4PresentDiagnostic {
 @property(nonatomic, assign) double feedbackGPUEndTime;
 @property(nonatomic, assign) uint64_t completionCurrentBeforeThrottle;
 @property(nonatomic, assign) uint64_t completionCurrentAtCommit;
+@property(nonatomic, assign) BOOL metal4ObjectsRecycled;
 @property(nonatomic, assign) struct WMTCommandBufferDiagnosticInfo diagnosticInfo;
+- (void)recycleMetal4ObjectsIfNeeded;
 - (instancetype)initWithQueue:(DXMTMetal4CommandQueue *)queue;
 - (id<MTL4CommandBuffer>)commandBuffer;
 - (id<MTL4ComputeCommandEncoder>)metal4ComputeEncoder;
 - (id<MTL4RenderCommandEncoder>)metal4RenderCommandEncoderWithDescriptor:(MTL4RenderPassDescriptor *)descriptor;
 - (void)registerResourceForCurrentCommandBuffer:(id<MTLAllocation>)allocation;
 - (void)retainTemporaryResourceForCurrentCommandBuffer:(id<MTLAllocation>)allocation;
+- (void)drainPendingLifetimeOwnership;
 - (id<MTL4ArgumentTable>)newArgumentTableWithLabel:(NSString *)label;
 - (id<MTLBuffer>)newUploadBufferWithBytes:(const void *)bytes length:(NSUInteger)length;
 - (void)commit;
@@ -1423,11 +1634,20 @@ dxmt_metal4_is_buffer(id object) {
 @property(nonatomic, retain) NSLock *errorLock;
 @property(nonatomic, retain) NSLock *sparseResidencyLock;
 @property(nonatomic, retain) NSMutableArray *externalLifetimeResidencySets;
+/* GPTK-style MTL4 object pools (returned only after GPU completion). */
+@property(nonatomic, retain) NSLock *metal4ObjectPoolLock;
+@property(nonatomic, retain) NSMutableArray *metal4CommandBufferPool;
+@property(nonatomic, retain) NSMutableArray *metal4AllocatorPool;
 - (instancetype)initWithDevice:(id<MTLDevice>)device maxCommandBufferCount:(uint64_t)maxCommandBufferCount;
 - (uint64_t)nextEventValueLocked;
 - (void)waitForCommandBufferSlotLocked:(uint64_t)completionValue;
+- (void)retireCompletedResidency;
 - (uint64_t)prepareCommandResidencyForAllocations:(NSArray *)allocations
                                   completionValue:(uint64_t)completionValue;
+- (id<MTL4CommandAllocator>)acquireCommandAllocator;
+- (id<MTL4CommandBuffer>)acquireCommandBuffer;
+- (void)recycleCommandBuffer:(id<MTL4CommandBuffer>)commandBuffer
+                   allocator:(id<MTL4CommandAllocator>)allocator;
 - (void)monitorWaitBegin:(DXMTMetal4QueueMonitorSource)source
            commandBuffer:(DXMTMetal4CommandBuffer *)commandBuffer;
 - (void)monitorWaitEnd:(DXMTMetal4QueueMonitorSource)source
@@ -1442,6 +1662,8 @@ dxmt_metal4_is_buffer(id object) {
                     count:(uint64_t)subjectCount
                     flags:(uint64_t)subjectFlags;
 - (void)monitorReleased;
+- (const char *)monitorCurrentPhaseName;
+- (uint64_t)monitorCurrentCompletionValue;
 - (void)recordPresentDiagnosticForCommandBuffer:
             (DXMTMetal4CommandBuffer *)commandBuffer
                             previousValue:(uint64_t)previousValue
@@ -1476,6 +1698,9 @@ dxmt_metal4_is_buffer(id object) {
   _submissionLock = [[NSLock alloc] init];
   _errorLock = [[NSLock alloc] init];
   _sparseResidencyLock = [[NSLock alloc] init];
+  _metal4ObjectPoolLock = [[NSLock alloc] init];
+  _metal4CommandBufferPool = [[NSMutableArray alloc] init];
+  _metal4AllocatorPool = [[NSMutableArray alloc] init];
   _monitorDiagnostic = dxmt_metal4_queue_monitor_register(
       (uintptr_t)self, (uintptr_t)_metal4Queue);
   MTLResidencySetDescriptor *sparseResidencyDescriptor =
@@ -1504,7 +1729,9 @@ dxmt_metal4_is_buffer(id object) {
       !_throttleLock || !_submissionLock || !_errorLock ||
       !_sparseResidencyLock || !_commandResidencyAllocationRefs ||
       !_commandResidencyRetirements || !_sparseTrackedTextures ||
-      !_sparseResidencyRetirements || !_externalLifetimeResidencySets) {
+      !_sparseResidencyRetirements || !_externalLifetimeResidencySets ||
+      !_metal4ObjectPoolLock || !_metal4CommandBufferPool ||
+      !_metal4AllocatorPool) {
     [self release];
     return nil;
   }
@@ -1538,6 +1765,9 @@ dxmt_metal4_is_buffer(id object) {
   [_sparseResidencyAllocationRefs release];
   [_sparseResidencySet release];
   [_sparseResidencyLock release];
+  [_metal4CommandBufferPool release];
+  [_metal4AllocatorPool release];
+  [_metal4ObjectPoolLock release];
   [_externalLifetimeResidencySets release];
   [_errorLock release];
   [_submissionLock release];
@@ -1552,6 +1782,50 @@ dxmt_metal4_is_buffer(id object) {
   [_testFeedbackErrorToken release];
   [_firstError release];
   [super dealloc];
+}
+
+enum { DXMT_METAL4_OBJECT_POOL_CAPACITY = 8 };
+
+- (id<MTL4CommandAllocator>)acquireCommandAllocator {
+  [_metal4ObjectPoolLock lock];
+  id<MTL4CommandAllocator> allocator =
+      (id<MTL4CommandAllocator>)[_metal4AllocatorPool lastObject];
+  if (allocator) {
+    [allocator retain];
+    [_metal4AllocatorPool removeLastObject];
+    [_metal4ObjectPoolLock unlock];
+    return [allocator autorelease];
+  }
+  [_metal4ObjectPoolLock unlock];
+  return [[_device newCommandAllocator] autorelease];
+}
+
+- (id<MTL4CommandBuffer>)acquireCommandBuffer {
+  [_metal4ObjectPoolLock lock];
+  id<MTL4CommandBuffer> buffer =
+      (id<MTL4CommandBuffer>)[_metal4CommandBufferPool lastObject];
+  if (buffer) {
+    [buffer retain];
+    [_metal4CommandBufferPool removeLastObject];
+    [_metal4ObjectPoolLock unlock];
+    return [buffer autorelease];
+  }
+  [_metal4ObjectPoolLock unlock];
+  return [[_device newCommandBuffer] autorelease];
+}
+
+- (void)recycleCommandBuffer:(id<MTL4CommandBuffer>)commandBuffer
+                   allocator:(id<MTL4CommandAllocator>)allocator {
+  // Match GPTK Get/ReturnMTL4CommandBuffer: recycle only after GPU completion.
+  // Drop objects when the pool is full so teardown does not accumulate.
+  [_metal4ObjectPoolLock lock];
+  if (commandBuffer &&
+      _metal4CommandBufferPool.count < DXMT_METAL4_OBJECT_POOL_CAPACITY)
+    [_metal4CommandBufferPool addObject:commandBuffer];
+  if (allocator &&
+      _metal4AllocatorPool.count < DXMT_METAL4_OBJECT_POOL_CAPACITY)
+    [_metal4AllocatorPool addObject:allocator];
+  [_metal4ObjectPoolLock unlock];
 }
 
 - (uint64_t)nextEventValueLocked {
@@ -1804,13 +2078,39 @@ dxmt_metal4_is_buffer(id object) {
   }
 }
 
-- (uint64_t)prepareCommandResidencyForAllocations:(NSArray *)allocations
-                                  completionValue:(uint64_t)completionValue {
-  const uint64_t begin = dxmt_monotonic_us();
+- (const char *)monitorCurrentPhaseName {
+  if (!_monitorDiagnostic)
+    return "monitor-disabled";
+  const uint32_t phase = atomic_load_explicit(&_monitorDiagnostic->phase,
+                                              memory_order_acquire);
+  return dxmt_metal4_queue_monitor_phase_name(phase);
+}
+
+- (uint64_t)monitorCurrentCompletionValue {
+  if (!_monitorDiagnostic)
+    return 0;
+  return atomic_load_explicit(&_monitorDiagnostic->completion_value,
+                              memory_order_acquire);
+}
+
+/*
+ * GPTK residency dichotomy:
+ * - Lifetime (device/queue-wide) lives in externalLifetimeResidencySets /
+ *   HasLifetimeResidency and is not churned per commit.
+ * - Transient command residency is added on submit and retired only after
+ *   the shared-event timeline passes the generation that used them.
+ * Retirement is deliberately NOT under submissionLock so a Metal residency
+ * set commit cannot block the whole queue serializer for hundreds of ms.
+ */
+- (void)retireCompletedResidency {
+  // Same lock order as prepare: sparseResidencyLock → residency set ops lock.
   [_sparseResidencyLock lock];
+  NSLock *opsLock = dxmt_residency_set_ops_lock_get();
+  [opsLock lock];
+  const uint64_t completedValue = _event.signaledValue;
   BOOL sparseChanged = NO;
   BOOL commandChanged = NO;
-  const uint64_t completedValue = _event.signaledValue;
+
   NSIndexSet *completedSparseRetirements =
       [_sparseResidencyRetirements
           indexesOfObjectsPassingTest:^BOOL(NSDictionary *retirement,
@@ -1835,6 +2135,7 @@ dxmt_metal4_is_buffer(id object) {
   }
   [_sparseResidencyRetirements
       removeObjectsAtIndexes:completedSparseRetirements];
+
   NSIndexSet *completedRetirements =
       [_commandResidencyRetirements
           indexesOfObjectsPassingTest:^BOOL(NSDictionary *retirement,
@@ -1861,11 +2162,42 @@ dxmt_metal4_is_buffer(id object) {
   [_commandResidencyRetirements
       removeObjectsAtIndexes:completedRetirements];
 
+  if (sparseChanged)
+    [_sparseResidencySet commit];
+  if (commandChanged)
+    [_commandResidencySet commit];
+  [opsLock unlock];
+  [_sparseResidencyLock unlock];
+}
+
+- (uint64_t)prepareCommandResidencyForAllocations:(NSArray *)allocations
+                                  completionValue:(uint64_t)completionValue {
+  const BOOL diag = dxmt_metal4_dense_hang_diagnostics_enabled() ||
+                    dxmt_metal4_residency_diag_enabled();
+  const uint64_t slow_step_us = 50000;
+  const uint64_t slow_total_us = 100000;
+  const uint64_t begin = dxmt_monotonic_us();
+  const NSUInteger allocation_count = allocations ? allocations.count : 0;
+  NSUInteger command_added = 0;
+
+  [self monitorSetPhase:DXMTMetal4QueueMonitorPhasePrepareResidencyAdd
+          commandBuffer:nil];
+  [self monitorSetSubject:(uintptr_t)allocation_count
+                      aux:(uintptr_t)completionValue
+                    count:0
+                    flags:DXMT_PREPARE_RESIDENCY_FLAG_STEP_ADD];
+  // Lock order: sparseResidencyLock → residency set ops lock (never reverse).
+  // Serialize Metal set mutations with RenderThread/persistent thunks.
+  [_sparseResidencyLock lock];
+  NSLock *opsLock = dxmt_residency_set_ops_lock_get();
+  [opsLock lock];
+  BOOL commandChanged = NO;
   if (allocations.count) {
     for (id<MTLAllocation> allocation in allocations) {
       if ([_commandResidencyAllocationRefs countForObject:allocation] == 0) {
         [_commandResidencySet addAllocation:allocation];
         commandChanged = YES;
+        command_added++;
       }
       [_commandResidencyAllocationRefs addObject:allocation];
     }
@@ -1874,13 +2206,31 @@ dxmt_metal4_is_buffer(id object) {
       @"allocations" : [[allocations copy] autorelease]
     }];
   }
-  if (sparseChanged)
-    [_sparseResidencySet commit];
-  if (commandChanged)
+  if (commandChanged) {
+    [self monitorSetPhase:
+              DXMTMetal4QueueMonitorPhasePrepareResidencyCommandCommit
+            commandBuffer:nil];
     [_commandResidencySet commit];
+  }
+  [opsLock unlock];
+  [self monitorSetPhase:DXMTMetal4QueueMonitorPhasePrepareResidencyUnlock
+          commandBuffer:nil];
   [_sparseResidencyLock unlock];
-  const uint64_t end = dxmt_monotonic_us();
-  return end >= begin ? end - begin : 0;
+
+  const uint64_t total_us = dxmt_monotonic_us() - begin;
+  if (diag && total_us >= slow_total_us) {
+    fprintf(stderr,
+            "warn:  DXMT Metal4 prepare-residency diagnostic: queue=%p"
+            " completionTarget=%" PRIu64 " totalUs=%" PRIu64
+            " allocCount=%lu commandAdded=%lu commandChanged=%u"
+            " path=add-only\n",
+            _metal4Queue, completionValue, total_us,
+            (unsigned long)allocation_count, (unsigned long)command_added,
+            commandChanged ? 1u : 0u);
+    fflush(stderr);
+  }
+  (void)slow_step_us;
+  return total_us;
 }
 
 - (void)recordPresentDiagnosticForCommandBuffer:
@@ -2050,8 +2400,9 @@ dxmt_metal4_is_buffer(id object) {
     return nil;
 
   _owner = [queue retain];
-  _allocator = [queue.device newCommandAllocator];
-  _metal4Buffer = [queue.device newCommandBuffer];
+  // GPTK-style pool: acquire recycled MTL4 objects when available.
+  _allocator = [[queue acquireCommandAllocator] retain];
+  _metal4Buffer = [[queue acquireCommandBuffer] retain];
   [_metal4Buffer beginCommandBufferWithAllocator:_allocator];
   _pendingWaitEvents = [[NSMutableArray alloc] init];
   _pendingSignalEvents = [[NSMutableArray alloc] init];
@@ -2061,6 +2412,7 @@ dxmt_metal4_is_buffer(id object) {
   _feedbackCondition = [[NSCondition alloc] init];
   _feedbackComplete = NO;
   _completionValue = 0;
+  _metal4ObjectsRecycled = NO;
   _internalStatus = DXMTMetal4CommandBufferStateNotEnqueued;
   _feedbackGPUStartTime = 0.0;
   _feedbackGPUEndTime = 0.0;
@@ -2078,11 +2430,16 @@ dxmt_metal4_is_buffer(id object) {
 }
 
 - (void)dealloc {
+  // Safety net if waitUntilCompleted was never called after a committed buffer.
+  [self drainPendingLifetimeOwnership];
+  // Do not return incomplete command buffers to the pool — end/commit may not
+  // have run. Only recycle after a successful wait path.
   [_pendingDrawable release];
   [_feedbackError release];
   [_pendingWaitEvents release];
   [_pendingSignalEvents release];
   [_retainedTemporaryResources release];
+  [_pendingLifetimeSnapshot release];
   [_queueResidencyAllocationSet release];
   [_queueResidencyAllocations release];
   [_feedbackCondition release];
@@ -2090,6 +2447,46 @@ dxmt_metal4_is_buffer(id object) {
   [_allocator release];
   [_owner release];
   [super dealloc];
+}
+
+- (void)drainPendingLifetimeOwnership {
+  // Release lifetime ownership on the waiter thread (dxmt-finish / PE with TEB),
+  // never on Metal's CompletionQueue. Snapshot is the exclusive temporary owner
+  // for this command-buffer generation; CommandChunk still owns long-lived
+  // original resources via retained_metal_resources until GPU complete.
+  NSArray *snapshot = nil;
+  [_feedbackCondition lock];
+  snapshot = _pendingLifetimeSnapshot;
+  _pendingLifetimeSnapshot = nil;
+  [_feedbackCondition unlock];
+  [snapshot release];
+}
+
+- (void)recycleMetal4ObjectsIfNeeded {
+  // GPTK ReturnMTL4CommandBuffer: only after GPU completion / terminal latch.
+  // Never recycle a buffer that was never submitted (begin without end/commit).
+  if (_metal4ObjectsRecycled)
+    return;
+  if (!_metal4Buffer || !_allocator)
+    return;
+  [_feedbackCondition lock];
+  const BOOL terminal =
+      _internalStatus == DXMTMetal4CommandBufferStateCompleted ||
+      _internalStatus == DXMTMetal4CommandBufferStateError;
+  const BOOL submitted = _completionValue != 0;
+  [_feedbackCondition unlock];
+  if (!terminal || !submitted)
+    return;
+  _metal4ObjectsRecycled = YES;
+  // Allocator must be reset before the next beginCommandBufferWithAllocator.
+  [_allocator reset];
+  [_owner recycleCommandBuffer:_metal4Buffer allocator:_allocator];
+  // Pool now owns the references; drop our retains so dealloc does not free
+  // objects still sitting in the pool.
+  [_metal4Buffer release];
+  _metal4Buffer = nil;
+  [_allocator release];
+  _allocator = nil;
 }
 
 - (id<MTL4CommandBuffer>)commandBuffer {
@@ -2108,22 +2505,15 @@ dxmt_metal4_is_buffer(id object) {
   if (!allocation)
     return;
 
-  // The logical CommandChunk already owns the original resource. This method
-  // only records the backing allocation needed by this native command buffer.
+  // GPTK split (D3DMCommandQueue::RetainResourceForCurrentCommandBuffer):
+  // - PE CommandChunk owns long-lived object retains until GPU complete.
+  // - This method is encode-local bookkeeping for transient command-residency
+  //   membership at prepare/submit only.
+  // - Do NOT take residency ops lock or call containsAllocation/addAllocation:
+  //   those serialized with RenderThread persistent residency and hung BMW.
+  // - Lifetime resources already live in the queue-attached persistent set.
   id<MTLAllocation> backing = dxmt_metal4_backing_allocation(allocation);
-  BOOL externallyResident = NO;
-  NSLock *membershipLock = dxmt_residency_membership_lock_get();
-  [membershipLock lock];
-  for (id<MTLResidencySet> set in
-           _owner.externalLifetimeResidencySets) {
-    if ([set containsAllocation:backing]) {
-      externallyResident = YES;
-      break;
-    }
-  }
-  [membershipLock unlock];
-  if (!externallyResident &&
-      ![_queueResidencyAllocationSet containsObject:backing]) {
+  if (![_queueResidencyAllocationSet containsObject:backing]) {
     [_queueResidencyAllocationSet addObject:backing];
     [_queueResidencyAllocations addObject:backing];
   }
@@ -2142,6 +2532,8 @@ dxmt_metal4_is_buffer(id object) {
     (id<MTLAllocation>)allocation {
   if (!allocation)
     return;
+  // Sole lifetime owner for native-side temporaries (upload buffers, etc.)
+  // until the generation snapshot is drained after GPU complete.
   if (![_retainedTemporaryResources containsObject:allocation])
     [_retainedTemporaryResources addObject:allocation];
   [self registerResourceForCurrentCommandBuffer:allocation];
@@ -2185,16 +2577,54 @@ dxmt_metal4_is_buffer(id object) {
   [self commitLocked];
 }
 
+// D3DMetal does not serialize command-buffer commits behind a recursive critical
+// section that also waits for GPU retirement. Track commit depth so nested
+// commits fail fast instead of deadlocking on NSLock.
+static _Thread_local int dxmt_metal4_commit_locked_depth = 0;
+
 - (uint64_t)commitLocked {
-  [_owner monitorSetPhase:DXMTMetal4QueueMonitorPhaseCommitPreflight
-            commandBuffer:self];
-  [_feedbackCondition lock];
-  if (_internalStatus != DXMTMetal4CommandBufferStateNotEnqueued) {
-    [_feedbackCondition unlock];
+  if (dxmt_metal4_commit_locked_depth > 0) {
+    dxmt_metal4_hang_log(
+        DXMT_METAL4_HANG_LOG_BOTH,
+        "err:   DXMT Metal4 reentrant commit rejected: commandBuffer=%p "
+        "queue=%p depth=%d parentPhase=%s parentCompletion=%" PRIu64
+        " nestedStatus=%u nestedCompletion=%" PRIu64
+        " frame=%" PRIu64 " chunk=%" PRIu64 " d3dSeq=%" PRIu64 "-%" PRIu64
+        " reason=reentrant\n",
+        self, _owner.metal4Queue, dxmt_metal4_commit_locked_depth,
+        [_owner monitorCurrentPhaseName],
+        [_owner monitorCurrentCompletionValue], (unsigned)_internalStatus,
+        _completionValue, _diagnosticInfo.frame_id, _diagnosticInfo.chunk_id,
+        _diagnosticInfo.d3d_sequence_begin, _diagnosticInfo.d3d_sequence_end);
     [_owner monitorWaitEnd:DXMTMetal4QueueMonitorSourceCommandBufferCommit
              commandBuffer:self];
     [_owner monitorWaitEnd:DXMTMetal4QueueMonitorSourceUnixCommitThunk
              commandBuffer:self];
+    return 0;
+  }
+  dxmt_metal4_commit_locked_depth++;
+
+  [_feedbackCondition lock];
+  if (_internalStatus != DXMTMetal4CommandBufferStateNotEnqueued) {
+    const unsigned already_status = (unsigned)_internalStatus;
+    const uint64_t already_completion = _completionValue;
+    const BOOL already_feedback = _feedbackComplete;
+    [_feedbackCondition unlock];
+    dxmt_metal4_hang_log(
+        DXMT_METAL4_HANG_LOG_BOTH,
+        "err:   DXMT Metal4 commit rejected already-enqueued: commandBuffer=%p "
+        "queue=%p status=%u completion=%" PRIu64 " feedbackComplete=%u"
+        " frame=%" PRIu64 " chunk=%" PRIu64 " d3dSeq=%" PRIu64 "-%" PRIu64
+        " reason=already-enqueued\n",
+        self, _owner.metal4Queue, already_status, already_completion,
+        already_feedback ? 1u : 0u, _diagnosticInfo.frame_id,
+        _diagnosticInfo.chunk_id, _diagnosticInfo.d3d_sequence_begin,
+        _diagnosticInfo.d3d_sequence_end);
+    [_owner monitorWaitEnd:DXMTMetal4QueueMonitorSourceCommandBufferCommit
+             commandBuffer:self];
+    [_owner monitorWaitEnd:DXMTMetal4QueueMonitorSourceUnixCommitThunk
+             commandBuffer:self];
+    dxmt_metal4_commit_locked_depth--;
     return 0;
   }
   _internalStatus = DXMTMetal4CommandBufferStateCommitted;
@@ -2229,18 +2659,19 @@ dxmt_metal4_is_buffer(id object) {
         fclose(marker);
       }
     }
-    if (dxmt_metal4_perf_stats_enabled()) {
-      fprintf(stderr,
-              "err:   DXMT Metal4 queue rejected command buffer after first error:"
-              " commandBuffer=%p queue=%p domain=%s code=%ld description=%s\n",
-              self, _owner.metal4Queue,
-              queueError.domain ? queueError.domain.UTF8String : "<no domain>",
-              (long)queueError.code,
-              queueError.localizedDescription
-                  ? queueError.localizedDescription.UTF8String
-                  : "<no description>");
-      fflush(stderr);
-    }
+    dxmt_metal4_hang_log(
+        DXMT_METAL4_HANG_LOG_BOTH,
+        "err:   DXMT Metal4 queue rejected command buffer after first error:"
+        " commandBuffer=%p queue=%p domain=%s code=%ld description=%s"
+        " frame=%" PRIu64 " chunk=%" PRIu64 " reason=queue-error\n",
+        self, _owner.metal4Queue,
+        queueError.domain ? queueError.domain.UTF8String : "<no domain>",
+        (long)queueError.code,
+        queueError.localizedDescription
+            ? queueError.localizedDescription.UTF8String
+            : "<no description>",
+        _diagnosticInfo.frame_id, _diagnosticInfo.chunk_id);
+    dxmt_metal4_commit_locked_depth--;
     return 0;
   }
 
@@ -2259,8 +2690,31 @@ dxmt_metal4_is_buffer(id object) {
   uint64_t previousPresentValue = 0;
   uint64_t currentPresentValue = 0;
   uint64_t residency_submit_us = 0;
+  BOOL holdingSubmissionLock = NO;
+  uint64_t completionValue = 0;
+  // GPTK WaitUntilSubmission closed-loop bookkeeping:
+  // once nextEventValue is taken we own a timeline hole that must be closed on
+  // every exit path; once Metal commit returns the feedback handler owns the
+  // terminal latch.
+  BOOL completionTimelineOwned = NO;
+  BOOL metalSubmitted = NO;
+  BOOL completionTimelineSignaled = NO;
+  // Declared outside @try so @finally can reclaim them on pre-submit abort.
+  MTL4CommitOptions *options = nil;
+  __block NSArray *feedbackRetainedResources = nil;
 
+  // GPTK residency dichotomy: retire completed *transient* memberships off the
+  // commit serializer. Lifetime/device sets are not touched here. A residency
+  // set commit under submissionLock has been observed to stall the whole queue
+  // for hundreds of ms (and nest with other waiters).
+  [_owner retireCompletedResidency];
+
+  // Match D3DMetal: never park a GPU-timeline wait under the commit serializer.
+  // submissionLock only covers short Metal-queue mutation; depth throttling
+  // waits for older completions outside the lock so other commits / sparse
+  // updates / feedback cannot deadlock behind UINT64_MAX waits.
   [_owner.submissionLock lock];
+  holdingSubmissionLock = YES;
   [_owner monitorWaitEnd:DXMTMetal4QueueMonitorSourceCommandBufferCommit
            commandBuffer:self];
   [_owner monitorWaitEnd:DXMTMetal4QueueMonitorSourceUnixCommitThunk
@@ -2285,6 +2739,7 @@ dxmt_metal4_is_buffer(id object) {
         (obj_handle_t)wait.event,
         wait.value,
         APITRACE_METAL_QUEUE_EVENT_ENQUEUED);
+    // Schedules a GPU dependency on the Metal 4 queue; does not CPU-block.
     [_owner.metal4Queue waitForEvent:wait.event value:wait.value];
   }
 
@@ -2311,7 +2766,8 @@ dxmt_metal4_is_buffer(id object) {
             commandBuffer:self];
   [_metal4Buffer endCommandBuffer];
 
-  const uint64_t completionValue = [_owner nextEventValueLocked];
+  completionValue = [_owner nextEventValueLocked];
+  completionTimelineOwned = YES;
   [_feedbackCondition lock];
   _completionValue = completionValue;
   [_feedbackCondition unlock];
@@ -2326,9 +2782,28 @@ dxmt_metal4_is_buffer(id object) {
   [_queueResidencyAllocationSet removeAllObjects];
   [_queueResidencyAllocations removeAllObjects];
   _completionCurrentBeforeThrottle = _owner.event.signaledValue;
-  [_owner monitorSetPhase:DXMTMetal4QueueMonitorPhaseCommandBufferThrottle
-            commandBuffer:self];
-  [_owner waitForCommandBufferSlotLocked:completionValue];
+
+  // Drop the serializer before any CPU wait on the retirement timeline.
+  const uint64_t throttleTarget =
+      (_owner.maxCommandBufferCount &&
+       completionValue > _owner.maxCommandBufferCount)
+          ? (completionValue - _owner.maxCommandBufferCount)
+          : 0;
+  if (throttleTarget &&
+      _completionCurrentBeforeThrottle < throttleTarget) {
+    [_owner monitorSetPhase:DXMTMetal4QueueMonitorPhaseCommandBufferThrottle
+              commandBuffer:self];
+    [_owner monitorReleased];
+    [_owner.submissionLock unlock];
+    holdingSubmissionLock = NO;
+    [_owner.event waitUntilSignaledValue:throttleTarget
+                               timeoutMS:UINT64_MAX];
+    [_owner.submissionLock lock];
+    holdingSubmissionLock = YES;
+    [_owner monitorAcquired:DXMTMetal4QueueMonitorSourceCommandBufferCommit
+                      phase:DXMTMetal4QueueMonitorPhaseCommandBufferThrottle
+              commandBuffer:self];
+  }
   _completionCurrentAtCommit = _owner.event.signaledValue;
 
   const BOOL denseHangDiagnostics =
@@ -2355,7 +2830,6 @@ dxmt_metal4_is_buffer(id object) {
 
   [_owner monitorSetPhase:DXMTMetal4QueueMonitorPhaseFeedbackSetup
             commandBuffer:self];
-  MTL4CommitOptions *options = nil;
   BOOL traceFeedback = NO;
 #if DXMT_APITRACE_METAL
   traceFeedback = dxmt_apitrace_runtime_enabled() &&
@@ -2387,11 +2861,11 @@ dxmt_metal4_is_buffer(id object) {
     const BOOL feedbackHasDrawable = _pendingDrawable != nil;
     const struct WMTCommandBufferDiagnosticInfo feedbackDiagnostic =
         _diagnosticInfo;
-    // Transfer this command buffer generation's resource owners to the
-    // feedback callback. Recording state immediately advances to fresh
-    // containers; only the callback releases the immutable snapshot.
-    __block NSArray *feedbackRetainedResources =
-        [_retainedTemporaryResources copy];
+    // Snapshot this generation's temporary resource owners for GPU lifetime.
+    // Recording state advances to a fresh container immediately. The Metal
+    // completion callback only *hands off* the immutable snapshot to the
+    // command buffer; the waiter (dxmt-finish-thr) is the sole releaser.
+    feedbackRetainedResources = [_retainedTemporaryResources copy];
     [_retainedTemporaryResources release];
     _retainedTemporaryResources = [[NSMutableArray alloc] init];
     __block id<MTLSharedEvent> feedbackCompletionEvent = [_owner.event retain];
@@ -2673,9 +3147,11 @@ dxmt_metal4_is_buffer(id object) {
       }
 #endif
       } @finally {
-        // Publish completion before releasing Objective-C resources. Even if a
-        // broken resource raises while being released, waiters cannot remain
-        // permanently blocked behind an unreported completion.
+        // Publish the completion latch on the Metal CompletionQueue, but do
+        // NOT free temporary GPU resources here. Hand the snapshot to the
+        // command buffer so dxmt-finish-thr can drain it after wait returns
+        // (Wine-safe thread with a TEB). Latch first so waiters never hang if
+        // a later diagnostic free faults.
         [feedbackOwner.feedbackCondition lock];
         feedbackOwner.feedbackGPUStartTime = feedback.GPUStartTime;
         feedbackOwner.feedbackGPUEndTime = feedback.GPUEndTime;
@@ -2684,10 +3160,17 @@ dxmt_metal4_is_buffer(id object) {
         feedbackOwner.internalStatus =
             error ? DXMTMetal4CommandBufferStateError
                   : DXMTMetal4CommandBufferStateCompleted;
+        // Transfer temporary lifetime ownership. The retain property setter
+        // takes ownership of the array (and releases any stale snapshot).
+        if (feedbackRetainedResources) {
+          feedbackOwner.pendingLifetimeSnapshot = feedbackRetainedResources;
+          [feedbackRetainedResources release];
+          feedbackRetainedResources = nil;
+        }
         feedbackOwner.feedbackComplete = YES;
         [feedbackOwner.feedbackCondition broadcast];
         [feedbackOwner.feedbackCondition unlock];
-        [feedbackRetainedResources release];
+        // Diagnostic copies are not GPU resources; safe to free here.
         [feedbackLabel release];
         [feedbackSignalEvents release];
         [feedbackWaitEvents release];
@@ -2703,12 +3186,19 @@ dxmt_metal4_is_buffer(id object) {
   // Match D3DMetal: a synchronous Objective-C exception from Metal commit is
   // process-fatal and is not converted into a recoverable command-buffer
   // result. Normal GPU failures arrive through feedback and always publish the
-  // completion latch above.
+  // completion latch above. Closed-loop in @finally still closes the timeline
+  // hole if we abort between nextEventValue and signalEvent.
   if (options)
     [_owner.metal4Queue commit:commandBuffers count:1 options:options];
   else
     [_owner.metal4Queue commit:commandBuffers count:1];
+  metalSubmitted = YES;
+  // Ownership of options (and the feedback block) transfers to Metal with the
+  // successful commit; drop our retain without destroying the in-flight block.
+  // Do NOT nil feedbackRetainedResources here: under MRC the __block storage is
+  // shared with the handler, which must release the snapshot on completion.
   [options release];
+  options = nil;
   dxmt_apitrace_record_command_buffer_commit_state(
       (obj_handle_t)self,
       APITRACE_METAL_COMMAND_BUFFER_COMMIT_SUBMITTED,
@@ -2722,6 +3212,7 @@ dxmt_metal4_is_buffer(id object) {
             commandBuffer:self];
   if (_pendingDrawable) {
     [_owner.metal4Queue signalEvent:_owner.event value:completionValue];
+    completionTimelineSignaled = YES;
     [_owner.metal4Queue signalDrawable:_pendingDrawable];
     if (_hasPresentDuration)
       [_pendingDrawable presentAfterMinimumDuration:_presentDuration];
@@ -2751,30 +3242,152 @@ dxmt_metal4_is_buffer(id object) {
         APITRACE_METAL_QUEUE_EVENT_ENQUEUED);
     [_owner.metal4Queue signalEvent:signal.event value:signal.value];
   }
-  if (!_pendingDrawable)
+  if (!_pendingDrawable) {
     [_owner.metal4Queue signalEvent:_owner.event value:completionValue];
+    completionTimelineSignaled = YES;
+  }
   } @finally {
-    [_owner monitorReleased];
-    [_owner.submissionLock unlock];
+    if (holdingSubmissionLock) {
+      [_owner monitorReleased];
+      [_owner.submissionLock unlock];
+      holdingSubmissionLock = NO;
+    }
+    // GPTK closed-loop: after nextEventValue is taken, every exit path must
+    // either leave the GPU signal path intact or force-close the timeline and
+    // publish the feedback latch so waiters cannot hang forever.
+    if (completionTimelineOwned && completionValue != 0) {
+      if (!completionTimelineSignaled &&
+          _owner.event.signaledValue < completionValue) {
+        _owner.event.signaledValue = completionValue;
+        completionTimelineSignaled = YES;
+      }
+      if (!metalSubmitted) {
+        [_feedbackCondition lock];
+        if (!_feedbackComplete) {
+          if (!_feedbackError) {
+            _feedbackError = [[NSError
+                errorWithDomain:@"DXMTMetal4CommitDomain"
+                           code:1
+                       userInfo:@{
+                         NSLocalizedDescriptionKey :
+                             @"Metal4 commit aborted before queue submission"
+                       }] retain];
+          }
+          // Reclaim the generation snapshot the uninvoked feedback handler
+          // would have owned, then hand it to the waiter drain path.
+          if (!_pendingLifetimeSnapshot && feedbackRetainedResources) {
+            _pendingLifetimeSnapshot = feedbackRetainedResources;
+            feedbackRetainedResources = nil;
+          } else if (!_pendingLifetimeSnapshot &&
+                     _retainedTemporaryResources.count) {
+            _pendingLifetimeSnapshot =
+                [_retainedTemporaryResources copy];
+            [_retainedTemporaryResources release];
+            _retainedTemporaryResources = [[NSMutableArray alloc] init];
+          }
+          _internalStatus = DXMTMetal4CommandBufferStateError;
+          _feedbackComplete = YES;
+          [_feedbackCondition broadcast];
+        }
+        [_feedbackCondition unlock];
+        if (feedbackRetainedResources) {
+          [feedbackRetainedResources release];
+          feedbackRetainedResources = nil;
+        }
+        // Destroy uncommitted options / feedback block (handler never runs).
+        if (options) {
+          [options release];
+          options = nil;
+        }
+        dxmt_metal4_hang_log(
+            DXMT_METAL4_HANG_LOG_BOTH,
+            "err:   DXMT Metal4 commit closed-loop abort: commandBuffer=%p "
+            "queue=%p completion=%" PRIu64 " metalSubmitted=0"
+            " timelineSignaled=%u frame=%" PRIu64 " chunk=%" PRIu64
+            " reason=pre-submit-abort\n",
+            self, _owner.metal4Queue, completionValue,
+            completionTimelineSignaled ? 1u : 0u, _diagnosticInfo.frame_id,
+            _diagnosticInfo.chunk_id);
+      }
+    }
+    dxmt_metal4_commit_locked_depth--;
   }
 
   [_owner monitorSetPhase:DXMTMetal4QueueMonitorPhaseFinalize
             commandBuffer:self];
   dxmt_apitrace_finalize_command_buffer((obj_handle_t)self);
+  if (dxmt_metal4_dense_hang_diagnostics_enabled() ||
+      dxmt_metal4_perf_stats_enabled()) {
+    /* File-only for the success path to avoid flooding wine-launch stderr. */
+    dxmt_metal4_hang_log(
+        DXMT_METAL4_HANG_LOG_FILE,
+        "info:  DXMT Metal4 commit result: commandBuffer=%p metalBuffer=%p "
+        "queue=%p status=%u completion=%" PRIu64 " residencyUs=%" PRIu64
+        " drawable=%d waitCount=%lu signalCount=%lu"
+        " frame=%" PRIu64 " chunk=%" PRIu64 " d3dSeq=%" PRIu64 "-%" PRIu64
+        " externalWait=%u skippedExternalFenceWait=%u"
+        " reason=submitted\n",
+        self, _metal4Buffer, _owner.metal4Queue,
+        (unsigned)DXMTMetal4CommandBufferStateCommitted, completionValue,
+        residency_submit_us, _pendingDrawable != nil,
+        (unsigned long)_pendingWaitEvents.count,
+        (unsigned long)_pendingSignalEvents.count, _diagnosticInfo.frame_id,
+        _diagnosticInfo.chunk_id, _diagnosticInfo.d3d_sequence_begin,
+        _diagnosticInfo.d3d_sequence_end,
+        _diagnosticInfo.external_fence_wait_count,
+        _diagnosticInfo.skipped_external_fence_wait_count);
+  }
   return residency_submit_us;
 }
 
 - (void)waitUntilCompleted {
   [_feedbackCondition lock];
+  const unsigned entry_status = (unsigned)_internalStatus;
+  const uint64_t entry_completion = _completionValue;
+  const BOOL entry_feedback = _feedbackComplete;
   const BOOL needsCommit =
       _internalStatus == DXMTMetal4CommandBufferStateNotEnqueued;
   [_feedbackCondition unlock];
+  const uint64_t entry_signaled =
+      _owner.event ? _owner.event.signaledValue : 0;
+  const BOOL hang_diag = dxmt_metal4_dense_hang_diagnostics_enabled() ||
+                         dxmt_metal4_perf_stats_enabled();
+  if (hang_diag) {
+    dxmt_metal4_hang_log(
+        DXMT_METAL4_HANG_LOG_BOTH,
+        "info:  DXMT Metal4 waitUntilCompleted enter: commandBuffer=%p "
+        "metalBuffer=%p queue=%p status=%u completion=%" PRIu64
+        " signaled=%" PRIu64 " feedbackComplete=%u needsCommit=%u"
+        " frame=%" PRIu64 " chunk=%" PRIu64 " d3dSeq=%" PRIu64 "-%" PRIu64
+        " externalWait=%u skippedExternalFenceWait=%u\n",
+        self, _metal4Buffer, _owner.metal4Queue, entry_status,
+        entry_completion, entry_signaled, entry_feedback ? 1u : 0u,
+        needsCommit ? 1u : 0u, _diagnosticInfo.frame_id,
+        _diagnosticInfo.chunk_id, _diagnosticInfo.d3d_sequence_begin,
+        _diagnosticInfo.d3d_sequence_end,
+        _diagnosticInfo.external_fence_wait_count,
+        _diagnosticInfo.skipped_external_fence_wait_count);
+  }
   if (needsCommit)
     [self commit];
 
   [_feedbackCondition lock];
   const uint64_t completionValue = _completionValue;
+  const unsigned wait_status = (unsigned)_internalStatus;
+  const BOOL wait_feedback = _feedbackComplete;
   [_feedbackCondition unlock];
+  if (!completionValue) {
+    dxmt_metal4_hang_log(
+        DXMT_METAL4_HANG_LOG_BOTH,
+        "err:   DXMT Metal4 waitUntilCompleted zero-completion: "
+        "commandBuffer=%p queue=%p status=%u feedbackComplete=%u "
+        "entryStatus=%u entryCompletion=%" PRIu64 " needsCommit=%u"
+        " frame=%" PRIu64 " chunk=%" PRIu64
+        " reason=zero-completion-risks-feedback-hang\n",
+        self, _owner.metal4Queue, wait_status, wait_feedback ? 1u : 0u,
+        entry_status, entry_completion, needsCommit ? 1u : 0u,
+        _diagnosticInfo.frame_id, _diagnosticInfo.chunk_id);
+  }
   if (completionValue) {
     if (!dxmt_metal4_perf_stats_enabled() &&
         !dxmt_metal4_dense_hang_diagnostics_enabled()) {
@@ -2789,109 +3402,163 @@ dxmt_metal4_is_buffer(id object) {
         if (timeout_count <= 5 || (timeout_count % 5) == 0) {
           uint64_t completion_current = _owner.event.signaledValue;
           uint64_t present_current = _owner.presentEvent.signaledValue;
-          fprintf(stderr,
-                  "warn:  DXMT Metal4 completion stall: commandBuffer=%p metalBuffer=%p queue=%p"
-                  " elapsedMs=%" PRIu64 " completionTarget=%" PRIu64 " completionCurrent=%" PRIu64
-                  " waitCount=%lu signalCount=%lu drawable=%d presentTarget=%" PRIu64
-                  " presentCurrent=%" PRIu64 "\n",
-                  self, _metal4Buffer, _owner.metal4Queue, elapsed_ms,
-                  completionValue, completion_current,
-                  (unsigned long)_pendingWaitEvents.count,
-                  (unsigned long)_pendingSignalEvents.count,
-                  _pendingDrawable != nil, _owner.presentEventValue,
-                  present_current);
+          [_feedbackCondition lock];
+          const unsigned stall_status = (unsigned)_internalStatus;
+          const BOOL stall_feedback = _feedbackComplete;
+          [_feedbackCondition unlock];
+          dxmt_metal4_hang_log(
+              DXMT_METAL4_HANG_LOG_BOTH,
+              "warn:  DXMT Metal4 completion stall: commandBuffer=%p metalBuffer=%p queue=%p"
+              " elapsedMs=%" PRIu64 " completionTarget=%" PRIu64 " completionCurrent=%" PRIu64
+              " waitCount=%lu signalCount=%lu drawable=%d presentTarget=%" PRIu64
+              " presentCurrent=%" PRIu64 " status=%u feedbackComplete=%u"
+              " frame=%" PRIu64 " chunk=%" PRIu64 "\n",
+              self, _metal4Buffer, _owner.metal4Queue, elapsed_ms,
+              completionValue, completion_current,
+              (unsigned long)_pendingWaitEvents.count,
+              (unsigned long)_pendingSignalEvents.count,
+              _pendingDrawable != nil, _owner.presentEventValue,
+              present_current, stall_status, stall_feedback ? 1u : 0u,
+              _diagnosticInfo.frame_id, _diagnosticInfo.chunk_id);
           const struct WMTCommandBufferDiagnosticInfo *diag = &_diagnosticInfo;
-          fprintf(stderr,
-                  "warn:  DXMT Metal4 completion diagnostic: commandBuffer=%p label=%s"
-                  " frame=%" PRIu64 " chunk=%" PRIu64
-                  " d3dSequence=%" PRIu64 "..%" PRIu64
-                  " inputEncoders=%u encodedEncoders=%u render=%u compute=%u blit=%u other=%u"
-                  " present=%u clear=%u resolve=%u scaler=%u timestamps=%u"
-                  " barrierOnly=%u fenceWait=%u fenceUpdate=%u"
-                  " priorLocal=%u futureLocal=%u sameEncoder=%u external=%u"
-                  " repeatedUpdate=%u renderCrossStage=%u renderSameStage=%u"
-                  " renderReverseStage=%u localFenceIds=%u boundFenceSlots=%u"
-                  " encodedFenceWait=%u skippedExternalFenceWait=%u"
-                  " fenceEdgeCount=%u fenceEdgeOverflow=%u"
-                  " resourceInitializerEvent=%" PRIu64 "\n",
-                  self,
-                  _metal4Buffer.label ? _metal4Buffer.label.UTF8String : "<none>",
-                  diag->frame_id, diag->chunk_id,
-                  diag->d3d_sequence_begin, diag->d3d_sequence_end,
-                  diag->input_encoder_count, diag->encoded_encoder_count,
-                  diag->render_encoder_count, diag->compute_encoder_count,
-                  diag->blit_encoder_count, diag->other_encoder_count,
-                  diag->present_encoder_count, diag->clear_encoder_count,
-                  diag->resolve_encoder_count, diag->scaler_encoder_count,
-                  diag->timestamp_encoder_count, diag->barrier_only_pass_count,
-                  diag->fence_wait_count, diag->fence_update_count,
-                  diag->prior_local_fence_wait_count,
-                  diag->future_local_fence_wait_count,
-                  diag->same_encoder_fence_wait_count,
-                  diag->external_fence_wait_count,
-                  diag->repeated_fence_update_count,
-                  diag->render_valid_cross_stage_count,
-                  diag->render_same_stage_wait_count,
-                  diag->render_reverse_stage_wait_count,
-                  diag->local_fence_id_count, diag->bound_fence_slot_count,
-                  diag->encoded_fence_wait_count,
-                  diag->skipped_external_fence_wait_count,
-                  diag->fence_edge_count,
-                  diag->fence_edge_overflow_count,
-                  diag->resource_initializer_event_id);
+          dxmt_metal4_hang_log(
+              DXMT_METAL4_HANG_LOG_BOTH,
+              "warn:  DXMT Metal4 completion diagnostic: commandBuffer=%p label=%s"
+              " frame=%" PRIu64 " chunk=%" PRIu64
+              " d3dSequence=%" PRIu64 "..%" PRIu64
+              " inputEncoders=%u encodedEncoders=%u render=%u compute=%u blit=%u other=%u"
+              " present=%u clear=%u resolve=%u scaler=%u timestamps=%u"
+              " barrierOnly=%u fenceWait=%u fenceUpdate=%u"
+              " priorLocal=%u futureLocal=%u sameEncoder=%u external=%u"
+              " repeatedUpdate=%u renderCrossStage=%u renderSameStage=%u"
+              " renderReverseStage=%u localFenceIds=%u boundFenceSlots=%u"
+              " encodedFenceWait=%u skippedExternalFenceWait=%u"
+              " fenceEdgeCount=%u fenceEdgeOverflow=%u"
+              " resourceInitializerEvent=%" PRIu64 "\n",
+              self,
+              _metal4Buffer.label ? _metal4Buffer.label.UTF8String : "<none>",
+              diag->frame_id, diag->chunk_id, diag->d3d_sequence_begin,
+              diag->d3d_sequence_end, diag->input_encoder_count,
+              diag->encoded_encoder_count, diag->render_encoder_count,
+              diag->compute_encoder_count, diag->blit_encoder_count,
+              diag->other_encoder_count, diag->present_encoder_count,
+              diag->clear_encoder_count, diag->resolve_encoder_count,
+              diag->scaler_encoder_count, diag->timestamp_encoder_count,
+              diag->barrier_only_pass_count, diag->fence_wait_count,
+              diag->fence_update_count, diag->prior_local_fence_wait_count,
+              diag->future_local_fence_wait_count,
+              diag->same_encoder_fence_wait_count,
+              diag->external_fence_wait_count,
+              diag->repeated_fence_update_count,
+              diag->render_valid_cross_stage_count,
+              diag->render_same_stage_wait_count,
+              diag->render_reverse_stage_wait_count,
+              diag->local_fence_id_count, diag->bound_fence_slot_count,
+              diag->encoded_fence_wait_count,
+              diag->skipped_external_fence_wait_count,
+              diag->fence_edge_count, diag->fence_edge_overflow_count,
+              diag->resource_initializer_event_id);
           for (uint32_t edge_index = 0;
                edge_index < diag->fence_edge_count &&
                edge_index < WMT_COMMAND_BUFFER_FENCE_EDGE_CAPACITY;
                edge_index++) {
             const struct WMTCommandBufferFenceEdgeDiagnostic *edge =
                 &diag->fence_edges[edge_index];
-            fprintf(stderr,
-                    "warn:  DXMT Metal4 completion fence edge: commandBuffer=%p"
-                    " edge=%u producer=%" PRIu64 " consumer=%" PRIu64
-                    " producerIndex=%u consumerIndex=%u slot=%u flags=0x%x\n",
-                    self, edge_index, edge->producer_id, edge->consumer_id,
-                    edge->producer_index, edge->consumer_index, edge->slot,
-                    edge->flags);
+            dxmt_metal4_hang_log(
+                DXMT_METAL4_HANG_LOG_BOTH,
+                "warn:  DXMT Metal4 completion fence edge: commandBuffer=%p"
+                " edge=%u producer=%" PRIu64 " consumer=%" PRIu64
+                " producerIndex=%u consumerIndex=%u slot=%u flags=0x%x\n",
+                self, edge_index, edge->producer_id, edge->consumer_id,
+                edge->producer_index, edge->consumer_index, edge->slot,
+                edge->flags);
           }
           NSUInteger wait_index = 0;
           for (DXMTMetal4QueueEvent *wait in _pendingWaitEvents) {
             uint64_t wait_current = dxmt_metal4_shared_event_value(wait.event);
-            fprintf(stderr,
-                    "warn:  DXMT Metal4 completion wait: commandBuffer=%p index=%lu event=%p"
-                    " target=%" PRIu64 " current=%" PRIu64 " blocked=%d\n",
-                    self, (unsigned long)wait_index++, wait.event,
-                    wait.value, wait_current, wait_current < wait.value);
+            dxmt_metal4_hang_log(
+                DXMT_METAL4_HANG_LOG_BOTH,
+                "warn:  DXMT Metal4 completion wait: commandBuffer=%p index=%lu event=%p"
+                " target=%" PRIu64 " current=%" PRIu64 " blocked=%d\n",
+                self, (unsigned long)wait_index++, wait.event, wait.value,
+                wait_current, wait_current < wait.value);
           }
           NSUInteger signal_index = 0;
           for (DXMTMetal4QueueEvent *signal in _pendingSignalEvents) {
-            uint64_t signal_current = dxmt_metal4_shared_event_value(signal.event);
-            fprintf(stderr,
-                    "warn:  DXMT Metal4 completion signal: commandBuffer=%p index=%lu event=%p"
-                    " target=%" PRIu64 " current=%" PRIu64 "\n",
-                    self, (unsigned long)signal_index++, signal.event,
-                    signal.value, signal_current);
+            uint64_t signal_current =
+                dxmt_metal4_shared_event_value(signal.event);
+            dxmt_metal4_hang_log(
+                DXMT_METAL4_HANG_LOG_BOTH,
+                "warn:  DXMT Metal4 completion signal: commandBuffer=%p index=%lu event=%p"
+                " target=%" PRIu64 " current=%" PRIu64 "\n",
+                self, (unsigned long)signal_index++, signal.event,
+                signal.value, signal_current);
           }
-          fflush(stderr);
         }
       }
       if (timeout_count) {
-        fprintf(stderr,
-                "warn:  DXMT Metal4 completion recovered: commandBuffer=%p elapsedMs=%" PRIu64
-                " completionTarget=%" PRIu64 " completionCurrent=%" PRIu64 "\n",
-                self, (dxmt_monotonic_us() - wait_begin_us) / 1000,
-                completionValue, _owner.event.signaledValue);
-        fflush(stderr);
+        dxmt_metal4_hang_log(
+            DXMT_METAL4_HANG_LOG_BOTH,
+            "warn:  DXMT Metal4 completion recovered: commandBuffer=%p elapsedMs=%" PRIu64
+            " completionTarget=%" PRIu64 " completionCurrent=%" PRIu64 "\n",
+            self, (dxmt_monotonic_us() - wait_begin_us) / 1000, completionValue,
+            _owner.event.signaledValue);
       }
     }
+    // GPU timeline has passed this generation: drop completed *transient*
+    // residency memberships without holding the commit serializer.
+    [_owner retireCompletedResidency];
   }
 
   // The queue timeline may be signaled before Metal invokes its CPU feedback
-  // handler. Feedback is the sole owner of final status, timing, error and
-  // lifetime release, so wait for that publication as well.
+  // handler. Feedback owns final status/timing/error publication; temporary
+  // resource lifetime is handed off via pendingLifetimeSnapshot and drained here
+  // on the waiter thread after the latch is visible.
   [_feedbackCondition lock];
-  while (!_feedbackComplete)
-    [_feedbackCondition wait];
+  if (hang_diag) {
+    uint64_t feedback_begin_us = dxmt_monotonic_us();
+    uint64_t feedback_timeouts = 0;
+    while (!_feedbackComplete) {
+      NSDate *deadline =
+          [NSDate dateWithTimeIntervalSinceNow:1.0];
+      if (![_feedbackCondition waitUntilDate:deadline]) {
+        feedback_timeouts++;
+        if (feedback_timeouts <= 5 || (feedback_timeouts % 5) == 0) {
+          const uint64_t elapsed_ms =
+              (dxmt_monotonic_us() - feedback_begin_us) / 1000;
+          const uint64_t signaled =
+              _owner.event ? _owner.event.signaledValue : 0;
+          dxmt_metal4_hang_log(
+              DXMT_METAL4_HANG_LOG_BOTH,
+              "warn:  DXMT Metal4 feedback latch stall: commandBuffer=%p "
+              "queue=%p elapsedMs=%" PRIu64 " completion=%" PRIu64
+              " signaled=%" PRIu64 " status=%u feedbackComplete=0"
+              " frame=%" PRIu64 " chunk=%" PRIu64 "\n",
+              self, _owner.metal4Queue, elapsed_ms, completionValue, signaled,
+              (unsigned)_internalStatus, _diagnosticInfo.frame_id,
+              _diagnosticInfo.chunk_id);
+        }
+      }
+    }
+  } else {
+    while (!_feedbackComplete)
+      [_feedbackCondition wait];
+  }
   [_feedbackCondition unlock];
+  if (hang_diag) {
+    dxmt_metal4_hang_log(
+        DXMT_METAL4_HANG_LOG_FILE,
+        "info:  DXMT Metal4 waitUntilCompleted leave: commandBuffer=%p "
+        "queue=%p status=%u completion=%" PRIu64 " signaled=%" PRIu64
+        " frame=%" PRIu64 " chunk=%" PRIu64 "\n",
+        self, _owner.metal4Queue, (unsigned)_internalStatus, completionValue,
+        _owner.event ? _owner.event.signaledValue : 0,
+        _diagnosticInfo.frame_id, _diagnosticInfo.chunk_id);
+  }
+  [self drainPendingLifetimeOwnership];
+  // GPTK Get/ReturnMTL4CommandBuffer: return objects to the pool only after
+  // GPU completion and lifetime drain (never from CompletionQueue).
+  [self recycleMetal4ObjectsIfNeeded];
 }
 
 - (enum WMTCommandBufferStatus)status {
@@ -3045,6 +3712,15 @@ dxmt_metal4_is_buffer(id object) {
                     updateFence:(id<MTLFence>)fenceToUpdate {
   if (!heap || !buffer || !length)
     return;
+  // Defined above helper section; keep a local guard (same crash class).
+  if (![(id)buffer respondsToSelector:@selector(gpuAddress)] ||
+      ![(id)buffer respondsToSelector:@selector(length)]) {
+    fprintf(stderr,
+            "err:   DXMT Metal4 resolveCounterHeap bad buffer: ptr=%p class=%s\n",
+            buffer, object_getClassName((id)buffer));
+    fflush(stderr);
+    return;
+  }
 
   dxmt_apitrace_record_counter_event(
       (obj_handle_t)self,
@@ -3117,6 +3793,45 @@ dxmt_metal4_argument_state_destroy(struct dxmt_metal4_argument_state *state) {
   [state->table release];
 }
 
+// Guard against invalid obj_handle_t casts (UAF / wrong type). The flash-exit
+// "NSConcreteValue gpuAddress" crash is this path calling Metal selectors on a
+// non-buffer ObjC object. Check is intentional; log is rate-limited.
+static bool
+dxmt_metal4_is_mtl_buffer(id object) {
+  if (!object)
+    return false;
+  // Prefer selector check over protocol: matches the crashing call site and
+  // still rejects NSValue / other non-buffer objects.
+  return [object respondsToSelector:@selector(gpuAddress)] &&
+         [object respondsToSelector:@selector(length)];
+}
+
+static void
+dxmt_diag_bad_buffer_handle(const char *site, id object, uint64_t offset,
+                            unsigned index, DXMTMetal4CommandBuffer *owner) {
+  static _Atomic uint32_t count = 0;
+  const uint32_t n =
+      atomic_fetch_add_explicit(&count, 1, memory_order_relaxed) + 1;
+  // Keep early failures; then every 16th so a flood cannot dominate I/O.
+  if (n > 48 && (n % 16) != 0)
+    return;
+
+  const char *cls = object ? object_getClassName(object) : "nil";
+  fprintf(stderr,
+          "err:   DXMT Metal4 bad buffer handle: site=%s ptr=%p class=%s "
+          "offset=%llu index=%u owner=%p metal4Buffer=%p count=%u\n",
+          site, object, cls, (unsigned long long)offset, index, owner,
+          owner ? (void *)owner.metal4Buffer : NULL, n);
+  if (object && [object isKindOfClass:[NSValue class]]) {
+    fprintf(stderr,
+            "err:   DXMT Metal4 bad buffer is NSValue pointerValue=%p "
+            "objCType=%s\n",
+            [(NSValue *)object pointerValue],
+            [(NSValue *)object objCType] ? [(NSValue *)object objCType] : "?");
+  }
+  fflush(stderr);
+}
+
 static void
 dxmt_metal4_argument_set_buffer(
     struct dxmt_metal4_argument_state *state,
@@ -3125,6 +3840,16 @@ dxmt_metal4_argument_set_buffer(
     uint8_t index) {
   if (!state->table || index >= 31)
     return;
+  if (buffer && !dxmt_metal4_is_mtl_buffer(buffer)) {
+    dxmt_diag_bad_buffer_handle("argument_set_buffer", buffer, offset, index,
+                                state->owner);
+    // Do not cache a bad pointer; bind slot 0 so encode continues.
+    state->buffers[index].buffer = nil;
+    state->buffers[index].offset = 0;
+    state->buffer_bound[index] = false;
+    [state->table setAddress:0 atIndex:index];
+    return;
+  }
   bool same_buffer = state->buffer_bound[index] && state->buffers[index].buffer == buffer;
   if (same_buffer && state->buffers[index].offset == offset)
     return;
@@ -3162,6 +3887,14 @@ static void
 dxmt_metal4_argument_set_texture(struct dxmt_metal4_argument_state *state, id<MTLTexture> texture, uint8_t index) {
   if (!state->table || index >= 128)
     return;
+  if (texture && ![texture respondsToSelector:@selector(gpuResourceID)]) {
+    dxmt_diag_bad_buffer_handle("argument_set_texture", texture, 0, index,
+                                state->owner);
+    state->textures[index] = nil;
+    state->texture_bound[index] = false;
+    [state->table setTexture:(MTLResourceID){0} atIndex:index];
+    return;
+  }
   if (state->texture_bound[index] && state->textures[index] == texture)
     return;
   state->textures[index] = texture;
@@ -3199,6 +3932,10 @@ static NSUInteger
 dxmt_metal4_index_buffer_length(id<MTLBuffer> buffer, uint64_t offset) {
   if (!buffer)
     return 0;
+  if (!dxmt_metal4_is_mtl_buffer(buffer)) {
+    dxmt_diag_bad_buffer_handle("index_buffer_length", buffer, offset, 0, nil);
+    return 0;
+  }
   NSUInteger length = [buffer length];
   if (offset >= length)
     return 0;
@@ -3207,8 +3944,14 @@ dxmt_metal4_index_buffer_length(id<MTLBuffer> buffer, uint64_t offset) {
 
 static MTLGPUAddress
 dxmt_metal4_buffer_address(obj_handle_t buffer, uint64_t offset) {
-  id<MTLBuffer> metal_buffer = (id<MTLBuffer>)buffer;
-  return metal_buffer ? [metal_buffer gpuAddress] + offset : 0;
+  id metal_buffer = (id)buffer;
+  if (!metal_buffer)
+    return 0;
+  if (!dxmt_metal4_is_mtl_buffer(metal_buffer)) {
+    dxmt_diag_bad_buffer_handle("buffer_address", metal_buffer, offset, 0, nil);
+    return 0;
+  }
+  return [(id<MTLBuffer>)metal_buffer gpuAddress] + offset;
 }
 
 struct dxmt_metal4_render_argument_state {
@@ -5801,15 +6544,34 @@ _MTLHeap_newBuffer(void *obj) {
 
   id<MTLBuffer> buffer = nil;
   if (@available(macOS 10.15, *)) {
+    const MTLResourceOptions options = (MTLResourceOptions)info->options;
     const MTLSizeAndAlign placement =
         [heap.device heapBufferSizeAndAlignWithLength:info->length
-                                              options:(MTLResourceOptions)info->options];
+                                              options:options];
     const uint64_t heap_size = heap.size;
     if (placement.align && !(params->offset % placement.align) &&
         params->offset <= heap_size && placement.size <= heap_size - params->offset) {
+      // Diagnose before Metal: Private subresource on Shared heap aborts the process.
+      dxmt_diag_heap_placement("buffer", heap, params->offset, info->length,
+                               options, NULL, YES);
       buffer = [heap newBufferWithLength:info->length
-                                 options:(MTLResourceOptions)info->options
+                                 options:options
                                   offset:params->offset];
+      if (!buffer) {
+        dxmt_diag_heap_placement("buffer-nil", heap, params->offset, info->length,
+                                 options, NULL, NO);
+      }
+    } else if (dxmt_metal4_heap_storage_diag_verbose()) {
+      fprintf(stderr,
+              "warn:  DXMT Metal4 heap placement rejected: kind=buffer heap=%p "
+              "offset=%llu length=%llu placementSize=%llu placementAlign=%llu "
+              "heapSize=%llu\n",
+              heap, (unsigned long long)params->offset,
+              (unsigned long long)info->length,
+              (unsigned long long)placement.size,
+              (unsigned long long)placement.align,
+              (unsigned long long)heap_size);
+      fflush(stderr);
     }
   }
   params->ret = (obj_handle_t)buffer;
@@ -6058,12 +6820,31 @@ _MTLHeap_newTexture(void *obj) {
   fill_texture_descriptor(desc, info);
   id<MTLTexture> texture = nil;
   if (@available(macOS 10.15, *)) {
+    const MTLResourceOptions options = (MTLResourceOptions)info->options;
     const MTLSizeAndAlign placement =
         [heap.device heapTextureSizeAndAlignWithDescriptor:desc];
     const uint64_t heap_size = heap.size;
     if (placement.align && !(params->offset % placement.align) &&
         params->offset <= heap_size && placement.size <= heap_size - params->offset) {
+      dxmt_diag_heap_placement("texture", heap, params->offset, placement.size,
+                               options, info, YES);
       texture = [heap newTextureWithDescriptor:desc offset:params->offset];
+      if (!texture) {
+        dxmt_diag_heap_placement("texture-nil", heap, params->offset,
+                                 placement.size, options, info, NO);
+      }
+    } else if (dxmt_metal4_heap_storage_diag_verbose()) {
+      fprintf(stderr,
+              "warn:  DXMT Metal4 heap placement rejected: kind=texture heap=%p "
+              "offset=%llu placementSize=%llu placementAlign=%llu heapSize=%llu "
+              "tex=%ux%ux%u format=%u\n",
+              heap, (unsigned long long)params->offset,
+              (unsigned long long)placement.size,
+              (unsigned long long)placement.align,
+              (unsigned long long)heap_size, (unsigned)info->width,
+              (unsigned)info->height, (unsigned)info->depth,
+              (unsigned)info->pixel_format);
+      fflush(stderr);
     }
   }
   params->ret = (obj_handle_t)texture;
@@ -6169,7 +6950,31 @@ _MTLDevice_newPlacementHeap(void *obj) {
     desc.resourceOptions = (MTLResourceOptions)info->options;
     if (@available(macOS 26.0, *))
       desc.maxCompatiblePlacementSparsePageSize = MTLSparsePageSize64;
-    params->ret = (obj_handle_t)[device newHeapWithDescriptor:desc];
+    id<MTLHeap> heap = [device newHeapWithDescriptor:desc];
+    params->ret = (obj_handle_t)heap;
+    if (heap && (dxmt_metal4_heap_storage_diag_verbose() ||
+                 dxmt_storage_mode_from_resource_options(
+                     (MTLResourceOptions)info->options) != heap.storageMode)) {
+      static _Atomic uint32_t heap_create_count = 0;
+      const uint32_t n =
+          atomic_fetch_add_explicit(&heap_create_count, 1,
+                                    memory_order_relaxed) +
+          1;
+      if (n <= 16 || (n % 64) == 0) {
+        fprintf(stderr,
+                "info:  DXMT Metal4 placement heap created: heap=%p size=%llu "
+                "reqOptions=0x%llx reqStorage=%s heapStorage=%s type=%lu "
+                "hazard=%lu count=%u\n",
+                heap, (unsigned long long)info->size,
+                (unsigned long long)info->options,
+                dxmt_storage_mode_name(dxmt_storage_mode_from_resource_options(
+                    (MTLResourceOptions)info->options)),
+                dxmt_storage_mode_name(heap.storageMode),
+                (unsigned long)heap.type,
+                (unsigned long)heap.hazardTrackingMode, n);
+        fflush(stderr);
+      }
+    }
     [desc release];
   }
   return STATUS_SUCCESS;
