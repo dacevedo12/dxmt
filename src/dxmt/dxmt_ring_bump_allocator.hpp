@@ -30,6 +30,54 @@ RingBumpGuardEnabled() {
   return enabled;
 }
 
+/**
+ * Poison host mappings before reclaiming ring blocks so late writers hit a
+ * deterministic trap (0xDE fill) rather than a recycled page. Disable with
+ * DXMT_DIAG_POISON_MAPPINGS=0. Enabled by default while ownership bugs are
+ * still under investigation; also forced on for dense hang/root-cause diags.
+ */
+inline bool
+RingBumpPoisonMappingsEnabled() {
+  static const bool enabled = []() {
+    auto explicit_value = env::getEnvVar("DXMT_DIAG_POISON_MAPPINGS");
+    if (explicit_value == "0" || explicit_value == "false" ||
+        explicit_value == "no" || explicit_value == "off")
+      return false;
+    if (explicit_value == "1" || explicit_value == "true" ||
+        explicit_value == "yes" || explicit_value == "on")
+      return true;
+    auto hang = env::getEnvVar("DXMT_DIAG_GPU_HANG_DENSE");
+    auto root = env::getEnvVar("DXMT_DIAG_ROOT_CAUSE_DENSE");
+    if (hang == "1" || hang == "true" || hang == "yes" || hang == "on" ||
+        root == "1" || root == "true" || root == "yes" || root == "on")
+      return true;
+    // Default on: BMW host-mapping AVs need attributable failures.
+    return true;
+  }();
+  return enabled;
+}
+
+template <typename Block>
+void
+PoisonRingBlockHostMapping(Block &block, size_t nbytes) {
+  if (!RingBumpPoisonMappingsEnabled() || !nbytes)
+    return;
+  // Only trap-fill host memory WE own (malloc). Metal Shared mappings from
+  // get_accessible_or_null() can already be unmapped when the last MTLBuffer
+  // retain drops — memset there is itself an AV, and concurrent encode may
+  // still hold a raw mapped pointer into the same range.
+  if constexpr (requires {
+                  block.owns_mapped_address;
+                  block.mapped_address;
+                }) {
+    if (block.owns_mapped_address && block.mapped_address)
+      std::memset(block.mapped_address, 0xDE, nbytes);
+  } else if constexpr (requires { block.ptr; }) {
+    if (block.ptr)
+      std::memset(block.ptr, 0xDE, nbytes);
+  }
+}
+
 template <typename Allocator, size_t BlockSize = kStagingBlockSize, class mutex = dxmt::mutex> class RingBumpState {
 
 public:
@@ -39,7 +87,8 @@ public:
   RingBumpState(Allocator &&allocator) : allocator_(std::move(allocator)) {}
 
   std::pair<typename Allocator::Block &, uint64_t>
-  allocate(uint64_t seq_id, uint64_t coherent_id, size_t size, size_t alignment);
+  allocate(uint64_t seq_id, uint64_t coherent_id, size_t size, size_t alignment,
+           bool retain_pin = false);
 
   void free_blocks(uint64_t coherent_id);
 
@@ -56,6 +105,13 @@ private:
     size_t total_size;
     uint64_t last_used_seq_id;
     uint64_t inc_time_to_live;
+    /**
+     * Active host-mapping leases (e.g. argument-buffer slices). free_blocks /
+     * reuse must not destroy the block while pin_count > 0 for an unfinished
+     * generation (last_used_seq_id > coherent_id). When the generation
+     * completes (last_used <= coherent), pins are dropped then reclaim runs.
+     */
+    uint32_t pin_count = 0;
     Allocator::Block block;
   };
 
@@ -275,7 +331,8 @@ RingBumpState<Allocator, BlockSize, mutex>::fill_guard(Allocation &allocation) {
 template <typename Allocator, size_t BlockSize, class mutex>
 std::pair<typename Allocator::Block &, uint64_t>
 RingBumpState<Allocator, BlockSize, mutex>::allocate(
-    uint64_t seq_id, uint64_t coherent_id, size_t size, size_t alignment
+    uint64_t seq_id, uint64_t coherent_id, size_t size, size_t alignment,
+    bool retain_pin
 ) {
   if (!alignment || (alignment & (alignment - 1)))
     throw std::invalid_argument("RingBumpState alignment must be a power of two");
@@ -287,6 +344,17 @@ RingBumpState<Allocator, BlockSize, mutex>::allocate(
           : 0;
   if (size > std::numeric_limits<size_t>::max() - guard_bytes)
     throw std::overflow_error("RingBumpState allocation size overflow");
+
+  auto finish = [&](Allocation &allocation)
+      -> std::pair<typename Allocator::Block &, uint64_t> {
+    allocation.last_used_seq_id = seq_id;
+    if (retain_pin) {
+      if (allocation.pin_count == std::numeric_limits<uint32_t>::max())
+        throw std::overflow_error("RingBumpState pin_count overflow");
+      allocation.pin_count++;
+    }
+    return suballocate(allocation, size, alignment);
+  };
 
   while (!fifo.empty()) {
     auto &latest = fifo.back();
@@ -301,15 +369,13 @@ RingBumpState<Allocator, BlockSize, mutex>::allocate(
     if (offset > available || size > available - offset)
       break;
 
-    latest.last_used_seq_id = seq_id;
-    return suballocate(latest, size, alignment);
+    return finish(latest);
   }
-  return suballocate(
-      allocate_or_reuse_block(
-          seq_id, coherent_id, std::max(size + guard_bytes, BlockSize) // in case required size is larger than block size
-      ),
-      size, alignment
-  );
+  return finish(allocate_or_reuse_block(
+      seq_id, coherent_id,
+      std::max(size + guard_bytes,
+               BlockSize) // in case required size is larger than block size
+      ));
 };
 
 template <typename Allocator, size_t BlockSize, class mutex>
@@ -319,13 +385,23 @@ RingBumpState<Allocator, BlockSize, mutex>::free_blocks(uint64_t coherent_id) {
   while (!fifo.empty()) {
     auto &front = fifo.front();
     check_guard(front, "free_blocks");
-    if (front.last_used_seq_id > coherent_id)
+    if (front.last_used_seq_id > coherent_id) {
+      // Unfinished generation: pins remain; do not reclaim past this block.
       break;
+    }
+    // last_used <= coherent: GPU of last host writer completed. Host encode for
+    // that generation is also complete (encode precedes GPU). Drop pin leases
+    // then reclaim. Never reclaim while pin_count > 0 before the drop — that
+    // would free host mappings under concurrent allocate(retain_pin) on this
+    // block if last_used were stale (defense in depth).
+    if (front.pin_count > 0)
+      front.pin_count = 0;
     auto expired = (coherent_id - front.last_used_seq_id) > kStagingBlockLifetime ||
                    front.inc_time_to_live > kStagingBlockLifetime || coherent_id == -1ull;
     auto adhoc = front.total_size != BlockSize;
     if (expired || adhoc) {
-      // can be deallocated
+      // Poison owned host pages only (see PoisonRingBlockHostMapping).
+      PoisonRingBlockHostMapping(front.block, front.total_size);
       if (release_callback_)
         release_callback_(front.block, front.last_used_seq_id);
       fifo.pop();
@@ -345,21 +421,34 @@ RingBumpState<Allocator, BlockSize, mutex>::allocate_or_reuse_block(
     auto &front = fifo.front();
     if (front.last_used_seq_id < coherent_id) {
       check_guard(front, "reuse_front");
+      // Do not destroy or reuse a block that still has active host leases
+      // for a generation that has not been reclaimed yet.
+      if (front.pin_count > 0) {
+        // last_used < coherent implies GPU of last use completed; drop pins.
+        front.pin_count = 0;
+      }
       if (front.total_size != BlockSize) {
+        PoisonRingBlockHostMapping(front.block, front.total_size);
         if (release_callback_)
           release_callback_(front.block, front.last_used_seq_id);
         fifo.pop();
         continue;
       } else if (front.total_size >= block_size) {
+        // Reuse: poison previous generation contents before suballoc reset.
+        PoisonRingBlockHostMapping(front.block, front.total_size);
         front.last_used_seq_id = seq_id;
         front.allocated_size = 0;
         front.inc_time_to_live = 0;
+        front.pin_count = 0;
         fifo.push(std::move(front));
         fifo.pop();
         fill_guard(fifo.back());
         return fifo.back();
       }
       WARN("forced to allocate new block of size ", block_size);
+    } else if (front.pin_count > 0 && front.last_used_seq_id > coherent_id) {
+      // Still leased by an unfinished generation — stop reclaim walk.
+      break;
     }
     break;
   }
@@ -368,6 +457,7 @@ RingBumpState<Allocator, BlockSize, mutex>::allocate_or_reuse_block(
       .total_size = block_size,
       .last_used_seq_id = seq_id,
       .inc_time_to_live = 0,
+      .pin_count = 0,
       .block = allocator_.allocate(block_size),
   });
   fill_guard(fifo.back());

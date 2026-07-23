@@ -36,6 +36,14 @@ DxmtQueueLifecycleEnabled() {
   return enabled;
 }
 
+static bool
+DxmtHangDenseEnabled() {
+  static const bool enabled =
+      DxmtQueueDiagEnabledEnv("DXMT_DIAG_GPU_HANG_DENSE") ||
+      DxmtQueueDiagEnabledEnv("DXMT_DIAG_ROOT_CAUSE_DENSE");
+  return enabled;
+}
+
 static void
 DxmtQueueLifecycleLog(const CommandQueue *queue, const char *stage,
                       uint64_t pair_id, uint64_t queue_pair_id,
@@ -345,10 +353,14 @@ CommandQueue::CommandQueue(WMT::Device device) :
                     WMTResourceStorageModeManaged, false
     }),
     copy_temp_allocator({device, WMTResourceHazardTrackingModeUntracked | WMTResourceStorageModePrivate}),
+    // placed_buffer=true: host mapping is malloc we own. Metal Shared wrapping
+    // external memory keeps GPU access, but free_blocks must not depend on
+    // MTLBuffer retain count to keep encode-time host pointers valid
+    // (historical AV write 0x2ad/0x2af in UploadArgumentBufferBytes).
     argbuf_allocator({
         device,
         WMTResourceHazardTrackingModeUntracked | WMTResourceCPUCacheModeDefaultCache | WMTResourceStorageModeShared,
-        false
+        true
     }),
     argbuf_shadow_allocator({}),
     cpu_command_allocator({}),
@@ -1137,6 +1149,7 @@ CommandQueue::CommitChunkInternal(CommandChunk &chunk) {
   chunk.metal_commit_time = clock::now();
   const uint64_t residency_submit_us =
       persistent_residency_submit_us + metal_residency_submit_us;
+  const auto post_commit_status = cmdbuf.status();
   perf::recordResidencySubmitTime(perf::currentFrameStatistics(),
                                   std::chrono::microseconds(residency_submit_us));
   perf::recordMetalCommandBufferCommit(
@@ -1146,7 +1159,31 @@ CommandQueue::CommitChunkInternal(CommandChunk &chunk) {
     WARN_FILE_ONLY("DXMT queue diagnostic: CommitChunkInternal after metal commit"
          " chunk=", chunk.chunk_id,
          " cmdbuf=", cmdbuf.handle,
-         " status=", static_cast<uint32_t>(cmdbuf.status()));
+         " status=", static_cast<uint32_t>(post_commit_status));
+  }
+  /* Hang forensics: detect encode.leave after a commit that never reached
+   * Committed (reentrant / already-enqueued / queue-error early return). */
+  if (post_commit_status == WMTCommandBufferStatusNotEnqueued ||
+      post_commit_status == WMTCommandBufferStatusEnqueued) {
+    WARN("DXMT metal commit anomaly: encode leave with non-committed buffer"
+         " frame=", chunk.frame_,
+         " chunk=", chunk.chunk_id,
+         " cmdbuf=", cmdbuf.handle,
+         " status=", static_cast<uint32_t>(post_commit_status),
+         " residencyUs=", residency_submit_us,
+         " persistentResidencyUs=", persistent_residency_submit_us,
+         " metalResidencyUs=", metal_residency_submit_us,
+         " reason=commit-early-return");
+  } else if (DxmtHangDenseEnabled() || DxmtQueueLifecycleEnabled()) {
+    WARN_FILE_ONLY("DXMT metal commit result:"
+         " frame=", chunk.frame_,
+         " chunk=", chunk.chunk_id,
+         " cmdbuf=", cmdbuf.handle,
+         " status=", static_cast<uint32_t>(post_commit_status),
+         " residencyUs=", residency_submit_us,
+         " metalResidencyUs=", metal_residency_submit_us,
+         " chunkEvent=", chunk.chunk_event_id,
+         " initEvent=", chunk.resource_initializer_event_id);
   }
 
   ready_for_commit.fetch_add(1, std::memory_order_release);
@@ -1409,31 +1446,56 @@ CommandQueue::WaitForFinishThread() {
       const auto wait_pair = lifecycle::nextPairSequence();
       const auto wait_queue_pair =
           lifecycle_sequence_.fetch_add(1, std::memory_order_relaxed);
+      const auto wait_status_before = chunk.attached_cmdbuf.status();
       DxmtQueueLifecycleLog(
           this, "metal-completion-wait.enter", wait_pair, wait_queue_pair,
           chunk.frame_, chunk.chunk_id, chunk.attached_cmdbuf.handle,
           internal_seq, chunk.chunk_event_id);
-      if (DxmtQueueDiagShouldLog(finish_log_count)) {
+      if (DxmtHangDenseEnabled() || DxmtQueueLifecycleEnabled()) {
+        WARN("DXMT finish metal wait begin:"
+             " frame=", chunk.frame_,
+             " chunk=", chunk.chunk_id,
+             " cmdbuf=", chunk.attached_cmdbuf.handle,
+             " status=", static_cast<uint32_t>(wait_status_before),
+             " seq=", internal_seq,
+             " chunkEvent=", chunk.chunk_event_id,
+             " initEvent=", chunk.resource_initializer_event_id,
+             " readyCommit=", ready_for_commit.load(std::memory_order_relaxed),
+             " coherent=", cpu_coherent.signaledValue());
+      } else if (DxmtQueueDiagShouldLog(finish_log_count)) {
         WARN_FILE_ONLY("DXMT queue diagnostic: FinishThread wait begin"
              " seq=", internal_seq,
              " chunk=", chunk.chunk_id,
              " cmdbuf=", chunk.attached_cmdbuf.handle,
-             " status=", static_cast<uint32_t>(chunk.attached_cmdbuf.status()));
+             " status=", static_cast<uint32_t>(wait_status_before));
       }
       auto wait_begin_time = clock::now();
       chunk.attached_cmdbuf.waitUntilCompleted();
       auto wait_end_time = clock::now();
+      const auto wait_status_after = chunk.attached_cmdbuf.status();
+      const auto wait_ms =
+          DxmtQueueDiagDurationMs(wait_end_time - wait_begin_time);
       DxmtQueueLifecycleLog(
           this, "metal-completion-wait.leave", wait_pair, wait_queue_pair,
           chunk.frame_, chunk.chunk_id, chunk.attached_cmdbuf.handle,
           internal_seq, chunk.chunk_event_id);
-      if (DxmtQueueDiagShouldLog(finish_log_count)) {
+      if (DxmtHangDenseEnabled() || wait_ms >= 1000.0) {
+        WARN("DXMT finish metal wait end:"
+             " frame=", chunk.frame_,
+             " chunk=", chunk.chunk_id,
+             " cmdbuf=", chunk.attached_cmdbuf.handle,
+             " statusBefore=", static_cast<uint32_t>(wait_status_before),
+             " statusAfter=", static_cast<uint32_t>(wait_status_after),
+             " waitMs=", wait_ms,
+             " seq=", internal_seq,
+             " chunkEvent=", chunk.chunk_event_id);
+      } else if (DxmtQueueDiagShouldLog(finish_log_count)) {
         WARN_FILE_ONLY("DXMT queue diagnostic: FinishThread wait end"
              " seq=", internal_seq,
              " chunk=", chunk.chunk_id,
              " cmdbuf=", chunk.attached_cmdbuf.handle,
-             " status=", static_cast<uint32_t>(chunk.attached_cmdbuf.status()),
-             " waitMs=", DxmtQueueDiagDurationMs(wait_end_time - wait_begin_time));
+             " status=", static_cast<uint32_t>(wait_status_after),
+             " waitMs=", wait_ms);
       }
     }
     chunk.finish_complete_time = clock::now();

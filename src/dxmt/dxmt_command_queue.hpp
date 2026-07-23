@@ -475,16 +475,56 @@ public:
   AllocateArgumentBuffer(uint64_t seq, size_t size, size_t alignment = 64) {
     if (!size)
       return {};
-    auto [block, offset] = argbuf_allocator.allocate(seq, cpu_coherent.signaledValue(), size, alignment);
-    EnsureCachedAllocationResidency(block.buffer);
-    if constexpr (sizeof(void *) == 4) {
-      auto [shadow_block, shadow_offset] = argbuf_shadow_allocator.allocate(seq, cpu_coherent.signaledValue(), size, alignment);
-      return {ptr_add(shadow_block.ptr, shadow_offset), block.buffer, offset,
-              block.gpu_address, size, true};
-    } else {
-      return {ptr_add(block.mapped_address, offset), block.buffer, offset,
-              block.gpu_address, size, false};
+    // Fail-closed ownership: host-mapped argbuf slices require an active
+    // encode generation so the Metal buffer is retained until GPU complete.
+    if (!argument_encoding_ctx.hasActiveCommandBufferGeneration()) {
+      ERR("DXMT AllocateArgumentBuffer: no active command-buffer generation "
+          "size=",
+          size, " seq=", seq);
+      return {};
     }
+    auto [block, offset] = argbuf_allocator.allocate(
+        seq, cpu_coherent.signaledValue(), size, alignment,
+        /*retain_pin=*/true);
+    // Snapshot under the allocation's returned Block& before any other queue
+    // work can race free_blocks/reuse. Slice holds a retaining Reference so
+    // the MTLBuffer (and host mapping) stays live for write()/encode.
+    WMT::Reference<WMT::Buffer> buffer_ref(block.buffer);
+    const uint64_t gpu_address = block.gpu_address;
+    void *const block_mapped = block.mapped_address;
+    if (!buffer_ref) {
+      ERR("DXMT AllocateArgumentBuffer: failed to create GPU buffer size=",
+          size, " seq=", seq);
+      return {};
+    }
+    EnsureCachedAllocationResidency(buffer_ref);
+    // GPTK-style CB retain (vector + chunk lifetime only — not residency set
+    // mutation). Host write safety also relies on slice's retaining Reference
+    // and EnsureCachedAllocationResidency above for queue-level set membership.
+    if (!argument_encoding_ctx.tryRetainResourceForCurrentCommandBuffer(
+            buffer_ref)) {
+      ERR("DXMT AllocateArgumentBuffer: generation pin failed size=", size,
+          " seq=", seq);
+      return {};
+    }
+    void *mapped = nullptr;
+    bool needs_flush = false;
+    if constexpr (sizeof(void *) == 4) {
+      auto [shadow_block, shadow_offset] = argbuf_shadow_allocator.allocate(
+          seq, cpu_coherent.signaledValue(), size, alignment,
+          /*retain_pin=*/true);
+      mapped = ptr_add(shadow_block.ptr, shadow_offset);
+      needs_flush = true;
+    } else {
+      mapped = ptr_add(block_mapped, offset);
+    }
+    if (!mapped) {
+      ERR("DXMT AllocateArgumentBuffer: null host mapping size=", size,
+          " seq=", seq, " offset=", offset);
+      return {};
+    }
+    return {mapped, std::move(buffer_ref), offset, gpu_address, size,
+            needs_flush};
   }
 
   void *
