@@ -4643,6 +4643,52 @@ public:
            " dimension=", desc->Dimension);
       return E_NOTIMPL;
     }
+
+    // Diagnostic only (no behavior change): sample placed allocations so the
+    // last CreatePlacedResource before an IOGPUMetalHeap storage-mode assert
+    // is visible in wine/d3d12 logs. Rate-limited; hot path is a counter bump.
+    {
+      const auto heap_type = d3d12::GetHeapType(heap_desc.Properties);
+      // Metal placement heap storage: DEFAULT→Private, else Shared.
+      const bool heap_metal_private = heap_type == D3D12_HEAP_TYPE_DEFAULT;
+      // Resource allocation flags currently follow the same heap type mapping.
+      const bool resource_metal_private = heap_type == D3D12_HEAP_TYPE_DEFAULT;
+      static std::atomic<uint32_t> placed_diag = 0;
+      const uint32_t n =
+          placed_diag.fetch_add(1, std::memory_order_relaxed) + 1;
+      // Prefer early samples + any non-DEFAULT heap (Shared Metal heap) +
+      // textures (common assert path).
+      const bool interesting =
+          !heap_metal_private ||
+          desc->Dimension != D3D12_RESOURCE_DIMENSION_BUFFER ||
+          heap_desc.Properties.Type == D3D12_HEAP_TYPE_CUSTOM;
+      if (n <= 32 || (interesting && (n % 32) == 0) || (n % 256) == 0) {
+        WARN("D3D12Device: CreatePlacedResource diag"
+             " heapOffset=", heap_offset,
+             " heapSize=", heap_desc.SizeInBytes,
+             " heapType=", heap_desc.Properties.Type,
+             " resolvedHeapType=", heap_type,
+             " cpuPage=", heap_desc.Properties.CPUPageProperty,
+             " memoryPool=", heap_desc.Properties.MemoryPoolPreference,
+             " heapFlags=", heap_desc.Flags,
+             " placementHeap=", placement_heap ? placement_heap.handle : 0,
+             " heapMetalPrivate=", heap_metal_private,
+             " resourceMetalPrivate=", resource_metal_private,
+             " usesMetalPlacementHeap=", placement_heap ? 1 : 0,
+             " dimension=", desc->Dimension,
+             " width=", desc->Width,
+             " height=", desc->Height,
+             " depthOrArray=", desc->DepthOrArraySize,
+             " mips=", desc->MipLevels,
+             " format=", desc->Format,
+             " layout=", desc->Layout,
+             " sampleCount=", desc->SampleDesc.Count,
+             " resourceFlags=", desc->Flags,
+             " initialState=", initial_state,
+             " count=", n);
+      }
+    }
+
     if (!resource)
       return S_FALSE;
     dxmt::Buffer *placed_buffer =
@@ -4668,10 +4714,15 @@ public:
       WARN("D3D12Device: CreatePlacedResource backing allocation failed"
            " heapOffset=", heap_offset,
            " heapSize=", heap_desc.SizeInBytes,
+           " heapType=", heap_desc.Properties.Type,
+           " resolvedHeapType=", d3d12::GetHeapType(heap_desc.Properties),
+           " placementHeap=", placement_heap ? placement_heap.handle : 0,
            " dimension=", desc->Dimension,
            " width=", desc->Width,
            " height=", desc->Height,
-           " format=", desc->Format);
+           " format=", desc->Format,
+           " layout=", desc->Layout,
+           " resourceFlags=", desc->Flags);
       return E_OUTOFMEMORY;
     }
     auto hr = resource_object->QueryInterface(riid, resource);

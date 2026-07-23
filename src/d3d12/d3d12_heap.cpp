@@ -197,14 +197,31 @@ public:
       info.options |= WMTResourceStorageModePrivate;
     else if (heap_type_ == D3D12_HEAP_TYPE_UPLOAD)
       info.options |= WMTResourceOptionCPUCacheModeWriteCombined;
+    // READBACK / other: leave Shared (no Private bit).
     placement_heap_ =
         device_->GetDXMTDevice().device().newPlacementHeap(info);
     if (!placement_heap_) {
       WARN("D3D12Heap: TODO failed to create Metal4 placement heap"
            " size=", desc_.SizeInBytes,
            " backendSize=", backend_size_,
-           " flags=", desc_.Flags);
+           " heapType=", heap_type_,
+           " flags=", desc_.Flags,
+           " options=", info.options);
     } else {
+      static std::atomic<uint32_t> placement_heap_diag = 0;
+      const uint32_t n =
+          placement_heap_diag.fetch_add(1, std::memory_order_relaxed) + 1;
+      if (n <= 16 || (n % 64) == 0) {
+        WARN("D3D12Heap: placement heap created"
+             " size=", desc_.SizeInBytes,
+             " backendSize=", backend_size_,
+             " heapType=", heap_type_,
+             " cpuVisible=", cpu_visible_,
+             " flags=", desc_.Flags,
+             " options=", info.options,
+             " metalHeap=", placement_heap_.handle,
+             " count=", n);
+      }
       device_->GetDXMTDevice().queue().AddPersistentResidency(
           placement_heap_);
     }
