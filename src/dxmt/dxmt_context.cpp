@@ -1339,13 +1339,15 @@ ArgumentEncodingContext::packBindlessStage(
   }
 
   auto bt = queue_.AllocateArgumentBuffer(currentSeqId(), uint64_t(qword_count) * sizeof(uint64_t));
-  if (!bt.mapped || !bt.gpu_buffer) {
+  if (!bt.valid()) {
     log_binding("allocation-failed");
     return {};
   }
-  retainResourceForCurrentCommandBuffer(bt.gpu_buffer);
-  auto *buf_table = static_cast<uint64_t *>(bt.mapped);
-  std::memset(buf_table, 0, bt.length);
+  auto *buf_table = bt.map<uint64_t>(0, qword_count);
+  if (!buf_table || !bt.fill_zero()) {
+    log_binding("allocation-failed");
+    return {};
+  }
 
   if (num_cbuffers && constant_buffers)
     packBindlessCBuffers<stage, kind>(reflection, constant_buffers, buf_table, qword_count,
@@ -1360,8 +1362,7 @@ ArgumentEncodingContext::packBindlessStage(
       reflection, constant_buffers, arguments, buf_table, qword_count,
       cb_bases.data(), res_bases.data(), verify_draw_id, verify_draw_serial);
 
-  if (bt.needs_flush)
-    bt.gpu_buffer.updateContents(bt.offset, bt.mapped, bt.length);
+  bt.flush_if_needed();
   log_binding("bound");
   return bt;
 }
@@ -3759,24 +3760,39 @@ ArgumentEncodingContext::endCommandBufferResourceLifetime() {
   current_command_buffer_resource_handles_ = nullptr;
 }
 
+bool
+ArgumentEncodingContext::tryRetainResourceForCurrentCommandBuffer(
+    WMT::Resource resource) {
+#if DXMT_DX12_METAL4
+  if (!resource)
+    return false;
+  // Fail-closed: no generation ⇒ no pin (callers must not write host mappings
+  // of unpinned argument buffers).
+  if (!hasActiveCommandBufferGeneration())
+    return false;
+  if (!current_command_buffer_resource_handles_->insert(resource.handle).second)
+    return true; // already pinned for this generation
+
+  // GPTK D3DMCommandQueue::RetainResourceForCurrentCommandBuffer: CPU-side
+  // retain list + refcount only. Do NOT call Metal residency set APIs here —
+  // lifetime residency is RegisterResource/AddPersistentResidency at create,
+  // and mixing membershipLock+containsAllocation on this path deadlocks with
+  // RenderThread addAllocation (BMW hang ~frame 1188).
+  current_command_buffer_resources_->emplace_back(resource);
+  return true;
+#else
+  (void)resource;
+  return true;
+#endif
+}
+
 void
 ArgumentEncodingContext::retainResourceForCurrentCommandBuffer(
     WMT::Resource resource) {
 #if DXMT_DX12_METAL4
-  if (!resource)
-    return;
-
-  assert(current_command_buffer_);
-  assert(current_command_buffer_resources_);
-  assert(current_command_buffer_resource_handles_);
-  if (!current_command_buffer_resource_handles_->insert(resource.handle).second)
-    return;
-
-  // Match D3DMetal's current-command-buffer ownership model: acquire the
-  // original resource before its raw handle enters an encoder command. The
-  // CommandChunk releases this reference only after GPU completion.
-  current_command_buffer_resources_->emplace_back(resource);
-  current_command_buffer_.registerResource(resource);
+  // Soft-skip only for non-argument-buffer retain paths (residency probes).
+  // AllocateArgumentBuffer uses tryRetain and fails closed on false.
+  (void)tryRetainResourceForCurrentCommandBuffer(resource);
 #else
   (void)resource;
 #endif
@@ -4034,12 +4050,8 @@ ArgumentEncodingContext::startRenderPass(
   encoder_info->dsv_readonly_flags = dsv_readonly_flags;
   encoder_info->render_target_count = render_target_count;
   auto argbuf = queue_.AllocateArgumentBuffer(seq_id_, encoder_argbuf_size);
-  retainResourceForCurrentCommandBuffer(argbuf.gpu_buffer);
-  encoder_info->allocated_argbuf = argbuf.gpu_buffer;
-  encoder_info->allocated_argbuf_offset = argbuf.offset;
-  encoder_info->allocated_argbuf_size = argbuf.length;
-  encoder_info->allocated_argbuf_mapping = argbuf.mapped;
-  encoder_info->allocated_argbuf_needs_flush = argbuf.needs_flush;
+  // AllocateArgumentBuffer already generation-pins; store owned slice for L2 writes.
+  encoder_info->argbuf_slice = argbuf;
   encoder_current = encoder_info;
 
   currentFrameStatistics().render_pass_count++;
@@ -4061,12 +4073,7 @@ ArgumentEncodingContext::startComputePass(uint64_t encoder_argbuf_size) {
   encoder_info->cmd_head.next.set(0);
   encoder_info->cmd_tail = (wmtcmd_base *)&encoder_info->cmd_head;
   auto argbuf = queue_.AllocateArgumentBuffer(seq_id_, encoder_argbuf_size);
-  retainResourceForCurrentCommandBuffer(argbuf.gpu_buffer);
-  encoder_info->allocated_argbuf = argbuf.gpu_buffer;
-  encoder_info->allocated_argbuf_offset = argbuf.offset;
-  encoder_info->allocated_argbuf_size = argbuf.length;
-  encoder_info->allocated_argbuf_mapping = argbuf.mapped;
-  encoder_info->allocated_argbuf_needs_flush = argbuf.needs_flush;
+  encoder_info->argbuf_slice = argbuf;
   encoder_current = encoder_info;
 
   currentFrameStatistics().compute_pass_count++;
@@ -4420,13 +4427,7 @@ constexpr unsigned kEncoderOptimizerThreshold = 64;
 
 static void
 FlushRenderEncoderArgumentBuffer(RenderEncoderData *data) {
-  if (!data->allocated_argbuf_needs_flush || !data->allocated_argbuf_size)
-    return;
-
-  data->allocated_argbuf.updateContents(
-      data->allocated_argbuf_offset, data->allocated_argbuf_mapping, data->allocated_argbuf_size
-  );
-  data->allocated_argbuf_needs_flush = false;
+  data->argbuf_slice.flush_if_needed();
 }
 
 void
@@ -4597,9 +4598,9 @@ ArgumentEncodingContext::flushCommands(
         const auto *render = static_cast<const RenderEncoderData *>(encoder);
         entry.vertex_encoder_id = render->encoder_id_vertex;
         entry.pipeline_handle = render->last_pso.handle;
-        entry.argument_buffer_handle = render->allocated_argbuf.handle;
-        entry.argument_buffer_offset = render->allocated_argbuf_offset;
-        entry.argument_buffer_size = render->allocated_argbuf_size;
+        entry.argument_buffer_handle = render->argbuf_slice.gpu_buffer.handle;
+        entry.argument_buffer_offset = render->argbuf_slice.offset;
+        entry.argument_buffer_size = render->argbuf_slice.length;
         auto hash_attachment = [&](uint64_t texture, uint64_t view) {
           entry.primary_resource ^= texture + 0x9e3779b97f4a7c15ull +
                                     (entry.primary_resource << 6) +
@@ -4657,9 +4658,9 @@ ArgumentEncodingContext::flushCommands(
       } else if (encoder->type == EncoderType::Compute) {
         const auto *compute =
             static_cast<const ComputeEncoderData *>(encoder);
-        entry.argument_buffer_handle = compute->allocated_argbuf.handle;
-        entry.argument_buffer_offset = compute->allocated_argbuf_offset;
-        entry.argument_buffer_size = compute->allocated_argbuf_size;
+        entry.argument_buffer_handle = compute->argbuf_slice.gpu_buffer.handle;
+        entry.argument_buffer_offset = compute->argbuf_slice.offset;
+        entry.argument_buffer_size = compute->argbuf_slice.length;
         entry.resource_plan_count =
             static_cast<uint32_t>(compute->resource_plan_accesses.size());
         for (const auto &[key, access] : compute->resource_plan_accesses) {
@@ -4902,7 +4903,7 @@ ArgumentEncodingContext::flushCommands(
       }
       NormalizeRenderPassInfo(render_pass_info);
       FlushRenderEncoderArgumentBuffer(data);
-      auto gpu_buffer_ = data->allocated_argbuf;
+      auto gpu_buffer_ = data->argbuf_slice.gpu_buffer;
       const bool sample_render_readback = DebugShouldSampleRenderReadback();
       DebugEncodeRenderAttachmentReadbacks(readbacks, cmdbuf, device_, queue_,
                                            frame_id_,
@@ -4917,14 +4918,14 @@ ArgumentEncodingContext::flushCommands(
           [&](auto id) { withFence(id, [&](auto fence) { encoder.waitForFence(fence, WMTRenderStagePreRaster); }); },
           [&](auto id) { withFence(id, [&](auto fence) { encoder.waitForFence(fence, WMTRenderStageFragment); }); }
       );
-      if (data->allocated_argbuf_size) {
+      if (data->argbuf_slice.length) {
         encoder.setArgumentBuffer(gpu_buffer_, 0, 16, WMTRenderStageVertex);
         encoder.setArgumentBuffer(gpu_buffer_, 0, 29, WMTRenderStageVertex);
         encoder.setArgumentBuffer(gpu_buffer_, 0, 30, WMTRenderStageVertex);
         encoder.setArgumentBuffer(gpu_buffer_, 0, 29, WMTRenderStageFragment);
         encoder.setArgumentBuffer(gpu_buffer_, 0, 30, WMTRenderStageFragment);
       }
-      if ((data->use_geometry || data->use_tessellation) && data->allocated_argbuf_size) {
+      if ((data->use_geometry || data->use_tessellation) && data->argbuf_slice.length) {
         encoder.setArgumentBuffer(gpu_buffer_, 0, 16, WMTRenderStageObject);
         encoder.setArgumentBuffer(gpu_buffer_, 0, 21, WMTRenderStageObject); // draw arguments
         if (data->use_tessellation) {
@@ -4968,7 +4969,6 @@ ArgumentEncodingContext::flushCommands(
         }
         auto task_argbuf =
             queue_.AllocateArgumentBuffer(seq_id_, task_bytes);
-        retainResourceForCurrentCommandBuffer(task_argbuf.gpu_buffer);
         auto *tasks_data =
             MappedArgumentBufferSlice<GS_MARSHAL_TASK>(task_argbuf,
                                                        task_count);
@@ -4987,9 +4987,7 @@ ArgumentEncodingContext::flushCommands(
           encoder.useResource(task.dispatch_arguments_buffer, WMTResourceUsageWrite, WMTRenderStageVertex);
         }
         tasks_data[task_count - 1].end_of_command = 1;
-        if (task_argbuf.needs_flush) {
-          task_argbuf.gpu_buffer.updateContents(task_argbuf.offset, task_argbuf.mapped, task_argbuf.length);
-        }
+        task_argbuf.flush_if_needed();
         emulated_cmd.MarshalGSDispatchArguments(encoder, task_argbuf.gpu_buffer, task_argbuf.offset);
       }
       if (data->ts_arg_marshal_tasks.size()) {
@@ -5010,7 +5008,6 @@ ArgumentEncodingContext::flushCommands(
         }
         auto task_argbuf =
             queue_.AllocateArgumentBuffer(seq_id_, task_bytes);
-        retainResourceForCurrentCommandBuffer(task_argbuf.gpu_buffer);
         auto *tasks_data =
             MappedArgumentBufferSlice<TS_MARSHAL_TASK>(task_argbuf,
                                                        task_count);
@@ -5030,9 +5027,7 @@ ArgumentEncodingContext::flushCommands(
           encoder.useResource(task.dispatch_arguments_buffer, WMTResourceUsageWrite, WMTRenderStageVertex);
         }
         tasks_data[task_count - 1].end_of_command = 1;
-        if (task_argbuf.needs_flush) {
-          task_argbuf.gpu_buffer.updateContents(task_argbuf.offset, task_argbuf.mapped, task_argbuf.length);
-        }
+        task_argbuf.flush_if_needed();
         emulated_cmd.MarshalTSDispatchArguments(encoder, task_argbuf.gpu_buffer, task_argbuf.offset);
       }
       if (data->gs_arg_marshal_tasks.size() > 0 || data->ts_arg_marshal_tasks.size() > 0) {
@@ -5085,10 +5080,7 @@ ArgumentEncodingContext::flushCommands(
       DebugLogArgumentTableSliceCache(
           "compute", "compute", frame_id_, seqId, data->id,
           data->argument_table_cache);
-      if (data->allocated_argbuf_needs_flush) {
-        data->allocated_argbuf.updateContents(data->allocated_argbuf_offset, data->allocated_argbuf_mapping,
-                                              data->allocated_argbuf_size);
-      }
+      data->argbuf_slice.flush_if_needed();
       if (queue_.apitraceEnabled()) {
         dxmt::apitrace::set_current_d3d_sequence(seqId);
       }
@@ -5146,11 +5138,11 @@ ArgumentEncodingContext::flushCommands(
              " updateFence=", command_summary.update_fences + data->fence_update.count());
       }
       data->fence_wait.forEach([&](auto id) { withFence(id, [&](auto fence) { encoder.waitForFence(fence); }); });
-      if (data->allocated_argbuf_size) {
+      if (data->argbuf_slice.length) {
         struct wmtcmd_compute_setargumentbuffer setcmd;
         setcmd.type = WMTComputeCommandSetArgumentBuffer;
         setcmd.next.set(nullptr);
-        setcmd.buffer = data->allocated_argbuf;
+        setcmd.buffer = data->argbuf_slice.gpu_buffer;
         setcmd.offset = 0;
         setcmd.index = 29;
         encoder.encodeCommands((const wmtcmd_compute_nop *)&setcmd);
@@ -5937,18 +5929,18 @@ ArgumentEncodingContext::checkEncoderRelation(EncoderData *former, EncoderData *
       r1->stencil.depth_plane = r0->stencil.depth_plane;
 
       if ((void *)r0->cmd_tail != &r0->cmd_head) {
-        if (r0->allocated_argbuf != r1->allocated_argbuf) {
+        if (r0->argbuf_slice.gpu_buffer != r1->argbuf_slice.gpu_buffer) {
           auto original_head = r0->cmd_head.next.get();
           auto original_tail = r0->cmd_tail;
           r0->cmd_head.next.set(nullptr);
           r0->cmd_tail = reinterpret_cast<wmtcmd_base *>(&r0->cmd_head);
           appendRenderArgumentBufferBindings(
-              r0, r0->allocated_argbuf, r0->use_geometry,
+              r0, r0->argbuf_slice.gpu_buffer, r0->use_geometry,
               r0->use_tessellation);
           r0->cmd_tail->next.set(original_head);
           r0->cmd_tail = original_tail;
           appendRenderArgumentBufferBindings(
-              r0, r1->allocated_argbuf, r1->use_geometry,
+              r0, r1->argbuf_slice.gpu_buffer, r1->use_geometry,
               r1->use_tessellation);
         }
         r0->cmd_tail->next.set(r1->cmd_head.next.get());
@@ -6035,23 +6027,19 @@ ArgumentEncodingContext::tryMergeComputeEncoders(ComputeEncoderData *former, Com
     return false;
 
   if ((void *)former->cmd_tail != &former->cmd_head) {
-    if (former->allocated_argbuf_needs_flush)
-      former->allocated_argbuf.updateContents(
-          former->allocated_argbuf_offset, former->allocated_argbuf_mapping,
-          former->allocated_argbuf_size);
-    former->allocated_argbuf_needs_flush = false;
+    former->argbuf_slice.flush_if_needed();
 
-    if (former->allocated_argbuf_size) {
+    if (former->argbuf_slice.length) {
       auto original_head = former->cmd_head.next.get();
       auto original_tail = former->cmd_tail;
       former->cmd_head.next.set(nullptr);
       former->cmd_tail = reinterpret_cast<wmtcmd_base *>(&former->cmd_head);
-      appendComputeArgumentBufferBindings(former, former->allocated_argbuf);
+      appendComputeArgumentBufferBindings(former, former->argbuf_slice.gpu_buffer);
       former->cmd_tail->next.set(original_head);
       former->cmd_tail = original_tail;
-      if (latter->allocated_argbuf_size &&
-          former->allocated_argbuf != latter->allocated_argbuf)
-        appendComputeArgumentBufferBindings(former, latter->allocated_argbuf);
+      if (latter->argbuf_slice.length &&
+          former->argbuf_slice.gpu_buffer != latter->argbuf_slice.gpu_buffer)
+        appendComputeArgumentBufferBindings(former, latter->argbuf_slice.gpu_buffer);
     }
 
     former->cmd_tail->next.set(latter->cmd_head.next.get());

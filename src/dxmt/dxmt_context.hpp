@@ -12,6 +12,7 @@
 #include "dxmt_statistics.hpp"
 #include "dxmt_texture.hpp"
 #include "dxmt_descriptor_revision.hpp"
+#include "dxmt_gpu_lifetime.hpp"
 #include "log/log.hpp"
 #include "rc/util_rc_ptr.hpp"
 #include "airconv_public.h"
@@ -430,14 +431,14 @@ struct RenderEncoderData : EncoderData {
   std::vector<TSDispatchArgumentsMarshal> ts_arg_marshal_tasks;
   wmtcmd_render_nop cmd_head;
   wmtcmd_base *cmd_tail;
-  WMT::Buffer allocated_argbuf;
-  uint64_t allocated_argbuf_offset;
-  uint64_t allocated_argbuf_size;
+  /**
+   * L2 pass-owned argument buffer. Host writes go through getMappedArgumentBuffer
+   * which bounds-checks against this slice; do not store a raw mapped pointer.
+   */
+  AllocatedArgumentBufferSlice argbuf_slice{};
   uint64_t encoder_id_vertex;
   FenceSet fence_wait_vertex;
   FenceSet fence_update_vertex;
-  void *allocated_argbuf_mapping;
-  bool allocated_argbuf_needs_flush;
   uint8_t dsv_planar_flags;
   uint8_t dsv_readonly_flags;
   uint8_t render_target_count;
@@ -467,11 +468,7 @@ struct RenderEncoderData : EncoderData {
 struct ComputeEncoderData : EncoderData {
   wmtcmd_compute_nop cmd_head;
   wmtcmd_base *cmd_tail;
-  WMT::Buffer allocated_argbuf;
-  uint64_t allocated_argbuf_offset;
-  uint64_t allocated_argbuf_size;
-  void *allocated_argbuf_mapping;
-  bool allocated_argbuf_needs_flush;
+  AllocatedArgumentBufferSlice argbuf_slice{};
   ArgumentTableSliceCache argument_table_cache;
   std::array<ComputeArgumentBufferOffsetState, 8> argument_buffer_offsets = {};
   std::array<NativeArgumentBufferBindingState, 31>
@@ -619,15 +616,6 @@ struct AllocatedTempBufferSlice {
   WMT::Buffer gpu_buffer;
   uint64_t offset;
   uint64_t gpu_address;
-};
-
-struct AllocatedArgumentBufferSlice {
-  void *mapped;
-  WMT::Buffer gpu_buffer;
-  uint64_t offset;
-  uint64_t gpu_address;
-  uint64_t length;
-  bool needs_flush;
 };
 
 class ArgumentEncodingContext {
@@ -953,6 +941,19 @@ public:
     retainResourceForCurrentCommandBuffer(resource);
   }
 
+  /** True while beginCommandBufferResourceLifetime is active for this context. */
+  bool hasActiveCommandBufferGeneration() const {
+    return bool(current_command_buffer_) &&
+           current_command_buffer_resources_ != nullptr &&
+           current_command_buffer_resource_handles_ != nullptr;
+  }
+
+  /**
+   * Generation-pin a Metal resource. Returns false if no generation is active
+   * or the resource is null (fail-closed; no soft-skip success).
+   */
+  bool tryRetainResourceForCurrentCommandBuffer(WMT::Resource resource);
+
   void beginCommandBufferResourceLifetime(
       WMT::CommandBuffer command_buffer,
       std::vector<WMT::Reference<WMT::Resource>> &resources,
@@ -1193,35 +1194,38 @@ public:
   template <typename T, bool ComputeCommandEncoder = false>
   T *
   getMappedArgumentBuffer(size_t offset, size_t byte_size = sizeof(T)) {
-    auto *mapping = [&]() -> void * {
+    auto &slice = [&]() -> AllocatedArgumentBufferSlice & {
       if constexpr (ComputeCommandEncoder)
-        return static_cast<ComputeEncoderData *>(encoder_current)
-            ->allocated_argbuf_mapping;
-      return static_cast<RenderEncoderData *>(encoder_current)
-          ->allocated_argbuf_mapping;
+        return static_cast<ComputeEncoderData *>(encoder_current)->argbuf_slice;
+      return static_cast<RenderEncoderData *>(encoder_current)->argbuf_slice;
     }();
-    const uint64_t allocated_size = [&]() {
-      if constexpr (ComputeCommandEncoder)
-        return static_cast<ComputeEncoderData *>(encoder_current)
-            ->allocated_argbuf_size;
-      return static_cast<RenderEncoderData *>(encoder_current)
-          ->allocated_argbuf_size;
-    }();
+    if (!slice.valid()) {
+      argument_buffer_overflowed_ = true;
+      return nullptr;
+    }
     const uint64_t offset64 = offset;
     const uint64_t size64 = byte_size;
-    const bool in_allocation =
-        mapping && offset64 <= allocated_size &&
-        size64 <= allocated_size - offset64;
     const bool in_write_window =
         !size64 ||
         (offset64 >= argument_buffer_write_begin_ &&
          offset64 <= argument_buffer_write_end_ &&
          size64 <= argument_buffer_write_end_ - offset64);
-    if (!in_allocation || !in_write_window) {
+    if (!in_write_window) {
       argument_buffer_overflowed_ = true;
       return nullptr;
     }
-    return reinterpret_cast<T *>(static_cast<char *>(mapping) + offset);
+    // Prefer slice.map for element types; byte_size path uses raw offset.
+    if (size64 == sizeof(T) && (offset64 % sizeof(T)) == 0) {
+      auto *p = slice.template map<T>(static_cast<size_t>(offset64 / sizeof(T)), 1);
+      if (!p)
+        argument_buffer_overflowed_ = true;
+      return p;
+    }
+    if (offset64 > slice.length || size64 > slice.length - offset64) {
+      argument_buffer_overflowed_ = true;
+      return nullptr;
+    }
+    return reinterpret_cast<T *>(static_cast<char *>(slice.mapped) + offset);
   }
 
   void setArgumentBufferWriteRange(uint64_t offset, uint64_t size) {
@@ -1247,16 +1251,16 @@ public:
   uint64_t
   getFinalArgumentBufferOffset(size_t offset) {
     if constexpr (ComputeCommandEncoder)
-      return static_cast<ComputeEncoderData *>(encoder_current)->allocated_argbuf_offset + offset;
-    return static_cast<RenderEncoderData *>(encoder_current)->allocated_argbuf_offset + offset;
+      return static_cast<ComputeEncoderData *>(encoder_current)->argbuf_slice.offset + offset;
+    return static_cast<RenderEncoderData *>(encoder_current)->argbuf_slice.offset + offset;
   }
 
   template <bool ComputeCommandEncoder = false>
   WMT::Buffer
   getFinalArgumentBuffer() {
     if constexpr (ComputeCommandEncoder)
-      return static_cast<ComputeEncoderData *>(encoder_current)->allocated_argbuf;
-    return static_cast<RenderEncoderData *>(encoder_current)->allocated_argbuf;
+      return static_cast<ComputeEncoderData *>(encoder_current)->argbuf_slice.gpu_buffer;
+    return static_cast<RenderEncoderData *>(encoder_current)->argbuf_slice.gpu_buffer;
   }
 
   uint64_t deduplicateRenderArgumentTableSlice(WMTRenderStages stages, uint8_t index, uint64_t offset, uint64_t size);
