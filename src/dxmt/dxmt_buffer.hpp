@@ -8,6 +8,8 @@
 #include "thread.hpp"
 #include "util_flags.hpp"
 #include "util_svector.hpp"
+#include <atomic>
+#include <cstdint>
 
 namespace dxmt {
 
@@ -79,8 +81,36 @@ public:
 
   void *
   mappedMemory(uint32_t sub) const noexcept {
+    if (!mappedMemory_)
+      return nullptr;
     return reinterpret_cast<void *>(reinterpret_cast<std::uintptr_t>(mappedMemory_) + sub * suballocation_size_);
   }
+
+  /** D3D12 Map/Unmap refcount: host mapping must stay valid while > 0. */
+  void addCpuMapRef() noexcept {
+    cpu_map_refs_.fetch_add(1u, std::memory_order_acq_rel);
+  }
+
+  void releaseCpuMapRef() noexcept {
+    uint32_t prev = cpu_map_refs_.load(std::memory_order_acquire);
+    while (prev > 0) {
+      if (cpu_map_refs_.compare_exchange_weak(prev, prev - 1,
+                                              std::memory_order_acq_rel,
+                                              std::memory_order_acquire))
+        return;
+    }
+  }
+
+  uint32_t cpuMapRefs() const noexcept {
+    return cpu_map_refs_.load(std::memory_order_acquire);
+  }
+
+  /**
+   * Trap-fill host-only mappings before reclaim. Must not touch Metal Shared
+   * contents: those remain GPU-visible while command buffers retain the
+   * MTLBuffer after D3D resource Release.
+   */
+  void poisonHostMapping(const char *reason) noexcept;
 
   uint64_t
   gpuAddress() const noexcept {
@@ -165,6 +195,7 @@ private:
   uint32_t current_suballocation_ = 0;
   uint64_t suballocation_size_;
   uint32_t suballocation_count_ = 1;
+  std::atomic<uint32_t> cpu_map_refs_{0};
 
   void * placed_buffer = nullptr;
 };

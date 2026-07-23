@@ -6,6 +6,7 @@
 #include "util_math.hpp"
 #include "wsi_platform.hpp"
 #include <cassert>
+#include <cstring>
 #include <mutex>
 
 namespace dxmt {
@@ -68,11 +69,53 @@ BufferAllocation::BufferAllocation(
   fenceTrackers.resize(1);
 }
 
+void
+BufferAllocation::poisonHostMapping(const char *reason) noexcept {
+  if (!mappedMemory_ || !info_.length)
+    return;
+  // Metal Shared/managed host mappings stay GPU-visible while any command
+  // buffer still retains the MTLBuffer (often past the D3D12 resource
+  // Release). Filling them with 0xDE corrupts in-flight GPU reads and has
+  // produced kIOGPUCommandBufferCallbackErrorHang → DEVICE_REMOVED on BMW.
+  // Only pure CPU-side pages (shadow / placed) are safe to trap-fill.
+  const bool host_only =
+      flags_.test(BufferAllocationFlag::CpuShadow) ||
+      flags_.test(BufferAllocationFlag::CpuPlaced) ||
+      flags_.test(BufferAllocationFlag::ExternalCpuPlaced) ||
+      placed_buffer != nullptr;
+  if (!host_only) {
+    if (cpu_map_refs_.load(std::memory_order_acquire) > 0) {
+      ERR("DXMT BufferAllocation: skip Shared poison with active Map refs "
+          "refs=",
+          cpu_map_refs_.load(std::memory_order_relaxed),
+          " length=", info_.length,
+          " reason=", reason ? reason : "unknown");
+    }
+    return;
+  }
+  std::memset(mappedMemory_, 0xDE, static_cast<size_t>(info_.length));
+  if (cpu_map_refs_.load(std::memory_order_acquire) > 0) {
+    ERR("DXMT BufferAllocation: poisoning host-only mapping with active Map "
+        "refs=",
+        cpu_map_refs_.load(std::memory_order_relaxed),
+        " length=", info_.length,
+        " reason=", reason ? reason : "unknown");
+  }
+}
+
 BufferAllocation::~BufferAllocation() {
+  if (cpu_map_refs_.load(std::memory_order_acquire) > 0) {
+    // Game still holds Map() while the allocation is dying. Host-only poison
+    // is safe; Shared Metal contents must stay intact for any in-flight CB.
+    poisonHostMapping("destructor-with-active-map");
+  } else if (mappedMemory_ && info_.length) {
+    poisonHostMapping("destructor");
+  }
   if (placed_buffer && !flags_.test(BufferAllocationFlag::ExternalCpuPlaced)) {
     wsi::aligned_free(placed_buffer);
     placed_buffer = nullptr;
   }
+  mappedMemory_ = nullptr;
 }
 
 void

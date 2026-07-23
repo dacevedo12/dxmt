@@ -905,6 +905,20 @@ public:
     CancelReservedTextureMaterialization();
     UnregisterBufferGpuVirtualAddress(this);
     UnregisterLifetimeResidency();
+    // Resource destroyed while Map still outstanding: drop holds so
+    // BufferAllocation can poison then free rather than UAF the host page.
+    if (buffer_map_count_ > 0 || !mapped_allocation_holds_.empty()) {
+      ERR("D3D12Resource: destroy with outstanding Map refs map_count=",
+          buffer_map_count_,
+          " holds=", mapped_allocation_holds_.size());
+    }
+    while (!mapped_allocation_holds_.empty()) {
+      auto held = std::move(mapped_allocation_holds_.back());
+      mapped_allocation_holds_.pop_back();
+      if (held)
+        held->releaseCpuMapRef();
+    }
+    buffer_map_count_ = 0;
   }
 
   HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid,
@@ -1015,6 +1029,11 @@ public:
       WaitPendingTimestampResolveForMapRead(read_range);
       mapped = static_cast<char *>(buffer_allocation_->mappedMemory(0)) +
                buffer_backing_offset_;
+      // Pin host mapping for this Map's lifetime: cpu_map_refs_ + Rc hold so
+      // rename/reclaim cannot destroy the allocation until matching Unmap.
+      buffer_allocation_->addCpuMapRef();
+      mapped_allocation_holds_.push_back(buffer_allocation_);
+      buffer_map_count_++;
       goto done;
     }
 
@@ -1036,6 +1055,7 @@ public:
     }
 
     mapped = texture_allocation_->mappedMemory;
+    texture_map_count_++;
 
   done:
     if (data)
@@ -1048,36 +1068,64 @@ public:
 
   void STDMETHODCALLTYPE Unmap(UINT sub_resource,
                                const D3D12_RANGE *written_range) override {
-    if (desc_.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER ||
-        sub_resource != 0 || !buffer_allocation_)
-      return;
+    if (desc_.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
+      if (sub_resource != 0)
+        return;
 
-    UINT64 written_begin = 0;
-    UINT64 written_end = desc_.Width;
-    if (written_range) {
-      written_begin = std::min<UINT64>(written_range->Begin, desc_.Width);
-      written_end = std::min<UINT64>(written_range->End, desc_.Width);
-    }
+      // Prefer the allocation actually leased by Map (hold stack), not the
+      // current resource pointer — rename can replace buffer_allocation_.
+      Rc<dxmt::BufferAllocation> mapped_alloc;
+      if (!mapped_allocation_holds_.empty())
+        mapped_alloc = mapped_allocation_holds_.back();
+      else
+        mapped_alloc = buffer_allocation_;
+      if (!mapped_alloc)
+        return;
 
-    auto *mapped_memory = static_cast<char *>(buffer_allocation_->mappedMemory(0));
-    if (mapped_memory && dxmt::apitrace::d3d_enabled()) {
-      if (written_end > written_begin) {
-        dxmt::apitrace::record_resource_unmap(
-            this, sub_resource, written_begin, written_end,
-            mapped_memory + buffer_backing_offset_ + written_begin,
-            static_cast<size_t>(written_end - written_begin));
-      } else {
-        dxmt::apitrace::record_resource_unmap(
-            this, sub_resource, written_begin, written_end, nullptr, 0);
+      UINT64 written_begin = 0;
+      UINT64 written_end = desc_.Width;
+      if (written_range) {
+        written_begin = std::min<UINT64>(written_range->Begin, desc_.Width);
+        written_end = std::min<UINT64>(written_range->End, desc_.Width);
       }
+
+      auto *mapped_memory =
+          static_cast<char *>(mapped_alloc->mappedMemory(0));
+      if (mapped_memory && dxmt::apitrace::d3d_enabled()) {
+        if (written_end > written_begin) {
+          dxmt::apitrace::record_resource_unmap(
+              this, sub_resource, written_begin, written_end,
+              mapped_memory + buffer_backing_offset_ + written_begin,
+              static_cast<size_t>(written_end - written_begin));
+        } else {
+          dxmt::apitrace::record_resource_unmap(
+              this, sub_resource, written_begin, written_end, nullptr, 0);
+        }
+      }
+
+      if (written_end > written_begin) {
+        mapped_alloc->flushCpuShadow(
+            buffer_backing_offset_ + written_begin, written_end - written_begin);
+        mapped_alloc->didModifyRange(
+            buffer_backing_offset_ + written_begin, written_end - written_begin);
+      }
+
+      if (buffer_map_count_ > 0) {
+        buffer_map_count_--;
+        if (!mapped_allocation_holds_.empty()) {
+          auto held = std::move(mapped_allocation_holds_.back());
+          mapped_allocation_holds_.pop_back();
+          if (held)
+            held->releaseCpuMapRef();
+        } else {
+          mapped_alloc->releaseCpuMapRef();
+        }
+      }
+      return;
     }
 
-    if (written_end > written_begin) {
-      buffer_allocation_->flushCpuShadow(buffer_backing_offset_ + written_begin,
-                                         written_end - written_begin);
-      buffer_allocation_->didModifyRange(buffer_backing_offset_ + written_begin,
-                                         written_end - written_begin);
-    }
+    if (texture_map_count_ > 0)
+      texture_map_count_--;
   }
 
 #ifdef WIDL_EXPLICIT_AGGREGATE_RETURNS
@@ -2565,6 +2613,15 @@ private:
   std::atomic<uint64_t> tile_mapping_generation_ = {0};
   Rc<dxmt::Buffer> buffer_;
   Rc<dxmt::BufferAllocation> buffer_allocation_;
+  /**
+   * Outstanding Map() count for CPU-visible buffers/textures. Buffer maps also
+   * pin BufferAllocation via addCpuMapRef so rename/free cannot reclaim host
+   * mapping until matching Unmap() calls complete.
+   */
+  uint32_t buffer_map_count_ = 0;
+  uint32_t texture_map_count_ = 0;
+  /** Allocations still held solely because of outstanding Map refs after rename. */
+  std::vector<Rc<dxmt::BufferAllocation>> mapped_allocation_holds_;
   Rc<dxmt::Texture> texture_;
   Rc<dxmt::TextureAllocation> texture_allocation_;
   std::array<Rc<dxmt::Texture>, kMaxTexturePlanes> plane_textures_{};
