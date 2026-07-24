@@ -6,6 +6,7 @@ winemetal4_runtime_targets = []
 dxgi_postprocess_targets = []
 d3d10_postprocess_targets = []
 d3d11_postprocess_targets = []
+d3d9_postprocess_targets = []
 d3d12_postprocess_targets = []
 nvext_postprocess_targets = []
 
@@ -36,11 +37,13 @@ dxmt_metal3_runtime_targets = [
   d3d11_backend_dll,
   d3d11_dll,
   d3d10core_dll,
+  d3d9_dll,
 ]
 dxmt_metal3_runtime_targets += winemetal_runtime_targets
 dxmt_metal3_runtime_targets += dxgi_postprocess_targets
 dxmt_metal3_runtime_targets += d3d10_postprocess_targets
 dxmt_metal3_runtime_targets += d3d11_postprocess_targets
+dxmt_metal3_runtime_targets += d3d9_postprocess_targets
 
 dxmt_metal4_runtime_targets = [
   dxgi_dll,
@@ -60,6 +63,7 @@ if get_option('enable_nvngx')
 endif
 
 alias_target('dxmt-runtime', dxmt_runtime_targets)
+alias_target('dxmt-d3d9', dxmt_metal3_runtime_targets)
 alias_target('dxmt-d3d10', dxmt_metal3_runtime_targets)
 alias_target('dxmt-d3d11', dxmt_metal3_runtime_targets)
 alias_target('dxmt-d3d12', dxmt_metal4_runtime_targets)

@@ -1,6 +1,7 @@
 @echo off
 setlocal EnableExtensions DisableDelayedExpansion
 
+set "ORACLE_D3D9_EXE=%~dp0dxmt-wine-d3d9-tests.exe"
 set "ORACLE_D3D10_EXE=%~dp0dxmt-wine-d3d10-tests.exe"
 set "ORACLE_D3D11_EXE=%~dp0dxmt-wine-d3d11-tests.exe"
 set "ORACLE_D3D12_EXE=%~dp0dxmt-wine-d3d12-tests.exe"
@@ -68,7 +69,7 @@ echo ERROR: Unknown argument: %~1
 goto usage_error
 
 :run_oracle
-for %%F in ("%ORACLE_D3D10_EXE%" "%ORACLE_D3D11_EXE%" "%ORACLE_D3D12_EXE%") do (
+for %%F in ("%ORACLE_D3D9_EXE%" "%ORACLE_D3D10_EXE%" "%ORACLE_D3D11_EXE%" "%ORACLE_D3D12_EXE%") do (
   if not exist "%%~F" (
     echo ERROR: Oracle executable was not found:
     echo   %%~F
@@ -84,6 +85,7 @@ if not exist "%ORACLE_OUTPUT%" (
     exit /b 2
   )
 )
+del /q "%ORACLE_OUTPUT%\d3d9-oracle-*.log" >nul 2>&1
 del /q "%ORACLE_OUTPUT%\d3d10-oracle-*.log" >nul 2>&1
 del /q "%ORACLE_OUTPUT%\d3d11-oracle-*.log" >nul 2>&1
 del /q "%ORACLE_OUTPUT%\d3d12-oracle-*.log" >nul 2>&1
@@ -105,18 +107,20 @@ if "%ORACLE_DEBUG%"=="1" (
 )
 
 set "ORACLE_STAMP=%RANDOM%-%RANDOM%"
+set "ORACLE_D3D9_LOG=%ORACLE_OUTPUT%\d3d9-oracle-%ORACLE_MODE%-%ORACLE_STAMP%.log"
 set "ORACLE_D3D10_LOG=%ORACLE_OUTPUT%\d3d10-oracle-%ORACLE_MODE%-%ORACLE_STAMP%.log"
 set "ORACLE_D3D11_LOG=%ORACLE_OUTPUT%\d3d11-oracle-%ORACLE_MODE%-%ORACLE_STAMP%.log"
 set "ORACLE_D3D12_LOG=%ORACLE_OUTPUT%\d3d12-oracle-%ORACLE_MODE%-%ORACLE_STAMP%.log"
 set "ORACLE_METADATA=%ORACLE_OUTPUT%\windows-oracle-%ORACLE_MODE%-%ORACLE_STAMP%.txt"
 set "ORACLE_EXIT=0"
+set "ORACLE_D3D9_EXIT=not-run"
 set "ORACLE_D3D10_EXIT=not-run"
 set "ORACLE_D3D11_EXIT=not-run"
 set "ORACLE_D3D12_EXIT=not-run"
 
 echo DXMT Windows behavior oracle
 echo   Suite schema: %ORACLE_SUITE_SCHEMA%
-echo   D3D10/11:   default Windows hardware adapter
+echo   D3D9/10/11: default Windows hardware adapter
 echo   D3D12:      %ORACLE_ADAPTER%
 echo   Debug layer: %ORACLE_DEBUG%
 echo   Output:      %ORACLE_OUTPUT%
@@ -132,12 +136,20 @@ echo.
   echo d3d12_case_filter=%ORACLE_CASES%
   echo d3d12_jobs=%ORACLE_D3D12_JOBS%
   ver
+  certutil -hashfile "%ORACLE_D3D9_EXE%" SHA256
   certutil -hashfile "%ORACLE_D3D10_EXE%" SHA256
   certutil -hashfile "%ORACLE_D3D11_EXE%" SHA256
   certutil -hashfile "%ORACLE_D3D12_EXE%" SHA256
 ) > "%ORACLE_METADATA%" 2>&1
 
 if "%ORACLE_D3D12_ONLY%"=="1" goto run_d3d12
+
+echo [ D3D9 ] Running complete suite...
+"%ORACLE_D3D9_EXE%" --dxmt-test-jobs=1 > "%ORACLE_D3D9_LOG%" 2>&1
+set "ORACLE_D3D9_EXIT=%ERRORLEVEL%"
+type "%ORACLE_D3D9_LOG%"
+if not "%ORACLE_D3D9_EXIT%"=="0" set "ORACLE_EXIT=1"
+echo.
 
 echo [ D3D10 ] Running complete suite...
 "%ORACLE_D3D10_EXE%" --dxmt-test-jobs=1 > "%ORACLE_D3D10_LOG%" 2>&1
@@ -161,6 +173,7 @@ type "%ORACLE_D3D12_LOG%"
 if not "%ORACLE_D3D12_EXIT%"=="0" set "ORACLE_EXIT=1"
 
 (
+  echo d3d9_exit_code=%ORACLE_D3D9_EXIT%
   echo d3d10_exit_code=%ORACLE_D3D10_EXIT%
   echo d3d11_exit_code=%ORACLE_D3D11_EXIT%
   echo d3d12_exit_code=%ORACLE_D3D12_EXIT%
@@ -170,6 +183,7 @@ if not "%ORACLE_D3D12_EXIT%"=="0" set "ORACLE_EXIT=1"
 echo.
 echo Overall exit code: %ORACLE_EXIT%
 echo Metadata: %ORACLE_METADATA%
+if not "%ORACLE_D3D9_EXIT%"=="not-run" echo D3D9 log: %ORACLE_D3D9_LOG%
 if not "%ORACLE_D3D10_EXIT%"=="not-run" echo D3D10 log: %ORACLE_D3D10_LOG%
 if not "%ORACLE_D3D11_EXIT%"=="not-run" echo D3D11 log: %ORACLE_D3D11_LOG%
 echo D3D12 log: %ORACLE_D3D12_LOG%

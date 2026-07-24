@@ -1,0 +1,113 @@
+[require]
+shader model = 3.0
+
+[pixel shader]
+float4 main(float4 pos : POSITION, float4 vec : TEXCOORD) : sv_target
+{
+    return vec;
+}
+
+[vertex shader d3dbc-hex]
+fffe0300                              % vs_3_0
+0200001f 80000000 900f0000            % dcl_position v0
+0200001f 80000000 e00f0000            % dcl_position o0
+0200001f 80000005 e00f0001            % dcl_texcoord o1
+02000001 800f0001 a0e40004            % mov r1, c4
+03000014 800f0000 80e40001 a0e40000   % m4x4 r0, r1, c0
+02000001 e00f0001 80e40000            % mov o1, r0
+02000001 e00f0000 90e40000            % mov o0, v0
+0000ffff                              % end
+
+[test]
+write cbv-f32  (0) f32(1.0, 2.0, 3.0, 4.0)
+write cbv-f32  (4) f32(5.0, 6.0, 7.0, 8.0)
+write cbv-f32  (8) f32(4.0, 5.0, 2.0, 1.0)
+write cbv-f32 (12) f32(4.0, 4.0, 5.0, 9.0)
+write cbv-f32 (16) f32(1000.0, 100.0, 10.0, 1.0)
+draw quad
+probe (0, 0) f32(1234.0, 5678.0, 4521.0, 4459.0)
+
+% Swizzle and neg modifiers are allowed on src0.
+[vertex shader d3dbc-hex]
+fffe0300                              % vs_3_0
+0200001f 80000000 900f0000            % dcl_position v0
+0200001f 80000000 e00f0000            % dcl_position o0
+0200001f 80000005 e00f0001            % dcl_texcoord o1
+02000001 800f0001 a0e40004            % mov r1, c4
+03000016 800f0000 81e10001 a0e40000   % m3x4 r0, -r1.yxzw, c0
+02000001 e00f0001 80e40000            % mov o1, r0
+02000001 e00f0000 90e40000            % mov o0, v0
+0000ffff                              % end
+
+[test]
+write cbv-f32  (0) f32(1.0, 2.0, 3.0, -1.0)
+write cbv-f32  (4) f32(4.0, 5.0, 6.0, -1.0)
+write cbv-f32  (8) f32(7.0, 8.0, 9.0, -1.0)
+write cbv-f32 (12) f32(5.0, 1.0, 3.0, -1.0)
+write cbv-f32 (16) f32(1000.0, 100.0, 10.0, 1.0)
+draw quad
+probe (0, 0) f32(-2130.0, -5460.0, -8790.0, -1530.0)
+
+[vertex shader d3dbc-hex]
+fffe0300                                                % vs_3_0
+05000051 a00f0004 bf800000 bf800000 bf800000 bf800000   % def c4, -1, -1, -1, -1
+0200001f 80000000 900f0000                              % dcl_position v0
+0200001f 80000000 e00f0000                              % dcl_position o0
+0200001f 80000005 e00f0001                              % dcl_texcoord o1
+02000001 800f0001 a0e40003                              % mov r1, c3
+02000001 800f0000 a0e40004                              % mov r0, c4
+03000015 80070000 80e40001 a0e40000                     % m4x3 r0.xyz, r1, c0
+02000001 e00f0001 80e40000                              % mov o1, r0
+02000001 e00f0000 90e40000                              % mov o0, v0
+0000ffff                                                % end
+
+[test]
+write cbv-f32  (0) f32(1.0, 2.0, 3.0, 4.0)
+write cbv-f32  (4) f32(5.0, 6.0, 7.0, 8.0)
+write cbv-f32  (8) f32(4.0, 5.0, 2.0, 1.0)
+write cbv-f32 (12) f32(1.0, 10.0, 100.0, 1000.0)
+draw quad
+probe (0, 0) f32(4321.0, 8765.0, 1254.0, -1)
+
+[vertex shader d3dbc-hex]
+fffe0300                                                % vs_3_0
+05000051 a00f0004 bf800000 bf800000 bf800000 bf800000   % def c4, -1, -1, -1, -1
+0200001f 80000000 900f0000                              % dcl_position v0
+0200001f 80000000 e00f0000                              % dcl_position o0
+0200001f 80000005 e00f0001                              % dcl_texcoord o1
+02000001 800f0001 a0e40003                              % mov r1, c3
+02000001 800f0000 a0e40004                              % mov r0, c4
+03000017 80070000 801b0001 a0e40000                     % m3x3 r0.xyz, r1.wzyx, c0
+02000001 e00f0001 80e40000                              % mov o1, r0
+02000001 e00f0000 90e40000                              % mov o0, v0
+0000ffff                                                % end
+
+[test]
+write cbv-f32  (0) f32(1.0, 2.0, 3.0, -42.0)
+write cbv-f32  (4) f32(4.0, 5.0, 6.0, -42.0)
+write cbv-f32  (8) f32(7.0, 8.0, 9.0, -42.0)
+write cbv-f32 (12) f32(-1.0, 10.0, 100.0, 1000.0)
+draw quad
+probe (0, 0) f32(1230.0, 4560.0, 7890.0, -1)
+
+% Here, also test allocating the vector in c0 and the matrix in c1-c2, and a
+% swizzle with a repeated component (r1.xzx)
+[vertex shader d3dbc-hex]
+fffe0300                                                % vs_3_0
+05000051 a00f0003 bf800000 c0000000 c0400000 c0800000   % def c3, -1, -2, -3, -4
+0200001f 80000000 900f0000                              % dcl_position v0
+0200001f 80000000 e00f0000                              % dcl_position o0
+0200001f 80000005 e00f0001                              % dcl_texcoord o1
+02000001 800f0001 a0e40000                              % mov r1, c0
+02000001 800f0000 a0e40003                              % mov r0, c3
+03000018 80030000 80080001 a0e40001                     % m3x2 r0.xy, r1.xzxx, c1
+02000001 e00f0001 80e40000                              % mov o1, r0
+02000001 e00f0000 90e40000                              % mov o0, v0
+0000ffff                                                % end
+
+[test]
+write cbv-f32 (0) f32(1.0, -42, 1000.0, -42.0)
+write cbv-f32 (4) f32(1.0, 2.0, 3.0, -99.0)
+write cbv-f32 (8) f32(4.0, 5.0, 6.0, -99.0)
+draw quad
+probe (0, 0) f32(2004.0, 5010.0, -3, -4)

@@ -1,0 +1,115 @@
+[require]
+shader model < 3.0
+
+[sampler 0]
+filter point point point
+address clamp clamp clamp
+
+[sampler 1]
+filter point point point
+address clamp clamp clamp
+
+% Only unsigned formats can be used as coords for texreg2ar and friends.
+[srv 0]
+format r8g8b8a8-unorm
+size (2d, 2, 2)
+0x018001fe 0x80fe0180
+0xfe018001 0x0180fefe
+
+[srv 1]
+size (2d, 3, 3)
+0.0 0.0 0.1 1.0     0.5 0.0 0.2 1.0      1.0 0.0 0.3 1.0
+0.0 0.5 0.4 1.0     0.5 0.5 0.5 1.0      1.0 0.5 0.6 1.0
+0.0 1.0 0.7 1.0     0.5 1.0 0.8 1.0      1.0 1.0 0.9 1.0
+
+[vertex shader d3dbc-hex]
+fffe0101                     % vs_1_1
+0000001f 80000000 900f0000   % dcl_position v0
+00000001 e00f0000 90e40000   % mov oT0, v0
+00000001 c00f0000 90e40000   % oPos, v0
+0000ffff                     % end
+
+% Check the values passed as texcoord.
+[pixel shader d3dbc-hex]
+ffff0102                                                % ps_1_2
+00000051 a00f0000 00000000 00000000 00000000 3f800000   % def c0, 0, 0, 0, 1
+00000040 b00f0000                                       % texcoord t0
+00000001 80070000 b0e40000                              % mov r0.xyz, t0
+40000001 80080000 a0ff0000                              % + mov r0.w, c0.w
+0000ffff                                                % end
+
+[test]
+draw quad
+probe (400, 60) f32(0.249999821, 0.749999702, 0.0, 1.0) 32768
+probe (560, 60) f32(0.749999702, 0.749999702, 0.0, 1.0) 32768
+probe (400, 180) f32(0.249999821, 0.249999821, 0.0, 1.0) 32768
+probe (560, 180) f32(0.749999702, 0.249999821, 0.0, 1.0) 32768
+
+% Verify srv0 values when sampled on these pixels, components of these will be
+% used as sampling coords for srv1 in the following pixel shaders.
+[pixel shader d3dbc-hex]
+ffff0102                     % ps_1_2
+00000042 b00f0000            % tex t0
+00000001 800f0000 b0e40000   % mov r0, t0
+0000ffff                     % end
+
+[test]
+draw quad
+probe (400, 60) f32(0.00392156886, 0.50196081, 0.00392156886, 0.996078432) 32768
+probe (560, 60) f32(0.996078432, 0.996078432, 0.50196081, 0.00392156886) 32768
+probe (400, 180) f32(0.996078432, 0.00392156886, 0.50196081, 0.00392156886) 32768
+probe (560, 180) f32(0.50196081, 0.00392156886, 0.996078432, 0.50196081) 32768
+
+[pixel shader d3dbc-hex]
+ffff0102                     % ps_1_2
+00000042 b00f0000            % tex t0
+00000045 b00f0001 b0e40000   % texreg2ar t1, t0
+00000001 800f0000 b0e40001   % mov r0, t1
+0000ffff                     % end
+
+[test]
+draw quad
+probe (400, 60) f32(1.0, 0.0, 0.3, 1.0)
+probe (560, 60) f32(0.0, 1.0, 0.7, 1.0)
+probe (400, 180) f32(0.0, 1.0, 0.7, 1.0)
+probe (560, 180) f32(0.5, 0.5, 0.5, 1.0)
+
+[pixel shader d3dbc-hex]
+ffff0102                     % ps_1_2
+00000042 b00f0000            % tex t0
+00000046 b00f0001 b0e40000   % texreg2gb t1, t0
+00000001 800f0000 b0e40001   % mov r0, t1
+0000ffff                     % end
+
+[test]
+draw quad
+probe (400, 60) f32(0.5, 0.0, 0.2, 1.0)
+probe (560, 60) f32(1.0, 0.5, 0.6, 1.0)
+probe (400, 180) f32(0.0, 0.5, 0.4, 1.0)
+probe (560, 180) f32(0.0, 1.0, 0.7, 1.0)
+
+[srv 1]
+size (3d, 3, 3, 3)
+0.0 0.0 0.0 1.0     0.5 0.0 0.0 1.0      1.0 0.0 0.0 1.0
+0.0 0.5 0.0 1.0     0.5 0.5 0.0 1.0      1.0 0.5 0.0 1.0
+0.0 1.0 0.0 1.0     0.5 1.0 0.0 1.0      1.0 1.0 0.0 1.0
+0.0 0.0 0.5 1.0     0.5 0.0 0.5 1.0      1.0 0.0 0.5 1.0
+0.0 0.5 0.5 1.0     0.5 0.5 0.5 1.0      1.0 0.5 0.5 1.0
+0.0 1.0 0.5 1.0     0.5 1.0 0.5 1.0      1.0 1.0 0.5 1.0
+0.0 0.0 1.0 1.0     0.5 0.0 1.0 1.0      1.0 0.0 1.0 1.0
+0.0 0.5 1.0 1.0     0.5 0.5 1.0 1.0      1.0 0.5 1.0 1.0
+0.0 1.0 1.0 1.0     0.5 1.0 1.0 1.0      1.0 1.0 1.0 1.0
+
+[pixel shader d3dbc-hex]
+ffff0102                     % ps_1_2
+00000042 b00f0000            % tex t0
+00000052 b00f0001 b0e40000   % texreg2rgb t1, t0
+00000001 800f0000 b0e40001   % mov r0, t1
+0000ffff                     % end
+
+[test]
+todo(mvk<1.4.0) draw quad
+probe (400, 60) f32(0.0, 0.5, 0.0, 1.0)
+probe (560, 60) f32(1.0, 1.0, 0.5, 1.0)
+probe (400, 180) f32(1.0, 0.0, 0.5, 1.0)
+probe (560, 180) f32(0.5, 0.0, 1.0, 1.0)
