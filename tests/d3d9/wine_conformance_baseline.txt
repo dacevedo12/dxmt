@@ -1,0 +1,67 @@
+# Known failures in Wine's d3d9 conformance modules, one per line as
+# "<module> <substring of the failing line>". A listed line is absorbed; any
+# other failure fails the suite. Matching is by assertion source line, so a site
+# that fires repeatedly from one cause is one entry, and fixing the cause removes
+# exactly one line (the cost is that a fresh failure at a listed line is absorbed).
+#
+# Modules run under WINETEST_PLATFORM=windows (strict Windows semantics, todo_wine
+# inactive). Entries fall into two classes, and the difference matters to anyone
+# reading this file as evidence of what the layer does and does not implement.
+#
+#   HOST ENVIRONMENT, and the large majority. The headless runner has no
+#   interactive desktop focus, reads window rects at the Retina backing scale, and
+#   its display offers no second mode to switch to. None of these paths run
+#   through DXMT, and several are gaps Wine itself marks todo_wine.
+#
+#   DOCUMENTED DIVERGENCE, one site, in visual. It is ours, it is deliberate, and
+#   it carries its reasoning where it is listed rather than in a design document
+#   nobody reads next to the failure.
+#
+# Whole tests that hang or vary run to run are excluded in wine_known_skips.txt
+# instead. stateblock runs clean.
+
+# test_wndproc_windowed: with no interactive desktop focus the foreground window
+# is a different HWND than expected (the handle varies run to run).
+d3d9ex d3d9ex.isolated.c:3309
+d3d9ex d3d9ex.isolated.c:3327
+# test_window_style: under winemac fullscreen the device-window style and extended
+# style differ from Windows (some are Wine's own todo_wine gaps), and GetWindowRect
+# reads back at the Retina backing scale (a 1920x1080 window measures 960x540).
+d3d9ex d3d9ex.isolated.c:3516
+d3d9ex d3d9ex.isolated.c:3521
+d3d9ex d3d9ex.isolated.c:3555
+d3d9ex d3d9ex.isolated.c:3560
+d3d9ex d3d9ex.isolated.c:3579
+d3d9ex d3d9ex.isolated.c:3600
+# test_window_style: SetForegroundWindow fails without desktop focus, and the
+# style checks that depend on it then differ.
+d3d9ex d3d9ex.isolated.c:3629
+d3d9ex d3d9ex.isolated.c:3633
+d3d9ex d3d9ex.isolated.c:3637
+
+# test_reset_fullscreen: the WM_ACTIVATEAPP (0x1c) focus message is never delivered
+# without real app activation on the headless runner.
+device device.isolated.c:4871
+# test_cursor_pos: Wine itself marks this MOUSEMOVE assertion flaky; there is no
+# synthetic pointer on the headless runner.
+device device.isolated.c:5407
+# test_cursor_clipping: EnumAdapterModes reports the winemac display-mode list,
+# which offers no second mode to switch to; forcing a real switch would hit the
+# winemac.drv hang that wine_known_skips.txt already excludes.
+device device.isolated.c:14903
+
+# test_map_synchronisation, the two cases that expect an UNSYNCHRONISED map.
+# D3D9 permits a driver to hand the application a pointer into the memory a
+# queued draw is reading, so a write issued after that draw was recorded can
+# still reach it. DXMT never does: Lock returns a host mirror and the device
+# allocation is a cache the consuming draw refreshes, so such a write cannot
+# reach a recorded draw and the map is always synchronised.
+#
+# The mirror is not a convenience. Registering guest pages for the GPU to read
+# livelocks under Rosetta, and on a 32-bit guest every registered allocation
+# spends address space the process does not have, so the storage model is forced
+# rather than chosen. Direct3D's own WARP renderer reports synchronised here as
+# well and Wine marks the case broken() for it, so no shipped application can
+# depend on the behaviour this asserts. The divergence also runs in the safe
+# direction: DXMT cannot race where a native driver can.
+visual visual.isolated.c:25933

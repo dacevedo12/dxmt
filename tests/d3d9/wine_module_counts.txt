@@ -1,0 +1,10 @@
+# Test-function counts per Wine conformance module, as last measured. The
+# transform reports a difference rather than failing on one: the managed cache
+# resets its Wine checkout to the branch tip, so this moves whenever Wine does
+# and a build must not break for that reason. Coverage itself is enforced at run
+# time, where every function is accounted for against the manifest the transform
+# emits from the source actually used.
+stateblock 1
+d3d9ex 27
+device 104
+visual 132

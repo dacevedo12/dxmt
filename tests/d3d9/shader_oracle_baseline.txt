@@ -1,0 +1,13 @@
+# Known shader-oracle probe failures, matched as substrings of a "Test failed:"
+# line. A failure listed here is expected and does not fail the suite; anything
+# else does. Remove an entry once the underlying cause is fixed, so the failure
+# turns back into a gate.
+#
+# Entries are substrings rather than whole lines because the runner interpolates
+# localized operating-system error text into some messages.
+
+# The runner loads the optional SM6 compiler unconditionally at startup, outside
+# the shader-model loop, so --sm-max cannot skip it. The corpus is d3dbc hex at
+# SM1 to SM3 and never uses it. Absent on the native Windows oracle and under
+# Wine alike, so it cancels out in a cross-environment diff.
+Failed to load dxcompiler library

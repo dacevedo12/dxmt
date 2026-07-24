@@ -32,8 +32,9 @@ struct JobSelection {
   bool explicit_count = false;
 };
 
-constexpr std::array<Suite, 4> kSuites = {{
+constexpr std::array<Suite, 5> kSuites = {{
     {"framework", L"dxmt-wine-framework-tests.exe"},
+    {"d3d9", L"dxmt-wine-d3d9-tests.exe"},
     {"d3d10", L"dxmt-wine-d3d10-tests.exe"},
     {"d3d11", L"dxmt-wine-d3d11-tests.exe"},
     {"d3d12", L"dxmt-wine-d3d12-tests.exe"},

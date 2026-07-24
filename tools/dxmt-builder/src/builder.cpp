@@ -3965,7 +3965,7 @@ private:
         << "  bootstrap [all|host|wine-x64|llvm-mingw|llvm-project|llvm-darwin-x64|llvm-win]...\n"
         << "  configure [--profile NAME]\n"
         << "  audit [--profile NAME] [--scope dx12-metal4] [--jobs N] [--policy-only] [--checker-fixtures-only] [--deep] [--sanitizers] [--no-cache] [--report PATH] [--update-baseline --baseline-reason TEXT]\n"
-        << "  build [--profile NAME] <runtime|d3d10|d3d11|d3d12|tests-*|benchmarks>...\n"
+        << "  build [--profile NAME] <runtime|d3d9|d3d10|d3d11|d3d12|tests-*|benchmarks>...\n"
         << "  test [--profile NAME] [all|unit|integration|performance] [--suite NAME] [--test-args ARG]\n"
         << "  package [--profile NAME] windows-oracle [--dest PATH]\n"
         << "  wine-exec [--] <wine-args...>   # Meson/benchmark Wine launcher\n"
@@ -4452,6 +4452,10 @@ private:
         existing.contains("native_llvm_link_args_digest") &&
         existing.at("native_llvm_link_args_digest") ==
             native_llvm_link_args_digest;
+    const auto wine_source =
+        profile.profile->cross ? FindManagedWineSource() : fs::path{};
+    const auto existing_wine_source =
+        existing.contains("wine_source") ? existing.at("wine_source") : "";
     if (!fs::is_regular_file(profile.build / "meson-private/coredata.dat")) {
       std::vector<std::string> command = {
           "meson", "setup", profile.build.string(), repo_root_.string(),
@@ -4485,20 +4489,31 @@ private:
       if (profile.profile->cross) {
         command.push_back("-Dwine_build_path=");
         command.push_back("-Dwine_install_path=" + profile.wine_root.string());
+        // Wine's own d3d9 conformance modules build from the Wine SOURCE tree,
+        // which carries include/wine/test.h and the test sources. The install
+        // does not, so the two paths are both needed and are not the same
+        // directory. Passing nothing simply leaves those modules unbuilt.
+        if (!wine_source.empty())
+          command.push_back("-Dwine_source_path=" + wine_source.string());
       }
       RequireSuccess(RunCommand(command, BuildEnvironment()), "Meson configure");
     } else if (!existing.contains("dxmt_version") ||
                existing.at("dxmt_version") != version ||
                !native_llvm_link_args_compatible ||
                !existing.contains("builder_config_path") ||
-               existing.at("builder_config_path") != config_path_.string()) {
-      RequireSuccess(
-          RunCommand({"meson", "configure", profile.build.string(),
-                      "-Ddxmt_version=" + version,
-                      "-Dnative_llvm_link_args=" + native_llvm_link_args,
-                      "-Ddxmt_builder_config_path=" + config_path_.string()},
-                     BuildEnvironment()),
-          "DXMT option reconfigure");
+               existing.at("builder_config_path") != config_path_.string() ||
+               existing_wine_source != wine_source.string()) {
+      std::vector<std::string> reconfigure = {
+          "meson", "configure", profile.build.string(),
+          "-Ddxmt_version=" + version,
+          "-Dnative_llvm_link_args=" + native_llvm_link_args,
+          "-Ddxmt_builder_config_path=" + config_path_.string()};
+      // A build directory configured before the Wine source was discoverable
+      // would otherwise keep the stale value for its whole life.
+      if (profile.profile->cross && !wine_source.empty())
+        reconfigure.push_back("-Dwine_source_path=" + wine_source.string());
+      RequireSuccess(RunCommand(reconfigure, BuildEnvironment()),
+                     "DXMT option reconfigure");
     }
 
     std::ostringstream properties;
@@ -4508,7 +4523,8 @@ private:
                << "\nnative_llvm_link_args_digest="
                << native_llvm_link_args_digest
                << "\nbuilder_config_path=" << config_path_.string()
-               << "\nwine_root=" << profile.wine_root.string() << '\n';
+               << "\nwine_root=" << profile.wine_root.string()
+               << "\nwine_source=" << wine_source.string() << '\n';
     WriteFileAtomic(properties_path, properties.str());
   }
 
@@ -5486,15 +5502,17 @@ private:
     if (targets.empty())
       return {"runtime"};
     static const std::set<std::string> supported = {
-        "runtime", "d3d10", "d3d11", "d3d12", "tests-framework",
-        "tests-d3d10", "tests-d3d11", "tests-d3d12", "tests-all",
-        "benchmarks"};
+        "runtime", "d3d9", "d3d10", "d3d11", "d3d12", "tests-framework",
+        "tests-d3d9", "tests-d3d10", "tests-d3d11", "tests-d3d12",
+        "tests-all", "benchmarks"};
     static const std::map<std::string, std::string> meson_targets = {
         {"runtime", "dxmt-runtime"},
+        {"d3d9", "dxmt-d3d9"},
         {"d3d10", "dxmt-d3d10"},
         {"d3d11", "dxmt-d3d11"},
         {"d3d12", "dxmt-d3d12"},
         {"tests-framework", "dxmt-wine-tests-framework"},
+        {"tests-d3d9", "dxmt-wine-tests-d3d9"},
         {"tests-d3d10", "dxmt-wine-tests-d3d10"},
         {"tests-d3d11", "dxmt-wine-tests-d3d11"},
         {"tests-d3d12", "dxmt-wine-tests-d3d12"},
@@ -5579,6 +5597,24 @@ private:
            fs::exists(prefix / "dosdevices/c:", error);
   }
 
+  // The managed cache keeps the Wine source it built the install from. Match on
+  // the header the tests need rather than on a directory name, so a branch
+  // rename does not silently disable them.
+  fs::path FindManagedWineSource() const {
+    const auto sources = managed_root_ / "sources";
+    std::error_code error;
+    if (!fs::is_directory(sources, error))
+      return {};
+    for (const auto &entry : fs::directory_iterator(sources, error)) {
+      if (!entry.is_directory(error))
+        continue;
+      if (fs::is_regular_file(entry.path() / "include/wine/test.h", error) &&
+          fs::is_directory(entry.path() / "dlls/d3d9/tests", error))
+        return entry.path();
+    }
+    return {};
+  }
+
   Environment WineTestEnvironment(const fs::path &wine_root,
                                   const fs::path &runtime_root,
                                   bool require_runtime_deps) const {
@@ -5587,9 +5623,16 @@ private:
     environment["WINEDEBUG"] = EnvironmentValue("WINEDEBUG", "-all");
     environment["DXMT_EXPERIMENT_DX12_SUPPORT"] =
         EnvironmentValue("DXMT_EXPERIMENT_DX12_SUPPORT", "1");
+    // Wine's own conformance modules read this. Their todo_wine marks record
+    // where Wine deviates, and a todo block that succeeds counts as a failure,
+    // so running as "wine" would score this frontend being more correct than
+    // Wine as a regression. Hold the assertions at their strict meaning and let
+    // the baseline carry what is not yet met.
+    environment["WINETEST_PLATFORM"] =
+        EnvironmentValue("WINETEST_PLATFORM", "windows");
     const auto dll_overrides = EnvironmentValue(
         "WINEDLLOVERRIDES",
-        "d3d10core,d3d11,d3d11_dxmt,d3d12,dxgi,winemetal,winemetal4=n,b");
+        "d3d9,d3d10core,d3d11,d3d11_dxmt,d3d12,dxgi,winemetal,winemetal4=n,b");
     // Managed test prefixes must initialize without interactive dependency
     // installers. Wine's mscoree registration can launch
     // `control.exe appwiz.cpl install_mono` while wineboot updates a prefix, so
@@ -5698,6 +5741,9 @@ private:
       install_tags = "runtime-common,runtime-metal3,runtime-metal4,nvext";
     } else if (suite == "framework") {
       build_targets = "dxmt-wine-tests-framework";
+    } else if (suite == "d3d9") {
+      build_targets = "dxmt-d3d9 dxmt-wine-tests-d3d9";
+      install_tags = "runtime-common,runtime-metal3";
     } else if (suite == "d3d10") {
       build_targets = "dxmt-d3d10 dxmt-wine-tests-d3d10";
       install_tags = "runtime-common,runtime-metal3";
@@ -5759,10 +5805,13 @@ private:
 
     std::vector<std::string> required;
     if (suite == "all") {
-      required = {"x86_64-windows/d3d11.dll", "x86_64-windows/d3d12.dll",
+      required = {"x86_64-windows/d3d9.dll", "x86_64-windows/d3d11.dll",
+                  "x86_64-windows/d3d12.dll",
                   "x86_64-windows/dxgi.dll", "x86_64-windows/winemetal.dll",
                   "x86_64-windows/winemetal4.dll", "x86_64-unix/winemetal.so",
                   "x86_64-unix/winemetal4.so"};
+    } else if (suite == "d3d9") {
+      required = {"x86_64-windows/d3d9.dll", "x86_64-unix/winemetal.so"};
     } else if (suite == "d3d10") {
       required = {"x86_64-windows/d3d10core.dll", "x86_64-windows/d3d11.dll",
                   "x86_64-windows/dxgi.dll", "x86_64-unix/winemetal.so"};
@@ -5839,15 +5888,17 @@ private:
                    "native Windows oracle configuration");
     RequireSuccess(
         RunCommand({meson.string(), "compile", "-C", build.string(),
-                    "dxmt-wine-d3d10-tests", "dxmt-wine-d3d11-tests",
-                    "dxmt-wine-d3d12-tests"},
+                    "dxmt-wine-d3d9-tests", "dxmt-wine-d3d10-tests",
+                    "dxmt-wine-d3d11-tests", "dxmt-wine-d3d12-tests"},
                    toolchain),
         "native Windows oracle build");
 
     const auto output = build / "tests";
-    for (const auto &name : {"dxmt-wine-d3d10-tests.exe",
+    for (const auto &name : {"dxmt-wine-d3d9-tests.exe",
+                             "dxmt-wine-d3d10-tests.exe",
                              "dxmt-wine-d3d11-tests.exe",
                              "dxmt-wine-d3d12-tests.exe",
+                             "shader_oracle_baseline.txt",
                              "run-windows-oracle.bat"}) {
       if (!fs::is_regular_file(output / name))
         throw std::runtime_error("native Windows oracle output is missing: " +
@@ -5898,9 +5949,11 @@ private:
                                                    .time_since_epoch()
                                                    .count()));
     fs::create_directories(staging);
-    for (const auto &name : {"dxmt-wine-d3d10-tests.exe",
+    for (const auto &name : {"dxmt-wine-d3d9-tests.exe",
+                             "dxmt-wine-d3d10-tests.exe",
                              "dxmt-wine-d3d11-tests.exe",
                              "dxmt-wine-d3d12-tests.exe",
+                             "shader_oracle_baseline.txt",
                              "run-windows-oracle.bat"}) {
       fs::copy_file(oracle / name, staging / name,
                     fs::copy_options::overwrite_existing);
@@ -5916,7 +5969,8 @@ private:
     WriteFileAtomic(staging / "README.txt", instructions.str());
 
     std::ostringstream digests;
-    for (const auto &file : {"dxmt-wine-d3d10-tests.exe",
+    for (const auto &file : {"dxmt-wine-d3d9-tests.exe",
+                             "dxmt-wine-d3d10-tests.exe",
                              "dxmt-wine-d3d11-tests.exe",
                              "dxmt-wine-d3d12-tests.exe",
                              "run-windows-oracle.bat"}) {
@@ -5930,10 +5984,11 @@ private:
     const auto tar = RequireExecutable("tar");
     RequireSuccess(
         RunCommand({tar.string(), "-a", "-c", "-f", incomplete.string(),
+                    "dxmt-wine-d3d9-tests.exe",
                     "dxmt-wine-d3d10-tests.exe",
                     "dxmt-wine-d3d11-tests.exe",
-                    "dxmt-wine-d3d12-tests.exe", "run-windows-oracle.bat",
-                    "README.txt", "SHA256SUMS.txt"},
+                    "dxmt-wine-d3d12-tests.exe", "shader_oracle_baseline.txt",
+                    "run-windows-oracle.bat", "README.txt", "SHA256SUMS.txt"},
                    {}, false, staging),
         "Windows oracle archive");
     RequireSuccess(RunCommand({tar.string(), "-t", "-f",
@@ -5986,7 +6041,7 @@ private:
       }
     }
     static const std::set<std::string> suites = {
-        "all", "builder", "framework", "d3d10", "d3d11", "d3d12",
+        "all", "builder", "framework", "d3d9", "d3d10", "d3d11", "d3d12",
         "d3d12-model"};
     if (!suites.contains(suite))
       throw std::runtime_error("unsupported test suite: " + suite);
@@ -6128,19 +6183,21 @@ private:
     const auto profile = EnsureConfigured(name);
     const auto compile = std::vector<std::string>{
         "meson", "compile", "-C", profile.build.string(),
-        "dxmt-wine-tests-d3d10", "dxmt-wine-tests-d3d11",
-        "dxmt-wine-tests-d3d12"};
+        "dxmt-wine-tests-d3d9", "dxmt-wine-tests-d3d10",
+        "dxmt-wine-tests-d3d11", "dxmt-wine-tests-d3d12"};
     RequireSuccess(RunCommand(compile, BuildEnvironment()),
                    "Windows oracle prerequisite build");
 
     const std::array executables = {
+        profile.build / "tests/dxmt-wine-d3d9-tests.exe",
         profile.build / "tests/dxmt-wine-d3d10-tests.exe",
         profile.build / "tests/dxmt-wine-d3d11-tests.exe",
         profile.build / "tests/dxmt-wine-d3d12-tests.exe",
     };
     const auto script = profile.build / "tests/run-windows-oracle.bat";
     for (const auto &required :
-         {executables[0], executables[1], executables[2], script}) {
+         {executables[0], executables[1], executables[2], executables[3],
+          script}) {
       if (!fs::is_regular_file(required))
         throw std::runtime_error("Windows oracle artifact is missing: " +
                                  required.string());
@@ -6169,9 +6226,10 @@ private:
     const auto checksums = staging / "SHA256SUMS.txt";
     std::ostringstream instructions;
     instructions
-        << "DXMT D3D10, D3D11, and D3D12 Windows behavior oracle\n\n"
+        << "DXMT D3D9, D3D10, D3D11, and D3D12 Windows behavior oracle\n\n"
         << "Suite schema: public-api-v1\n\n"
-        << "Keep all three EXEs and the batch script in the same directory.\n"
+        << "Keep all four EXEs, the baseline, and the batch script in the same\n"
+        << "directory.\n"
         << "Do not copy DXMT Direct3D or DXGI DLLs beside the EXEs.\n\n"
         << "Default run (complete D3D10/D3D11/D3D12 suites):\n"
         << "  run-windows-oracle.bat\n\n"
@@ -6185,10 +6243,12 @@ private:
 
     std::ostringstream digest_manifest;
     digest_manifest << Sha256File(executables[0])
-                    << "  dxmt-wine-d3d10-tests.exe\n"
+                    << "  dxmt-wine-d3d9-tests.exe\n"
                     << Sha256File(executables[1])
-                    << "  dxmt-wine-d3d11-tests.exe\n"
+                    << "  dxmt-wine-d3d10-tests.exe\n"
                     << Sha256File(executables[2])
+                    << "  dxmt-wine-d3d11-tests.exe\n"
+                    << Sha256File(executables[3])
                     << "  dxmt-wine-d3d12-tests.exe\n"
                     << Sha256File(script) << "  run-windows-oracle.bat\n";
     WriteFileAtomic(checksums, digest_manifest.str());
@@ -6252,7 +6312,8 @@ private:
     std::string tags;
     if (component == "d3d12")
       tags = "runtime-common,runtime-metal4";
-    else if (component == "d3d10" || component == "d3d11")
+    else if (component == "d3d9" || component == "d3d10" ||
+             component == "d3d11")
       tags = "runtime-common,runtime-metal3";
     else
       tags = "runtime-common,runtime-metal3,runtime-metal4,nvext";
