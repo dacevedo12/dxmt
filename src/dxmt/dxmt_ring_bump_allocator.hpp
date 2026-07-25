@@ -275,7 +275,7 @@ public:
 
 private:
   WMT::Device device_;
-  WMTBufferInfo buffer_info_;
+  WMTBufferInfo buffer_info_ = {};
 };
 
 class StagingBufferBlockAllocator {
@@ -320,7 +320,7 @@ public:
     Block block{};
     block.mapped_address = placed_buffer_ ? malloc(block_size) : nullptr;
     block.owns_mapped_address = placed_buffer_;
-    WMTBufferInfo info;
+    WMTBufferInfo info = {};
     info.options = buffer_info_;
     info.memory.set(block.mapped_address);
     info.length = block_size;

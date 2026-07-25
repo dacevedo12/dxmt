@@ -334,7 +334,7 @@ Texture::allocate(Flags<TextureAllocationFlag> flags) {
   }
   info.options = options;
   if (bytes_per_image_) {
-    WMTBufferInfo buffer_info;
+    WMTBufferInfo buffer_info = {};
     buffer_info.length = bytes_per_image_;
     buffer_info.options = options;
     buffer_info.memory.set(nullptr);
@@ -426,7 +426,7 @@ Texture::wrapBuffer(
 Rc<TextureAllocation>
 Texture::import(mach_port_t mach_port) {
   Flags<TextureAllocationFlag> flags;
-  WMTTextureInfo info;
+  WMTTextureInfo info = {};
   info.mach_port = mach_port;
   auto texture = device_.newSharedTexture(info);
   // now allocation's info is populated

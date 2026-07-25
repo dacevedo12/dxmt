@@ -1597,7 +1597,7 @@ private:
   std::shared_ptr<LifetimeResidencyRegistration>
       dummy_cbuffer_residency_registration_;
   void *dummy_cbuffer_host_;
-  WMTBufferInfo dummy_cbuffer_info_;
+  WMTBufferInfo dummy_cbuffer_info_ = {};
   std::array<DummyTextureBinding, 28> dummy_srv_textures_;
 
   EncoderData encoder_head = {EncoderType::Null, nullptr, ~0ull};

@@ -361,7 +361,7 @@ private:
     return counter.fetch_add(1, std::memory_order_relaxed);
   }
 
-  WMTTextureInfo info_;
+  WMTTextureInfo info_ = {};
   uint64_t bytes_per_image_ = 0;
   uint32_t bytes_per_row_ = 0;
   uint64_t creation_serial_ = nextCreationSerial();

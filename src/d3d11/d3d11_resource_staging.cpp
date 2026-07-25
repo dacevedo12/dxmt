@@ -102,7 +102,7 @@ HRESULT CreateStagingTextureInternal(MTLD3D11Device *pDevice,
                                      typename tag::COM_IMPL **ppTexture) {
   auto metal = pDevice->GetMTLDevice();
   typename tag::DESC1 finalDesc;
-  WMTTextureInfo texDesc; // unused
+  WMTTextureInfo texDesc = {}; // out param, discarded: only finalDesc is used
   if (FAILED(CreateMTLTextureDescriptor(pDevice, pDesc, &finalDesc, &texDesc))) {
     return E_INVALIDARG;
   }

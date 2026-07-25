@@ -6165,7 +6165,7 @@ public:
       info.requires_synchronous_initialization = true;
       scaler_entry.scaler = new TemporalScaler(ctx_->device->GetMTLDevice(), info);
       if (pDesc->MotionVectorInDisplayRes) {
-        WMTTextureInfo tex_info;
+        WMTTextureInfo tex_info = {};
         tex_info.width = scaler_entry.input_width;
         tex_info.height = scaler_entry.input_height;
         tex_info.depth = 1;
