@@ -30,7 +30,7 @@ Presenter::Presenter(CommandQueue &queue, WMT::Device device,
   // clobber such a cap with the layer's default on every property sync.
   layer_props_.maximum_drawable_count = 0;
 
-  WMTTextureInfo texture_info;
+  WMTTextureInfo texture_info = {};
   texture_info.type = WMTTextureType2D;
   texture_info.pixel_format = WMTPixelFormatRGBA32Float;
   texture_info.usage = WMTTextureUsageShaderRead;

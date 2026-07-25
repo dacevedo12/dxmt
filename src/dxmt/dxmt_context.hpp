@@ -1512,7 +1512,7 @@ private:
   WMTSamplerInfo dummy_sampler_info_;
   WMT::Reference<WMT::Buffer> dummy_cbuffer_;
   void *dummy_cbuffer_host_;
-  WMTBufferInfo dummy_cbuffer_info_;
+  WMTBufferInfo dummy_cbuffer_info_ = {};
   std::array<DummyTextureBinding, 28> dummy_srv_textures_;
 
   EncoderData encoder_head = {EncoderType::Null, nullptr, ~0ull};

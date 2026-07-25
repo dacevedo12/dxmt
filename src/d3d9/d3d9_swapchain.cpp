@@ -340,7 +340,7 @@ MTLD3D9SwapChain::buildBackBuffer() {
   const UINT count = std::max<UINT>(1u, m_params.BackBufferCount);
 
   const uint32_t sampleCount = m_device->metalSampleCount(m_params.MultiSampleType, m_params.MultiSampleQuality);
-  WMTTextureInfo info;
+  WMTTextureInfo info = {};
   D3DSURFACE_DESC desc;
   backBufferDescriptors(m_params, sampleCount, info, desc);
   if (sampleCount > 1) {
@@ -409,7 +409,7 @@ MTLD3D9SwapChain::ResetForDeviceReset(const D3DPRESENT_PARAMETERS &params, HWND 
   // Allocate textures first; only swap on success to keep chain coherent on OOM.
   const UINT new_count = std::max<UINT>(1u, params.BackBufferCount);
   const uint32_t sampleCount = m_device->metalSampleCount(params.MultiSampleType, params.MultiSampleQuality);
-  WMTTextureInfo info;
+  WMTTextureInfo info = {};
   D3DSURFACE_DESC desc;
   backBufferDescriptors(params, sampleCount, info, desc);
   Rc<dxmt::Texture> new_resolve_target;
@@ -754,7 +754,7 @@ MTLD3D9SwapChain::Present(
   bool canvas_seed = false;
   if (m_params.SwapEffect == D3DSWAPEFFECT_COPY && (pSourceRect || pDestRect) && m_frontCanvas == nullptr &&
       m_resolveTarget == nullptr) {
-    WMTTextureInfo cinfo;
+    WMTTextureInfo cinfo = {};
     D3DSURFACE_DESC cdesc;
     backBufferDescriptors(m_params, /*sampleCount=*/1, cinfo, cdesc);
     m_frontCanvas = buildResolveTarget(m_device, cinfo);
@@ -941,7 +941,7 @@ MTLD3D9SwapChain::Present(
       // which a single-sample sampler blit could not source. Allocated like the
       // backbuffers themselves in buildBackBuffer (same sampleCount + info).
       const uint32_t sampleCount = m_device->metalSampleCount(m_params.MultiSampleType, m_params.MultiSampleQuality);
-      WMTTextureInfo sinfo;
+      WMTTextureInfo sinfo = {};
       D3DSURFACE_DESC sdesc;
       backBufferDescriptors(m_params, sampleCount, sinfo, sdesc);
       m_rotationScratch = buildPrivateTarget(m_device, sinfo);

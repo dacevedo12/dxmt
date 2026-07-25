@@ -704,8 +704,7 @@ ResourceInitializer::allocateZeroBuffer(size_t size) {
       return {};
     }
 
-    WMTBufferInfo buffer_info;
-    buffer_info.gpu_address = 0;
+    WMTBufferInfo buffer_info = {};
     buffer_info.length = size;
     buffer_info.memory.set(nullptr);
     buffer_info.options = WMTResourceStorageModePrivate | WMTResourceHazardTrackingModeUntracked;

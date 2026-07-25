@@ -671,7 +671,7 @@ struct WMTTextureInfo {
   uint32_t sample_count       : 8;
   enum WMTTextureUsage usage  : 8;
   enum WMTResourceOptions options;
-  uint32_t reserved;
+  uint32_t reserved; // in, WMTTextureInfoFlag bits
   mach_port_t mach_port; // in/out
   uint64_t gpu_resource_id; // out
 };

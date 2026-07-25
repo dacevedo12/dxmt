@@ -164,7 +164,7 @@ private:
   BufferAllocation(BufferAllocation &&) = delete;
 
   WMT::Reference<WMT::Buffer> obj_;
-  WMTBufferInfo info_;
+  WMTBufferInfo info_ = {};
   uint32_t version_ = 0;
   Flags<BufferAllocationFlag> flags_;
   small_vector<std::unique_ptr<BufferView>, 1> cached_view_;
