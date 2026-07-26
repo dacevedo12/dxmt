@@ -62,7 +62,7 @@ template <typename Task> task_scheduler<Task>::~task_scheduler() {
 
   for (auto &worker : workers_) {
     if (worker.joinable())
-      worker.join();
+      worker.join_noexcept();
   }
 
   workers_.clear();

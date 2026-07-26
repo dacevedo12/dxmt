@@ -7,10 +7,12 @@
 #include "winemetal.h"
 #include <atomic>
 #include <cstdint>
+#include <memory>
 
 namespace dxmt {
 
 class CommandQueue;
+class LifetimeResidencyRegistration;
 
 struct DXMTPresentMetadata {
   float edr_scale;
@@ -50,7 +52,7 @@ public:
         frame_id(frame_id),
         presenter(presenter) {}
     PresentState(const PresentState &copy) = delete;
-    PresentState(PresentState &&move)  {
+    PresentState(PresentState &&move) noexcept {
       metadata = move.metadata;
       frame_id = move.frame_id;
       presenter = move.presenter;
@@ -95,6 +97,8 @@ private:
   uint64_t gamma_version_ = 0;
   std::array<float, DXMT_GAMMA_CP_COUNT * 4> gamma_lut_rgba_;
   WMT::Reference<WMT::Texture> gamma_lut_texture_;
+  std::shared_ptr<LifetimeResidencyRegistration>
+      gamma_lut_residency_registration_;
   WMT::Reference<WMT::RenderPipelineState> present_blit_;
   WMT::Reference<WMT::RenderPipelineState> present_scale_;
   std::atomic_flag pso_valid = 0;

@@ -36,11 +36,13 @@ Presenter::Presenter(CommandQueue &queue, WMT::Device device,
   texture_info.sample_count = 1;
   texture_info.array_length = 1;
   gamma_lut_texture_ = device.newTexture(texture_info);
-  queue_.AddPersistentResidency(gamma_lut_texture_);
+  gamma_lut_residency_registration_ =
+      queue_.RegisterLifetimeResidency(
+          ResidencyOwnership::Lifetime(gamma_lut_texture_));
 }
 
 Presenter::~Presenter() {
-  queue_.RemovePersistentResidencyAfterCompletion(gamma_lut_texture_);
+  gamma_lut_residency_registration_.reset();
 }
 
 bool

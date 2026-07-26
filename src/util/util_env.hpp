@@ -37,6 +37,29 @@ constexpr bool is32BitHostPlatform() { return sizeof(void *) == 4; }
 std::string getEnvVar(const char *name);
 
 /**
+ * \brief True when env var is a truthy switch (1/true/yes/on).
+ */
+bool envTruthy(const char *name);
+
+/**
+ * \brief Set env var only when currently unset/empty.
+ *
+ * Used by the DXMT validation layer to enable diagnostic defaults without
+ * clobbering an explicit user setting.
+ */
+void setEnvVarIfUnset(const char *name, const char *value);
+
+/**
+ * \brief Apply DXMT_VALIDATION=1 diagnostic defaults.
+ *
+ * Enables dense GPU hang capture, Metal PSO labels, residency diags, and
+ * related PE-side probes. Metal's own MTL_DEBUG_LAYER / MTL_SHADER_VALIDATION
+ * must still be set by the host process before Metal initializes.
+ * Safe to call multiple times; only the first call applies.
+ */
+void applyValidationLayerDefaults();
+
+/**
  * \brief Checks whether a file name has a given extension
  *
  * \param [in] name File name

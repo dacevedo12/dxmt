@@ -27,6 +27,8 @@
 
 namespace dxmt {
 
+class LifetimeResidencyRegistration;
+
 constexpr size_t kCommandChunkCPUHeapSize = 0x400000;
 constexpr size_t kCommandChunkGPUHeapSize = 0x400000;
 constexpr size_t kEncodingContextCPUHeapSize = 0x100000;
@@ -34,8 +36,8 @@ constexpr size_t kEncodingContextCPUHeapLifetime = 600;
 
 constexpr auto kIntrapassControlBitIgnoreUAVWaW = 1ull << 1;
 
-constexpr uint32_t kCommandBufferFenceEdgeCapacity = 64;
-constexpr uint32_t kCommandBufferEncoderDiagnosticCapacity = 32;
+constexpr uint32_t kCommandBufferFenceEdgeCapacity = 96;
+constexpr uint32_t kCommandBufferEncoderDiagnosticCapacity = 64;
 
 enum CommandBufferFenceEdgeFlag : uint32_t {
   CommandBufferFenceEdgePreRaster = 1u << 0,
@@ -44,6 +46,8 @@ enum CommandBufferFenceEdgeFlag : uint32_t {
   CommandBufferFenceEdgeBlit = 1u << 3,
   CommandBufferFenceEdgeOther = 1u << 4,
   CommandBufferFenceEdgePending = 1u << 5,
+  CommandBufferFenceEdgeProducerPreRaster = 1u << 6,
+  CommandBufferFenceEdgeProducerFragment = 1u << 7,
 };
 
 struct CommandBufferFenceEdgeDiagnostic {
@@ -53,6 +57,24 @@ struct CommandBufferFenceEdgeDiagnostic {
   uint32_t consumer_index = 0;
   uint32_t slot = 0;
   uint32_t flags = 0;
+  uint64_t resource_object = 0;
+  uint64_t resource_identity = 0;
+  uint64_t allocation_object = 0;
+  uint64_t metal_resource_handle = 0;
+  uint64_t gpu_address_or_resource_id = 0;
+  uint64_t producer_offset = 0;
+  uint64_t producer_length = 0;
+  uint64_t producer_view_id = 0;
+  uint64_t consumer_offset = 0;
+  uint64_t consumer_length = 0;
+  uint64_t consumer_view_id = 0;
+  uint64_t resource_match_hash = 0;
+  uint32_t producer_access = 0;
+  uint32_t consumer_access = 0;
+  uint32_t producer_stage_kind = 0;
+  uint32_t consumer_stage_kind = 0;
+  uint32_t resource_match_count = 0;
+  uint32_t reserved = 0;
 };
 
 enum CommandBufferEncoderDiagnosticFlag : uint32_t {
@@ -72,6 +94,8 @@ struct CommandBufferEncoderDiagnostic {
   uint64_t primary_resource = 0;
   uint64_t secondary_resource = 0;
   uint64_t resource_plan_hash = 0;
+  uint64_t d3d_sequence_begin = 0;
+  uint64_t d3d_sequence_end = 0;
   uint32_t encoder_index = 0;
   uint32_t type = 0;
   uint32_t wait_count = 0;
@@ -227,6 +251,7 @@ struct BindlessBufferTableSnapshot {
 
 struct DummyTextureBinding {
   WMT::Reference<WMT::Texture> texture;
+  std::shared_ptr<LifetimeResidencyRegistration> residency_registration;
   uint64_t gpu_resource_id = 0;
   uint32_t array_length = 1;
   DXMT_RESOURCE_RESIDENCY_STATE residency;
@@ -255,6 +280,8 @@ struct EncoderData {
   FenceSet fence_wait;
   FenceSet fence_update;
   EncoderBarrierState barrier_state;
+  uint64_t diagnostic_d3d_sequence_begin = 0;
+  uint64_t diagnostic_d3d_sequence_end = 0;
   bool requires_cross_submit_wait = false;
 };
 
@@ -445,6 +472,9 @@ struct RenderEncoderData : EncoderData {
   bool use_visibility_result = 0;
   bool use_tessellation = 0;
   bool use_geometry = 0;
+  // A Fragment -> PreRaster split is a semantic encoder boundary. The
+  // immediate predecessor must not be folded back into this pass.
+  bool prevent_merge_with_previous = 0;
   TileBarrierPSOKey tile_barrier_pso_key = {};
   WMT::RenderPipelineState last_pso = {};
   uint64_t pixel_shader_demote_msaa_srv_mask_lo = 0;
@@ -460,6 +490,8 @@ struct RenderEncoderData : EncoderData {
       native_argument_buffers_fragment = {};
   RenderDynamicStateCache dynamic_state_cache = {};
   RenderBindingStateCache binding_state_cache = {};
+  // Diagnostic summary only. Resource hazards are published for every
+  // command; this map must never gate ordered access tracking.
   std::unordered_map<EncoderResourcePlanKey, int,
                      EncoderResourcePlanKeyHash>
       resource_plan_accesses;
@@ -474,6 +506,7 @@ struct ComputeEncoderData : EncoderData {
   std::array<NativeArgumentBufferBindingState, 31>
       native_argument_buffers = {};
   ComputeBindingStateCache binding_state_cache = {};
+  // Diagnostic summary only; see RenderEncoderData::resource_plan_accesses.
   std::unordered_map<EncoderResourcePlanKey, int,
                      EncoderResourcePlanKeyHash>
       resource_plan_accesses;
@@ -621,6 +654,8 @@ struct AllocatedTempBufferSlice {
 class ArgumentEncodingContext {
 private:
   template <PipelineStage stage> void track(GenericAccessTracker &tracker, int flags);
+  bool trackerRequiresReverseRenderPassBoundary(GenericAccessTracker &tracker,
+                                                int flags);
   void noteSparseTextureAccess(TextureAllocation *allocation, unsigned level,
                                unsigned slice, int flags);
 
@@ -1031,6 +1066,7 @@ public:
   cmd_struct &
   encodeRenderCommand() {
     assert(encoder_current->type == EncoderType::Render);
+    noteCurrentEncoderD3DSequence();
     auto encoder = static_cast<RenderEncoderData *>(encoder_current);
     auto storage = (cmd_struct *)allocate_cpu_heap(sizeof(cmd_struct), 16);
     encoder->cmd_tail->next.set(storage);
@@ -1074,6 +1110,7 @@ public:
   cmd_struct &
   encodeComputeCommand() {
     assert(encoder_current->type == EncoderType::Compute);
+    noteCurrentEncoderD3DSequence();
     auto encoder = static_cast<ComputeEncoderData *>(encoder_current);
     auto storage = (cmd_struct *)allocate_cpu_heap(sizeof(cmd_struct), 16);
     encoder->cmd_tail->next.set(storage);
@@ -1086,6 +1123,7 @@ public:
   cmd_struct &
   encodeBlitCommand() {
     assert(encoder_current->type == EncoderType::Blit);
+    noteCurrentEncoderD3DSequence();
     auto encoder = static_cast<BlitEncoderData *>(encoder_current);
     auto storage = (cmd_struct *)allocate_cpu_heap(sizeof(cmd_struct), 16);
     encoder->cmd_tail->next.set(storage);
@@ -1146,6 +1184,7 @@ public:
   EncoderData *startBlitPass();
 
   void endPass();
+  void noteCurrentEncoderD3DSequence();
 
   void appendRenderArgumentBufferBindings(
       RenderEncoderData *data, WMT::Buffer buffer, bool use_geometry,
@@ -1340,6 +1379,23 @@ public:
 
   void resolveRenderPassBarrier();
 
+  bool requiresReverseRenderPassBoundary(Rc<Buffer> const &buffer,
+                                         int flags);
+  bool requiresReverseRenderPassBoundary(Rc<Texture> const &texture,
+                                         unsigned level, unsigned slice,
+                                         int flags);
+  bool requiresReverseRenderPassBoundary(Rc<Texture> const &texture,
+                                         uint64_t view_id, int flags);
+
+  /**
+   * Metal4 cannot express Fragment→PreRaster reverse barriers as
+   * barrierAfterEncoderStages (debug layer rejects Fragment as after stages).
+   * GPTK SynchroniseStages flush-first: close the current render pass (UpdateFence
+   * at Fragment) and reopen with Load so the reverse wait becomes an inter-pass
+   * MTLFence edge (deptrack re-establishes the wait on next resource access).
+   */
+  void splitRenderPassForReverseStage();
+
   void requireCrossSubmitWait() {
     assert(encoder_current);
     encoder_current->requires_cross_submit_wait = true;
@@ -1361,8 +1417,6 @@ public:
   ArgumentEncodingContext(CommandQueue &queue, WMT::Device device, InternalCommandLibrary &lib);
   ~ArgumentEncodingContext();
 
-  void RetirePersistentResidency(uint64_t completed_sequence);
-
   uint32_t tess_num_output_control_point_element;
   uint32_t tess_threads_per_patch;
 
@@ -1377,6 +1431,19 @@ public:
 private:
   void retainResourceForCurrentCommandBuffer(WMT::Resource resource);
 
+  /**
+   * Metal 4 replay is planned after every encoder has published its resource
+   * dependencies. Independent intervening encoders may be crossed so a
+   * compatible earlier encoder can be coalesced into a later one; event and
+   * timestamp encoders, or a dependency edge, stop the search.
+   *
+   * This is the DXMT equivalent of D3DMetal's
+   * BuildEncoderSubmissionOrder/MergeEncoders stage. The array keeps recording
+   * order: coalescing prepends the earlier command stream to the later encoder
+   * and leaves a Null tombstone at the original position.
+   */
+  void planEncoderSubmissionOrder(EncoderData **encoders,
+                                  unsigned encoder_count);
   DXMT_ENCODER_LIST_OP checkEncoderRelation(EncoderData* former, EncoderData* latter);
   bool hasDataDependency(EncoderData* from, EncoderData* to);
   bool tryMergeBlitEncoders(BlitEncoderData* former, BlitEncoderData* latter);
@@ -1419,6 +1486,8 @@ private:
   WMT::Reference<WMT::SamplerState> dummy_sampler_;
   WMTSamplerInfo dummy_sampler_info_;
   WMT::Reference<WMT::Buffer> dummy_cbuffer_;
+  std::shared_ptr<LifetimeResidencyRegistration>
+      dummy_cbuffer_residency_registration_;
   void *dummy_cbuffer_host_;
   WMTBufferInfo dummy_cbuffer_info_;
   std::array<DummyTextureBinding, 28> dummy_srv_textures_;
@@ -1432,7 +1501,22 @@ private:
   unsigned encoder_count_ = 0;
   
   uint64_t encoder_id_ = kParityLane; // actually important to not start from 0
-  std::vector<WMT::Reference<WMT::Fence>> fence_pool_;
+  /**
+   * Bumped at each flushCommands boundary so GenericAccessTracker epochs drop
+   * residual exclusive_/shared_ state from prior command buffers (GPTK CB-local
+   * ResolveBarriers — cross-submit is timeline only).
+   */
+  uint64_t access_tracker_generation_ = 1;
+  /**
+   * Fence slots are interval-coloured within a command buffer and isolated
+   * between in-flight command buffers. The queue admits at most 128 command
+   * buffers, so a bank selected by event_seq_id cannot be reused until its
+   * previous generation has completed.
+   */
+  static constexpr uint32_t kFencePoolBanks = 256;
+  uint32_t fence_pool_bank_index_ = 0;
+  std::array<std::vector<WMT::Reference<WMT::Fence>>, kFencePoolBanks>
+      fence_pool_banks_;
   CommandBufferFenceBindingTable fence_bindings_;
   FenceLocalityCheck fence_locality_;
 
@@ -1454,7 +1538,7 @@ private:
       underused_times = 0;
     }
     chunk(const chunk &copy) = delete;
-    chunk(chunk &&move) {
+    chunk(chunk &&move) noexcept {
       ptr = move.ptr;
       underused_times = move.underused_times;
       move.ptr = nullptr;
@@ -1487,7 +1571,6 @@ private:
 
   WMT::Device device_;
   CommandQueue& queue_;
-  bool persistent_residency_retired_ = false;
 };
 
 template <>
@@ -1539,6 +1622,7 @@ ArgumentEncodingContext::bindOutputTexture<PipelineStage::Pixel>(
 template <PipelineStage stage>
 inline void
 ArgumentEncodingContext::track(GenericAccessTracker &tracker, int flags) {
+  tracker.ensureGeneration(access_tracker_generation_);
   auto current_encoder = currentRenderEncoder();
   auto id = current_encoder->encoder_id_vertex;
   EncoderBarrierState &barrier_state = current_encoder->barrier_state;
@@ -1553,6 +1637,7 @@ ArgumentEncodingContext::track(GenericAccessTracker &tracker, int flags) {
 template <>
 inline void
 ArgumentEncodingContext::track<PipelineStage::Compute>(GenericAccessTracker &tracker, int flags) {
+  tracker.ensureGeneration(access_tracker_generation_);
   auto current_encoder = currentEncoder();
   EncoderBarrierState &barrier_state = current_encoder->barrier_state;
   if (flags & ResourceAccess::Write)
@@ -1566,6 +1651,7 @@ ArgumentEncodingContext::track<PipelineStage::Compute>(GenericAccessTracker &tra
 template <>
 inline void
 ArgumentEncodingContext::track<PipelineStage::Pixel>(GenericAccessTracker &tracker, int flags) {
+  tracker.ensureGeneration(access_tracker_generation_);
   auto current_encoder = currentRenderEncoder();
   EncoderBarrierState &barrier_state = current_encoder->barrier_state;
   if (flags & ResourceAccess::Write)

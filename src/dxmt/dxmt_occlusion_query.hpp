@@ -2,17 +2,22 @@
 
 #include "Metal.hpp"
 #include "rc/util_rc_ptr.hpp"
+#include "util_noexcept.hpp"
 #include "wsi_platform.hpp"
 #include <algorithm>
 #include <atomic>
 #include <cassert>
 #include <cstdint>
-#include <functional>
 #include <memory>
+#include <string>
+#include <type_traits>
 #include <unordered_map>
+#include <variant>
 #include <vector>
 
 namespace dxmt {
+class LifetimeResidencyRegistration;
+
 class VisibilityResultOffsetBumpState {
 public:
   void
@@ -175,20 +180,24 @@ public:
         visibility_result_heap_info.length = num_results * sizeof(uint64_t);
         visibility_result_heap = device.newBuffer(visibility_result_heap_info);
       }
-  ~VisibilityResultReadback() {
+  ~VisibilityResultReadback() noexcept {
     for (auto query : queries) {
-      query->issue(seq_id, (uint64_t *)visibility_result_heap_info.memory.get(), num_results);
+      dxmt::invokeNoexcept("visibility result delivery", [&]() {
+        query->issue(seq_id,
+                     (uint64_t *)visibility_result_heap_info.memory.get(),
+                     num_results);
+      });
     }
-    if (retire_residency_)
-      retire_residency_();
+    residency_retirement_.reset();
 #ifdef __i386__
     wsi::aligned_free(visibility_result_heap_info.memory.get());
 #endif
   }
 
   void
-  setResidencyRetirement(std::function<void()> retirement) {
-    retire_residency_ = std::move(retirement);
+  setResidencyRetirement(
+      std::shared_ptr<LifetimeResidencyRegistration> retirement) {
+    residency_retirement_ = std::move(retirement);
   }
 
   VisibilityResultReadback(const VisibilityResultReadback &) = delete;
@@ -201,21 +210,21 @@ public:
   WMT::Reference<WMT::Buffer> visibility_result_heap;
 
 private:
-  std::function<void()> retire_residency_;
+  std::shared_ptr<LifetimeResidencyRegistration> residency_retirement_;
 };
 
 /**
  * TODO: rename the whole file to dxmt_query.hpp
  */
 
+class TimestampSampleOwner {
+public:
+  virtual ~TimestampSampleOwner() noexcept = default;
+};
+
 class TimestampQuery {
 public:
-  ~TimestampQuery() {
-#if DXMT_DX12_METAL4
-    if (release_sample_ && sample_index_ != ~0ull)
-      release_sample_(sample_index_);
-#endif
-  }
+  ~TimestampQuery() noexcept = default;
 
   void
   incRef() {
@@ -272,10 +281,10 @@ public:
   void
   setResolveSource(const WMT::Reference<WMT::CounterHeap> &heap,
                    uint64_t heap_entry_size,
-                   std::function<void(uint64_t)> release_sample = {}) {
+                   std::unique_ptr<TimestampSampleOwner> sample_owner) {
     resolve_heap_ = heap;
     resolve_heap_entry_size_ = heap_entry_size;
-    release_sample_ = std::move(release_sample);
+    sample_owner_ = std::move(sample_owner);
   }
 
   WMT::Reference<WMT::CounterHeap>
@@ -297,7 +306,7 @@ private:
 #if DXMT_DX12_METAL4
   WMT::Reference<WMT::CounterHeap> resolve_heap_;
   uint64_t resolve_heap_entry_size_ = 0;
-  std::function<void(uint64_t)> release_sample_;
+  std::unique_ptr<TimestampSampleOwner> sample_owner_;
 #endif
   std::atomic<uint32_t> refcount_ = {0u};
 };
@@ -321,45 +330,53 @@ public:
 #endif
   }
 
-  ~TimestampReadbackSBuf() {
+  ~TimestampReadbackSBuf() noexcept {
     // TODO: small_vector opt
 #if DXMT_DX12_METAL4
-    std::unordered_map<obj_handle_t, std::vector<std::pair<Rc<TimestampQuery>, uint64_t>>> groups;
-    for (const auto &[query, sample_index] : queries_) {
-      auto heap = query->resolveHeap();
-      if (!heap || !query->resolveHeapEntrySize())
-        continue;
-      groups[heap.handle].push_back({query, sample_index});
-    }
-
-    for (auto &[heap_handle, group] : groups) {
-      if (group.empty())
-        continue;
-      uint64_t heap_entry_size = group.front().first->resolveHeapEntrySize();
-      uint64_t first = group.front().second;
-      uint64_t last = first;
-      for (const auto &[query, sample_index] : group) {
-        first = std::min(first, sample_index);
-        last = std::max(last, sample_index);
+    dxmt::invokeNoexcept("Metal4 timestamp readback", [this]() {
+      std::unordered_map<
+          obj_handle_t,
+          std::vector<std::pair<Rc<TimestampQuery>, uint64_t>>>
+          groups;
+      for (const auto &[query, sample_index] : queries_) {
+        auto heap = query->resolveHeap();
+        if (!heap || !query->resolveHeapEntrySize())
+          continue;
+        groups[heap.handle].push_back({query, sample_index});
       }
 
-      WMT::CounterHeap heap(heap_handle);
-      std::vector<uint8_t> resolved((last - first + 1) * heap_entry_size);
-      heap.resolveCounterRange(first, last - first + 1,
-                               resolved.data(), resolved.size());
-      for (const auto &[query, sample_index] : group) {
-        auto *entry = reinterpret_cast<const WMTMTL4TimestampHeapEntry *>(
-            resolved.data() + (sample_index - first) * heap_entry_size);
-        query->issue(entry->timestamp);
+      for (auto &[heap_handle, group] : groups) {
+        if (group.empty())
+          continue;
+        uint64_t heap_entry_size = group.front().first->resolveHeapEntrySize();
+        uint64_t first = group.front().second;
+        uint64_t last = first;
+        for (const auto &[query, sample_index] : group) {
+          first = std::min(first, sample_index);
+          last = std::max(last, sample_index);
+        }
+
+        WMT::CounterHeap heap(heap_handle);
+        std::vector<uint8_t> resolved((last - first + 1) * heap_entry_size);
+        heap.resolveCounterRange(first, last - first + 1, resolved.data(),
+                                 resolved.size());
+        for (const auto &[query, sample_index] : group) {
+          auto *entry = reinterpret_cast<const WMTMTL4TimestampHeapEntry *>(
+              resolved.data() + (sample_index - first) * heap_entry_size);
+          query->issue(entry->timestamp);
+        }
       }
-    }
-    timestamp_context_.destroy();
+    });
+    dxmt::invokeNoexcept("Metal4 timestamp context destruction",
+                         [this]() { timestamp_context_.destroy(); });
 #else
-    std::vector<uint64_t> results(num_samples_);
-    sample_buffer_.resolveCounterRange(0, num_samples_, results.data(), num_samples_ * sizeof(uint64_t));
-    for (const auto &[query, sample_index] : queries_) {
-      query->issue(results[sample_index]);
-    }
+    dxmt::invokeNoexcept("timestamp readback", [this]() {
+      std::vector<uint64_t> results(num_samples_);
+      sample_buffer_.resolveCounterRange(0, num_samples_, results.data(),
+                                         num_samples_ * sizeof(uint64_t));
+      for (const auto &[query, sample_index] : queries_)
+        query->issue(results[sample_index]);
+    });
 #endif
   }
 
@@ -396,22 +413,24 @@ public:
       num_samples_(num_samples),
       cmdbuf_(cmdbuf) {}
 
-  ~TimestampReadbackCBuf() {
+  ~TimestampReadbackCBuf() noexcept {
     // TODO: small_vector opt
-    std::vector<uint64_t> results(num_samples_);
-    /**
-    There is no implicit relationship between `gpuEndTime` and order of commit, but we still want a later issued query
-    to return a timestamp greater or equal to previous ones, so check and use maximum.
+    dxmt::invokeNoexcept("command-buffer timestamp readback", [this]() {
+      std::vector<uint64_t> results(num_samples_);
+      /**
+      There is no implicit relationship between `gpuEndTime` and order of commit, but we still want a later issued query
+      to return a timestamp greater or equal to previous ones, so check and use maximum.
 
-    `thread_local` makes sense because this destructor is only called on 1. finishing thread 2. (abnormal) device
-    destruction
-    */
-    thread_local uint64_t latest_ts_on_finish_thread = 0;
-    latest_ts_on_finish_thread = std::max(cmdbuf_.gpuEndTime(), latest_ts_on_finish_thread);
-    std::fill(results.begin(), results.end(), latest_ts_on_finish_thread);
-    for (const auto &[query, sample_index] : queries_) {
-      query->issue(results[sample_index]);
-    }
+      `thread_local` makes sense because this destructor is only called on 1. finishing thread 2. (abnormal) device
+      destruction
+      */
+      thread_local uint64_t latest_ts_on_finish_thread = 0;
+      latest_ts_on_finish_thread =
+          std::max(cmdbuf_.gpuEndTime(), latest_ts_on_finish_thread);
+      std::fill(results.begin(), results.end(), latest_ts_on_finish_thread);
+      for (const auto &[query, sample_index] : queries_)
+        query->issue(results[sample_index]);
+    });
   }
 
   TimestampReadbackCBuf(const TimestampReadbackCBuf &) = delete;
@@ -492,10 +511,102 @@ private:
   WMT::Device device_;
 };
 
+class TexturePointDiagnosticReadback final {
+public:
+  TexturePointDiagnosticReadback() = default;
+
+  TexturePointDiagnosticReadback(WMT::Buffer buffer, uint8_t *mapped) noexcept
+      : buffer_(buffer), mapped_(mapped) {}
+
+  TexturePointDiagnosticReadback(const TexturePointDiagnosticReadback &) =
+      delete;
+  TexturePointDiagnosticReadback &
+  operator=(const TexturePointDiagnosticReadback &) = delete;
+
+  TexturePointDiagnosticReadback(
+      TexturePointDiagnosticReadback &&other) noexcept
+      : label(std::move(other.label)), frame_id(other.frame_id),
+        seq_id(other.seq_id), texture_id(other.texture_id),
+        format(other.format), width(other.width), height(other.height),
+        x(other.x), y(other.y), texel_size(other.texel_size),
+        encoder_id(other.encoder_id), index(other.index), level(other.level),
+        slice(other.slice), buffer_(std::move(other.buffer_)),
+        mapped_(other.mapped_) {
+    other.mapped_ = nullptr;
+  }
+
+  TexturePointDiagnosticReadback &
+  operator=(TexturePointDiagnosticReadback &&other) noexcept {
+    if (this == &other)
+      return *this;
+    Reset();
+    buffer_ = std::move(other.buffer_);
+    mapped_ = other.mapped_;
+    other.mapped_ = nullptr;
+    label = std::move(other.label);
+    frame_id = other.frame_id;
+    seq_id = other.seq_id;
+    texture_id = other.texture_id;
+    format = other.format;
+    width = other.width;
+    height = other.height;
+    x = other.x;
+    y = other.y;
+    texel_size = other.texel_size;
+    encoder_id = other.encoder_id;
+    index = other.index;
+    level = other.level;
+    slice = other.slice;
+    return *this;
+  }
+
+  ~TexturePointDiagnosticReadback() noexcept {
+    Reset();
+  }
+
+  [[nodiscard]] const uint8_t *mapped() const noexcept {
+    return mapped_;
+  }
+
+  std::string label;
+  uint64_t frame_id = 0;
+  uint64_t seq_id = 0;
+  uint64_t texture_id = 0;
+  uint32_t format = 0;
+  uint32_t width = 0;
+  uint32_t height = 0;
+  uint32_t x = 0;
+  uint32_t y = 0;
+  uint32_t texel_size = 0;
+  uint64_t encoder_id = 0;
+  uint32_t index = 0;
+  uint16_t level = 0;
+  uint16_t slice = 0;
+
+private:
+  void Reset() noexcept {
+#ifdef __i386__
+    wsi::aligned_free(mapped_);
+#endif
+    mapped_ = nullptr;
+    buffer_ = nullptr;
+  }
+
+  WMT::Reference<WMT::Buffer> buffer_;
+  uint8_t *mapped_ = nullptr;
+};
+
+using DiagnosticReadback = std::variant<TexturePointDiagnosticReadback>;
+static_assert(!std::is_copy_constructible_v<DiagnosticReadback>);
+static_assert(std::is_nothrow_move_constructible_v<DiagnosticReadback>);
+
+void ExecuteDiagnosticReadback(
+    TexturePointDiagnosticReadback &readback) noexcept;
+
 struct QueryReadbacks {
   std::unique_ptr<VisibilityResultReadback> visibility;
   std::unique_ptr<TimestampReadback> timestamp;
-  std::vector<std::function<void()>> diagnostics;
+  std::vector<DiagnosticReadback> diagnostics;
 };
 
 } // namespace dxmt

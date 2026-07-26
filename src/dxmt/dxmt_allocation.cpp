@@ -1,4 +1,5 @@
 #include "dxmt_allocation.hpp"
+#include "dxmt_command_queue.hpp"
 #include "util_likely.hpp"
 #include <iterator>
 #include <new>
@@ -15,6 +16,25 @@ Allocation::decRef() {
   if (refcount_.fetch_sub(1u, std::memory_order_acq_rel) == 1u)
     delete this;
 };
+
+void
+Allocation::ensureLifetimeResidency(CommandQueue &queue,
+                                    WMT::Object allocation,
+                                    ResidencyProvenance provenance) {
+  if (!allocation)
+    return;
+  std::lock_guard lock(lifetime_residency_mutex_);
+  if (!lifetime_residency_registration_)
+    lifetime_residency_registration_ =
+        queue.RegisterLifetimeResidency(
+            ResidencyOwnership::Lifetime(allocation, provenance));
+}
+
+bool
+Allocation::hasLifetimeResidency() const {
+  std::lock_guard lock(lifetime_residency_mutex_);
+  return bool(lifetime_residency_registration_);
+}
 
 AllocationRefTracking::AllocationRefTracking() {
   chunk_placed.next_chunk = nullptr;

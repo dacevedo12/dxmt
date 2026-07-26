@@ -265,9 +265,11 @@ BuildRenderFenceMergePlan(
 }
 
 /**
- * Maps exact logical encoder dependency IDs to reusable Metal fence objects
- * for one command buffer. Bindings never survive reset: ordering between
- * command buffers on the same queue already provides that dependency.
+ * Maps exact command-buffer-local dependency IDs to Metal fence objects.
+ *
+ * A fence is only required for an update that has a later consumer. Metal 4
+ * keeps every stage-domain fence unique for the lifetime of the command
+ * buffer; completed generations return their fence objects to the pool.
  */
 class CommandBufferFenceBindingTable {
 public:
@@ -281,6 +283,15 @@ public:
     while (slot < slot_last_use_.size() &&
            slot_last_use_[slot] >= static_cast<int64_t>(first))
       slot++;
+    if (slot == slot_last_use_.size())
+      slot_last_use_.push_back(-1);
+    slot_last_use_[slot] = last;
+    bindings_.insert_or_assign(id, slot);
+    return slot;
+  }
+
+  uint32_t bindUnique(EncoderId id, uint32_t last) {
+    const auto slot = static_cast<uint32_t>(bindings_.size());
     if (slot == slot_last_use_.size())
       slot_last_use_.push_back(-1);
     slot_last_use_[slot] = last;
@@ -421,6 +432,40 @@ public:
   void accessSharedFragment(EncoderId id, FenceSet &wait_fences, EncoderBarrierState &barrier_state);
   void accessExclusiveFragment(EncoderId id, FenceSet &wait_fences, EncoderBarrierState &barrier_state, bool uav);
 
+  /**
+   * Probe a pre-raster access without mutating dependency state. Metal 4 cannot
+   * encode Fragment -> PreRaster as an in-render-pass barrier, so callers must
+   * close the render encoder before publishing an access that returns true.
+   */
+  bool wouldRequireFragmentToPreRasterBoundary(EncoderId id,
+                                               int flags) const;
+
+  /**
+   * GPTK resource trackers are command-buffer scoped. Cross-submit order is the
+   * queue timeline only — residual exclusive_/shared_ EncoderIds from earlier
+   * CBs must not seed wait sets (would become stripped external waits).
+   */
+  void reset() {
+    shared_.clear();
+    exclusive_ = {};
+    isShared = 0;
+    isSharedPreRaster = 0;
+    lastWriteFromPreRaster = 0;
+    generation_ = 0;
+  }
+
+  /** Lazy epoch reset when first touched in a new command-buffer generation. */
+  void ensureGeneration(uint64_t generation) {
+    if (generation_ == generation)
+      return;
+    shared_.clear();
+    exclusive_ = {};
+    isShared = 0;
+    isSharedPreRaster = 0;
+    lastWriteFromPreRaster = 0;
+    generation_ = generation;
+  }
+
 private:
   /**
    * Previous shared access
@@ -433,6 +478,7 @@ private:
   uint64_t isShared               : 1 = 0;
   uint64_t isSharedPreRaster      : 1 = 0;
   uint64_t lastWriteFromPreRaster : 1 = 0;
+  uint64_t generation_ = 0;
 };
 
 class FenceLocalityCheck {
@@ -442,6 +488,13 @@ public:
       EncoderId id,
       bool implicit_pre_raster_wait = false,
       const char *trace_scope = nullptr);
+
+  /** Clear rolling summaries at command-buffer boundaries (GPTK CB-local). */
+  void reset() {
+    for (auto &summary : summary_)
+      summary.clear();
+    summary_generation_.fill(0);
+  }
 
 private:
   std::array<FenceSet, kParityLane> summary_;

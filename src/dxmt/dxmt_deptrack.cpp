@@ -280,6 +280,25 @@ GenericAccessTracker::accessExclusiveFragment(
   isSharedPreRaster = 0;
 }
 
+bool
+GenericAccessTracker::wouldRequireFragmentToPreRasterBoundary(
+    EncoderId id, int flags) const {
+  // Reuse the production state machine on a value snapshot. This keeps the
+  // probe exactly aligned with accessShared/ExclusivePreRaster as those rules
+  // evolve, without consuming the real Fragment producer identity.
+  auto probe = *this;
+  FenceSet ignored_waits;
+  EncoderBarrierState probe_barrier = {};
+  if (flags & ResourceAccess::Write) {
+    probe.accessExclusivePreRaster(
+        id, ignored_waits, probe_barrier,
+        (flags & ResourceAccess::UAV) != 0);
+  } else {
+    probe.accessSharedPreRaster(id, ignored_waits, probe_barrier);
+  }
+  return probe_barrier.barrierPreRasterAfterFragmentSet != 0;
+}
+
 FenceSet
 FenceLocalityCheck::collectAndSimplifyWaits(
     FenceSet strong_fences,

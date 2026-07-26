@@ -96,10 +96,14 @@ public:
       new (ptr(m_state.size++)) T(*iter);
   }
 
-  /** Move constructor. */
-  small_vector(small_vector&& other)
+  /** Move constructor. Moving an equal-capacity vector never allocates. */
+  small_vector(small_vector&& other) noexcept(
+      std::is_nothrow_move_constructible_v<T> &&
+      std::is_nothrow_destructible_v<T> &&
+      std::is_nothrow_copy_constructible_v<Allocator> &&
+      std::is_nothrow_copy_assignable_v<Allocator>)
   : m_state(N, other.m_state.getAllocator()) {
-    move(std::move(other));
+    move_same_capacity(std::move(other));
   }
 
   /** Move constructor from different small_vector type. */
@@ -122,10 +126,16 @@ public:
     copy(other);
   }
 
-  /** Move assignment. */
-  small_vector& operator = (small_vector&& other) {
+  /** Move assignment. Moving an equal-capacity vector never allocates. */
+  small_vector& operator = (small_vector&& other) noexcept(
+      std::is_nothrow_move_constructible_v<T> &&
+      std::is_nothrow_destructible_v<T> &&
+      std::is_nothrow_copy_assignable_v<Allocator>) {
+    if (this == &other)
+      return *this;
+
     free();
-    move(std::move(other));
+    move_same_capacity(std::move(other));
     return *this;
   }
 
@@ -435,6 +445,28 @@ private:
 
     m_state.capacity = N;
     m_state.size = 0;
+  }
+
+  /** Convenience method to move from another vector, assumes
+   *  that the destination vector is empty. */
+  void move_same_capacity(small_vector&& other) noexcept(
+      std::is_nothrow_move_constructible_v<T> &&
+      std::is_nothrow_destructible_v<T> &&
+      std::is_nothrow_copy_assignable_v<Allocator>) {
+    m_state.setAllocator(other.m_state.getAllocator());
+
+    if (other.is_embedded()) {
+      for (size_t i = 0; i < other.size(); i++) {
+        auto object = std::launder(other.ptr(i));
+        new (ptr(i)) T(std::move(*object));
+        object->~T();
+      }
+      m_state.size = std::exchange(other.m_state.size, size_t(0));
+    } else {
+      m_state.capacity = std::exchange(other.m_state.capacity, N);
+      m_state.size = std::exchange(other.m_state.size, size_t(0));
+      u.m_ptr = std::exchange(other.u.m_ptr, nullptr);
+    }
   }
 
   /** Convenience method to move from another vector, assumes

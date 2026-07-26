@@ -200,29 +200,19 @@ ArgumentEncodingContext::ArgumentEncodingContext(CommandQueue &queue, WMT::Devic
                                 WMTResourceHazardTrackingModeUntracked;
   std::memset(dummy_cbuffer_info_.memory.get(), 0, 65536);
   dummy_cbuffer_ = device.newBuffer(dummy_cbuffer_info_);
-  queue_.AddPersistentResidency(dummy_cbuffer_);
+  dummy_cbuffer_residency_registration_ =
+      queue_.RegisterLifetimeResidency(
+          ResidencyOwnership::Lifetime(dummy_cbuffer_));
   cpu_buffer_chunks_.emplace_back();
   barrier_event_ = device_.newEvent();
 };
 
 ArgumentEncodingContext::~ArgumentEncodingContext() {
+  for (auto &binding : dummy_srv_textures_)
+    binding.residency_registration.reset();
+  dummy_cbuffer_residency_registration_.reset();
   wsi::aligned_free(dummy_cbuffer_host_);
 };
-
-void
-ArgumentEncodingContext::RetirePersistentResidency(
-    uint64_t completed_sequence) {
-  if (persistent_residency_retired_)
-    return;
-  persistent_residency_retired_ = true;
-  queue_.RemovePersistentResidencyAfterCompletion(dummy_cbuffer_,
-                                                   completed_sequence);
-  for (auto &binding : dummy_srv_textures_) {
-    if (binding.texture)
-      queue_.RemovePersistentResidencyAfterCompletion(binding.texture,
-                                                       completed_sequence);
-  }
-}
 
 WMT::Fence
 ArgumentEncodingContext::fenceForEncoder(EncoderId id) {
@@ -230,10 +220,11 @@ ArgumentEncodingContext::fenceForEncoder(EncoderId id) {
   if (!mapping)
     return {};
 
-  const auto slot = *mapping;
-  if (slot >= fence_pool_.size())
-    fence_pool_.resize(slot + 1);
-  auto &fence = fence_pool_[slot];
+  const uint32_t slot = *mapping;
+  auto &bank = fence_pool_banks_[fence_pool_bank_index_];
+  if (slot >= bank.size())
+    bank.resize(slot + 1);
+  auto &fence = bank[slot];
   if (fence)
     return fence;
 
@@ -243,7 +234,7 @@ ArgumentEncodingContext::fenceForEncoder(EncoderId id) {
   const auto marker = env::getEnvVar("DXMT_TEST_FENCE_CREATION_MARKER");
   if (!marker.empty()) {
     if (FILE *file = fopen(marker.c_str(), "a")) {
-      fprintf(file, "%u\n", slot);
+      fprintf(file, "%u %u\n", fence_pool_bank_index_, slot);
       fclose(file);
     }
   }
@@ -254,6 +245,19 @@ FencePoolPreparationResult
 ArgumentEncodingContext::prepareFencePool(
     EncoderData **encoders, unsigned encoder_count,
     CommandBufferDiagnosticInfo *diagnostic_info) {
+  // ---------------------------------------------------------------------------
+  // GPTK barrier/fence model (IDA ResolveBarriers / FlushEncoders / UpdateFence /
+  // DoExecute) mapped onto DXMT deptrack EncoderIds for this command buffer:
+  //
+  // 1) Bind only local producer ids with a later consumer. D3DMetal Metal 4
+  //    builds encoder submission order first, then reuses a bounded set of
+  //    stage-domain fences; interval colouring is the equivalent for DXMT's
+  //    EncoderId dependency representation.
+  //
+  // 2) Wait only on local producer fences (ids updated in this CB).
+  //    Residual EncoderIds from earlier CBs are NOT Metal wait sources —
+  //    DoExecute timeline wait(prev)/signal(next) covers cross-submit order.
+  // ---------------------------------------------------------------------------
   struct FenceInterval {
     EncoderId id;
     uint32_t first;
@@ -261,15 +265,16 @@ ArgumentEncodingContext::prepareFencePool(
   };
   std::vector<FenceInterval> intervals;
   std::unordered_map<EncoderId, size_t> interval_by_id;
-  std::unordered_map<EncoderId, std::vector<uint32_t>>
-      producer_indices_by_id;
+  std::unordered_map<EncoderId, std::vector<uint32_t>> producer_indices_by_id;
+  std::unordered_set<EncoderId> local_update_ids;
   std::unordered_set<EncoderId> consumed_updates;
   FenceDependencyOrderTracker dependency_order;
   FencePoolPreparationResult result = {};
 
-  auto add_updates = [&](const FenceSet &updates, uint32_t index) {
+  auto record_producer = [&](const FenceSet &updates, uint32_t index) {
     updates.forEach([&](EncoderId id) {
       producer_indices_by_id[id].push_back(index);
+      local_update_ids.insert(id);
       if (interval_by_id.contains(id))
         return;
       interval_by_id.emplace(id, intervals.size());
@@ -279,27 +284,38 @@ ArgumentEncodingContext::prepareFencePool(
   auto extend_waits = [&](const FenceSet &waits, uint32_t index) {
     waits.forEach([&](EncoderId id) {
       const auto interval = interval_by_id.find(id);
-      if (interval != interval_by_id.end()) {
-        intervals[interval->second].last =
-            std::max(intervals[interval->second].last, index);
-        consumed_updates.insert(id);
-      }
+      if (interval == interval_by_id.end())
+        return;
+      intervals[interval->second].last =
+          std::max(intervals[interval->second].last, index);
+      consumed_updates.insert(id);
     });
+  };
+  auto collect_updates = [&](const EncoderData *encoder) {
+    FenceSet updates = encoder->fence_update;
+    if (encoder->type == EncoderType::Render)
+      updates.merge(
+          static_cast<const RenderEncoderData *>(encoder)->fence_update_vertex);
+    return updates;
+  };
+  auto collect_waits = [&](const EncoderData *encoder) {
+    FenceSet waits = encoder->fence_wait;
+    if (encoder->type == EncoderType::Render)
+      waits.merge(
+          static_cast<const RenderEncoderData *>(encoder)->fence_wait_vertex);
+    return waits;
   };
 
   for (unsigned i = 0; i < encoder_count; i++) {
     const auto *encoder = encoders[i];
     if (encoder->type == EncoderType::Null)
       continue;
-    FenceSet updates = encoder->fence_update;
-    if (encoder->type == EncoderType::Render)
-      updates.merge(
-          static_cast<const RenderEncoderData *>(encoder)->fence_update_vertex);
-    add_updates(updates, i);
+    const FenceSet updates = collect_updates(encoder);
+    record_producer(updates, i);
     dependency_order.recordUpdates(updates);
   }
   if (has_pending_fence_only_blit_) {
-    add_updates(pending_fence_only_blit_update_, encoder_count);
+    record_producer(pending_fence_only_blit_update_, encoder_count);
     dependency_order.recordUpdates(pending_fence_only_blit_update_);
   }
 
@@ -307,22 +323,17 @@ ArgumentEncodingContext::prepareFencePool(
     const auto *encoder = encoders[i];
     if (encoder->type == EncoderType::Null)
       continue;
-    FenceSet waits = encoder->fence_wait;
-    FenceSet updates = encoder->fence_update;
-    if (encoder->type == EncoderType::Render) {
-      const auto *render = static_cast<const RenderEncoderData *>(encoder);
-      waits.merge(render->fence_wait_vertex);
-      updates.merge(render->fence_update_vertex);
-    }
+    const FenceSet waits = collect_waits(encoder);
+    const FenceSet updates = collect_updates(encoder);
     if (encoder->type == EncoderType::Blit) {
       waits.forEach([&](EncoderId id) {
-        result.external_blit_wait_count += !interval_by_id.contains(id);
+        result.external_blit_wait_count += !local_update_ids.contains(id);
       });
     }
     if (encoder->requires_cross_submit_wait) {
       waits.forEach([&](EncoderId id) {
         result.external_explicit_barrier_wait_count +=
-            !interval_by_id.contains(id);
+            !local_update_ids.contains(id);
       });
     }
     extend_waits(waits, i);
@@ -330,7 +341,7 @@ ArgumentEncodingContext::prepareFencePool(
   }
   if (has_pending_fence_only_blit_) {
     pending_fence_only_blit_wait_.forEach([&](EncoderId id) {
-      result.external_blit_wait_count += !interval_by_id.contains(id);
+      result.external_blit_wait_count += !local_update_ids.contains(id);
     });
     extend_waits(pending_fence_only_blit_wait_, encoder_count);
     dependency_order.analyzeEncoder(pending_fence_only_blit_wait_,
@@ -344,16 +355,68 @@ ArgumentEncodingContext::prepareFencePool(
   std::erase_if(intervals, [&](const auto &interval) {
     return !consumed_updates.contains(interval.id);
   });
-  fence_bindings_.reset(static_cast<uint32_t>(fence_pool_.size()));
+
+  auto &bank = fence_pool_banks_[fence_pool_bank_index_];
+  fence_bindings_.reset(static_cast<uint32_t>(bank.size()));
   uint32_t used_slot_count = 0;
   for (const auto &interval : intervals) {
+    /*
+     * D3DMetal's Metal 4 UpdateFence calls
+     * GetFenceForCurrentCommandBuffer once per stage-domain update (twice for
+     * render: PreRaster and Fragment), moves each returned fence from the free
+     * pool to the current-CB used list, and only returns that whole list after
+     * completion. Reusing one MTLFence for disjoint index intervals is not
+     * equivalent: stage-overlapped render/compute encoders may observe a later
+     * update on the same fence and form a GPU-side cycle.
+     */
     const auto slot =
-        fence_bindings_.bind(interval.id, interval.first, interval.last);
+        fence_bindings_.bindUnique(interval.id, interval.last);
     used_slot_count = std::max(used_slot_count, slot + 1);
   }
+  const uint32_t local_fence_id_count =
+      static_cast<uint32_t>(intervals.size());
 
   if (diagnostic_info &&
-      DebugEnabledEnv("DXMT_DIAG_GPU_HANG_DENSE")) {
+      (DebugEnabledEnv("DXMT_DIAG_GPU_HANG_DENSE") ||
+       DebugEnabledEnv("DXMT_DIAG_ROOT_CAUSE_DENSE") ||
+       DebugEnabledEnv("DXMT_DIAG_ERROR_SNAPSHOT") ||
+       DebugEnabledEnv("DXMT_VALIDATION") ||
+       DebugEnabledEnv("DXMT_DIAG_VALIDATION"))) {
+    struct ResourcePlanAggregate {
+      const EncoderResourcePlanKey *key = nullptr;
+      uint32_t access = 0;
+      uint32_t count = 0;
+      uint64_t hash = 1469598103934665603ull;
+    };
+    std::vector<std::unordered_map<uintptr_t, ResourcePlanAggregate>>
+        resource_plans_by_encoder(encoder_count);
+    for (unsigned i = 0; i < encoder_count; i++) {
+      const auto *encoder = encoders[i];
+      const std::unordered_map<EncoderResourcePlanKey, int,
+                               EncoderResourcePlanKeyHash> *plan = nullptr;
+      if (encoder->type == EncoderType::Render) {
+        plan = &static_cast<const RenderEncoderData *>(encoder)
+                    ->resource_plan_accesses;
+      } else if (encoder->type == EncoderType::Compute) {
+        plan = &static_cast<const ComputeEncoderData *>(encoder)
+                    ->resource_plan_accesses;
+      }
+      if (!plan)
+        continue;
+      auto &aggregates = resource_plans_by_encoder[i];
+      aggregates.reserve(plan->size());
+      for (const auto &[key, access] : *plan) {
+        auto &aggregate = aggregates[key.object];
+        if (!aggregate.key)
+          aggregate.key = &key;
+        aggregate.access |= static_cast<uint32_t>(access);
+        aggregate.count++;
+        aggregate.hash ^= EncoderResourcePlanKeyHash{}(key) +
+                          0x9e3779b97f4a7c15ull +
+                          (aggregate.hash << 6) + (aggregate.hash >> 2);
+      }
+    }
+
     auto record_edge = [&](EncoderId dependency_id, EncoderId consumer_id,
                            uint32_t consumer_index, uint32_t flags,
                            bool want_local) {
@@ -384,6 +447,10 @@ ArgumentEncodingContext::prepareFencePool(
             flags & CommandBufferFenceEdgePreRaster;
         const bool consumer_fragment =
             flags & CommandBufferFenceEdgeFragment;
+        if (producer_vertex)
+          flags |= CommandBufferFenceEdgeProducerPreRaster;
+        if (producer_fragment)
+          flags |= CommandBufferFenceEdgeProducerFragment;
         diagnostic_info->render_valid_cross_stage_count +=
             producer_vertex && consumer_fragment;
         diagnostic_info->render_same_stage_wait_count +=
@@ -406,6 +473,87 @@ ArgumentEncodingContext::prepareFencePool(
       edge.consumer_index = consumer_index;
       edge.slot = fence_bindings_.find(dependency_id).value_or(UINT32_MAX);
       edge.flags = flags;
+      if (!local || producer_index >= encoder_count ||
+          consumer_index >= encoder_count)
+        return;
+
+      const auto &producer_plan =
+          resource_plans_by_encoder[producer_index];
+      const auto &consumer_plan =
+          resource_plans_by_encoder[consumer_index];
+      const auto *smaller = &producer_plan;
+      const auto *larger = &consumer_plan;
+      if (smaller->size() > larger->size())
+        std::swap(smaller, larger);
+      const ResourcePlanAggregate *producer_resource = nullptr;
+      const ResourcePlanAggregate *consumer_resource = nullptr;
+      for (const auto &[object, aggregate] : *smaller) {
+        const auto other = larger->find(object);
+        if (other == larger->end())
+          continue;
+        const auto producer = producer_plan.find(object);
+        const auto consumer = consumer_plan.find(object);
+        if (producer == producer_plan.end() ||
+            consumer == consumer_plan.end())
+          continue;
+        edge.resource_match_count++;
+        edge.resource_match_hash ^=
+            producer->second.hash + 0x9e3779b97f4a7c15ull +
+            (edge.resource_match_hash << 6) +
+            (edge.resource_match_hash >> 2);
+        edge.resource_match_hash ^=
+            consumer->second.hash + 0x9e3779b97f4a7c15ull +
+            (edge.resource_match_hash << 6) +
+            (edge.resource_match_hash >> 2);
+        if (!producer_resource) {
+          producer_resource = &producer->second;
+          consumer_resource = &consumer->second;
+        }
+      }
+      if (!producer_resource || !consumer_resource ||
+          !producer_resource->key || !consumer_resource->key)
+        return;
+
+      const auto &producer_key = *producer_resource->key;
+      const auto &consumer_key = *consumer_resource->key;
+      edge.resource_object = producer_key.object;
+      edge.producer_offset = producer_key.offset;
+      edge.producer_length = producer_key.length;
+      edge.producer_view_id = producer_key.view_id;
+      edge.consumer_offset = consumer_key.offset;
+      edge.consumer_length = consumer_key.length;
+      edge.consumer_view_id = consumer_key.view_id;
+      edge.producer_access = producer_resource->access;
+      edge.consumer_access = consumer_resource->access;
+      edge.producer_stage_kind =
+          static_cast<uint32_t>(producer_key.stage) |
+          (static_cast<uint32_t>(producer_key.kind) << 8);
+      edge.consumer_stage_kind =
+          static_cast<uint32_t>(consumer_key.stage) |
+          (static_cast<uint32_t>(consumer_key.kind) << 8);
+
+      if (producer_key.kind <= 1) {
+        auto *buffer = reinterpret_cast<Buffer *>(producer_key.object);
+        auto *allocation = buffer ? buffer->current() : nullptr;
+        edge.resource_identity = producer_key.object;
+        edge.allocation_object =
+            reinterpret_cast<uintptr_t>(allocation);
+        if (allocation) {
+          edge.metal_resource_handle = allocation->buffer().handle;
+          edge.gpu_address_or_resource_id = allocation->gpuAddress();
+        }
+      } else if (producer_key.kind == 2) {
+        auto *texture = reinterpret_cast<Texture *>(producer_key.object);
+        auto *allocation = texture ? texture->current() : nullptr;
+        edge.resource_identity =
+            texture ? texture->diagnosticIdentity() : 0;
+        edge.allocation_object =
+            reinterpret_cast<uintptr_t>(allocation);
+        if (allocation) {
+          edge.metal_resource_handle = allocation->texture().handle;
+          edge.gpu_address_or_resource_id = allocation->gpuResourceID;
+        }
+      }
     };
     auto record_edges = [&](bool want_local) {
       for (unsigned i = 0; i < encoder_count; i++) {
@@ -445,12 +593,17 @@ ArgumentEncodingContext::prepareFencePool(
         });
       }
     };
-    // Preserve the command-buffer-local dependency graph even when hundreds
-    // of cross-submit waits would otherwise fill the fixed diagnostic array.
+    // Local graph first, then external residuals (diagnostic only — encode
+    // strips external waits via retain_bound below).
     record_edges(true);
     record_edges(false);
   }
 
+  // Waits and updates retain only consumed local producers. External residual
+  // EncoderIds drop — covered by DoExecute timeline, not per-id MTLFence waits.
+  // Same-encoder self-waits (wait id also updated by this encoder) would
+  // deadlock on MTLFence (wait before update); GPTK resolves those as
+  // intrapass memoryBarrier / implicit stage order, not waitForFence.
   auto retain_bound = [&](FenceSet &fences) {
     FenceSet retained;
     fences.forEach([&](EncoderId id) {
@@ -458,6 +611,14 @@ ArgumentEncodingContext::prepareFencePool(
         retained.set(id);
     });
     fences = std::move(retained);
+  };
+  auto strip_self_waits = [&](FenceSet &waits, const FenceSet &updates) {
+    FenceSet retained;
+    waits.forEach([&](EncoderId id) {
+      if (!updates.test(id))
+        retained.set(id);
+    });
+    waits = std::move(retained);
   };
   for (unsigned i = 0; i < encoder_count; i++) {
     auto *encoder = encoders[i];
@@ -469,11 +630,20 @@ ArgumentEncodingContext::prepareFencePool(
       auto *render = static_cast<RenderEncoderData *>(encoder);
       retain_bound(render->fence_wait_vertex);
       retain_bound(render->fence_update_vertex);
+      // Render updates cover both stage ids for self-wait stripping.
+      FenceSet all_updates = render->fence_update;
+      all_updates.merge(render->fence_update_vertex);
+      strip_self_waits(render->fence_wait_vertex, all_updates);
+      strip_self_waits(encoder->fence_wait, all_updates);
+    } else {
+      strip_self_waits(encoder->fence_wait, encoder->fence_update);
     }
   }
   if (has_pending_fence_only_blit_) {
     retain_bound(pending_fence_only_blit_wait_);
     retain_bound(pending_fence_only_blit_update_);
+    strip_self_waits(pending_fence_only_blit_wait_,
+                     pending_fence_only_blit_update_);
   }
 
   const auto &order = dependency_order.analysis();
@@ -484,8 +654,7 @@ ArgumentEncodingContext::prepareFencePool(
     diagnostic_info->same_encoder_fence_wait_count = order.same_encoder_waits;
     diagnostic_info->external_fence_wait_count = order.external_waits;
     diagnostic_info->repeated_fence_update_count = order.repeated_updates;
-    diagnostic_info->local_fence_id_count =
-        static_cast<uint32_t>(intervals.size());
+    diagnostic_info->local_fence_id_count = local_fence_id_count;
     diagnostic_info->bound_fence_slot_count = used_slot_count;
   }
   return result;
@@ -1759,6 +1928,16 @@ DebugEnabledEnv(const char *name) {
 }
 
 static bool
+DebugHangDenseEnabled() {
+  static const bool enabled =
+      DebugEnabledEnv("DXMT_DIAG_GPU_HANG_DENSE") ||
+      DebugEnabledEnv("DXMT_DIAG_ROOT_CAUSE_DENSE") ||
+      DebugEnabledEnv("DXMT_VALIDATION") ||
+      DebugEnabledEnv("DXMT_DIAG_VALIDATION");
+  return enabled;
+}
+
+static bool
 DebugShouldLogArgumentTableSliceCache() {
   static const bool enabled = DebugEnabledEnv("DXMT_DIAG_ARGUMENT_TABLE_CACHE");
   return enabled;
@@ -2182,8 +2361,8 @@ DebugEncodeTexturePointReadback(QueryReadbacks &readbacks, WMT::CommandBuffer cm
 #endif
     return;
   }
-  queue.AddPersistentResidency(buffer);
-  queue.RemovePersistentResidencyAfterCompletion(buffer, seq_id);
+  queue.RetainReplayTemporaryResidencyUntilGpuComplete(
+      ResidencyOwnership::ReplayTemporary(buffer), seq_id);
 
   const auto x = std::min(point_x, width - 1);
   const auto y = std::min(point_y, height - 1);
@@ -2205,35 +2384,52 @@ DebugEncodeTexturePointReadback(QueryReadbacks &readbacks, WMT::CommandBuffer cm
   encoder.endEncoding();
 
   const auto format = texture.pixelFormat();
-  readbacks.diagnostics.push_back(
-       [buffer = WMT::Reference<WMT::Buffer>(buffer), mapped, label = std::string(label),
-       frame_id, seq_id, texture_id = uint64_t(texture), format, width, height,
-       x, y, texel_size, encoder_id, index, level, slice]() {
-        uint8_t bytes[16] = {};
-        const auto copy_size = std::min<uint32_t>(texel_size, sizeof(bytes));
-        std::memcpy(bytes, mapped, copy_size);
-        const uint32_t u32 = uint32_t(bytes[0]) | (uint32_t(bytes[1]) << 8) |
-                             (uint32_t(bytes[2]) << 16) | (uint32_t(bytes[3]) << 24);
-        INFO("DXMT diagnostic: texture readback",
-             " label=", label,
-             " frame=", frame_id,
-             " seq=", seq_id,
-             " encoder=", encoder_id,
-             " index=", index,
-             " texture=", texture_id,
-             " format=", uint32_t(format),
-             " size=", width, "x", height,
-             " level=", uint32_t(level),
-             " slice=", uint32_t(slice),
-             " xy=", x, ",", y,
-             " texelSize=", texel_size,
-             " bytes=", uint32_t(bytes[0]), ",", uint32_t(bytes[1]), ",",
-             uint32_t(bytes[2]), ",", uint32_t(bytes[3]),
-             " u32=", u32);
-#ifdef __i386__
-        wsi::aligned_free(mapped);
-#endif
-      });
+  TexturePointDiagnosticReadback readback(buffer, mapped);
+  readback.label = label;
+  readback.frame_id = frame_id;
+  readback.seq_id = seq_id;
+  readback.texture_id = uint64_t(texture);
+  readback.format = uint32_t(format);
+  readback.width = width;
+  readback.height = height;
+  readback.x = x;
+  readback.y = y;
+  readback.texel_size = texel_size;
+  readback.encoder_id = encoder_id;
+  readback.index = index;
+  readback.level = level;
+  readback.slice = slice;
+  readbacks.diagnostics.emplace_back(std::move(readback));
+}
+
+void
+ExecuteDiagnosticReadback(
+    TexturePointDiagnosticReadback &readback) noexcept {
+  dxmt::invokeNoexcept("texture diagnostic readback", [&readback]() {
+    uint8_t bytes[16] = {};
+    const auto copy_size =
+        std::min<uint32_t>(readback.texel_size, sizeof(bytes));
+    std::memcpy(bytes, readback.mapped(), copy_size);
+    const uint32_t u32 =
+        uint32_t(bytes[0]) | (uint32_t(bytes[1]) << 8) |
+        (uint32_t(bytes[2]) << 16) | (uint32_t(bytes[3]) << 24);
+    INFO("DXMT diagnostic: texture readback",
+         " label=", readback.label,
+         " frame=", readback.frame_id,
+         " seq=", readback.seq_id,
+         " encoder=", readback.encoder_id,
+         " index=", readback.index,
+         " texture=", readback.texture_id,
+         " format=", readback.format,
+         " size=", readback.width, "x", readback.height,
+         " level=", uint32_t(readback.level),
+         " slice=", uint32_t(readback.slice),
+         " xy=", readback.x, ",", readback.y,
+         " texelSize=", readback.texel_size,
+         " bytes=", uint32_t(bytes[0]), ",", uint32_t(bytes[1]), ",",
+         uint32_t(bytes[2]), ",", uint32_t(bytes[3]),
+         " u32=", u32);
+  });
 }
 
 static void
@@ -2877,6 +3073,144 @@ DebugSummarizeBlitCommands(const wmtcmd_blit_nop *cmd_head) {
   return summary;
 }
 
+/* One-shot Invalid Resource forensics: dump every blit command's Metal handles.
+ * Enabled under hang-dense / validation only. Never alters encoding. */
+static void
+DebugLogBlitCommandsForHang(uint64_t frame_id, uint64_t seq_id, uint64_t encoder_id,
+                            const DebugBlitCommandSummary &summary,
+                            const wmtcmd_blit_nop *cmd_head) {
+  if (!DebugHangDenseEnabled() || !cmd_head)
+    return;
+  WARN("DXMT hang-diag blit encoder:"
+       " frame=", frame_id,
+       " seq=", seq_id,
+       " encoderId=", encoder_id,
+       " cmds=", summary.command_count,
+       " b2b=", summary.copy_buffer_to_buffer,
+       " b2t=", summary.copy_buffer_to_texture,
+       " t2t=", summary.copy_texture_to_texture,
+       " t2b=", summary.copy_texture_to_buffer,
+       " fill=", summary.fills,
+       " mip=", summary.generate_mipmaps,
+       " waitFence=", summary.wait_fences,
+       " updateFence=", summary.update_fences);
+  uint32_t index = 0;
+  auto command = reinterpret_cast<const wmtcmd_base *>(cmd_head->next.ptr);
+  while (command) {
+    switch (static_cast<WMTBlitCommandType>(command->type)) {
+    case WMTBlitCommandCopyFromBufferToBuffer: {
+      const auto *c =
+          reinterpret_cast<const wmtcmd_blit_copy_from_buffer_to_buffer *>(
+              command);
+      WARN("DXMT hang-diag blit cmd:"
+           " frame=", frame_id, " seq=", seq_id, " encoderId=", encoder_id,
+           " idx=", index, " kind=b2b",
+           " src=", uint64_t(c->src), " srcOff=", c->src_offset,
+           " dst=", uint64_t(c->dst), " dstOff=", c->dst_offset,
+           " len=", c->copy_length,
+           " nullSrc=", c->src ? 0u : 1u, " nullDst=", c->dst ? 0u : 1u);
+      break;
+    }
+    case WMTBlitCommandCopyFromBufferToTexture: {
+      const auto *c =
+          reinterpret_cast<const wmtcmd_blit_copy_from_buffer_to_texture *>(
+              command);
+      WARN("DXMT hang-diag blit cmd:"
+           " frame=", frame_id, " seq=", seq_id, " encoderId=", encoder_id,
+           " idx=", index, " kind=b2t",
+           " srcBuf=", uint64_t(c->src), " srcOff=", c->src_offset,
+           " rowPitch=", c->bytes_per_row, " imagePitch=", c->bytes_per_image,
+           " size=", c->size.width, "x", c->size.height, "x", c->size.depth,
+           " dstTex=", uint64_t(c->dst),
+           " slice=", c->slice, " level=", c->level,
+           " origin=", c->origin.x, ",", c->origin.y, ",", c->origin.z,
+           " nullSrc=", c->src ? 0u : 1u, " nullDst=", c->dst ? 0u : 1u);
+      break;
+    }
+    case WMTBlitCommandCopyFromTextureToBuffer: {
+      const auto *c =
+          reinterpret_cast<const wmtcmd_blit_copy_from_texture_to_buffer *>(
+              command);
+      WARN("DXMT hang-diag blit cmd:"
+           " frame=", frame_id, " seq=", seq_id, " encoderId=", encoder_id,
+           " idx=", index, " kind=t2b",
+           " srcTex=", uint64_t(c->src),
+           " slice=", c->slice, " level=", c->level,
+           " origin=", c->origin.x, ",", c->origin.y, ",", c->origin.z,
+           " size=", c->size.width, "x", c->size.height, "x", c->size.depth,
+           " dstBuf=", uint64_t(c->dst), " dstOff=", c->offset,
+           " rowPitch=", c->bytes_per_row, " imagePitch=", c->bytes_per_image,
+           " nullSrc=", c->src ? 0u : 1u, " nullDst=", c->dst ? 0u : 1u);
+      break;
+    }
+    case WMTBlitCommandCopyFromTextureToTexture: {
+      const auto *c =
+          reinterpret_cast<const wmtcmd_blit_copy_from_texture_to_texture *>(
+              command);
+      WARN("DXMT hang-diag blit cmd:"
+           " frame=", frame_id, " seq=", seq_id, " encoderId=", encoder_id,
+           " idx=", index, " kind=t2t",
+           " srcTex=", uint64_t(c->src),
+           " srcSlice=", c->src_slice, " srcLevel=", c->src_level,
+           " srcOrigin=", c->src_origin.x, ",", c->src_origin.y, ",",
+           c->src_origin.z,
+           " size=", c->src_size.width, "x", c->src_size.height, "x",
+           c->src_size.depth,
+           " dstTex=", uint64_t(c->dst),
+           " dstSlice=", c->dst_slice, " dstLevel=", c->dst_level,
+           " dstOrigin=", c->dst_origin.x, ",", c->dst_origin.y, ",",
+           c->dst_origin.z,
+           " nullSrc=", c->src ? 0u : 1u, " nullDst=", c->dst ? 0u : 1u);
+      break;
+    }
+    case WMTBlitCommandFillBuffer: {
+      const auto *c =
+          reinterpret_cast<const wmtcmd_blit_fillbuffer *>(command);
+      WARN("DXMT hang-diag blit cmd:"
+           " frame=", frame_id, " seq=", seq_id, " encoderId=", encoder_id,
+           " idx=", index, " kind=fill",
+           " buf=", uint64_t(c->buffer), " off=", c->offset, " len=", c->length,
+           " value=", uint32_t(c->value),
+           " nullBuf=", c->buffer ? 0u : 1u);
+      break;
+    }
+    case WMTBlitCommandGenerateMipmaps: {
+      const auto *c =
+          reinterpret_cast<const wmtcmd_blit_generate_mipmaps *>(command);
+      WARN("DXMT hang-diag blit cmd:"
+           " frame=", frame_id, " seq=", seq_id, " encoderId=", encoder_id,
+           " idx=", index, " kind=mip",
+           " tex=", uint64_t(c->texture),
+           " nullTex=", c->texture ? 0u : 1u);
+      break;
+    }
+    case WMTBlitCommandWaitForFence:
+    case WMTBlitCommandUpdateFence: {
+      const auto *c =
+          reinterpret_cast<const wmtcmd_blit_fence_op *>(command);
+      WARN("DXMT hang-diag blit cmd:"
+           " frame=", frame_id, " seq=", seq_id, " encoderId=", encoder_id,
+           " idx=", index,
+           " kind=",
+           (static_cast<WMTBlitCommandType>(command->type) ==
+            WMTBlitCommandWaitForFence)
+               ? "waitFence"
+               : "updateFence",
+           " fence=", uint64_t(c->fence),
+           " nullFence=", c->fence ? 0u : 1u);
+      break;
+    }
+    default:
+      WARN("DXMT hang-diag blit cmd:"
+           " frame=", frame_id, " seq=", seq_id, " encoderId=", encoder_id,
+           " idx=", index, " kind=other type=", uint32_t(command->type));
+      break;
+    }
+    index++;
+    command = static_cast<const wmtcmd_base *>(command->next.ptr);
+  }
+}
+
 static void
 DebugLogRenderPassInfo(uint64_t frame_id, uint64_t seq_id, uint64_t encoder_id,
                        const RenderEncoderData *data,
@@ -3469,7 +3803,9 @@ ArgumentEncodingContext::dummySRVTexture(const MTL_SM50_SHADER_ARGUMENT &arg) {
     );
     return binding;
   }
-  queue_.AddPersistentResidency(binding.texture);
+  binding.residency_registration =
+      queue_.RegisterLifetimeResidency(
+          ResidencyOwnership::Lifetime(binding.texture));
 
   if (format != DummyTextureFormat::Depth && info.sample_count == 1) {
     std::array<uint32_t, 4> zero = {};
@@ -4102,6 +4438,7 @@ ArgumentEncodingContext::startBlitPass() {
 void
 ArgumentEncodingContext::endPass() {
   assert(encoder_current);
+  noteCurrentEncoderD3DSequence();
 
   if (FenceOnlyBlitOptimizationEnabled()) {
     if (tryDeferFenceOnlyBlitPass(encoder_current)) {
@@ -4181,22 +4518,21 @@ ArgumentEncodingContext::endPass() {
     }
   }
 
-  // Resource dependencies are established when each access is appended. Only
-  // attempt a constant-time merge with the immediately preceding encoder;
-  // unrelated work remains in submission order and no flush-time relation
-  // search is required.
-  if (encoder_last != &encoder_head) {
-    checkEncoderRelation(encoder_last, encoder_current);
-    if (encoder_current->type == EncoderType::Null) {
-      encoder_current = nullptr;
-      return;
-    }
-  }
-
   encoder_last->next = encoder_current;
   encoder_last = encoder_current;
   encoder_current = nullptr;
   encoder_count_++;
+}
+
+void
+ArgumentEncodingContext::noteCurrentEncoderD3DSequence() {
+  assert(encoder_current);
+  uint64_t sequence = dxmt::apitrace::current_d3d_sequence();
+  if (!sequence)
+    sequence = seq_id_;
+  if (!encoder_current->diagnostic_d3d_sequence_begin)
+    encoder_current->diagnostic_d3d_sequence_begin = sequence;
+  encoder_current->diagnostic_d3d_sequence_end = sequence;
 }
 
 std::pair<WMT::Buffer, size_t>
@@ -4355,39 +4691,199 @@ ArgumentEncodingContext::resolveComputePassBarrier() {
   }
 }
 
+bool
+ArgumentEncodingContext::trackerRequiresReverseRenderPassBoundary(
+    GenericAccessTracker &tracker, int flags) {
+  assert(encoder_current);
+  assert(encoder_current->type == EncoderType::Render);
+  tracker.ensureGeneration(access_tracker_generation_);
+  return tracker.wouldRequireFragmentToPreRasterBoundary(
+      static_cast<RenderEncoderData *>(encoder_current)->encoder_id_vertex,
+      flags);
+}
+
+bool
+ArgumentEncodingContext::requiresReverseRenderPassBoundary(
+    Rc<Buffer> const &buffer, int flags) {
+  if (!buffer)
+    return false;
+  auto *allocation = buffer->current();
+  if (!allocation ||
+      allocation->flags().test(BufferAllocationFlag::GpuReadonly))
+    return false;
+  const auto suballocation = allocation->currentSuballocation();
+  if (suballocation >= allocation->fenceTrackers.size())
+    return false;
+  return trackerRequiresReverseRenderPassBoundary(
+      allocation->fenceTrackers[suballocation], flags);
+}
+
+bool
+ArgumentEncodingContext::requiresReverseRenderPassBoundary(
+    Rc<Texture> const &texture, unsigned level, unsigned slice, int flags) {
+  if (!texture)
+    return false;
+  auto *allocation = texture->current();
+  if (!allocation ||
+      allocation->flags().test(TextureAllocationFlag::GpuReadonly))
+    return false;
+  if (allocation->fenceTrackers.empty())
+    return false;
+  if (allocation->flags().test(TextureAllocationFlag::ShaderReadonly)) {
+    return trackerRequiresReverseRenderPassBoundary(
+        allocation->fenceTrackers[0], flags);
+  }
+  const auto mip_count = allocation->descriptor->miplevelCount();
+  const uint64_t tracker_index = uint64_t(slice) * mip_count + level;
+  if (level >= mip_count ||
+      tracker_index >= allocation->fenceTrackers.size()) {
+    return trackerRequiresReverseRenderPassBoundary(
+        allocation->fenceTrackers[0], flags);
+  }
+  return trackerRequiresReverseRenderPassBoundary(
+      allocation->fenceTrackers[tracker_index], flags);
+}
+
+bool
+ArgumentEncodingContext::requiresReverseRenderPassBoundary(
+    Rc<Texture> const &texture, uint64_t view_id, int flags) {
+  if (!texture || !view_id)
+    return false;
+  auto *allocation = texture->current();
+  if (!allocation ||
+      allocation->flags().test(TextureAllocationFlag::GpuReadonly))
+    return false;
+  if (allocation->fenceTrackers.empty())
+    return false;
+  if (allocation->flags().test(TextureAllocationFlag::ShaderReadonly)) {
+    return trackerRequiresReverseRenderPassBoundary(
+        allocation->fenceTrackers[0], flags);
+  }
+  const TextureViewKey key = view_id;
+  const auto mip_count = allocation->descriptor->miplevelCount();
+  for (unsigned slice = key.array_start; slice < key.array_end; ++slice) {
+    for (unsigned level = key.mip_start; level < key.mip_end; ++level) {
+      const uint64_t tracker_index = uint64_t(slice) * mip_count + level;
+      if (level >= mip_count ||
+          tracker_index >= allocation->fenceTrackers.size()) {
+        return trackerRequiresReverseRenderPassBoundary(
+            allocation->fenceTrackers[0], flags);
+      }
+      if (trackerRequiresReverseRenderPassBoundary(
+              allocation->fenceTrackers[tracker_index], flags))
+        return true;
+    }
+  }
+  return false;
+}
+
+void
+ArgumentEncodingContext::splitRenderPassForReverseStage() {
+  assert(encoder_current);
+  assert(encoder_current->type == EncoderType::Render);
+  auto *former = static_cast<RenderEncoderData *>(encoder_current);
+  const EncoderId fragment_producer = former->id;
+
+  // Snapshot pass topology before endPass moves the encoder into the list.
+  const uint8_t dsv_planar = former->dsv_planar_flags;
+  const uint8_t dsv_readonly = former->dsv_readonly_flags;
+  const uint8_t rt_count = former->render_target_count;
+  const uint64_t argbuf_size =
+      former->argbuf_slice.length
+          ? former->argbuf_slice.length
+          : 65536ull;
+  const auto colors = former->colors;
+  const auto depth = former->depth;
+  const auto stencil = former->stencil;
+  const uint32_t width = former->render_target_width;
+  const uint32_t height = former->render_target_height;
+  const uint16_t array_length = former->render_target_array_length;
+  const uint8_t sample_count = former->default_raster_sample_count;
+  const bool use_geometry = former->use_geometry;
+  const bool use_tessellation = former->use_tessellation;
+  const bool use_visibility = former->use_visibility_result;
+  const auto tile_key = former->tile_barrier_pso_key;
+
+  // Clear reverse bit so endPass/track does not re-enter.
+  former->barrier_state.barrierPreRasterAfterFragmentSet = 0;
+
+  endPass(); // UpdateFence(Fragment) on former pass
+
+  auto *reopen = startRenderPass(dsv_planar, dsv_readonly, rt_count, argbuf_size);
+  reopen->colors = colors;
+  reopen->depth = depth;
+  reopen->stencil = stencil;
+  // Re-open mid-frame: always load previous contents.
+  for (auto &color : reopen->colors) {
+    if (color.attachment)
+      color.load_action = WMTLoadActionLoad;
+  }
+  if (reopen->depth.attachment)
+    reopen->depth.load_action = WMTLoadActionLoad;
+  if (reopen->stencil.attachment)
+    reopen->stencil.load_action = WMTLoadActionLoad;
+  reopen->render_target_width = width;
+  reopen->render_target_height = height;
+  reopen->render_target_array_length = array_length;
+  reopen->default_raster_sample_count = sample_count;
+  reopen->use_geometry = use_geometry;
+  reopen->use_tessellation = use_tessellation;
+  reopen->use_visibility_result = use_visibility;
+  reopen->tile_barrier_pso_key = tile_key;
+  reopen->prevent_merge_with_previous = true;
+  // Preserve the Fragment producer even for a late fallback split. Preflight
+  // callers publish the resource access only after reopening and therefore
+  // establish the same edge through deptrack; FenceSet deduplicates it.
+  reopen->fence_wait_vertex.set(fragment_producer);
+}
+
 void
 ArgumentEncodingContext::resolveRenderPassBarrier() {
   assert(encoder_current);
   assert(encoder_current->type == EncoderType::Render);
   auto &barrier_state = encoder_current->barrier_state;
+  // GPTK SynchroniseStages / EncodeBarrier (memoryBarrier):
+  // Metal barrierAfterEncoderStages:after beforeEncoderStages:before —
+  // after = producers that must complete, before = consumers that wait.
+  //
+  // Metal4 debug rejects reverse-stage barriers with afterEncoderStages that
+  // include Fragment ("must be Vertex|Object|Mesh"). Classic Metal3 allows
+  // reverse memoryBarrier; Metal4 requires flush-first (split pass + fence).
   if (barrier_state.barrierPreRasterAfterFragmentSet & ~intrapass_barrier_control_bits_) {
+#if DXMT_DX12_METAL4
+    splitRenderPassForReverseStage();
+#else
     auto &cmd = encodeRenderCommand<wmtcmd_render_memory_barrier>();
     cmd.type = WMTRenderCommandMemoryBarrier;
     cmd.scope = WMTBarrierScopeBuffers | WMTBarrierScopeTextures;
-    cmd.stages_before = WMTRenderStageFragment;
-    cmd.stages_after = WMTRenderStagePreRaster;
+    cmd.stages_after = WMTRenderStageFragment;   // producers complete
+    cmd.stages_before = WMTRenderStagePreRaster; // consumers wait
     barrier_state.barrierPreRasterAfterFragmentSet = 0;
+#endif
   }
-  // Individual barriers
-  if (barrier_state.barrierSet & ~intrapass_barrier_control_bits_) {
+  // Individual barriers (encoder still open after optional reverse split)
+  if (!encoder_current || encoder_current->type != EncoderType::Render)
+    return;
+  auto &state = encoder_current->barrier_state;
+  if (state.barrierSet & ~intrapass_barrier_control_bits_) {
     tile_barrier_cmd.dispatch();
-    barrier_state.barrierSet = 0;
+    state.barrierSet = 0;
   }
-  if (barrier_state.barrierPreRasterSet & ~intrapass_barrier_control_bits_) {
+  if (state.barrierPreRasterSet & ~intrapass_barrier_control_bits_) {
     auto &cmd = encodeRenderCommand<wmtcmd_render_memory_barrier>();
     cmd.type = WMTRenderCommandMemoryBarrier;
     cmd.scope = WMTBarrierScopeBuffers | WMTBarrierScopeTextures;
     cmd.stages_before = WMTRenderStagePreRaster;
     cmd.stages_after = WMTRenderStagePreRaster;
-    barrier_state.barrierPreRasterSet = 0;
+    state.barrierPreRasterSet = 0;
   }
-  if (barrier_state.barrierFragmentAfterPreRasterSet & ~intrapass_barrier_control_bits_) {
+  if (state.barrierFragmentAfterPreRasterSet & ~intrapass_barrier_control_bits_) {
     auto &cmd = encodeRenderCommand<wmtcmd_render_memory_barrier>();
     cmd.type = WMTRenderCommandMemoryBarrier;
     cmd.scope = WMTBarrierScopeBuffers | WMTBarrierScopeTextures;
-    cmd.stages_before = WMTRenderStageFragment;
-    cmd.stages_after = WMTRenderStagePreRaster;
-    barrier_state.barrierFragmentAfterPreRasterSet = 0;
+    cmd.stages_after = WMTRenderStagePreRaster; // producers complete
+    cmd.stages_before = WMTRenderStageFragment; // consumers wait
+    state.barrierFragmentAfterPreRasterSet = 0;
   }
 }
 
@@ -4552,8 +5048,18 @@ ArgumentEncodingContext::flushCommands(
     perf.collect += clock::now() - t0;
   }
 
+  {
+    const auto t0 = clock::now();
+    planEncoderSubmissionOrder(encoders, encoder_count);
+    perf.relation += clock::now() - t0;
+  }
+
   if (diagnostic_info &&
-      DebugEnabledEnv("DXMT_DIAG_GPU_HANG_DENSE")) {
+      (DebugEnabledEnv("DXMT_DIAG_GPU_HANG_DENSE") ||
+       DebugEnabledEnv("DXMT_DIAG_ROOT_CAUSE_DENSE") ||
+       DebugEnabledEnv("DXMT_DIAG_ERROR_SNAPSHOT") ||
+       DebugEnabledEnv("DXMT_VALIDATION") ||
+       DebugEnabledEnv("DXMT_DIAG_VALIDATION"))) {
     constexpr uint64_t kFenceHashOffset = 1469598103934665603ull;
     constexpr uint64_t kFenceHashPrime = 1099511628211ull;
     auto hash_fence = [&](EncoderId id, uint64_t domain, uint64_t &hash,
@@ -4586,6 +5092,10 @@ ArgumentEncodingContext::flushCommands(
       entry.encoder_id = encoder->id;
       entry.encoder_index = i;
       entry.type = static_cast<uint32_t>(encoder->type);
+      entry.d3d_sequence_begin =
+          encoder->diagnostic_d3d_sequence_begin;
+      entry.d3d_sequence_end =
+          encoder->diagnostic_d3d_sequence_end;
       entry.wait_hash = kFenceHashOffset;
       entry.update_hash = kFenceHashOffset;
       entry.resource_plan_hash = kFenceHashOffset;
@@ -4755,12 +5265,11 @@ ArgumentEncodingContext::flushCommands(
         device_, seqId, count, pending_queries_
     );
     auto visibility_buffer = readbacks.visibility->visibility_result_heap;
-    queue_.AddPersistentResidency(visibility_buffer);
+    auto visibility_residency =
+        queue_.RegisterLifetimeResidency(
+            ResidencyOwnership::Lifetime(visibility_buffer));
     readbacks.visibility->setResidencyRetirement(
-        [queue = &queue_, visibility_buffer, seqId]() {
-          queue->RemovePersistentResidencyAfterCompletion(
-              visibility_buffer, seqId);
-        });
+        std::move(visibility_residency));
   }
   std::erase_if(pending_queries_, [=](auto &query) -> bool { return query->queryEndAt() == seqId; });
     perf.queries += clock::now() - t0;
@@ -4772,33 +5281,49 @@ ArgumentEncodingContext::flushCommands(
     perf.timestamp += clock::now() - t0;
   }
 
+  // Isolate MTLFence objects for this command-buffer generation. Banks contain
+  // only the peak number of overlapping dependency intervals, not one fence
+  // per encoder.
+  fence_pool_bank_index_ =
+      static_cast<uint32_t>(event_seq_id % kFencePoolBanks);
+
   const auto fence_preparation =
       prepareFencePool(encoders, encoder_count, diagnostic_info);
-  static const bool force_cross_submit_wait = [] {
-    const auto value = env::getEnvVar("DXMT_CROSS_SUBMIT_FENCE_WAIT");
-    return value == "1" || value == "true" || value == "yes" || value == "on";
-  }();
-  // Blit consumers and encoders carrying an explicit cross-submit UAV barrier
-  // require an event edge when their producer lives in an earlier command
-  // buffer. Relying on commit order alone can lose either copied results or UAV
-  // visibility under concurrent execution. Keep ordinary render/compute-only
-  // external edges on the non-serializing default path that avoids the FH4 UI
-  // regression which motivated 8a8f1d1a. The environment override retains the
-  // former all-external-edge behavior for diagnostics.
-  const bool encode_cross_submit_wait =
-      fence_preparation.external_blit_wait_count ||
-      fence_preparation.external_explicit_barrier_wait_count ||
-      (force_cross_submit_wait && fence_preparation.external_wait_count);
-  if (encode_cross_submit_wait && event_seq_id > 1)
-    cmdbuf.encodeWaitForEvent(queue_.event, event_seq_id - 1);
+  // ---------------------------------------------------------------------------
+  // Cross-submit — GPTK DoExecute only (no residual EncoderId waits)
+  //
+  // prepareFencePool already dropped non-local wait EncoderIds. Cross-submit
+  // order is solely:
+  //   EncodeWaitMTL4(prev) → commit → signal(prev+1)
+  // EncodeWaitMTL4: if (value <= completed) skip.
+  // ---------------------------------------------------------------------------
+  bool encoded_cross_submit_wait = false;
+  bool skipped_wait_as_complete = false;
+  if (event_seq_id > 1) {
+    const uint64_t wait_value = event_seq_id - 1;
+    const uint64_t completed = queue_.SignaledEventSeqId();
+    if (wait_value > completed) {
+      cmdbuf.encodeWaitForEvent(queue_.event, wait_value);
+      encoded_cross_submit_wait = true;
+    } else {
+      skipped_wait_as_complete = true;
+    }
+  }
   if (diagnostic_info) {
+    // Residual external deptrack edges are never encoded as MTLFence waits;
+    // report them only when the timeline wait was skipped-as-complete (or no
+    // previous value). When a Metal timeline wait ran, residual is covered.
     diagnostic_info->skipped_external_fence_wait_count =
-        encode_cross_submit_wait ? 0 : fence_preparation.external_wait_count;
+        encoded_cross_submit_wait
+            ? 0
+            : fence_preparation.external_wait_count;
+    (void)skipped_wait_as_complete;
+    (void)fence_preparation.external_blit_wait_count;
+    (void)fence_preparation.external_explicit_barrier_wait_count;
   }
 
-  // Report and benchmark only the fence operations that will reach Metal.
-  // Encoder construction gives every producer a logical update, but an update
-  // with no consumer in this command buffer carries no dependency.
+  // Fence ops that remain after prepareFencePool (local waits + always-signal
+  // updates) are what reach Metal.
   perf.fenceWaits = 0;
   perf.fenceUpdates = 0;
   for (unsigned i = 0; i < encoder_count; i++) {
@@ -4915,7 +5440,11 @@ ArgumentEncodingContext::flushCommands(
       auto encoder = cmdbuf.renderCommandEncoder(render_pass_info);
       data->fence_wait.forEach(
           data->fence_wait_vertex, // if a fence is waited pre-raster, no need to wait again at fragment
-          [&](auto id) { withFence(id, [&](auto fence) { encoder.waitForFence(fence, WMTRenderStagePreRaster); }); },
+          [&](auto id) {
+            withFence(id, [&](auto fence) {
+              encoder.waitForFence(fence, WMTRenderStageGptkPreRasterFence);
+            });
+          },
           [&](auto id) { withFence(id, [&](auto fence) { encoder.waitForFence(fence, WMTRenderStageFragment); }); }
       );
       if (data->argbuf_slice.length) {
@@ -4937,17 +5466,27 @@ ArgumentEncodingContext::flushCommands(
         encoder.setArgumentBuffer(gpu_buffer_, 0, 29, WMTRenderStageMesh);
         encoder.setArgumentBuffer(gpu_buffer_, 0, 30, WMTRenderStageMesh);
       }
-      auto abort_unmapped_marshal_buffer = [&](const char *kind) {
-        WARN("RenderPass guard: skipped pass after ", kind,
-             " marshal argument-buffer allocation failed encoder=", data->id);
+      // D3DMetal UpdateFence (IDA): render pops TWO distinct MTLFences —
+      // update fenceA after Vertex|Mesh (17), fenceB after Fragment (2).
+      // DXMT maps fenceA↔encoder_id_vertex, fenceB↔encoder_id.
+      auto update_stage_fences = [&](WMT::RenderCommandEncoder enc) {
         data->fence_update_vertex.forEach(
             data->fence_update,
             [&](auto id) {
-              withFence(id, [&](auto fence) { encoder.updateFence(fence, WMTRenderStageFragment); });
+              withFence(id, [&](auto fence) {
+                enc.updateFence(fence, WMTRenderStageFragment);
+              });
             },
             [&](auto id) {
-              withFence(id, [&](auto fence) { encoder.updateFence(fence, WMTRenderStagePreRaster); });
+              withFence(id, [&](auto fence) {
+                enc.updateFence(fence, WMTRenderStageGptkPreRasterFence);
+              });
             });
+      };
+      auto abort_unmapped_marshal_buffer = [&](const char *kind) {
+        WARN("RenderPass guard: skipped pass after ", kind,
+             " marshal argument-buffer allocation failed encoder=", data->id);
+        update_stage_fences(encoder);
         encoder.endEncoding();
         data->~RenderEncoderData();
         perf.skippedRender++;
@@ -5057,11 +5596,7 @@ ArgumentEncodingContext::flushCommands(
           " mesh=" + std::to_string(command_summary.mesh_draws) +
           " tile=" + std::to_string(command_summary.tile_dispatches)));
       encoder.encodeCommands(&data->cmd_head);
-      data->fence_update_vertex.forEach(
-          data->fence_update, // if a fence is updated at fragment, no need to update again pre-raster
-          [&](auto id) { withFence(id, [&](auto fence) { encoder.updateFence(fence, WMTRenderStageFragment); }); },
-          [&](auto id) { withFence(id, [&](auto fence) { encoder.updateFence(fence, WMTRenderStagePreRaster); }); }
-      );
+      update_stage_fences(encoder);
       encoder.endEncoding();
       DebugEncodeRenderAttachmentReadbacks(readbacks, cmdbuf, device_, queue_,
                                            frame_id_,
@@ -5163,6 +5698,8 @@ ArgumentEncodingContext::flushCommands(
       }
       DebugAccumulateBlitPass(currentFrameStatistics(), data);
       auto command_summary = DebugSummarizeBlitCommands(&data->cmd_head);
+      DebugLogBlitCommandsForHang(currentFrameId(), seqId, data->id,
+                                  command_summary, &data->cmd_head);
       auto encoder = cmdbuf.blitCommandEncoder();
       encoder.setLabel(DebugEncoderLabel(
           "BlitPass id=" + std::to_string(data->id) +
@@ -5449,11 +5986,38 @@ ArgumentEncodingContext::flushCommands(
 #if DXMT_DX12_METAL4
       if (auto readback = readbacks.timestamp.get()) {
         auto timestamp_context = readback->timestampContext();
+        if (DebugHangDenseEnabled()) {
+          WARN("DXMT hang-diag sample-timestamp encoder:"
+               " frame=", currentFrameId(),
+               " seq=", seqId,
+               " queryCount=", data->queries.size(),
+               " readbackIndex=", data->readback_index,
+               " hasContext=", timestamp_context ? 1u : 0u);
+        }
+        uint32_t sample_i = 0;
         for (const auto &query : data->queries) {
           auto heap = query->resolveHeap();
-          if (heap && query->sampleIndex() != ~0ull)
-            timestamp_context.writeTimestamp(cmdbuf, heap, query->sampleIndex());
+          const uint64_t sample_index = query->sampleIndex();
+          if (DebugHangDenseEnabled()) {
+            WARN("DXMT hang-diag sample-timestamp write:"
+                 " frame=", currentFrameId(),
+                 " seq=", seqId,
+                 " i=", sample_i,
+                 " heap=", uint64_t(heap),
+                 " index=", sample_index,
+                 " nullHeap=", heap ? 0u : 1u,
+                 " invalidIndex=", (sample_index == ~0ull) ? 1u : 0u);
+          }
+          if (heap && sample_index != ~0ull)
+            timestamp_context.writeTimestamp(cmdbuf, heap, sample_index);
+          sample_i++;
         }
+      } else if (DebugHangDenseEnabled()) {
+        WARN("DXMT hang-diag sample-timestamp encoder:"
+             " frame=", currentFrameId(),
+             " seq=", seqId,
+             " reason=no-timestamp-readback"
+             " queryCount=", data->queries.size());
       }
 #else
       if (auto readback = readbacks.timestamp.get(); readback->sampleBuffer()) {
@@ -5497,13 +6061,36 @@ ArgumentEncodingContext::flushCommands(
     case EncoderType::ResolveTimestamp: {
       auto data = static_cast<ResolveTimestampData *>(current);
 #if DXMT_DX12_METAL4
+      if (DebugHangDenseEnabled()) {
+        WARN("DXMT hang-diag resolve-timestamp encoder:"
+             " frame=", currentFrameId(),
+             " seq=", seqId,
+             " rangeCount=", data->ranges.size());
+      }
+      uint32_t range_i = 0;
       for (const auto &range : data->ranges) {
-        if (!range.src_heap)
-          continue;
-        cmdbuf.resolveCounterHeap(
-            WMT::CounterHeap(range.src_heap), range.start_index,
-            range.query_count, range.dst_buffer, range.dst_offset,
-            range.dst_length);
+        if (DebugHangDenseEnabled()) {
+          WARN("DXMT hang-diag resolve-timestamp range:"
+               " frame=", currentFrameId(),
+               " seq=", seqId,
+               " i=", range_i,
+               " srcHeap=", uint64_t(range.src_heap),
+               " start=", range.start_index,
+               " count=", range.query_count,
+               " end=", range.start_index + range.query_count,
+               " dstBuf=", uint64_t(range.dst_buffer),
+               " dstOff=", range.dst_offset,
+               " dstLen=", range.dst_length,
+               " nullHeap=", range.src_heap ? 0u : 1u,
+               " nullDst=", range.dst_buffer ? 0u : 1u);
+        }
+        if (range.src_heap) {
+          cmdbuf.resolveCounterHeap(
+              WMT::CounterHeap(range.src_heap), range.start_index,
+              range.query_count, range.dst_buffer, range.dst_offset,
+              range.dst_length);
+        }
+        range_i++;
       }
 #else
       if (auto readback = readbacks.timestamp.get()) {
@@ -5600,6 +6187,14 @@ ArgumentEncodingContext::flushCommands(
     encoder_head.next = nullptr;
     encoder_last = &encoder_head;
     encoder_count_ = 0;
+    // GPTK CB boundary: next recording session starts a new ResolveBarriers
+    // epoch. Access trackers lazily clear exclusive_/shared_ on first touch;
+    // fence locality summaries are CB-local only.
+    access_tracker_generation_++;
+    if (access_tracker_generation_ == 0)
+      access_tracker_generation_ = 1;
+    fence_locality_.reset();
+    fence_bindings_.reset(0);
     perf.cleanup += clock::now() - t0;
   }
 
@@ -5750,6 +6345,43 @@ IsFenceOnlyBlitPass(const BlitEncoderData *data);
 static void
 MergeFenceOnlyBlitPassInto(BlitEncoderData *former, EncoderData *latter);
 
+void
+ArgumentEncodingContext::planEncoderSubmissionOrder(
+    EncoderData **encoders, unsigned encoder_count) {
+  if (encoder_count < 2)
+    return;
+
+  // Walk backwards so a later coalesced encoder can absorb every compatible
+  // predecessor in original command order. checkEncoderRelation returns SWAP
+  // when the two encoders may cross; its merge paths prepend the former
+  // command stream into the latter and replace the former with a Null
+  // tombstone. SYNCHRONIZE is a hard ordering boundary.
+  for (unsigned former_index = encoder_count - 1; former_index-- > 0;) {
+    auto *former = encoders[former_index];
+    switch (former->type) {
+    case EncoderType::Clear:
+    case EncoderType::Render:
+    case EncoderType::Compute:
+    case EncoderType::Blit:
+      break;
+    default:
+      continue;
+    }
+
+    for (unsigned latter_index = former_index + 1;
+         latter_index < encoder_count; latter_index++) {
+      auto *latter = encoders[latter_index];
+      if (latter->type == EncoderType::Null)
+        continue;
+      if (checkEncoderRelation(former, latter) ==
+          DXMT_ENCODER_LIST_OP_SYNCHRONIZE)
+        break;
+      if (former->type == EncoderType::Null)
+        break;
+    }
+  }
+}
+
 DXMT_ENCODER_LIST_OP
 ArgumentEncodingContext::checkEncoderRelation(EncoderData *former, EncoderData *latter) {
 
@@ -5899,7 +6531,8 @@ ArgumentEncodingContext::checkEncoderRelation(EncoderData *former, EncoderData *
     auto r0 = reinterpret_cast<RenderEncoderData *>(former);
 
     std::optional<RenderFenceMergePlan> fence_merge;
-    if (isEncoderSignatureMatched(r0, r1)) {
+    if (!r1->prevent_merge_with_previous &&
+        isEncoderSignatureMatched(r0, r1)) {
       fence_merge = BuildRenderFenceMergePlan(
           r1->fence_wait, r1->fence_wait_vertex,
           r1->fence_update, r1->fence_update_vertex,

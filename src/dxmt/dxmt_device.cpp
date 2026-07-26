@@ -24,7 +24,10 @@ public:
     return max_object_threadgroups_;
   };
 
-  DeviceImpl(const DEVICE_DESC &desc) : device_(desc.device), cmd_queue_(device_) {
+  DeviceImpl(const DEVICE_DESC &desc)
+      : device_(desc.device),
+        residency_(std::make_shared<DeviceResidency>(device_)),
+        cmd_queue_(device_, residency_) {
     uint64_t macos_major_version = 0, macos_minor_version = 0;
     int version_conf = Config::getInstance().getOption<int>("dxmt.shaderMetalVersion", 0);
     switch (version_conf) {
@@ -57,6 +60,7 @@ public:
 
 private:
   WMT::Reference<WMT::Device> device_;
+  std::shared_ptr<DeviceResidency> residency_;
   CommandQueue cmd_queue_;
   WMTMetalVersion metal_version_;
   uint64_t max_object_threadgroups_;

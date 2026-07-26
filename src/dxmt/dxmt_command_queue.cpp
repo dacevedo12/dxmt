@@ -6,11 +6,14 @@
 #include "dxmt_statistics.hpp"
 #include "util_env.hpp"
 #include "util_lifecycle_telemetry.hpp"
+#include "util_noexcept.hpp"
 #include "util_win32_compat.h"
 #include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdio>
+#include <ctime>
+#include <iterator>
 
 #define ASYNC_ENCODING 1
 
@@ -40,7 +43,9 @@ static bool
 DxmtHangDenseEnabled() {
   static const bool enabled =
       DxmtQueueDiagEnabledEnv("DXMT_DIAG_GPU_HANG_DENSE") ||
-      DxmtQueueDiagEnabledEnv("DXMT_DIAG_ROOT_CAUSE_DENSE");
+      DxmtQueueDiagEnabledEnv("DXMT_DIAG_ROOT_CAUSE_DENSE") ||
+      DxmtQueueDiagEnabledEnv("DXMT_VALIDATION") ||
+      DxmtQueueDiagEnabledEnv("DXMT_DIAG_VALIDATION");
   return enabled;
 }
 
@@ -114,7 +119,6 @@ DxmtQueueDiagNsToMs(uint64_t ns) {
 }
 
 constexpr uint64_t kPersistentResidencyInitialCapacity = 4096;
-constexpr auto kPersistentResidencyFlushDelay = std::chrono::milliseconds(1);
 
 void *
 CommandChunk::allocate_cpu_heap(size_t size, size_t alignment) {
@@ -286,6 +290,24 @@ CommandChunk::encode(WMT::CommandBuffer cmdbuf, ArgumentEncodingContext &enc) {
     dst.consumer_index = src.consumer_index;
     dst.slot = src.slot;
     dst.flags = src.flags;
+    dst.resource_object = src.resource_object;
+    dst.resource_identity = src.resource_identity;
+    dst.allocation_object = src.allocation_object;
+    dst.metal_resource_handle = src.metal_resource_handle;
+    dst.gpu_address_or_resource_id = src.gpu_address_or_resource_id;
+    dst.producer_offset = src.producer_offset;
+    dst.producer_length = src.producer_length;
+    dst.producer_view_id = src.producer_view_id;
+    dst.consumer_offset = src.consumer_offset;
+    dst.consumer_length = src.consumer_length;
+    dst.consumer_view_id = src.consumer_view_id;
+    dst.resource_match_hash = src.resource_match_hash;
+    dst.producer_access = src.producer_access;
+    dst.consumer_access = src.consumer_access;
+    dst.producer_stage_kind = src.producer_stage_kind;
+    dst.consumer_stage_kind = src.consumer_stage_kind;
+    dst.resource_match_count = src.resource_match_count;
+    dst.reserved = src.reserved;
   }
   for (uint32_t i = 0;
        i < diagnostic.encoder_diagnostic_count &&
@@ -304,6 +326,8 @@ CommandChunk::encode(WMT::CommandBuffer cmdbuf, ArgumentEncodingContext &enc) {
     dst.primary_resource = src.primary_resource;
     dst.secondary_resource = src.secondary_resource;
     dst.resource_plan_hash = src.resource_plan_hash;
+    dst.d3d_sequence_begin = src.d3d_sequence_begin;
+    dst.d3d_sequence_end = src.d3d_sequence_end;
     dst.encoder_index = src.encoder_index;
     dst.type = src.type;
     dst.wait_count = src.wait_count;
@@ -336,16 +360,289 @@ CommandChunk::encode(WMT::CommandBuffer cmdbuf, ArgumentEncodingContext &enc) {
   statistics.encode_flush_interval += flush_elapsed;
 };
 
-CommandQueue::CommandQueue(WMT::Device device) :
+DeviceResidency::DeviceResidency(WMT::Device device)
+    : set_(device.newResidencySet(kPersistentResidencyInitialCapacity)) {}
+
+void
+DeviceResidency::AttachQueue(WMT::CommandQueue queue) {
+  if (queue && set_)
+    queue.addResidencySet(set_);
+}
+
+static const char *
+ResidencyProvenanceKindName(ResidencyProvenanceKind kind) {
+  switch (kind) {
+  case ResidencyProvenanceKind::Unknown:
+    return "unknown";
+  case ResidencyProvenanceKind::CommittedResource:
+    return "committed-resource";
+  case ResidencyProvenanceKind::PlacedResourceChild:
+    return "placed-resource-child";
+  case ResidencyProvenanceKind::ReservedResource:
+    return "reserved-resource";
+  case ResidencyProvenanceKind::HeapBacking:
+    return "heap-backing";
+  case ResidencyProvenanceKind::PlacementHeap:
+    return "placement-heap";
+  case ResidencyProvenanceKind::DescriptorHeap:
+    return "descriptor-heap";
+  case ResidencyProvenanceKind::InternalResource:
+    return "internal-resource";
+  case ResidencyProvenanceKind::ReplayAllocator:
+    return "replay-allocator";
+  case ResidencyProvenanceKind::ReplayTemporary:
+    return "replay-temporary";
+  }
+  return "invalid";
+}
+
+void
+DeviceResidency::Add(WMT::Object allocation, ResidencyProvenance provenance,
+                     Kind kind) {
+  if (!allocation)
+    return;
+
+  auto owner =
+      std::make_shared<RetainedAllocation>(allocation, provenance);
+  DeviceResidencyLock lock(mutex_);
+  AddLocked(owner, kind);
+}
+
+void
+DeviceResidency::AddLocked(const AllocationOwner &allocation, Kind kind) {
+  const auto handle = allocation->object.handle;
+  auto [it, inserted] = entries_.try_emplace(handle);
+  auto &entry = it->second;
+  if (inserted) {
+    entry.allocation = allocation;
+    QueueDesiredStateLocked(entry.allocation, true);
+  }
+
+  uint32_t *references = nullptr;
+  switch (kind) {
+  case Kind::Lifetime:
+    references = &entry.lifetime_references;
+    break;
+  case Kind::ReplayAllocator:
+    references = &entry.replay_allocator_references;
+    break;
+  case Kind::ReplayTemporary:
+    references = &entry.replay_temporary_references;
+    break;
+  }
+  if (*references == UINT32_MAX)
+    throw MTLD3DError("Device residency reference count overflow");
+  ++*references;
+}
+
+void
+DeviceResidency::Remove(WMT::Object allocation, Kind kind) noexcept {
+  if (!allocation)
+    return;
+
+  dxmt::invokeNoexcept("device residency removal", [&] {
+    AllocationOwner retired;
+    {
+      DeviceResidencyLock lock(mutex_);
+      RemoveLocked(allocation, kind, &retired);
+    }
+  });
+}
+
+void
+DeviceResidency::RemoveLocked(WMT::Object allocation, Kind kind,
+                              AllocationOwner *retired) noexcept {
+  const auto it = entries_.find(allocation.handle);
+  if (it == entries_.end()) {
+    ERR("DXMT device residency: removal without registration allocation=",
+        allocation.handle);
+    return;
+  }
+
+  auto &entry = it->second;
+  uint32_t *references = nullptr;
+  switch (kind) {
+  case Kind::Lifetime:
+    references = &entry.lifetime_references;
+    break;
+  case Kind::ReplayAllocator:
+    references = &entry.replay_allocator_references;
+    break;
+  case Kind::ReplayTemporary:
+    references = &entry.replay_temporary_references;
+    break;
+  }
+  if (!*references) {
+    ERR("DXMT device residency: ownership-domain underflow allocation=",
+        allocation.handle, " kind=", static_cast<uint32_t>(kind));
+    return;
+  }
+  --*references;
+  if (entry.referenceCount())
+    return;
+
+  *retired = std::move(entry.allocation);
+  entries_.erase(it);
+  QueueDesiredStateLocked(*retired, false);
+}
+
+void
+DeviceResidency::QueueDesiredStateLocked(const AllocationOwner &allocation,
+                                         bool make_resident) {
+  const auto handle = allocation->object.handle;
+  ++desired_generation_;
+  const bool backend_resident =
+      backend_entries_.find(handle) != backend_entries_.end();
+  if (backend_resident == make_resident) {
+    pending_mutations_.erase(handle);
+    return;
+  }
+
+  pending_mutations_.insert_or_assign(
+      handle, PendingMutation{allocation, make_resident});
+}
+
+DeviceResidency::SubmissionBatch
+DeviceResidency::PrepareSubmissionBatchLocked() {
+  SubmissionBatch batch;
+  batch.generation = desired_generation_;
+  batch.request_residency = !residency_requested_;
+  residency_requested_ = true;
+
+  /*
+   * Publish the batch's target backend state before dropping the logical-state
+   * lock. A producer racing with the synchronous native call can then journal
+   * the inverse transition for the next submission instead of losing it.
+  */
+  for (auto &[handle, mutation] : pending_mutations_) {
+    if (mutation.make_resident) {
+      batch.additions.emplace_back(mutation.allocation);
+      backend_entries_.insert_or_assign(handle, mutation.allocation);
+    } else {
+      batch.removals.emplace_back(mutation.allocation);
+      const auto backend = backend_entries_.find(handle);
+      if (backend != backend_entries_.end()) {
+        batch.retired_backend_owners.emplace_back(
+            std::move(backend->second));
+        backend_entries_.erase(backend);
+      }
+    }
+  }
+  pending_mutations_.clear();
+  return batch;
+}
+
+DeviceResidency::SubmissionResult
+DeviceResidency::ApplyForSubmission() {
+  SubmissionBatch batch;
+  {
+    DeviceResidencyLock lock(mutex_);
+    batch = PrepareSubmissionBatchLocked();
+  }
+
+  SubmissionResult result;
+  result.retired_allocations.reserve(batch.retired_backend_owners.size());
+  for (const auto &allocation : batch.retired_backend_owners)
+    result.retired_allocations.emplace_back(
+        WMT::Object(allocation->object.handle));
+
+  if (batch.additions.empty() && batch.removals.empty() &&
+      !batch.request_residency) {
+    applied_generation_.store(batch.generation, std::memory_order_release);
+    return result;
+  }
+
+  const auto begin = clock::now();
+  const auto log_failure = [&](const char *operation, uint64_t operation_index,
+                               const auto &allocation) {
+    const auto &source = allocation->provenance;
+    ERR("DXMT device residency: ", operation, " failed"
+        " operation=", operation_index,
+        " allocation=", allocation->object.handle,
+        " source=", ResidencyProvenanceKindName(source.kind),
+        " owner=", source.owner,
+        " identity=", source.identity,
+        " parent=", source.parent,
+        " heapOffset=", source.heap_offset,
+        " size=", source.size,
+        " dimension=", source.dimension,
+        " component=", source.component,
+        " additions=", batch.additions.size(),
+        " removals=", batch.removals.size());
+  };
+  uint64_t operation_index = 0;
+  for (const auto &allocation : batch.additions) {
+    if (!set_.addAllocation(allocation->object)) {
+      log_failure("add", operation_index, allocation);
+      result.succeeded = false;
+      break;
+    }
+    ++operation_index;
+  }
+  if (result.succeeded) {
+    operation_index = 0;
+    for (const auto &allocation : batch.removals) {
+      if (!set_.removeAllocation(allocation->object)) {
+        log_failure("remove", operation_index, allocation);
+        result.succeeded = false;
+        break;
+      }
+      ++operation_index;
+    }
+  }
+  if (result.succeeded && !set_.commit()) {
+    ERR("DXMT device residency: commit failed"
+        " additions=", batch.additions.size(),
+        " removals=", batch.removals.size());
+    result.succeeded = false;
+  }
+  if (result.succeeded && batch.request_residency &&
+      !set_.requestResidency()) {
+    ERR("DXMT device residency: request failed");
+    result.succeeded = false;
+  }
+  const auto end = clock::now();
+  result.elapsed_us =
+      std::chrono::duration_cast<std::chrono::microseconds>(end - begin)
+          .count();
+
+  if (result.succeeded) {
+    applied_generation_.store(batch.generation, std::memory_order_release);
+    commit_count_.fetch_add(1, std::memory_order_relaxed);
+  }
+  return result;
+}
+
+std::tuple<uint32_t, uint64_t, uint32_t, uint32_t, uint64_t>
+DeviceResidency::StatsForTesting() {
+  DeviceResidencyLock lock(mutex_);
+  uint32_t live_entry_count = 0;
+  uint64_t total_reference_count = 0;
+  uint32_t replay_allocator_count = 0;
+  for (const auto &[handle, entry] : entries_) {
+    (void)handle;
+    live_entry_count++;
+    total_reference_count += entry.referenceCount();
+    replay_allocator_count += entry.replay_allocator_references ? 1 : 0;
+  }
+  const auto pending_removal_count = static_cast<uint32_t>(std::count_if(
+      pending_mutations_.begin(), pending_mutations_.end(),
+      [](const auto &item) { return !item.second.make_resident; }));
+  return {live_entry_count, total_reference_count, pending_removal_count,
+          replay_allocator_count,
+          commit_count_.load(std::memory_order_relaxed)};
+}
+
+CommandQueue::CommandQueue(
+    WMT::Device device,
+    std::shared_ptr<DeviceResidency> device_residency) :
     apitrace_enabled_(dxmt::apitrace::enabled()),
     encodeThread([this]() { this->EncodingThread(); }),
     finishThread([this]() { this->WaitForFinishThread(); }),
     readbackThread([this]() { this->ReadbackThread(); }),
     device(device),
     commandQueue(device.newCommandQueue(kCommandChunkCount)),
-    // Growth hint only; the residency set can grow as allocations are added.
-    persistent_residency_set_(device.newResidencySet(kPersistentResidencyInitialCapacity)),
-    persistent_residency_thread_([this]() { this->PersistentResidencyThread(); }),
+    device_residency_(std::move(device_residency)),
     shared_event_listener(SharedEventListener_create()),
     event_listener_thread([this]() { SharedEventListener_start(this->shared_event_listener); }),
     staging_allocator({
@@ -368,13 +665,6 @@ CommandQueue::CommandQueue(WMT::Device device) :
     cmd_library(device),
     argument_encoding_ctx(*this, device, cmd_library),
     initializer(device) {
-  auto retire_cached_block =
-      [this](const auto &block, uint64_t sequence) {
-        this->RetireCachedAllocationResidency(block.buffer, sequence);
-      };
-  staging_allocator.setReleaseCallback(retire_cached_block);
-  copy_temp_allocator.setReleaseCallback(retire_cached_block);
-  argbuf_allocator.setReleaseCallback(retire_cached_block);
   for (unsigned i = 0; i < kCommandChunkCount; i++) {
     auto &chunk = chunks[i];
     chunk.queue = this;
@@ -384,12 +674,78 @@ CommandQueue::CommandQueue(WMT::Device device) :
   statistics.at(frame_count).begin_time = initial_frame_time;
   perf::setCurrentFrameStatistics(&statistics.at(frame_count));
   event = device.newSharedEvent();
-  persistent_residency_set_.requestResidency();
-  commandQueue.addResidencySet(persistent_residency_set_);
-
+  device_residency_->AttachQueue(commandQueue);
 }
 
-CommandQueue::~CommandQueue() {
+LifetimeResidencyRegistration::LifetimeResidencyRegistration(
+    std::shared_ptr<DeviceResidency> owner,
+    LifetimeResidencyAllocation allocation)
+    : owner_(std::move(owner)), allocation_(allocation.object()) {
+  owner_->Add(allocation_, allocation.provenance(),
+              DeviceResidency::Kind::Lifetime);
+}
+
+LifetimeResidencyRegistration::~LifetimeResidencyRegistration() noexcept {
+  if (owner_ && allocation_)
+    owner_->Remove(allocation_, DeviceResidency::Kind::Lifetime);
+}
+
+std::shared_ptr<LifetimeResidencyRegistration>
+CommandQueue::RegisterLifetimeResidency(
+    LifetimeResidencyAllocation allocation) {
+  const auto object = allocation.object();
+  if (!object)
+    return {};
+  return std::shared_ptr<LifetimeResidencyRegistration>(
+      new LifetimeResidencyRegistration(device_residency_, allocation));
+}
+
+ReplayResidencyRegistration::ReplayResidencyRegistration(
+    std::shared_ptr<DeviceResidency> owner, WMT::Object allocation,
+    ResidencyProvenance provenance, Kind kind)
+    : owner_(std::move(owner)), allocation_(allocation), kind_(kind) {
+  owner_->Add(allocation_, provenance,
+              kind_ == Kind::Allocator
+                  ? DeviceResidency::Kind::ReplayAllocator
+                  : DeviceResidency::Kind::ReplayTemporary);
+}
+
+ReplayResidencyRegistration::~ReplayResidencyRegistration() noexcept {
+  if (owner_ && allocation_)
+    owner_->Remove(allocation_,
+                   kind_ == Kind::Allocator
+                       ? DeviceResidency::Kind::ReplayAllocator
+                       : DeviceResidency::Kind::ReplayTemporary);
+}
+
+std::shared_ptr<ReplayResidencyRegistration>
+CommandQueue::RegisterReplayAllocatorResidency(
+    ReplayAllocatorResidencyAllocation allocation) {
+  const auto object = allocation.object();
+  if (!object)
+    return {};
+  return std::shared_ptr<ReplayResidencyRegistration>(
+      new ReplayResidencyRegistration(
+          device_residency_, object, allocation.provenance(),
+          ReplayResidencyRegistration::Kind::Allocator));
+}
+
+void
+CommandQueue::RetainReplayTemporaryResidencyUntilGpuComplete(
+    ReplayTemporaryResidencyAllocation allocation, uint64_t sequence) {
+  const auto object = allocation.object();
+  if (!object)
+    return;
+  auto registration = std::shared_ptr<ReplayResidencyRegistration>(
+      new ReplayResidencyRegistration(
+          device_residency_, object, allocation.provenance(),
+          ReplayResidencyRegistration::Kind::Temporary));
+  if (!registration)
+    return;
+  RetainGpuOwner(sequence, std::move(registration));
+}
+
+CommandQueue::~CommandQueue() noexcept {
   auto pool = WMT::MakeAutoreleasePool();
   TRACE("Destructing command queue");
   stopped.store(true, std::memory_order_release);
@@ -398,30 +754,20 @@ CommandQueue::~CommandQueue() {
   ready_for_commit.fetch_add(1, std::memory_order_release);
   ready_for_commit.notify_all();
   SharedEventListener_destroy(shared_event_listener);
-  encodeThread.join();
-  finishThread.join();
+  encodeThread.join_noexcept();
+  finishThread.join_noexcept();
   readback_cond_.notify_all();
-  readbackThread.join();
+  readbackThread.join_noexcept();
   staging_allocator.free_blocks(UINT64_MAX);
   copy_temp_allocator.free_blocks(UINT64_MAX);
   argbuf_allocator.free_blocks(UINT64_MAX);
-  argument_encoding_ctx.RetirePersistentResidency(
-      cpu_coherent.signaledValue());
-  FlushPersistentResidency();
-  {
-    std::lock_guard<dxmt::mutex> lock(persistent_residency_mutex_);
-    persistent_residency_stop_ = true;
-  }
-  persistent_residency_cond_.notify_all();
-  persistent_residency_thread_.join();
-  FlushPersistentResidency();
   FlushFinalFrameStatistics();
   for (unsigned i = 0; i < kCommandChunkCount; i++) {
     auto &chunk = chunks[i];
     chunk.reset();
   };
-  DrainDeferredReleases();
-  event_listener_thread.join();
+  DrainRetainedGpuOwners();
+  event_listener_thread.join_noexcept();
   if (apitrace_enabled_)
     dxmt::apitrace::shutdown();
   perf::flushFinal(frame_count);
@@ -435,51 +781,51 @@ CommandQueue::MarkDeviceError() {
   if (device_error_.exchange(true, std::memory_order_acq_rel))
     return;
 
-  std::vector<std::shared_ptr<std::function<void()>>> callbacks;
+  std::vector<std::shared_ptr<DeviceErrorTarget>> targets;
   {
-    std::lock_guard<dxmt::mutex> lock(device_error_callbacks_mutex_);
-    callbacks.reserve(device_error_callbacks_.size());
-    for (auto &[callback_id, weak_callback] : device_error_callbacks_) {
-      (void)callback_id;
-      if (auto callback = weak_callback.lock())
-        callbacks.push_back(std::move(callback));
+    std::lock_guard<dxmt::mutex> lock(device_error_targets_mutex_);
+    targets.reserve(device_error_targets_.size());
+    for (auto &[target_id, weak_target] : device_error_targets_) {
+      (void)target_id;
+      if (auto target = weak_target.lock())
+        targets.push_back(std::move(target));
     }
-    device_error_callbacks_.clear();
+    device_error_targets_.clear();
   }
 
-  for (const auto &callback : callbacks)
-    (*callback)();
+  for (const auto &target : targets)
+    target->CompleteDeviceError();
 }
 
 uint64_t
-CommandQueue::RegisterDeviceErrorCallback(
-    const std::shared_ptr<std::function<void()>> &callback) {
-  if (!callback)
+CommandQueue::RegisterDeviceErrorTarget(
+    const std::shared_ptr<DeviceErrorTarget> &target) {
+  if (!target)
     return 0;
 
   bool invoke_now = false;
-  uint64_t callback_id = 0;
+  uint64_t target_id = 0;
   {
-    std::lock_guard<dxmt::mutex> lock(device_error_callbacks_mutex_);
+    std::lock_guard<dxmt::mutex> lock(device_error_targets_mutex_);
     if (HasDeviceError())
       invoke_now = true;
     else {
-      callback_id = next_device_error_callback_id_++;
-      device_error_callbacks_.emplace(callback_id, callback);
+      target_id = next_device_error_target_id_++;
+      device_error_targets_.emplace(target_id, target);
     }
   }
 
   if (invoke_now)
-    (*callback)();
-  return callback_id;
+    target->CompleteDeviceError();
+  return target_id;
 }
 
 void
-CommandQueue::UnregisterDeviceErrorCallback(uint64_t callback_id) {
-  if (!callback_id)
+CommandQueue::UnregisterDeviceErrorTarget(uint64_t target_id) {
+  if (!target_id)
     return;
-  std::lock_guard<dxmt::mutex> lock(device_error_callbacks_mutex_);
-  device_error_callbacks_.erase(callback_id);
+  std::lock_guard<dxmt::mutex> lock(device_error_targets_mutex_);
+  device_error_targets_.erase(target_id);
 }
 
 void
@@ -756,292 +1102,84 @@ CommandQueue::WaitCPUFence(uint64_t seq) {
   }
 }
 
-void
-CommandQueue::AddPersistentResidency(WMT::Object allocation) {
-  if (!allocation)
-    return;
-
-  std::lock_guard<dxmt::mutex> lock(persistent_residency_mutex_);
-  auto &entry = persistent_residency_entries_[allocation.handle];
-  if (!entry.allocation) {
-    entry.allocation = allocation;
-    persistent_residency_set_.addAllocation(allocation);
-    persistent_residency_dirty_ = true;
-  }
-  entry.ref_count++;
-  entry.pending_remove = false;
-  entry.remove_after_seq = 0;
-}
-
-void
-CommandQueue::EnsureCachedAllocationResidency(WMT::Resource allocation) {
-  if (!allocation)
-    return;
-
-  std::lock_guard<dxmt::mutex> lock(persistent_residency_mutex_);
-  if (!persistent_residency_cached_allocations_
-           .emplace(allocation.handle, true)
-           .second)
-    return;
-  auto &entry = persistent_residency_entries_[allocation.handle];
-  if (!entry.allocation) {
-    entry.allocation = allocation;
-    persistent_residency_set_.addAllocation(allocation);
-    persistent_residency_dirty_ = true;
-  }
-  entry.ref_count++;
-  entry.pending_remove = false;
-  entry.remove_after_seq = 0;
-}
-
-void
-CommandQueue::RetireCachedAllocationResidency(WMT::Resource allocation,
-                                              uint64_t sequence) {
-  if (!allocation)
-    return;
-  {
-    std::lock_guard<dxmt::mutex> lock(persistent_residency_mutex_);
-    if (!persistent_residency_cached_allocations_.erase(allocation.handle))
-      return;
-  }
-  RemovePersistentResidencyAfterCompletion(allocation, sequence);
-}
-
 std::tuple<uint32_t, uint64_t, uint32_t, uint32_t, uint64_t>
 CommandQueue::PersistentResidencyStatsForTesting() {
-  std::lock_guard<dxmt::mutex> lock(persistent_residency_mutex_);
-  uint64_t total_ref_count = 0;
-  uint32_t pending_removal_count = 0;
-  for (const auto &[handle, entry] : persistent_residency_entries_) {
-    (void)handle;
-    total_ref_count += entry.ref_count;
-    pending_removal_count += entry.pending_remove ? 1 : 0;
-  }
-  return {
-      static_cast<uint32_t>(persistent_residency_entries_.size()),
-      total_ref_count,
-      pending_removal_count,
-      static_cast<uint32_t>(persistent_residency_cached_allocations_.size()),
-      persistent_residency_commit_count_};
+  return device_residency_->StatsForTesting();
 }
 
 void
-CommandQueue::RemovePersistentResidencyAfterCompletion(WMT::Object allocation) {
-  // Descriptor writes happen independently of queue submission. Retire against
-  // the last sequence that was actually published, rather than the current
-  // (possibly forever empty) chunk.
+CommandQueue::RetainGpuOwner(GpuRetainedOwner owner) {
   const auto next_seq = ready_for_encode.load(std::memory_order_acquire);
-  RemovePersistentResidencyAfterCompletion(
-      allocation, next_seq ? next_seq - 1 : 0);
+  RetainGpuOwner(next_seq ? next_seq - 1 : 0, std::move(owner));
 }
 
 void
-CommandQueue::RemovePersistentResidencyAfterCompletion(
-    WMT::Object allocation, uint64_t sequence) {
-  if (!allocation)
-    return;
-
-  bool notify_flush = false;
+CommandQueue::RetainGpuOwner(uint64_t sequence, GpuRetainedOwner owner) {
+  std::optional<GpuRetainedOwner> release_now;
   {
-    std::lock_guard<dxmt::mutex> lock(persistent_residency_mutex_);
-    auto entry = persistent_residency_entries_.find(allocation.handle);
-    if (entry == persistent_residency_entries_.end())
-      return;
-    if (entry->second.ref_count)
-      entry->second.ref_count--;
-    if (entry->second.ref_count)
-      return;
-
-    // Removal is safe immediately when the sequence that could have referenced
-    // the allocation has already completed. RetirePersistentResidencyRemovals()
-    // handles the complementary race where completion happens just after this
-    // check while holding the same mutex.
-    if (sequence <= cpu_coherent.signaledValue()) {
-      // Metal residency removals are only effective after commit. Keep an
-      // explicit strong reference through that commit. A short-lived worker
-      // coalesces descriptor churn while still guaranteeing that an idle queue
-      // eventually publishes the removal and drops even a single large
-      // allocation.
-      persistent_residency_retired_allocations_.emplace_back(
-          WMT::Object(entry->second.allocation.handle));
-      persistent_residency_set_.removeAllocation(entry->second.allocation);
-      persistent_residency_dirty_ = true;
-      persistent_residency_entries_.erase(entry);
-      if (!persistent_residency_flush_requested_) {
-        persistent_residency_flush_requested_ = true;
-        notify_flush = true;
-      }
-    } else {
-      entry->second.pending_remove = true;
-      entry->second.remove_after_seq =
-          std::max(entry->second.remove_after_seq, sequence);
-    }
-  }
-  if (notify_flush)
-    persistent_residency_cond_.notify_one();
-}
-
-void
-CommandQueue::RetainUntilGpuComplete(std::function<void()> release) {
-  const auto next_seq = ready_for_encode.load(std::memory_order_acquire);
-  RetainUntilGpuComplete(next_seq ? next_seq - 1 : 0, std::move(release));
-}
-
-void
-CommandQueue::RetainUntilGpuComplete(uint64_t sequence,
-                                     std::function<void()> release) {
-  if (!release)
-    return;
-
-  std::function<void()> release_now;
-  {
-    std::lock_guard<dxmt::mutex> lock(deferred_release_mutex_);
-    deferred_release_completed_seq_ = std::max(
-        deferred_release_completed_seq_, cpu_coherent.signaledValue());
-    if (sequence <= deferred_release_completed_seq_)
-      release_now = std::move(release);
+    std::lock_guard<dxmt::mutex> lock(retained_gpu_owner_mutex_);
+    retained_gpu_owner_completed_seq_ = std::max(
+        retained_gpu_owner_completed_seq_, cpu_coherent.signaledValue());
+    if (sequence <= retained_gpu_owner_completed_seq_)
+      release_now.emplace(std::move(owner));
     else
-      deferred_releases_[sequence].push_back(std::move(release));
+      deferred_retained_owners_[sequence].push_back(std::move(owner));
+  }
+  release_now.reset();
+}
+
+void
+CommandQueue::RetainGpuOwners(
+    uint64_t sequence, std::vector<GpuRetainedOwner> owners) {
+  if (owners.empty())
+    return;
+  bool release_now = false;
+  {
+    std::lock_guard<dxmt::mutex> lock(retained_gpu_owner_mutex_);
+    retained_gpu_owner_completed_seq_ = std::max(
+        retained_gpu_owner_completed_seq_, cpu_coherent.signaledValue());
+    if (sequence <= retained_gpu_owner_completed_seq_) {
+      release_now = true;
+    } else {
+      auto &retained = deferred_retained_owners_[sequence];
+      retained.reserve(retained.size() + owners.size());
+      for (auto &owner : owners)
+        retained.push_back(std::move(owner));
+    }
   }
   if (release_now)
-    release_now();
-}
-
-uint64_t
-CommandQueue::FlushPersistentResidency() {
-  std::deque<WMT::Reference<WMT::Object>> retired_allocations;
-  clock::time_point begin;
-  clock::time_point end;
-  {
-    std::lock_guard<dxmt::mutex> lock(persistent_residency_mutex_);
-    if (!persistent_residency_dirty_) {
-      persistent_residency_flush_requested_ = false;
-      return 0;
-    }
-
-    begin = clock::now();
-    persistent_residency_set_.commit();
-    end = clock::now();
-    persistent_residency_commit_count_++;
-    persistent_residency_dirty_ = false;
-    persistent_residency_flush_requested_ = false;
-    retired_allocations.swap(persistent_residency_retired_allocations_);
-  }
-  return std::chrono::duration_cast<std::chrono::microseconds>(end - begin).count();
+    owners.clear();
 }
 
 void
-CommandQueue::RetirePersistentResidencyRemovals(uint64_t completed_seq) {
-  bool notify_flush = false;
+CommandQueue::ReleaseCompletedGpuOwners(uint64_t completed_seq) {
+  std::vector<GpuRetainedOwner> releases;
   {
-    std::lock_guard<dxmt::mutex> lock(persistent_residency_mutex_);
-    bool removed = false;
-    for (auto it = persistent_residency_entries_.begin();
-         it != persistent_residency_entries_.end();) {
-      auto &entry = it->second;
-      if (entry.pending_remove && entry.ref_count == 0 &&
-          entry.remove_after_seq <= completed_seq) {
-        persistent_residency_retired_allocations_.emplace_back(
-            WMT::Object(entry.allocation.handle));
-        persistent_residency_set_.removeAllocation(entry.allocation);
-        persistent_residency_dirty_ = true;
-        removed = true;
-        it = persistent_residency_entries_.erase(it);
-      } else {
-        ++it;
-      }
-    }
-    if (removed || !persistent_residency_retired_allocations_.empty()) {
-      // The finish thread only publishes retirement. ResidencySet mutation is
-      // committed by the dedicated maintenance worker (or by the encode
-      // submit path before a command-buffer commit), so completion callbacks
-      // never enter the backend residency commit path.
-      if (!persistent_residency_flush_requested_) {
-        persistent_residency_flush_requested_ = true;
-        notify_flush = true;
-      }
-    }
-  }
-  if (notify_flush)
-    persistent_residency_cond_.notify_one();
-}
-
-void
-CommandQueue::PersistentResidencyThread() {
-  env::setThreadName("dxmt-residency-thread");
-
-  for (;;) {
-    std::deque<WMT::Reference<WMT::Object>> retired_allocations;
-    std::unique_lock<dxmt::mutex> lock(persistent_residency_mutex_);
-    persistent_residency_cond_.wait(lock, [this]() {
-      return persistent_residency_stop_ ||
-             persistent_residency_flush_requested_;
-    });
-    if (persistent_residency_stop_)
-      return;
-
-    // Keep the request armed during this delay, so additional removals join
-    // the same batch without repeatedly waking the worker.
-    persistent_residency_cond_.wait_for(
-        lock, kPersistentResidencyFlushDelay,
-        [this]() { return persistent_residency_stop_; });
-    if (persistent_residency_stop_)
-      return;
-
-    // This is a long-lived Wine/engine thread. Bound every flush with its own
-    // autorelease pool so Metal/Foundation temporaries cannot accumulate for
-    // the lifetime of the queue.
-    auto pool = WMT::MakeAutoreleasePool();
-    if (persistent_residency_dirty_) {
-      persistent_residency_set_.commit();
-      persistent_residency_commit_count_++;
-      persistent_residency_dirty_ = false;
-      retired_allocations.swap(persistent_residency_retired_allocations_);
-    }
-    persistent_residency_flush_requested_ = false;
-    lock.unlock();
-    // Resource releases may enter backend/object lifetime code. Keep them
-    // outside the residency mutex so no callback can invert this lock order.
-    retired_allocations.clear();
-  }
-}
-
-void
-CommandQueue::CompleteDeferredReleases(uint64_t completed_seq) {
-  std::vector<std::function<void()>> releases;
-  {
-    std::lock_guard<dxmt::mutex> lock(deferred_release_mutex_);
-    deferred_release_completed_seq_ =
-        std::max(deferred_release_completed_seq_, completed_seq);
-    for (auto it = deferred_releases_.begin();
-         it != deferred_releases_.end();) {
-      if (it->first <= deferred_release_completed_seq_) {
+    std::lock_guard<dxmt::mutex> lock(retained_gpu_owner_mutex_);
+    retained_gpu_owner_completed_seq_ =
+        std::max(retained_gpu_owner_completed_seq_, completed_seq);
+    for (auto it = deferred_retained_owners_.begin();
+         it != deferred_retained_owners_.end();) {
+      if (it->first <= retained_gpu_owner_completed_seq_) {
         for (auto &release : it->second)
           releases.push_back(std::move(release));
-        it = deferred_releases_.erase(it);
+        it = deferred_retained_owners_.erase(it);
       } else {
         ++it;
       }
     }
   }
-  for (auto &release : releases)
-    release();
+  releases.clear();
 }
 
 void
-CommandQueue::DrainDeferredReleases() {
-  std::vector<std::function<void()>> releases;
+CommandQueue::DrainRetainedGpuOwners() {
+  decltype(deferred_retained_owners_) retained_owners;
   {
-    std::lock_guard<dxmt::mutex> lock(deferred_release_mutex_);
-    for (auto &[sequence, callbacks] : deferred_releases_) {
-      (void)sequence;
-      for (auto &callback : callbacks)
-        releases.push_back(std::move(callback));
-    }
-    deferred_releases_.clear();
+    std::lock_guard<dxmt::mutex> lock(retained_gpu_owner_mutex_);
+    retained_owners.swap(deferred_retained_owners_);
   }
-  for (auto &release : releases)
-    release();
+  retained_owners.clear();
 }
 
 void
@@ -1073,7 +1211,20 @@ CommandQueue::CommitChunkInternal(CommandChunk &chunk) {
     char filename[1024];
     std::time_t now;
     std::time(&now);
-    std::strftime(filename, 1024, "_%H'%M'%S_%m-%d-%y.gputrace", std::localtime(&now));
+    // std::localtime() returns a pointer to shared storage and may return
+    // null; CommitChunkInternal runs on the encoding thread (and on the
+    // submitting thread when ASYNC_ENCODING is off), so use the reentrant
+    // variant and keep filename a valid string if the conversion fails.
+    std::tm local_time{};
+#ifdef _WIN32
+    const bool local_time_ok = ::localtime_s(&local_time, &now) == 0;
+#else
+    const bool local_time_ok = ::localtime_r(&now, &local_time) != nullptr;
+#endif
+    if (!local_time_ok ||
+        std::strftime(filename, sizeof(filename),
+                      "_%H'%M'%S_%m-%d-%y.gputrace", &local_time) == 0)
+      std::snprintf(filename, sizeof(filename), "_unknown-time.gputrace");
     auto fileUrl = env::getUnixPath(env::getExeBaseName() + "_F." + std::to_string(chunk.frame_) + filename);
     WARN("A new capture will be saved to ", fileUrl);
     info.output_url.set(fileUrl.c_str());
@@ -1143,7 +1294,23 @@ CommandQueue::CommitChunkInternal(CommandChunk &chunk) {
          " status=", static_cast<uint32_t>(cmdbuf.status()));
   }
   const auto commit_begin = clock::now();
-  const uint64_t persistent_residency_submit_us = FlushPersistentResidency();
+  DeviceResidencySubmissionScope residency_submission_scope(
+      device_residency_->submission_owner_);
+  auto persistent_residency_result =
+      device_residency_->ApplyForSubmission();
+  chunk.retired_residency_allocations.insert(
+      chunk.retired_residency_allocations.end(),
+      std::make_move_iterator(
+          persistent_residency_result.retired_allocations.begin()),
+      std::make_move_iterator(
+          persistent_residency_result.retired_allocations.end()));
+  if (!persistent_residency_result.succeeded) {
+    ERR("DXMT device residency: failed to apply submission mutations"
+        " frame=", chunk.frame_, " chunk=", chunk.chunk_id);
+    MarkDeviceError();
+  }
+  const uint64_t persistent_residency_submit_us =
+      persistent_residency_result.elapsed_us;
   uint64_t metal_residency_submit_us = 0;
   cmdbuf.commitAndGetStats(&metal_residency_submit_us);
   chunk.metal_commit_time = clock::now();
@@ -1629,7 +1796,7 @@ CommandQueue::WaitForFinishThread() {
            " publishToCompleteMs=", DxmtQueueDiagElapsedMs(chunk.publish_time, chunk.finish_complete_time),
            " event=", chunk.chunk_event_id,
            " initEvent=", chunk.resource_initializer_event_id,
-           " callbacks=", chunk.completionCallbackCount());
+           " completionTargets=", chunk.completionTargetCount());
       if (gpu_end)
         diag_last_gpu_end_ns_ = std::max(diag_last_gpu_end_ns_, gpu_end);
     }
@@ -1640,10 +1807,10 @@ CommandQueue::WaitForFinishThread() {
     chunk.readback.visibility = {};
     chunk.readback.timestamp = {};
 
-    std::vector<std::function<void()>> completion_callbacks;
+    std::vector<std::shared_ptr<GpuCompletionTarget>> completion_targets;
     {
-      std::lock_guard<dxmt::mutex> lock(chunk.completion_callbacks_mutex_);
-      completion_callbacks.swap(chunk.completion_callbacks);
+      std::lock_guard<dxmt::mutex> lock(chunk.completion_targets_mutex_);
+      completion_targets.swap(chunk.completion_targets);
     }
     const auto completion_chunk_id = chunk.chunk_id;
     const auto completion_frame = chunk.frame_;
@@ -1658,12 +1825,10 @@ CommandQueue::WaitForFinishThread() {
     EnqueueReadbacks(chunk);
     chunk.reset();
 
-    // Completion callbacks can re-enter D3D12 and wait on this queue. Publish
-    // command-buffer completion after releasing command-list storage so the CPU
-    // command heap cannot be recycled while chunk.reset() still walks it.
+    // Release typed GPU owners only after command-list storage has been reset.
+    // Their destructors run outside the retention lock.
     cpu_coherent.signal(internal_seq);
-    RetirePersistentResidencyRemovals(internal_seq);
-    CompleteDeferredReleases(internal_seq);
+    ReleaseCompletedGpuOwners(internal_seq);
     DxmtQueueLifecycleLog(
         this, "completion-publish.leave", completion_pair_id,
         completion_queue_pair_id, completion_frame, completion_chunk_id,
@@ -1673,7 +1838,7 @@ CommandQueue::WaitForFinishThread() {
            " seq=", internal_seq,
            " readyEncode=", ready_for_encode.load(std::memory_order_relaxed),
            " readyCommit=", ready_for_commit.load(std::memory_order_relaxed),
-           " callbacks=", completion_callbacks.size(),
+           " completionTargets=", completion_targets.size(),
            " ongoingBeforeDec=", chunk_ongoing.load(std::memory_order_relaxed),
            " coherent=", cpu_coherent.signaledValue());
     }
@@ -1684,20 +1849,20 @@ CommandQueue::WaitForFinishThread() {
     DxmtQueueLifecycleLog(
         this, "completion-callbacks.enter", callbacks_pair,
         callbacks_queue_pair, completion_frame, completion_chunk_id,
-        completion_cmdbuf, internal_seq, completion_callbacks.size());
-    for (auto &callback : completion_callbacks)
-      callback();
+        completion_cmdbuf, internal_seq, completion_targets.size());
+    for (const auto &target : completion_targets)
+      target->CompleteGpuWork(GpuCompletionStatus::Complete);
     const auto callbacks_end_time = clock::now();
     DxmtQueueLifecycleLog(
         this, "completion-callbacks.leave", callbacks_pair,
         callbacks_queue_pair, completion_frame, completion_chunk_id,
-        completion_cmdbuf, internal_seq, completion_callbacks.size());
-    if (DxmtQueueDiagEnabled() && !completion_callbacks.empty()) {
-      WARN_FILE_ONLY("DXMT queue diagnostic: CompletionCallbacks"
+        completion_cmdbuf, internal_seq, completion_targets.size());
+    if (DxmtQueueDiagEnabled() && !completion_targets.empty()) {
+      WARN_FILE_ONLY("DXMT queue diagnostic: CompletionTargets"
            " seq=", internal_seq,
            " chunk=", completion_chunk_id,
            " frame=", completion_frame,
-           " count=", completion_callbacks.size(),
+           " count=", completion_targets.size(),
            " elapsedMs=", DxmtQueueDiagDurationMs(callbacks_end_time - callbacks_begin_time));
     }
 
@@ -1727,45 +1892,49 @@ CommandQueue::WaitForFinishThread() {
 
 void
 CommandQueue::EnqueueReadbacks(CommandChunk &chunk) {
-  if (chunk.readback.diagnostics.empty() && chunk.deferred_readbacks.empty())
+  if (chunk.readback.diagnostics.empty())
     return;
 
-  std::vector<std::function<void()>> callbacks;
-  callbacks.reserve(chunk.readback.diagnostics.size() + chunk.deferred_readbacks.size());
-  for (auto &diagnostic : chunk.readback.diagnostics)
-    callbacks.push_back(std::move(diagnostic));
-  chunk.readback.diagnostics.clear();
+  std::vector<DiagnosticReadback> readbacks;
+  readbacks.swap(chunk.readback.diagnostics);
   chunk.readback.visibility = {};
   chunk.readback.timestamp = {};
-  for (auto &readback : chunk.deferred_readbacks)
-    callbacks.push_back(std::move(readback));
-  chunk.deferred_readbacks.clear();
 
   {
     std::lock_guard lock(readback_mutex_);
-    for (auto &callback : callbacks)
-      pending_readbacks_.push_back(std::move(callback));
+    pending_readbacks_.reserve(
+        pending_readbacks_.size() + readbacks.size());
+    for (auto &readback : readbacks)
+      pending_readbacks_.push_back(std::move(readback));
   }
   readback_cond_.notify_one();
 }
+
+class DiagnosticReadbackVisitor final {
+public:
+  template <typename Readback>
+  void operator()(Readback &readback) const noexcept {
+    ExecuteDiagnosticReadback(readback);
+  }
+};
 
 uint32_t
 CommandQueue::ReadbackThread() {
   env::setThreadName("dxmt-readback-thread");
   SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
   for (;;) {
-    std::vector<std::function<void()>> callbacks;
+    std::vector<DiagnosticReadback> readbacks;
     {
       std::unique_lock lock(readback_mutex_);
       readback_cond_.wait(lock, [this]() {
         return stopped.load(std::memory_order_acquire) || !pending_readbacks_.empty();
       });
-      callbacks.swap(pending_readbacks_);
+      readbacks.swap(pending_readbacks_);
     }
 
     auto pool = WMT::MakeAutoreleasePool();
-    for (auto &callback : callbacks)
-      callback();
+    for (auto &readback : readbacks)
+      std::visit(DiagnosticReadbackVisitor{}, readback);
 
     if (stopped.load(std::memory_order_acquire)) {
       std::lock_guard lock(readback_mutex_);

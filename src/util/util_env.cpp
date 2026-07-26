@@ -25,6 +25,13 @@
 #include <limits.h>
 #endif
 
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#endif
+
 #include "util_env.hpp"
 #include "unknwn.h"
 
@@ -58,6 +65,64 @@ std::string getEnvVar(const char *name) {
   const char *result = std::getenv(name);
   return result ? result : "";
 #endif
+}
+
+namespace {
+
+bool
+valueTruthy(const std::string &value) {
+  if (value.empty())
+    return false;
+  if (value == "1" || value == "true" || value == "TRUE" || value == "yes" ||
+      value == "YES" || value == "on" || value == "ON")
+    return true;
+  return false;
+}
+
+} // namespace
+
+bool envTruthy(const char *name) {
+  return valueTruthy(getEnvVar(name));
+}
+
+void setEnvVarIfUnset(const char *name, const char *value) {
+  if (!name || !value)
+    return;
+  if (!getEnvVar(name).empty())
+    return;
+#ifdef _WIN32
+  ::SetEnvironmentVariableA(name, value);
+#else
+  ::setenv(name, value, 0);
+#endif
+}
+
+void applyValidationLayerDefaults() {
+  static bool applied = false;
+  if (applied)
+    return;
+  applied = true;
+
+  if (!envTruthy("DXMT_VALIDATION") && !envTruthy("DXMT_DIAG_VALIDATION"))
+    return;
+
+  // Dense hang forensics + root-cause PE dumps.
+  setEnvVarIfUnset("DXMT_DIAG_GPU_HANG_DENSE", "1");
+  setEnvVarIfUnset("DXMT_DIAG_ERROR_SNAPSHOT", "1");
+  setEnvVarIfUnset("DXMT_DIAG_ROOT_CAUSE_DENSE", "1");
+  setEnvVarIfUnset("DXMT_DIAG_METAL_PSO_LABELS", "1");
+  setEnvVarIfUnset("DXMT_DIAG_METAL_RESIDENCY", "1");
+  setEnvVarIfUnset("DXMT_DIAG_DXMT_QUEUE", "1");
+  setEnvVarIfUnset("DXMT_DIAG_METAL4_QUEUE_MONITOR", "1");
+
+  // Prefer info-level PE logs when validation is on and level is unset.
+  setEnvVarIfUnset("DXMT_LOG_LEVEL", "info");
+
+  // Metal API/shader validation must be present before Metal initializes.
+  // setenv here helps only when d3d12 loads before first Metal device create.
+  setEnvVarIfUnset("MTL_DEBUG_LAYER", "1");
+  setEnvVarIfUnset("MTL_SHADER_VALIDATION", "1");
+  setEnvVarIfUnset("MTL_SHADER_VALIDATION_REPORT_TO_STDERR", "1");
 }
 
 size_t matchFileExtension(const std::string &name, const char *ext) {

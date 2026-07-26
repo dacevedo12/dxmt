@@ -5,14 +5,18 @@
 #include "thread.hpp"
 #include "util_env.hpp"
 #include "util_math.hpp"
+#include "util_noexcept.hpp"
 #include <cstring>
 #include <functional>
 #include <limits>
+#include <memory>
 #include <mutex>
 #include <queue>
 #include <stdexcept>
 
 namespace dxmt {
+
+class ReplayResidencyRegistration;
 
 constexpr size_t kStagingBlockSize = 0x2000000; // 32MB
 constexpr size_t kStagingBlockSizeForDeferredContext = 0x200000; // 2MB
@@ -48,8 +52,13 @@ RingBumpPoisonMappingsEnabled() {
       return true;
     auto hang = env::getEnvVar("DXMT_DIAG_GPU_HANG_DENSE");
     auto root = env::getEnvVar("DXMT_DIAG_ROOT_CAUSE_DENSE");
-    if (hang == "1" || hang == "true" || hang == "yes" || hang == "on" ||
-        root == "1" || root == "true" || root == "yes" || root == "on")
+    auto validation = env::getEnvVar("DXMT_VALIDATION");
+    if (validation.empty())
+      validation = env::getEnvVar("DXMT_DIAG_VALIDATION");
+    auto truthy = [](const std::string &v) {
+      return v == "1" || v == "true" || v == "yes" || v == "on";
+    };
+    if (truthy(hang) || truthy(root) || truthy(validation))
       return true;
     // Default on: BMW host-mapping AVs need attributable failures.
     return true;
@@ -147,6 +156,7 @@ public:
   public:
     WMT::Reference<WMT::Buffer> buffer;
     uint64_t gpu_address;
+    std::shared_ptr<ReplayResidencyRegistration> residency;
 
     Block() = default;
     Block(const Block &copy) = delete;
@@ -181,6 +191,7 @@ public:
     uint64_t gpu_address;
     void *mapped_address;
     bool owns_mapped_address = false;
+    std::shared_ptr<ReplayResidencyRegistration> residency;
 
     ~Block() {
       if (owns_mapped_address && mapped_address) {
@@ -192,11 +203,12 @@ public:
     Block() = default;
 
     Block(const Block &) = delete;
-    Block(Block &&move) {
+    Block(Block &&move) noexcept {
       buffer = std::move(move.buffer);
       gpu_address = move.gpu_address;
       mapped_address = move.mapped_address;
       owns_mapped_address = move.owns_mapped_address;
+      residency = std::move(move.residency);
       move.mapped_address = nullptr;
       move.owns_mapped_address = false;
     };
@@ -233,7 +245,7 @@ public:
     Block() = default;
 
     Block(const Block &) = delete;
-    Block(Block &&move) {
+    Block(Block &&move) noexcept {
       ptr = move.ptr;
       move.ptr = nullptr;
     };
@@ -402,8 +414,11 @@ RingBumpState<Allocator, BlockSize, mutex>::free_blocks(uint64_t coherent_id) {
     if (expired || adhoc) {
       // Poison owned host pages only (see PoisonRingBlockHostMapping).
       PoisonRingBlockHostMapping(front.block, front.total_size);
-      if (release_callback_)
-        release_callback_(front.block, front.last_used_seq_id);
+      if (release_callback_) {
+        dxmt::invokeNoexcept("ring block release", [this, &front]() {
+          release_callback_(front.block, front.last_used_seq_id);
+        });
+      }
       fifo.pop();
       continue;
     }
@@ -429,8 +444,11 @@ RingBumpState<Allocator, BlockSize, mutex>::allocate_or_reuse_block(
       }
       if (front.total_size != BlockSize) {
         PoisonRingBlockHostMapping(front.block, front.total_size);
-        if (release_callback_)
-          release_callback_(front.block, front.last_used_seq_id);
+        if (release_callback_) {
+          dxmt::invokeNoexcept("ring block release", [this, &front]() {
+            release_callback_(front.block, front.last_used_seq_id);
+          });
+        }
         fifo.pop();
         continue;
       } else if (front.total_size >= block_size) {
