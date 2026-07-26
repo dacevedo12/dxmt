@@ -785,9 +785,11 @@ TEST_F(D3D12SparseResourceSpec,
   ASSERT_EQ(context_.device()->CheckFeatureSupport(
                 D3D12_FEATURE_D3D12_OPTIONS, &options, sizeof(options)),
             S_OK);
-  constexpr auto kTiledResourcesTier4 =
-      static_cast<D3D12_TILED_RESOURCES_TIER>(4);
-  if (options.TiledResourcesTier < kTiledResourcesTier4)
+  // D3D12_TILED_RESOURCES_TIER tops out at _3, so its value range is 0..3 and
+  // static_cast<D3D12_TILED_RESOURCES_TIER>(4) is undefined -- clang rejects it
+  // outright in a constant expression. Compare the underlying integer instead.
+  constexpr int kTiledResourcesTier4 = 4;
+  if (static_cast<int>(options.TiledResourcesTier) < kTiledResourcesTier4)
     GTEST_SKIP() << "Array textures with packed mips require tiled resources tier 4";
   D3D12_FEATURE_DATA_FORMAT_SUPPORT format_support = {DXGI_FORMAT_R32_UINT};
   ASSERT_EQ(context_.device()->CheckFeatureSupport(
@@ -1161,9 +1163,11 @@ TEST_F(D3D12SparseResourceSpec, ReportsPackedMipTilesForEveryArraySlice) {
   D3D12_FEATURE_DATA_D3D12_OPTIONS options = {};
   ASSERT_TRUE(SUCCEEDED(context_.device()->CheckFeatureSupport(
       D3D12_FEATURE_D3D12_OPTIONS, &options, sizeof(options))));
-  constexpr auto kTiledResourcesTier4 =
-      static_cast<D3D12_TILED_RESOURCES_TIER>(4);
-  if (options.TiledResourcesTier < kTiledResourcesTier4)
+  // D3D12_TILED_RESOURCES_TIER tops out at _3, so its value range is 0..3 and
+  // static_cast<D3D12_TILED_RESOURCES_TIER>(4) is undefined -- clang rejects it
+  // outright in a constant expression. Compare the underlying integer instead.
+  constexpr int kTiledResourcesTier4 = 4;
+  if (static_cast<int>(options.TiledResourcesTier) < kTiledResourcesTier4)
     GTEST_SKIP() << "Array textures with packed mips require tiled resources tier 4";
   D3D12_FEATURE_DATA_FORMAT_SUPPORT format_support = {DXGI_FORMAT_R32_UINT};
   ASSERT_EQ(context_.device()->CheckFeatureSupport(
