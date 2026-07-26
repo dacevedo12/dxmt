@@ -1,4 +1,14 @@
 #include <stdatomic.h>
+#include <crt_externs.h>
+
+/*
+ * Several diagnostic helpers below are reachable only from call sites guarded by
+ * DXMT_APITRACE_METAL, so whichever branch of that guard compiles a given
+ * definition may leave it with no caller.  clang's -Wunused-function fires on
+ * unused static functions in C even when they are marked inline, so say what is
+ * actually meant instead.
+ */
+#define DXMT_MAYBE_UNUSED __attribute__((unused))
 #include <dlfcn.h>
 #include <execinfo.h>
 #include <inttypes.h>
@@ -38,6 +48,173 @@
 #if DXMT_APITRACE_METAL
 #include "apitrace/metal_capi.h"
 #endif
+
+/*
+ * ---------------------------------------------------------------------------
+ * Process environment snapshot -- the only place in this file that touches the
+ * environment block.
+ *
+ * getenv() does not copy: it hands back an interior pointer into the block that
+ * `environ` points at.  macOS setenv() grows that block by reallocating both
+ * the `environ` vector and the individual "NAME=VALUE" strings, free()ing the
+ * old ones, so a pointer previously returned by getenv() becomes a
+ * use-after-free the moment any thread writes the same variable.  That is not
+ * theoretical here: it was reproduced under ASan while dxmt_apitrace.cpp still
+ * published APITRACE_TRACE_BUNDLE into the unix environment from a DXMT worker
+ * thread (removed in "fix(apitrace): stop writing the unix environment from
+ * worker threads"), against the getenv() result this file held live across
+ * apitrace_metal_session_open() file I/O.
+ *
+ * DXMT itself no longer writes the unix-side environment from anywhere.  The
+ * surviving setenv() call sites are:
+ *   - src/util/util_env.cpp:96 (setEnvVarIfUnset), reached only from
+ *     applyValidationLayerDefaults() at src/d3d12/d3d12.cpp:35.  util_lib is
+ *     linked into the d3d1x DLLs only (src/util/meson.build:44), and this
+ *     unix .so is built solely in cross builds (src/meson.build:12-17 puts
+ *     winemetal4/ behind `dxmt_crossbuild`), so on every configuration that
+ *     produces this file util_env.cpp is mingw PE code writing msvcrt's
+ *     environment, not this process's libc one.
+ *   - src/dxmt/dxmt_apitrace.cpp:101 (_putenv_s), PE CRT only, guarded by
+ *     #ifdef _WIN32.
+ *   - tools/dxmt-builder/src/builder.cpp:277, the build driver, a different
+ *     process entirely.
+ * But this .so is loaded into a process DXMT does not own -- Wine, its host
+ * frameworks and any injected library are free to call setenv() -- so "nobody
+ * writes it" is not a property this file can assert about the whole address
+ * space.  It can only bound its own exposure.
+ *
+ * So instead of 29 unaudited getenv() call sites spread over the file, every
+ * environment read funnels through dxmt_env_lookup().  The block is walked
+ * exactly once, under pthread_once, at whichever call site gets there first,
+ * and every value DXMT cares about is copied into storage this file owns.
+ * After that the file never reads `environ` again and every pointer handed out
+ * is stable and privately owned for the process lifetime.  The window in which
+ * a foreign setenv() can hurt us shrinks from "any diagnostic read, at any
+ * time, on any thread" to "one pass at initialisation".
+ *
+ * The copies are deliberately never freed: they outlive every reader by
+ * construction, and this is a fixed, bounded, one-time allocation.
+ *
+ * environ_lock_np() is NOT usable to close the remaining window: it is not
+ * reentrant and libc takes it inside getenv()/setenv() themselves, so wrapping
+ * a lookup in it deadlocks (measured).
+ * ---------------------------------------------------------------------------
+ */
+enum dxmt_env_key {
+  DXMT_ENV_APITRACE_ENABLED,
+  DXMT_ENV_DIAG_ERROR_SNAPSHOT,
+  DXMT_ENV_DIAG_GPU_HANG_DENSE,
+  DXMT_ENV_DIAG_HEAP_STORAGE,
+  DXMT_ENV_DIAG_METAL4_QUEUE_MONITOR,
+  DXMT_ENV_DIAG_METAL_PSO_LABELS,
+  DXMT_ENV_DIAG_METAL_RESIDENCY,
+  DXMT_ENV_DIAG_RESIDENCY_CALLS,
+  DXMT_ENV_DIAG_ROOT_CAUSE_DENSE,
+  DXMT_ENV_DIAG_VALIDATION,
+  DXMT_ENV_LOG_PATH,
+  DXMT_ENV_METAL4_COMMIT_FEEDBACK,
+  DXMT_ENV_METAL4_COMMIT_FEEDBACK_SAMPLE_RATE,
+  DXMT_ENV_METAL4_PRESENT_ORDERING,
+  DXMT_ENV_METAL4_WAIT_FOR_DRAWABLE,
+  DXMT_ENV_PERF_STATS,
+  DXMT_ENV_TEST_METAL4_INJECT_FEEDBACK_ERROR,
+  DXMT_ENV_TEST_METAL4_INJECT_FEEDBACK_ERROR_ONCE,
+  DXMT_ENV_TEST_METAL4_REJECTION_MARKER,
+  DXMT_ENV_VALIDATION,
+  DXMT_ENV_MTL_DEBUG_LAYER,
+  DXMT_ENV_MTL_SHADER_VALIDATION,
+  DXMT_ENV_KEY_COUNT,
+};
+
+static const char *const dxmt_env_key_names[] = {
+    [DXMT_ENV_APITRACE_ENABLED] = "DXMT_APITRACE_ENABLED",
+    [DXMT_ENV_DIAG_ERROR_SNAPSHOT] = "DXMT_DIAG_ERROR_SNAPSHOT",
+    [DXMT_ENV_DIAG_GPU_HANG_DENSE] = "DXMT_DIAG_GPU_HANG_DENSE",
+    [DXMT_ENV_DIAG_HEAP_STORAGE] = "DXMT_DIAG_HEAP_STORAGE",
+    [DXMT_ENV_DIAG_METAL4_QUEUE_MONITOR] = "DXMT_DIAG_METAL4_QUEUE_MONITOR",
+    [DXMT_ENV_DIAG_METAL_PSO_LABELS] = "DXMT_DIAG_METAL_PSO_LABELS",
+    [DXMT_ENV_DIAG_METAL_RESIDENCY] = "DXMT_DIAG_METAL_RESIDENCY",
+    [DXMT_ENV_DIAG_RESIDENCY_CALLS] = "DXMT_DIAG_RESIDENCY_CALLS",
+    [DXMT_ENV_DIAG_ROOT_CAUSE_DENSE] = "DXMT_DIAG_ROOT_CAUSE_DENSE",
+    [DXMT_ENV_DIAG_VALIDATION] = "DXMT_DIAG_VALIDATION",
+    [DXMT_ENV_LOG_PATH] = "DXMT_LOG_PATH",
+    [DXMT_ENV_METAL4_COMMIT_FEEDBACK] = "DXMT_METAL4_COMMIT_FEEDBACK",
+    [DXMT_ENV_METAL4_COMMIT_FEEDBACK_SAMPLE_RATE] =
+        "DXMT_METAL4_COMMIT_FEEDBACK_SAMPLE_RATE",
+    [DXMT_ENV_METAL4_PRESENT_ORDERING] = "DXMT_METAL4_PRESENT_ORDERING",
+    [DXMT_ENV_METAL4_WAIT_FOR_DRAWABLE] = "DXMT_METAL4_WAIT_FOR_DRAWABLE",
+    [DXMT_ENV_PERF_STATS] = "DXMT_PERF_STATS",
+    [DXMT_ENV_TEST_METAL4_INJECT_FEEDBACK_ERROR] =
+        "DXMT_TEST_METAL4_INJECT_FEEDBACK_ERROR",
+    [DXMT_ENV_TEST_METAL4_INJECT_FEEDBACK_ERROR_ONCE] =
+        "DXMT_TEST_METAL4_INJECT_FEEDBACK_ERROR_ONCE",
+    [DXMT_ENV_TEST_METAL4_REJECTION_MARKER] =
+        "DXMT_TEST_METAL4_REJECTION_MARKER",
+    [DXMT_ENV_VALIDATION] = "DXMT_VALIDATION",
+    [DXMT_ENV_MTL_DEBUG_LAYER] = "MTL_DEBUG_LAYER",
+    [DXMT_ENV_MTL_SHADER_VALIDATION] = "MTL_SHADER_VALIDATION",
+};
+
+_Static_assert(sizeof(dxmt_env_key_names) / sizeof(dxmt_env_key_names[0]) ==
+                   DXMT_ENV_KEY_COUNT,
+               "dxmt_env_key_names must name every dxmt_env_key");
+
+static const char *dxmt_env_values[DXMT_ENV_KEY_COUNT];
+static pthread_once_t dxmt_env_snapshot_once = PTHREAD_ONCE_INIT;
+
+/*
+ * Records one "NAME=VALUE" entry if DXMT tracks NAME.
+ *
+ * Set-but-empty is folded to "unset", which is what every caller in this file
+ * already open-codes as `value && value[0]`.  First entry wins, matching
+ * getenv() semantics for a duplicated name.  A failed strdup() leaves the slot
+ * NULL, i.e. the variable reads as unset -- the diagnostics gated on these are
+ * off by default anyway.
+ */
+static void
+dxmt_env_snapshot_entry(const char *entry) {
+  const char *separator = strchr(entry, '=');
+  if (!separator || separator == entry || !separator[1])
+    return;
+
+  const size_t name_length = (size_t)(separator - entry);
+  for (unsigned index = 0; index < DXMT_ENV_KEY_COUNT; index++) {
+    if (dxmt_env_values[index])
+      continue;
+    const char *name = dxmt_env_key_names[index];
+    if (strlen(name) != name_length || strncmp(entry, name, name_length))
+      continue;
+    dxmt_env_values[index] = strdup(separator + 1);
+    return;
+  }
+}
+
+static void
+dxmt_env_snapshot_initialize(void) {
+  /*
+   * _NSGetEnviron() rather than the `environ` global: on Darwin `environ` is
+   * only linkable from the main executable, not from a shared library like
+   * this one.  Walking the block ourselves also keeps this file free of
+   * getenv(), whose interior pointers are the whole problem described above.
+   */
+  char ***environ_slot = _NSGetEnviron();
+  char **entries = environ_slot ? *environ_slot : NULL;
+  for (; entries && *entries; entries++)
+    dxmt_env_snapshot_entry(*entries);
+}
+
+/*
+ * Returns the snapshotted value of `key`, or NULL when it was unset or empty.
+ * The returned pointer is owned by this file and valid for the process
+ * lifetime, so callers may hold it across blocking work.
+ */
+static const char *
+dxmt_env_lookup(enum dxmt_env_key key) {
+  pthread_once(&dxmt_env_snapshot_once, dxmt_env_snapshot_initialize);
+  if ((unsigned)key >= DXMT_ENV_KEY_COUNT)
+    return NULL;
+  return dxmt_env_values[key];
+}
 
 typedef int NTSTATUS;
 #define STATUS_SUCCESS 0
@@ -126,7 +303,7 @@ static BOOL dxmt_residency_call_trace_is_enabled = NO;
 
 static void
 dxmt_residency_call_trace_initialize(void) {
-  const char *value = getenv("DXMT_DIAG_RESIDENCY_CALLS");
+  const char *value = dxmt_env_lookup(DXMT_ENV_DIAG_RESIDENCY_CALLS);
   dxmt_residency_call_trace_is_enabled =
       value && value[0] && strcmp(value, "0") != 0;
 }
@@ -444,8 +621,8 @@ dxmt_truthy_env_value(const char *value) {
 }
 
 static bool
-dxmt_env_enabled_default(const char *name, bool default_value) {
-  const char *value = getenv(name);
+dxmt_env_enabled_default(enum dxmt_env_key key, bool default_value) {
+  const char *value = dxmt_env_lookup(key);
   if (!value || !value[0])
     return default_value;
   if (!strcmp(value, "0") || !strcmp(value, "false") ||
@@ -466,8 +643,8 @@ static bool dxmt_metal4_heap_storage_diag_verbose_is_enabled = false;
 static void
 dxmt_metal4_heap_storage_diag_verbose_initialize(void) {
   dxmt_metal4_heap_storage_diag_verbose_is_enabled =
-      dxmt_truthy_env_value(getenv("DXMT_DIAG_HEAP_STORAGE")) ||
-      dxmt_truthy_env_value(getenv("DXMT_DIAG_ROOT_CAUSE_DENSE"));
+      dxmt_truthy_env_value(dxmt_env_lookup(DXMT_ENV_DIAG_HEAP_STORAGE)) ||
+      dxmt_truthy_env_value(dxmt_env_lookup(DXMT_ENV_DIAG_ROOT_CAUSE_DENSE));
 }
 
 static bool
@@ -564,8 +741,8 @@ dxmt_diag_heap_placement(const char *kind, id<MTLHeap> heap, uint64_t offset,
 }
 
 static uint64_t
-dxmt_parse_u64_env(const char *name, uint64_t default_value) {
-  const char *value = getenv(name);
+dxmt_parse_u64_env(enum dxmt_env_key key, uint64_t default_value) {
+  const char *value = dxmt_env_lookup(key);
   if (!value || !value[0])
     return default_value;
   char *end = NULL;
@@ -582,16 +759,18 @@ static uint64_t dxmt_metal4_commit_feedback_sample_rate = 64;
 
 static void
 dxmt_metal4_commit_feedback_initialize(void) {
-  const char *value = getenv("DXMT_METAL4_COMMIT_FEEDBACK");
+  const char *value = dxmt_env_lookup(DXMT_ENV_METAL4_COMMIT_FEEDBACK);
   dxmt_metal4_commit_feedback_is_enabled = dxmt_truthy_env_value(value);
   dxmt_metal4_commit_feedback_is_sampled = value && !strcmp(value, "sampled");
   dxmt_metal4_commit_feedback_sample_rate =
-      dxmt_parse_u64_env("DXMT_METAL4_COMMIT_FEEDBACK_SAMPLE_RATE", 64);
+      dxmt_parse_u64_env(DXMT_ENV_METAL4_COMMIT_FEEDBACK_SAMPLE_RATE, 64);
   if (!dxmt_metal4_commit_feedback_sample_rate)
     dxmt_metal4_commit_feedback_sample_rate = 64;
 }
 
-static bool
+/* Used only from a DXMT_APITRACE_METAL-guarded call site; the
+ * configuration that compiles this definition may have none. */
+static DXMT_MAYBE_UNUSED bool
 dxmt_metal4_commit_feedback_enabled(uint64_t completion_value) {
   pthread_once(&dxmt_metal4_commit_feedback_once,
                dxmt_metal4_commit_feedback_initialize);
@@ -609,7 +788,7 @@ static bool dxmt_metal4_present_ordering_is_enabled = true;
 static void
 dxmt_metal4_present_ordering_initialize(void) {
   dxmt_metal4_present_ordering_is_enabled =
-      dxmt_env_enabled_default("DXMT_METAL4_PRESENT_ORDERING", true);
+      dxmt_env_enabled_default(DXMT_ENV_METAL4_PRESENT_ORDERING, true);
 }
 
 static bool
@@ -625,7 +804,7 @@ static bool dxmt_metal4_wait_for_drawable_is_enabled = true;
 static void
 dxmt_metal4_wait_for_drawable_initialize(void) {
   dxmt_metal4_wait_for_drawable_is_enabled =
-      dxmt_env_enabled_default("DXMT_METAL4_WAIT_FOR_DRAWABLE", true);
+      dxmt_env_enabled_default(DXMT_ENV_METAL4_WAIT_FOR_DRAWABLE, true);
 }
 
 static bool
@@ -641,7 +820,7 @@ static bool dxmt_metal4_perf_stats_is_enabled = false;
 static void
 dxmt_metal4_perf_stats_initialize(void) {
   dxmt_metal4_perf_stats_is_enabled =
-      dxmt_truthy_env_value(getenv("DXMT_PERF_STATS"));
+      dxmt_truthy_env_value(dxmt_env_lookup(DXMT_ENV_PERF_STATS));
 }
 
 static bool
@@ -657,10 +836,10 @@ static bool dxmt_metal4_pso_labels_is_enabled = false;
 static void
 dxmt_metal4_pso_labels_initialize(void) {
   dxmt_metal4_pso_labels_is_enabled =
-      dxmt_truthy_env_value(getenv("DXMT_DIAG_METAL_PSO_LABELS")) ||
-      dxmt_truthy_env_value(getenv("DXMT_DIAG_ROOT_CAUSE_DENSE")) ||
-      dxmt_truthy_env_value(getenv("DXMT_VALIDATION")) ||
-      dxmt_truthy_env_value(getenv("DXMT_DIAG_VALIDATION"));
+      dxmt_truthy_env_value(dxmt_env_lookup(DXMT_ENV_DIAG_METAL_PSO_LABELS)) ||
+      dxmt_truthy_env_value(dxmt_env_lookup(DXMT_ENV_DIAG_ROOT_CAUSE_DENSE)) ||
+      dxmt_truthy_env_value(dxmt_env_lookup(DXMT_ENV_VALIDATION)) ||
+      dxmt_truthy_env_value(dxmt_env_lookup(DXMT_ENV_DIAG_VALIDATION));
 }
 
 static bool
@@ -676,9 +855,9 @@ static bool dxmt_metal4_residency_diag_is_enabled = false;
 static void
 dxmt_metal4_residency_diag_initialize(void) {
   dxmt_metal4_residency_diag_is_enabled =
-      dxmt_truthy_env_value(getenv("DXMT_DIAG_METAL_RESIDENCY")) ||
-      dxmt_truthy_env_value(getenv("DXMT_VALIDATION")) ||
-      dxmt_truthy_env_value(getenv("DXMT_DIAG_VALIDATION"));
+      dxmt_truthy_env_value(dxmt_env_lookup(DXMT_ENV_DIAG_METAL_RESIDENCY)) ||
+      dxmt_truthy_env_value(dxmt_env_lookup(DXMT_ENV_VALIDATION)) ||
+      dxmt_truthy_env_value(dxmt_env_lookup(DXMT_ENV_DIAG_VALIDATION));
 }
 
 static bool
@@ -708,10 +887,10 @@ static bool dxmt_metal4_dense_hang_diagnostics_is_enabled = false;
 static void
 dxmt_metal4_dense_hang_diagnostics_initialize(void) {
   dxmt_metal4_dense_hang_diagnostics_is_enabled =
-      dxmt_truthy_env_value(getenv("DXMT_DIAG_GPU_HANG_DENSE")) ||
-      dxmt_truthy_env_value(getenv("DXMT_DIAG_ROOT_CAUSE_DENSE")) ||
-      dxmt_truthy_env_value(getenv("DXMT_VALIDATION")) ||
-      dxmt_truthy_env_value(getenv("DXMT_DIAG_VALIDATION"));
+      dxmt_truthy_env_value(dxmt_env_lookup(DXMT_ENV_DIAG_GPU_HANG_DENSE)) ||
+      dxmt_truthy_env_value(dxmt_env_lookup(DXMT_ENV_DIAG_ROOT_CAUSE_DENSE)) ||
+      dxmt_truthy_env_value(dxmt_env_lookup(DXMT_ENV_VALIDATION)) ||
+      dxmt_truthy_env_value(dxmt_env_lookup(DXMT_ENV_DIAG_VALIDATION));
 }
 
 static bool
@@ -727,7 +906,7 @@ static bool dxmt_metal4_error_snapshot_is_enabled = false;
 static void
 dxmt_metal4_error_snapshot_initialize(void) {
   dxmt_metal4_error_snapshot_is_enabled =
-      dxmt_truthy_env_value(getenv("DXMT_DIAG_ERROR_SNAPSHOT"));
+      dxmt_truthy_env_value(dxmt_env_lookup(DXMT_ENV_DIAG_ERROR_SNAPSHOT));
 }
 
 static bool
@@ -808,10 +987,13 @@ dxmt_metal4_emit_hang_validation_report(
   const double gpu_ms =
       (gpu_end > gpu_start) ? (gpu_end - gpu_start) * 1000.0 : 0.0;
   const char *metal_debug =
-      dxmt_truthy_env_value(getenv("MTL_DEBUG_LAYER")) ? "on" : "off";
+      dxmt_truthy_env_value(dxmt_env_lookup(DXMT_ENV_MTL_DEBUG_LAYER)) ? "on"
+                                                                      : "off";
   const char *metal_shader_val =
-      dxmt_truthy_env_value(getenv("MTL_SHADER_VALIDATION")) ? "on" : "off";
-  const char *log_path = getenv("DXMT_LOG_PATH");
+      dxmt_truthy_env_value(dxmt_env_lookup(DXMT_ENV_MTL_SHADER_VALIDATION))
+          ? "on"
+          : "off";
+  const char *log_path = dxmt_env_lookup(DXMT_ENV_LOG_PATH);
   if (!log_path || !log_path[0])
     log_path = "<unset>";
 
@@ -1012,7 +1194,7 @@ static FILE *dxmt_metal4_hang_log_file_handle = NULL;
 
 static void
 dxmt_metal4_hang_log_file_open(void) {
-  const char *dir = getenv("DXMT_LOG_PATH");
+  const char *dir = dxmt_env_lookup(DXMT_ENV_LOG_PATH);
   if (!dir || !dir[0])
     return;
   char path[PATH_MAX];
@@ -1062,7 +1244,8 @@ static bool dxmt_metal4_queue_monitor_is_enabled = false;
 static void
 dxmt_metal4_queue_monitor_initialize(void) {
   dxmt_metal4_queue_monitor_is_enabled =
-      dxmt_truthy_env_value(getenv("DXMT_DIAG_METAL4_QUEUE_MONITOR")) ||
+      dxmt_truthy_env_value(
+          dxmt_env_lookup(DXMT_ENV_DIAG_METAL4_QUEUE_MONITOR)) ||
       dxmt_metal4_dense_hang_diagnostics_enabled();
 }
 
@@ -1073,12 +1256,20 @@ dxmt_metal4_queue_monitor_enabled(void) {
   return dxmt_metal4_queue_monitor_is_enabled;
 }
 
+/*
+ * Both injection switches come from the process-lifetime snapshot, so a test
+ * must set them before launching the runtime -- rewriting them mid-run from a
+ * debugger no longer takes effect.  Nothing in the tree drives them that way
+ * (no in-tree reference to either name outside this file), and mid-run rewrites
+ * were never usable anyway: an in-process setenv() of a name this file reads is
+ * exactly the use-after-free described at the top.
+ */
 static bool
 dxmt_metal4_test_feedback_error_enabled(void) {
   const char *once =
-      getenv("DXMT_TEST_METAL4_INJECT_FEEDBACK_ERROR_ONCE");
+      dxmt_env_lookup(DXMT_ENV_TEST_METAL4_INJECT_FEEDBACK_ERROR_ONCE);
   return dxmt_truthy_env_value(
-             getenv("DXMT_TEST_METAL4_INJECT_FEEDBACK_ERROR")) ||
+             dxmt_env_lookup(DXMT_ENV_TEST_METAL4_INJECT_FEEDBACK_ERROR)) ||
          (once && once[0] && strcmp(once, "0") && strcmp(once, "false") &&
           strcmp(once, "no") && strcmp(once, "off"));
 }
@@ -2332,7 +2523,9 @@ dxmt_apitrace_record_command_buffer_commit_state(
   (void)d3d_sequence;
 }
 
-static void
+/* Used only from a DXMT_APITRACE_METAL-guarded call site; the
+ * configuration that compiles this definition may have none. */
+static DXMT_MAYBE_UNUSED void
 dxmt_apitrace_record_command_buffer_feedback(
     obj_handle_t command_buffer,
     int status,
@@ -2384,7 +2577,9 @@ dxmt_apitrace_record_counter_event(
   (void)update_fence;
 }
 
-static void
+/* Used only from a DXMT_APITRACE_METAL-guarded call site; the
+ * configuration that compiles this definition may have none. */
+static DXMT_MAYBE_UNUSED void
 dxmt_apitrace_record_buffer_binding(
     void *session,
     obj_handle_t encoder,
@@ -2400,7 +2595,9 @@ dxmt_apitrace_record_buffer_binding(
   (void)index;
 }
 
-static void
+/* Used only from a DXMT_APITRACE_METAL-guarded call site; the
+ * configuration that compiles this definition may have none. */
+static DXMT_MAYBE_UNUSED void
 dxmt_apitrace_record_texture_binding(
     void *session,
     obj_handle_t encoder,
@@ -2414,7 +2611,9 @@ dxmt_apitrace_record_texture_binding(
   (void)index;
 }
 
-static void
+/* Used only from a DXMT_APITRACE_METAL-guarded call site; the
+ * configuration that compiles this definition may have none. */
+static DXMT_MAYBE_UNUSED void
 dxmt_apitrace_record_indirect_arguments(
     void *session,
     obj_handle_t encoder,
@@ -2424,7 +2623,9 @@ dxmt_apitrace_record_indirect_arguments(
   (void)info;
 }
 
-static void
+/* Used only from a DXMT_APITRACE_METAL-guarded call site; the
+ * configuration that compiles this definition may have none. */
+static DXMT_MAYBE_UNUSED void
 dxmt_apitrace_record_emulated_blit(
     void *session,
     obj_handle_t encoder,
@@ -3717,7 +3918,7 @@ dxmt_metal4_commit_depth_scope_cleanup(volatile int *armed) {
     [_owner monitorWaitEnd:DXMTMetal4QueueMonitorSourceUnixCommitThunk
              commandBuffer:self];
     const char *rejection_marker =
-        getenv("DXMT_TEST_METAL4_REJECTION_MARKER");
+        dxmt_env_lookup(DXMT_ENV_TEST_METAL4_REJECTION_MARKER);
     if (rejection_marker && *rejection_marker) {
       FILE *marker = fopen(rejection_marker, "a");
       if (marker) {
@@ -4013,12 +4214,19 @@ dxmt_metal4_commit_depth_scope_cleanup(volatile int *armed) {
               monitorWaitEnd:DXMTMetal4QueueMonitorSourceFeedbackInjection
                commandBuffer:feedbackOwner];
           [feedbackQueueOwner.errorLock lock];
-          if (dxmt_truthy_env_value(
-                  getenv("DXMT_TEST_METAL4_INJECT_FEEDBACK_ERROR"))) {
+          if (dxmt_truthy_env_value(dxmt_env_lookup(
+                  DXMT_ENV_TEST_METAL4_INJECT_FEEDBACK_ERROR))) {
             injectTestError = YES;
           } else {
-            const char *token =
-                getenv("DXMT_TEST_METAL4_INJECT_FEEDBACK_ERROR_ONCE");
+            /*
+             * The token is snapshotted, so it cannot change during the run and
+             * this "inject once per distinct token" gate fires at most once per
+             * process.  That already was the effective behaviour: no DXMT code
+             * writes this variable, and a foreign writer is precisely the
+             * hazard the snapshot exists to bound.
+             */
+            const char *token = dxmt_env_lookup(
+                DXMT_ENV_TEST_METAL4_INJECT_FEEDBACK_ERROR_ONCE);
             if (token && token[0] && strcmp(token, "0") &&
                 strcmp(token, "false") && strcmp(token, "no") &&
                 strcmp(token, "off")) {
@@ -5769,7 +5977,7 @@ dxmt_apitrace_truthy_env_value(const char *value) {
 
 static bool
 dxmt_apitrace_runtime_enabled(void) {
-  const char *enabled = getenv("DXMT_APITRACE_ENABLED");
+  const char *enabled = dxmt_env_lookup(DXMT_ENV_APITRACE_ENABLED);
   return dxmt_apitrace_truthy_env_value(enabled);
 }
 
@@ -6827,7 +7035,9 @@ dxmt_apitrace_snapshot_buffer(apitrace_metal_session_t *session, obj_handle_t bu
   apitrace_metal_buffer_gpu_address_metadata(session, buffer_handle, (uint64_t)[buffer gpuAddress]);
 }
 
-static void
+/* Used only from a DXMT_APITRACE_METAL-guarded call site; the
+ * configuration that compiles this definition may have none. */
+static DXMT_MAYBE_UNUSED void
 dxmt_apitrace_record_buffer_binding(
     apitrace_metal_session_t *session,
     obj_handle_t encoder,
@@ -6846,7 +7056,9 @@ dxmt_apitrace_record_buffer_binding(
       session, encoder, stage, index, buffer_handle, offset, gpu_address, length);
 }
 
-static void
+/* Used only from a DXMT_APITRACE_METAL-guarded call site; the
+ * configuration that compiles this definition may have none. */
+static DXMT_MAYBE_UNUSED void
 dxmt_apitrace_record_texture_binding(
     apitrace_metal_session_t *session,
     obj_handle_t encoder,
@@ -6859,7 +7071,9 @@ dxmt_apitrace_record_texture_binding(
   apitrace_metal_argument_table_texture_binding(session, encoder, stage, index, texture_handle, resource_id);
 }
 
-static void
+/* Used only from a DXMT_APITRACE_METAL-guarded call site; the
+ * configuration that compiles this definition may have none. */
+static DXMT_MAYBE_UNUSED void
 dxmt_apitrace_record_indirect_arguments(
     apitrace_metal_session_t *session,
     obj_handle_t encoder,
@@ -6874,7 +7088,9 @@ dxmt_apitrace_record_indirect_arguments(
   apitrace_metal_indirect_arguments(session, encoder, info);
 }
 
-static void
+/* Used only from a DXMT_APITRACE_METAL-guarded call site; the
+ * configuration that compiles this definition may have none. */
+static DXMT_MAYBE_UNUSED void
 dxmt_apitrace_record_emulated_blit(
     apitrace_metal_session_t *session,
     obj_handle_t encoder,
@@ -6944,7 +7160,9 @@ dxmt_apitrace_record_command_buffer_commit_state(
   pthread_mutex_unlock(&dxmt_apitrace_lock);
 }
 
-static void
+/* Used only from a DXMT_APITRACE_METAL-guarded call site; the
+ * configuration that compiles this definition may have none. */
+static DXMT_MAYBE_UNUSED void
 dxmt_apitrace_record_command_buffer_feedback(
     obj_handle_t command_buffer,
     apitrace_metal_command_buffer_feedback_status status,
@@ -10394,7 +10612,32 @@ _MTLTexture_replaceRegion(void *obj) {
 static NTSTATUS
 _MTLBuffer_didModifyRange(void *obj) {
   struct unixcall_generic_obj_uint64_uint64_ret *params = obj;
-  [(id<MTLBuffer>)params->handle didModifyRange:NSMakeRange(params->arg, params->ret)];
+  /*
+   * No buffer reaching the Metal 4 layer is Managed.  BufferAllocation::
+   * didModifyRange (src/dxmt/dxmt_buffer.hpp:165-166) returns before the thunk
+   * unless BufferAllocationFlag::GpuManaged is set, and that flag is only ever
+   * set from src/d3d11 (d3d11_buffer.cpp:100,104,323; d3d11_context_impl.cpp:3824;
+   * d3d11_texture_{dynamic,linear,device}.cpp), which links winemetal, not
+   * winemetal4 (src/d3d11/meson.build:57 vs src/d3d12/meson.build:229).  So the
+   * publish is a no-op here, and -didModifyRange: is deprecated as of macOS 27
+   * because Managed storage has no effect on Apple Silicon, which is the only
+   * hardware this project targets.  Keep the entry point for ABI, drop the call,
+   * and shout if the invariant ever breaks.
+   */
+  static atomic_bool managed_reported = false;
+/*
+ * Naming the deprecated constant is the entire point of this guard: it exists to
+ * detect a managed buffer, so it has to be able to say "managed".
+ */
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+  const BOOL managed =
+      [(id<MTLBuffer>)params->handle storageMode] == MTLStorageModeManaged;
+#pragma clang diagnostic pop
+  if (managed && !atomic_exchange(&managed_reported, true))
+    fprintf(stderr,
+            "err:   winemetal4: a managed buffer reached the Metal 4 layer; "
+            "didModifyRange is no longer published\n");
 #if DXMT_APITRACE_METAL
   if (dxmt_apitrace_runtime_enabled() && [(id<MTLBuffer>)params->handle storageMode] != MTLStorageModePrivate) {
     const uint64_t offset = params->arg;
@@ -12219,8 +12462,7 @@ static NTSTATUS
 _MTLBuffer_updateContents(void *obj) {
   struct unixcall_mtlbuffer_updatecontents *params = obj;
   memcpy((void *)((char *)[(id<MTLBuffer>)params->buffer contents] + params->offset), params->data.ptr, params->length);
-  if ([(id<MTLBuffer>)params->buffer storageMode] == MTLStorageModeManaged)
-    [(id<MTLBuffer>)params->buffer didModifyRange:NSMakeRange(params->offset, params->length)];
+  /* Managed storage never reaches this layer; see _MTLBuffer_didModifyRange. */
 #if DXMT_APITRACE_METAL
   if (dxmt_apitrace_runtime_enabled() && [(id<MTLBuffer>)params->buffer storageMode] != MTLStorageModePrivate) {
     pthread_mutex_lock(&dxmt_apitrace_lock);
