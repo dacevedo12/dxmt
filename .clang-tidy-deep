@@ -11,6 +11,20 @@
 #     only catches a cast applied too late; this catches the 32-bit multiply that
 #     overflows before any widening happens, which is how an undersized staging
 #     allocation turns into an out-of-bounds copy.
+#     No CheckOptions entry on purpose.  IgnoreConstantIntExpr looks like the
+#     answer for the constant `std::array<T, kA * kB>` bounds and the
+#     `constexpr size_t x = 16u * 1024u * 1024u` caps, and it does nothing for
+#     them: measured on clang-tidy 21.1.8, the option exempts a constant
+#     multiplication only when the multiplication was performed in a *signed*
+#     type, and every one of those operands is `unsigned`/`uint32_t`.  Turning
+#     it on over the real translation units moved exactly two findings, both
+#     inside libc++ headers that `SystemHeaders: false` drops anyway.  Those
+#     sites were fixed in the source instead, by forming the product in
+#     std::size_t at the multiplication.  That is the right answer regardless:
+#     unsigned wraparound is well-defined, so an oversized `unsigned` constant
+#     product is a *valid* constant expression that silently truncates -- even
+#     as a std::array extent -- rather than the hard error a signed overflow
+#     would be.  There is real signal in these, not just noise.
 #
 #   concurrency-mt-unsafe (FunctionSet: posix)
 #     Re-enabled after being dropped as noise.  That call was wrong: the one

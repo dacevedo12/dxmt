@@ -18,6 +18,7 @@
 #include "airconv_public.h"
 #include <array>
 #include <cassert>
+#include <cstddef>
 #include <optional>
 #include <string>
 #include <vector>
@@ -1476,9 +1477,20 @@ private:
   std::array<VertexBufferBinding, kVertexBufferSlots> vbuf_;
   Rc<Buffer> ibuf_;
 
-  std::array<ConstantBufferBinding, 14 * kStages> cbuf_;
-  std::array<SamplerBinding, 16 * kStages> sampler_;
-  std::array<ResourceViewBinding, kSRVBindings * kStages> resview_;
+  // The extent of a std::array is a std::size_t, so form the product there
+  // instead of multiplying two `unsigned` constants and letting the result be
+  // widened afterwards.  Same reasoning as ComputePlacedFootprintRowLayout()
+  // in d3d12_copy_footprint.cpp: the target width belongs at the
+  // multiplication, not after it.
+  //
+  // Being constants is not what makes these safe -- the values are (84, 96,
+  // 768 for kStages=6/kSRVBindings=128 above).  Unsigned wraparound is
+  // well-defined, so `std::array<T, kA * kB>` with an oversized `unsigned`
+  // product is a *valid* constant expression that silently yields a truncated
+  // extent; it is not the hard compile error a signed overflow would be.
+  std::array<ConstantBufferBinding, std::size_t{14} * kStages> cbuf_;
+  std::array<SamplerBinding, std::size_t{16} * kStages> sampler_;
+  std::array<ResourceViewBinding, std::size_t{kSRVBindings} * kStages> resview_;
 
   std::array<UnorderedAccessViewBinding, kUAVBindings> om_uav_;
   std::array<UnorderedAccessViewBinding, kUAVBindings> cs_uav_;

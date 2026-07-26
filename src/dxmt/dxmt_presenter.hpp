@@ -6,6 +6,7 @@
 #include "util_cpu_fence.hpp"
 #include "winemetal.h"
 #include <atomic>
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 
@@ -95,7 +96,10 @@ private:
   WMTHDRMetadata display_hdr_metadata_;
   WMTEDRValue display_edr_value_{0.0, 1.0};
   uint64_t gamma_version_ = 0;
-  std::array<float, DXMT_GAMMA_CP_COUNT * 4> gamma_lut_rgba_;
+  // DXMT_GAMMA_CP_COUNT is a uint32_t; widen before the multiply so the extent
+  // is computed in the array's own index type rather than in 32-bit and then
+  // converted.
+  std::array<float, std::size_t{DXMT_GAMMA_CP_COUNT} * 4> gamma_lut_rgba_;
   WMT::Reference<WMT::Texture> gamma_lut_texture_;
   std::shared_ptr<LifetimeResidencyRegistration>
       gamma_lut_residency_registration_;

@@ -23,7 +23,10 @@ namespace dxmt::d3d12 {
 
 // Argument-buffer bytes larger than this are refused: a corrupted freeze must
 // not memcpy multi-GB into a bad mapping.
-inline constexpr size_t kMaxArgumentUploadBytes = 16u * 1024u * 1024u;
+// Written as a size_t product rather than `16u * 1024u * 1024u`: a byte count
+// is a size_t, and a byte count assembled out of 32-bit factors is exactly the
+// shape that starts wrapping once someone raises the cap.
+inline constexpr size_t kMaxArgumentUploadBytes = size_t{16} * 1024 * 1024;
 
 // Copies `size` bytes into a freshly allocated argument-buffer slice for the
 // encoder's current sequence. Returns an empty slice for an empty or

@@ -6219,7 +6219,9 @@ private:
         return; // unchanged since last emit -> already in trace
       // Bound memory on pathologically long traces. Clearing is correctness-safe; it only forces
       // re-emitting spans seen before the clear.
-      constexpr size_t kMaxDedupEntries = 2u * 1024u * 1024u;
+      // Compared against map::size(), so build it in size_t rather than
+      // multiplying 32-bit factors and widening the result.
+      constexpr size_t kMaxDedupEntries = size_t{2} * 1024 * 1024;
       if (g_copy_snapshot_dedup.size() >= kMaxDedupEntries)
         g_copy_snapshot_dedup.clear();
       g_copy_snapshot_dedup[key] = fingerprint;

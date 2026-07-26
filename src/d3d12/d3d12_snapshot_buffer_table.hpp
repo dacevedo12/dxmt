@@ -13,6 +13,7 @@
 #include "dxmt_context.hpp"
 
 #include <array>
+#include <cstddef>
 
 namespace dxmt::d3d12 {
 
@@ -21,11 +22,15 @@ inline constexpr unsigned kSnapshotConstantBufferSlotsPerStage = 14;
 
 // Owning storage for one packBindlessStage buffer-table view.
 struct BindlessBufferTableSnapshotStorage {
+  // std::size_t at the multiplication, not after it: these extents mirror
+  // ContextInternal::cbuf_/resview_ in dxmt_context.hpp and must be computed
+  // the same way, in the array's own index type rather than in `unsigned`.
   std::array<ConstantBufferBindingSnapshot,
-             kSnapshotConstantBufferSlotsPerStage * kStages>
+             std::size_t{kSnapshotConstantBufferSlotsPerStage} * kStages>
       constant_buffers = {};
-  std::array<ShaderResourceBindingSnapshot, kSRVBindings * kStages> resources =
-      {};
+  std::array<ShaderResourceBindingSnapshot,
+             std::size_t{kSRVBindings} * kStages>
+      resources = {};
 
   BindlessBufferTableSnapshot view() const {
     return BindlessBufferTableSnapshot{constant_buffers.data(),
