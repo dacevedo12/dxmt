@@ -112,6 +112,22 @@ EncodeIndirectDraw(const SubmissionBindingContext &ctx,
       WARN("D3D12CommandQueue: counted geometry indirect draw is unsupported");
       return;
     }
+    // The queue only reaches this branch after LowerIndirectDrawTopology
+    // engaged `geometry_counts` for a geometry PSO
+    // (d3d12_indirect_encoding.cpp:233-241) and the caller dropped the draw
+    // when it could not (d3d12_command_queue_indirect.inc:249-250). Naming
+    // that chain in a comment is not enough: the correlation between
+    // `use_geometry` and which of the three lowering optionals is engaged is
+    // established in another translation unit, is carried across a
+    // `IndirectDrawEncodeParams` copy, a lambda capture and a pass batch, and
+    // is never re-expressed here, so a flow-sensitive reader of this function
+    // -- human or clang-tidy -- has nothing to derive it from. Re-check it the
+    // way the tessellation branch above already re-checks
+    // `control_point_count`.
+    if (!geometry_counts) {
+      WARN("D3D12CommandQueue: geometry indirect draw skipped because geometry metadata is invalid");
+      return;
+    }
     auto *render_encoder = enc.currentRenderEncoder();
     render_encoder->use_geometry = 1;
     auto [arg_allocation, arg_sub_offset] =
@@ -138,6 +154,14 @@ EncodeIndirectDraw(const SubmissionBindingContext &ctx,
     draw.indirect_args_offset = arg_sub_offset + arg_offset;
     draw.imm_draw_arguments = enc.getFinalArgumentBuffer();
   } else {
+    // Same reasoning as the geometry branch above: `primitive` is the lowering
+    // result reserved for the plain (non-geometry, non-tessellation) PSO
+    // variant (d3d12_indirect_encoding.cpp:242-251), but the bools that select
+    // this branch travel here separately from the optional they constrain.
+    if (!primitive) {
+      WARN("D3D12CommandQueue: indirect draw skipped because primitive topology is unavailable");
+      return;
+    }
     WMT::Buffer indirect_buffer;
     UINT64 indirect_offset;
     if (count_buffer.ptr()) {
@@ -274,6 +298,12 @@ EncodeIndirectDrawIndexed(const SubmissionBindingContext &ctx,
       WARN("D3D12CommandQueue: counted geometry indirect indexed draw is unsupported");
       return;
     }
+    // See EncodeIndirectDraw for why the `use_geometry` bool alone does not
+    // make `geometry_counts` observably engaged at this point.
+    if (!geometry_counts) {
+      WARN("D3D12CommandQueue: geometry indirect indexed draw skipped because geometry metadata is invalid");
+      return;
+    }
     auto *render_encoder = enc.currentRenderEncoder();
     render_encoder->use_geometry = 1;
     auto [arg_allocation, arg_sub_offset] =
@@ -302,6 +332,12 @@ EncodeIndirectDrawIndexed(const SubmissionBindingContext &ctx,
     draw.index_buffer_offset = index_offset;
     draw.imm_draw_arguments = enc.getFinalArgumentBuffer();
   } else {
+    // See EncodeIndirectDraw for why the branch condition alone does not make
+    // `primitive` observably engaged at this point.
+    if (!primitive) {
+      WARN("D3D12CommandQueue: indirect indexed draw skipped because primitive topology is unavailable");
+      return;
+    }
     WMT::Buffer indirect_buffer;
     UINT64 indirect_offset;
     if (count_buffer.ptr()) {

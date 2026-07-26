@@ -304,6 +304,22 @@ void EncodeReplayDrawIndexedInstancedBody(
 
 void EncodeReplayDrawIndirectCompiledBody(
     ArgumentEncodingContext &enc, ReplayDrawIndirectCompiledPacket &packet) {
+  // ResolveCompiledGraphicsMetalPipeline only reports
+  // CompiledCommandFallbackReason::None once it has engaged `plan.primitive`
+  // (d3d12_compiled_graphics_emit_plan.cpp:100-102), and the compiled replay
+  // bails out on any other reason before it ever queues an indirect command
+  // (d3d12_command_queue_execute.inc:738-741 into
+  // QueueCompiledGraphicsIndirectCommands, which copies the plan value at
+  // d3d12_command_queue_execute.inc:399). None of that is visible from here:
+  // the guarantee is expressed as an enum return value in a different
+  // translation unit, and the packet is parked in a queued command before this
+  // body runs. Re-check it once, exactly like the direct compiled draw bodies
+  // above already do.
+  if (!packet.common.primitive) {
+    WARN("D3D12CommandQueue: compiled indirect draw skipped because primitive topology is unavailable");
+    return;
+  }
+  const auto primitive_type = *packet.common.primitive;
   auto [argument_allocation, argument_sub_offset] =
       enc.access<PipelineStage::Vertex>(
           packet.argument_buffer, packet.argument_offset,
@@ -318,7 +334,7 @@ void EncodeReplayDrawIndirectCompiledBody(
     auto &draw = enc.encodeRenderCommand<
         wmtcmd_render_draw_indexed_indirect>();
     draw.type = WMTRenderCommandDrawIndexedIndirect;
-    draw.primitive_type = *packet.common.primitive;
+    draw.primitive_type = primitive_type;
     draw.index_type = packet.index_type;
     draw.index_buffer = packet.index_allocation->buffer();
     draw.index_buffer_offset = packet.index_buffer_offset;
@@ -328,7 +344,7 @@ void EncodeReplayDrawIndirectCompiledBody(
     auto &draw =
         enc.encodeRenderCommand<wmtcmd_render_draw_indirect>();
     draw.type = WMTRenderCommandDrawIndirect;
-    draw.primitive_type = *packet.common.primitive;
+    draw.primitive_type = primitive_type;
     draw.indirect_args_buffer = argument_allocation->buffer();
     draw.indirect_args_offset = metal_argument_offset;
   }

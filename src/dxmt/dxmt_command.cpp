@@ -976,7 +976,19 @@ ClearResourceKernelContext::clear(uint32_t offset_x, uint32_t offset_y, uint32_t
   meta_temp_.size[0] = width;
   meta_temp_.size[1] = height;
 
-  if (clearing_texture_) {
+  // `clearing_view_` is engaged next to every assignment that makes
+  // `clearing_texture_` non-null (begin() overloads at dxmt_command.cpp:828-829
+  // and 874-875) and end() clears both together (dxmt_command.cpp:1059-1061),
+  // so `clearing_texture_` alone used to be treated as proof that the view is
+  // there. That proof is a class invariant spread over three member functions,
+  // which no flow-sensitive reader of clear() can reconstruct, and it is not
+  // even airtight: the raw-buffer begin() overloads
+  // (dxmt_command.cpp:945-946, 960-961) reset the view without resetting
+  // `clearing_texture_`, so a begin(texture)/begin(buffer) pair that skipped
+  // end() would dereference an empty optional here. Testing both makes the
+  // texture branch self-evidently safe and routes that mispaired case to the
+  // buffer branch, which is the resource actually being cleared.
+  if (clearing_texture_ && clearing_view_) {
     auto &dst_ = ctx_.access(clearing_texture_, *clearing_view_, ResourceAccess::Write);
     auto &settex = ctx_.encodeComputeCommand<wmtcmd_compute_settexture>();
     settex.type = WMTComputeCommandSetTexture;
