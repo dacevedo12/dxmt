@@ -83,8 +83,17 @@ ComputePlacedFootprintRowLayout(const D3D12_SUBRESOURCE_FOOTPRINT &footprint,
 
 WMTOrigin
 TileCopyOrigin(const D3D12_TILE_SHAPE &tile_shape, UINT x, UINT y, UINT z) {
-  return WMTOrigin{x * tile_shape.WidthInTexels, y * tile_shape.HeightInTexels,
-                   z * tile_shape.DepthInTexels};
+  // The tile coordinate and the tile shape are both UINT while WMTOrigin is
+  // 64-bit, so widen before multiplying exactly like the footprint helpers
+  // above: a 32-bit product would wrap at 2^32 texels and only then be
+  // widened. The reserved-texture tiling that feeds this today keeps the
+  // product inside a texture dimension, but the reserved-buffer tiling in
+  // d3d12_resource.cpp already pairs a 65536-texel tile shape with a tile
+  // count spanning the whole UINT range, so the narrow form is one caller
+  // away from wrapping.
+  return WMTOrigin{UINT64(x) * tile_shape.WidthInTexels,
+                   UINT64(y) * tile_shape.HeightInTexels,
+                   UINT64(z) * tile_shape.DepthInTexels};
 }
 
 WMTSize

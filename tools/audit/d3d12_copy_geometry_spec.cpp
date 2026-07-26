@@ -687,6 +687,34 @@ TestBufferTileCopiesRejectOutOfBoundsRegions() {
         "a start offset that would wrap the 64-bit sum must be rejected");
 }
 
+void
+TestTileCopyOriginIsComputedIn64Bit() {
+  // A legal texture-sized origin must be untouched.
+  const D3D12_TILE_SHAPE texture_shape = {128, 128, 1};
+  const auto texel = d3d12::TileCopyOrigin(texture_shape, 3, 2, 0);
+  Check(texel.x == 384 && texel.y == 256 && texel.z == 0,
+        "an ordinary tile origin must be unchanged");
+
+  // The reserved-buffer tiling built in d3d12_resource.cpp is the shape that
+  // bites: WidthInTexels is the whole 64 KiB tile and width_in_tiles spans the
+  // UINT range, so tile 65536 lands on exactly 2^32 texels. A 32-bit product
+  // would report that origin as zero.
+  const D3D12_TILE_SHAPE buffer_shape = {
+      static_cast<UINT>(kTileBytes), 1, 1};
+  const auto wrapping = d3d12::TileCopyOrigin(buffer_shape, 65536, 0, 0);
+  Check(wrapping.x == UINT64(65536) * kTileBytes,
+        "a tile origin of exactly 2^32 texels must not wrap to zero");
+
+  // Every axis, not just the first one.
+  const D3D12_TILE_SHAPE cube_shape = {4096, 4096, 4096};
+  const auto far_origin =
+      d3d12::TileCopyOrigin(cube_shape, 0x100000, 0x200000, 0x300000);
+  Check(far_origin.x == UINT64(0x100000) * 4096 &&
+            far_origin.y == UINT64(0x200000) * 4096 &&
+            far_origin.z == UINT64(0x300000) * 4096,
+        "every tile-origin axis must be computed in 64-bit");
+}
+
 dxmt::MTL_DXGI_FORMAT_DESC
 Rgba8FormatDesc() {
   dxmt::MTL_DXGI_FORMAT_DESC format = {};
@@ -795,6 +823,7 @@ main() {
   TestIndirectArgumentSizeRejectsOverflowingConstants();
   TestBufferTileCopiesAcceptLegalRegions();
   TestBufferTileCopiesRejectOutOfBoundsRegions();
+  TestTileCopyOriginIsComputedIn64Bit();
   TestTextureTileCopiesAcceptLegalRegions();
   TestTextureTileCopiesRejectOutOfBoundsRegions();
   return 0;
