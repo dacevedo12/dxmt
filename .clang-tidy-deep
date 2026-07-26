@@ -1,0 +1,69 @@
+---
+# NOTE: `Checks:` below is a YAML folded scalar -- everything indented under it
+# is literal text, so a `#` line inside it is NOT a comment.  It gets folded
+# into the check-name string and silently swallows the neighbouring entries,
+# which clang-tidy accepts without a word.  Keep rationale here, above the key.
+#
+# Rationale for the non-obvious entries:
+#
+#   bugprone-implicit-widening-of-multiplication-result
+#     Byte sizes here are routinely width * height * bpp.  misplaced-widening-cast
+#     only catches a cast applied too late; this catches the 32-bit multiply that
+#     overflows before any widening happens, which is how an undersized staging
+#     allocation turns into an out-of-bounds copy.
+#
+#   concurrency-mt-unsafe (FunctionSet: posix)
+#     Re-enabled after being dropped as noise.  That call was wrong: the one
+#     finding that survived was a real std::localtime data race in the native
+#     build (process-global struct tm plus a lazy tzset), together with an
+#     unchecked null return fed straight into strftime.  The noise came from the
+#     default 'any' function set flagging single-threaded init code; 'posix'
+#     keeps the reentrancy signal without it.
+#
+#   -clang-analyzer-security.insecureAPI.DeprecatedOrUnsafeBufferHandling
+#     Annex K (fprintf_s and friends) is not implemented by the macOS libc, so
+#     every diagnostic this sub-check emits is unfixable by construction.  It was
+#     only ever pulled in by the security.* wildcard, and it produced the entire
+#     deep baseline -- 55 entries whose counts had to be bumped each time anyone
+#     added a diagnostic fprintf.  A check that can only be baselined is noise.
+Checks: >
+  -*,
+  bugprone-assert-side-effect,
+  bugprone-dangling-handle,
+  bugprone-exception-escape,
+  bugprone-infinite-loop,
+  bugprone-misplaced-widening-cast,
+  bugprone-implicit-widening-of-multiplication-result,
+  bugprone-multiple-statement-macro,
+  bugprone-sizeof-container,
+  bugprone-sizeof-expression,
+  bugprone-suspicious-memset-usage,
+  bugprone-unused-raii,
+  bugprone-use-after-move,
+  bugprone-unchecked-optional-access,
+  bugprone-integer-division,
+  bugprone-too-small-loop-variable,
+  bugprone-signed-char-misuse,
+  bugprone-inc-dec-in-conditions,
+  misc-no-recursion,
+  concurrency-mt-unsafe,
+  clang-analyzer-optin.cplusplus.UninitializedObject,
+  clang-analyzer-optin.cplusplus.VirtualCall,
+  clang-analyzer-core.*,
+  clang-analyzer-cplusplus.*,
+  clang-analyzer-deadcode.*,
+  clang-analyzer-nullability.*,
+  clang-analyzer-osx.cocoa.RetainCount,
+  clang-analyzer-security.*,
+  -clang-analyzer-security.insecureAPI.DeprecatedOrUnsafeBufferHandling,
+  clang-analyzer-unix.Malloc,
+  clang-analyzer-unix.MismatchedDeallocator,
+  clang-analyzer-unix.cstring.*,
+  performance-noexcept-move-constructor
+CheckOptions:
+  concurrency-mt-unsafe.FunctionSet: posix
+WarningsAsErrors: ''
+HeaderFilterRegex: '(^|/)(include|src)/(d3d12|dxmt|winemetal4)/'
+SystemHeaders: false
+FormatStyle: none
+...

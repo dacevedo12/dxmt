@@ -45,6 +45,10 @@ std::filesystem::path StagedInstallRoot(
 void WriteFileAtomic(const std::filesystem::path &path, std::string_view contents);
 void WithFileLock(const std::filesystem::path &path,
                   const std::function<void()> &operation);
+std::vector<std::string>
+AuditDx12Metal4Policy(const std::filesystem::path &repo_root);
+bool AuditDiagnosticMayBeBaselined(std::string_view path,
+                                   std::string_view check);
 } // namespace testing
 
 class Application {
