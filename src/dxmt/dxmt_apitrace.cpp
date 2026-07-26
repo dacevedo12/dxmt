@@ -10,7 +10,9 @@
 
 #include <atomic>
 #include <cstdlib>
+#include <mutex>
 #include <string>
+#include <utility>
 
 #ifdef _WIN32
 #include <windows.h>
@@ -73,8 +75,23 @@ ends_with(const std::string &value, const char *suffix) {
          value.compare(value.size() - suffix_string.size(), suffix_string.size(), suffix_string) == 0;
 }
 
+// Publishes `name` into the PE-side environment only.
+//
+// Deliberately does NOT touch the unix-side environment (formerly via ntdll's
+// __wine_set_unix_env, and plain setenv() on native builds). getenv() hands out
+// interior pointers into the environment block and setenv() frees the old value
+// string when it grows the block, so writing the unix environment from a DXMT
+// worker thread turned every concurrent unix-side getenv() of the same variable
+// into a use-after-free. winemetal's unix side now receives the bundle root as
+// an explicit WMT*ApitraceSessionEnsureOpen argument instead, so nothing on that
+// side reads APITRACE_TRACE_BUNDLE any more.
+//
+// The remaining PE-side write is still required: apitrace's own
+// resolve_bundle_root() (external, not ours to change) reads it through
+// std::getenv. It is ordered by the std::call_once in ensure_session_open(),
+// which happens-before any thread can reach apitrace's readers.
 void
-set_env_var(const char *name, const char *value) {
+set_pe_env_var([[maybe_unused]] const char *name, [[maybe_unused]] const char *value) {
 #ifdef _WIN32
   SetEnvironmentVariableA(name, value);
   // SetEnvironmentVariableA only updates the PEB; mingw msvcrt keeps its own
@@ -82,14 +99,6 @@ set_env_var(const char *name, const char *value) {
   // std::getenv, so without the CRT-side write the PE TraceSession would fall
   // back to the cwd-default bundle even after we mirror the value here.
   _putenv_s(name, value);
-
-  using WineSetUnixEnvProc = LONG(WINAPI *)(const char *, const char *);
-  auto set_unix_env = reinterpret_cast<WineSetUnixEnvProc>(
-      GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "__wine_set_unix_env"));
-  if (set_unix_env)
-    set_unix_env(name, value);
-#else
-  setenv(name, value, 1);
 #endif
 }
 
@@ -123,6 +132,10 @@ bundle_root_from_env(const std::string &value) {
   return {};
 }
 
+// Written exactly once, under bundle_root_once, before any reader observes it.
+std::string resolved_bundle_root;
+std::once_flag bundle_root_once;
+
 void
 initialize_bundle_root() {
   auto trace_bundle = bundle_root_from_env(env::getEnvVar(kTraceBundleEnv));
@@ -130,8 +143,23 @@ initialize_bundle_root() {
   if (trace_bundle.empty())
     trace_bundle = default_bundle_root();
 
-  if (!trace_bundle.empty())
-    set_env_var(kTraceBundleEnv, trace_bundle.c_str());
+  if (trace_bundle.empty())
+    return;
+
+  set_pe_env_var(kTraceBundleEnv, trace_bundle.c_str());
+  resolved_bundle_root = std::move(trace_bundle);
+}
+
+// Returns the process-wide bundle root, initializing it on first use.
+//
+// std::call_once (unlike the previous atomic exchange flag) makes every caller
+// block until initialization completes, so the single PE-side environment write
+// inside initialize_bundle_root() happens-before any other thread can reach
+// apitrace's std::getenv-based resolve_bundle_root().
+const std::string &
+bundle_root() {
+  std::call_once(bundle_root_once, initialize_bundle_root);
+  return resolved_bundle_root;
 }
 
 #ifdef _WIN32
@@ -200,15 +228,15 @@ ensure_session_open() {
   if (shutdown_requested.load(std::memory_order_acquire))
     return;
 
-  static std::atomic_bool bundle_initialized = false;
-  if (!bundle_initialized.exchange(true, std::memory_order_relaxed))
-    initialize_bundle_root();
+  const std::string &root = bundle_root();
 
 #ifdef _WIN32
   install_crash_flush_handler();
 #endif
 
-  DXMT_WMT_APITRACE_SESSION_ENSURE_OPEN();
+  // The unix side copies this string under its own lock; it never keeps the
+  // pointer, and it never reads the environment for it.
+  DXMT_WMT_APITRACE_SESSION_ENSURE_OPEN(root.empty() ? nullptr : root.c_str());
   if (!session_open_logged.exchange(true, std::memory_order_relaxed))
     INFO("DXMT apitrace: session open requested");
 }

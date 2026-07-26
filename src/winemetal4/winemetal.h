@@ -97,7 +97,14 @@ WINEMETAL_API void MTLCommandQueue_addResidencySet(obj_handle_t queue, obj_handl
 
 WINEMETAL_API void MTLCommandQueue_removeResidencySet(obj_handle_t queue, obj_handle_t set);
 
-WINEMETAL_API void WMT4ApitraceSessionEnsureOpen(void);
+/*
+ * bundle_root is owned by the caller and is copied into unix-side storage under
+ * the apitrace lock. The unix side never reads APITRACE_TRACE_BUNDLE from the
+ * environment: getenv() hands out interior pointers into the environment block
+ * that setenv() may free from another thread, so the bundle root is pushed down
+ * explicitly instead.
+ */
+WINEMETAL_API void WMT4ApitraceSessionEnsureOpen(const char *bundle_root);
 
 WINEMETAL_API void WMT4ApitraceSessionClose(void);
 

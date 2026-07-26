@@ -167,9 +167,10 @@ MTLCommandQueue_updateSparseTextureMappings(
 }
 
 WINEMETAL_API void
-WMT4ApitraceSessionEnsureOpen(void) {
-  struct unixcall_generic_obj_noret params;
+WMT4ApitraceSessionEnsureOpen(const char *bundle_root) {
+  struct unixcall_generic_obj_constptr_noret params;
   params.handle = 0;
+  WMT_MEMPTR_SET(params.arg, bundle_root);
   UNIX_CALL(136, &params);
 }
 

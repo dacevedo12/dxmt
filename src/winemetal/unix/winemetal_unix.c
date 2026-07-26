@@ -130,17 +130,43 @@ dxmt_apitrace_has_bundle_suffix(const char *path) {
   return path_len >= suffix_len && !strcmp(path + path_len - suffix_len, suffix);
 }
 
+/*
+ * Bundle root pushed down from the PE side via WMTApitraceSessionEnsureOpen.
+ *
+ * This deliberately does NOT come from getenv("APITRACE_TRACE_BUNDLE"). getenv()
+ * returns a raw pointer into the environment block; macOS setenv() reallocates
+ * that block and frees the old value string, so any pointer previously handed
+ * out by getenv() becomes a use-after-free the moment another thread writes the
+ * same variable. The PE side used to perform exactly that write from an
+ * arbitrary worker thread (dxmt_apitrace.cpp), while this file held the getenv()
+ * result across apitrace_metal_session_open() file I/O.
+ *
+ * Guarded by dxmt_apitrace_lock: every writer and every reader below runs with
+ * that mutex held, so the buffer cannot be mutated while it is in use.
+ */
+static char dxmt_apitrace_pe_bundle_root[PATH_MAX] = {};
+
+/* Caller must hold dxmt_apitrace_lock. */
+static void
+dxmt_apitrace_set_bundle_root_locked(const char *bundle_root) {
+  if (!bundle_root || !bundle_root[0] || !dxmt_apitrace_has_bundle_suffix(bundle_root))
+    return;
+  if (!strcmp(dxmt_apitrace_pe_bundle_root, bundle_root))
+    return;
+  snprintf(dxmt_apitrace_pe_bundle_root, sizeof(dxmt_apitrace_pe_bundle_root), "%s", bundle_root);
+}
+
+/* Caller must hold dxmt_apitrace_lock. */
 static const char *
 dxmt_apitrace_bundle_root(void) {
-  const char *bundle_root = getenv("APITRACE_TRACE_BUNDLE");
-  if (bundle_root && bundle_root[0] && dxmt_apitrace_has_bundle_suffix(bundle_root))
-    return bundle_root;
+  if (dxmt_apitrace_pe_bundle_root[0])
+    return dxmt_apitrace_pe_bundle_root;
 
   static bool warned = false;
   if (!warned) {
     warned = true;
     fprintf(stderr,
-            "warn:  DXMT apitrace: APITRACE_TRACE_BUNDLE not set to a .apitrace bundle; "
+            "warn:  DXMT apitrace: bundle root not published by the PE side yet; "
             "PE side must initialize child bundle root before opening unix session\n");
   }
   return NULL;
@@ -5195,10 +5221,11 @@ _MTLDevice_newTileRenderPipelineState(void *obj) {
 #if DXMT_APITRACE_METAL
 static NTSTATUS
 _WMTApitraceSessionEnsureOpen(void *obj) {
-  (void)obj;
+  struct unixcall_generic_obj_constptr_noret *params = obj;
   if (!dxmt_apitrace_runtime_enabled())
     return STATUS_SUCCESS;
   pthread_mutex_lock(&dxmt_apitrace_lock);
+  dxmt_apitrace_set_bundle_root_locked((const char *)params->arg.ptr);
   (void)dxmt_apitrace_ensure_session_locked();
   pthread_mutex_unlock(&dxmt_apitrace_lock);
   return STATUS_SUCCESS;

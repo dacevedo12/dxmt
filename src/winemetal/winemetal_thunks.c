@@ -124,9 +124,10 @@ MTLCommandQueue_commandBuffer(obj_handle_t queue) {
 }
 
 WINEMETAL_API void
-WMTApitraceSessionEnsureOpen(void) {
-  struct unixcall_generic_obj_noret params;
+WMTApitraceSessionEnsureOpen(const char *bundle_root) {
+  struct unixcall_generic_obj_constptr_noret params;
   params.handle = 0;
+  WMT_MEMPTR_SET(params.arg, bundle_root);
   UNIX_CALL(136, &params);
 }
 

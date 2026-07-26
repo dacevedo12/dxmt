@@ -87,7 +87,14 @@ WINEMETAL_API obj_handle_t NSAutoreleasePool_alloc_init();
 
 WINEMETAL_API obj_handle_t MTLCommandQueue_commandBuffer(obj_handle_t queue);
 
-WINEMETAL_API void WMTApitraceSessionEnsureOpen(void);
+/*
+ * bundle_root is owned by the caller and is copied into unix-side storage under
+ * the apitrace lock. The unix side never reads APITRACE_TRACE_BUNDLE from the
+ * environment: getenv() hands out interior pointers into the environment block
+ * that setenv() may free from another thread, so the bundle root is pushed down
+ * explicitly instead.
+ */
+WINEMETAL_API void WMTApitraceSessionEnsureOpen(const char *bundle_root);
 
 WINEMETAL_API void WMTApitraceSessionClose(void);
 
