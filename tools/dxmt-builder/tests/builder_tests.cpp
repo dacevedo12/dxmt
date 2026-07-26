@@ -640,6 +640,81 @@ int main() {
               "src/d3d12/d3d12_command_queue.cpp",
               "clang-diagnostic-thread-safety-analysis"),
           "thread-safety diagnostics must never be baselined");
+    {
+      // A finding inside a header comes back once per translation unit that
+      // includes it.  At the scale of the deep scan that is a three-digit
+      // multiplier on a single line of source, so the audit must count source
+      // locations, not clang-tidy reports: otherwise one new line in a widely
+      // included header hides every other finding behind hundreds of copies of
+      // itself.
+      std::vector<std::string> lines;
+      const std::string header_line =
+          "src/dxmt/dxmt_context.hpp:1479:37: warning: performing an implicit "
+          "widening conversion to type 'size_t' of a multiplication performed "
+          "in type 'unsigned int' "
+          "[bugprone-implicit-widening-of-multiplication-result]";
+      for (int unit = 0; unit < 175; ++unit)
+        lines.push_back(header_line);
+      // Same header, same check, one line further down: a distinct location
+      // that must survive the collapse.
+      lines.push_back(
+          "src/dxmt/dxmt_context.hpp:1480:30: warning: performing an implicit "
+          "widening conversion to type 'size_t' of a multiplication performed "
+          "in type 'unsigned int' "
+          "[bugprone-implicit-widening-of-multiplication-result]");
+      lines.push_back("clang-tidy: 42 warnings generated.");
+      const auto collapsed =
+          testing::DeduplicateAuditDiagnosticLines(audit_repo, lines);
+      Check(collapsed.size() == 2,
+            "header diagnostics were not collapsed to one entry per location");
+      Check(collapsed[0].find("dxmt_context.hpp:1479:37") != std::string::npos &&
+                collapsed[0].ends_with(" x175"),
+            "collapsed header diagnostic lost its translation unit count");
+      Check(collapsed[1].find("dxmt_context.hpp:1480:30") != std::string::npos &&
+                collapsed[1].ends_with(" x1"),
+            "a distinct location in the same header was collapsed away");
+    }
+    {
+      // The analyzer cache is keyed by content, and the check list is content.
+      // The command line names the config by path only, so if the key ignored
+      // what is inside that file, enabling a check would serve verdicts
+      // produced before it existed: an audit reporting a clean tree for files
+      // the new check never opened.  That is the dangerous direction, so pin
+      // it: same inputs must hit, one edited byte anywhere must miss.
+      const auto cache_repo = temp / "cache-key-repo";
+      std::filesystem::create_directories(cache_repo / "src/d3d12");
+      std::filesystem::create_directories(cache_repo / "include");
+      testing::WriteFileAtomic(cache_repo / "include/shared.hpp",
+                               "#pragma once\nint Shared();\n");
+      testing::WriteFileAtomic(cache_repo / "src/d3d12/unit.cpp",
+                               "#include \"shared.hpp\"\nint Unit() { return "
+                               "Shared(); }\n");
+      const auto unit = cache_repo / "src/d3d12/unit.cpp";
+      const std::vector<std::string> command = {
+          "clang-tidy", "-p", "build", unit.string(),
+          "--config-file=" + (cache_repo / ".clang-tidy").string()};
+      const std::string config = "Checks: >\n  -*,\n  bugprone-use-after-move\n";
+      const auto key =
+          testing::AuditCacheKey(unit, cache_repo, command, "tool-v1", config);
+      Check(key == testing::AuditCacheKey(unit, cache_repo, command, "tool-v1",
+                                          config),
+            "analyzer cache key is not stable for identical inputs");
+      Check(key != testing::AuditCacheKey(unit, cache_repo, command, "tool-v1",
+                                          config + "\n"),
+            "analyzer cache key ignores the clang-tidy config contents");
+      Check(key != testing::AuditCacheKey(
+                       unit, cache_repo, command, "tool-v1",
+                       config + "  bugprone-sizeof-expression\n"),
+            "analyzer cache key ignores an added check");
+      Check(key != testing::AuditCacheKey(unit, cache_repo, command, "tool-v2",
+                                          config),
+            "analyzer cache key ignores the clang-tidy binary identity");
+      testing::WriteFileAtomic(cache_repo / "include/shared.hpp",
+                               "#pragma once\nint Shared();\nint Added();\n");
+      Check(key != testing::AuditCacheKey(unit, cache_repo, command, "tool-v1",
+                                          config),
+            "analyzer cache key ignores a reachable header's contents");
+    }
     testing::WriteFileAtomic(
         audit_repo / "src/d3d12/d3d12_resource.hpp",
         valid_cpu_query_target +

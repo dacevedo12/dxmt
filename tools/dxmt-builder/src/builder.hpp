@@ -49,6 +49,17 @@ std::vector<std::string>
 AuditDx12Metal4Policy(const std::filesystem::path &repo_root);
 bool AuditDiagnosticMayBeBaselined(std::string_view path,
                                    std::string_view check);
+std::string AuditCacheKey(const std::filesystem::path &translation_unit,
+                          const std::filesystem::path &repo_root,
+                          const std::vector<std::string> &command,
+                          std::string_view tool_identity,
+                          std::string_view config_contents);
+// Parses raw clang-tidy output lines exactly as the audit does and collapses
+// them to one entry per unique source location, formatted with the number of
+// translation units that reported it as a trailing "xN".
+std::vector<std::string> DeduplicateAuditDiagnosticLines(
+    const std::filesystem::path &repo_root,
+    const std::vector<std::string> &lines);
 } // namespace testing
 
 class Application {

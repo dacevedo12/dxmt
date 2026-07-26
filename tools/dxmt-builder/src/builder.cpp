@@ -33,6 +33,7 @@
 #include <stdexcept>
 #include <system_error>
 #include <thread>
+#include <tuple>
 #include <utility>
 
 namespace dxmt::builder {
@@ -2998,7 +2999,26 @@ AuditCompilationDatabase PrepareAuditCompilationDatabase(
       score += 100;
     if (IsPathWithin(path, repo_root / "src/winemetal4"))
       score += 50;
-    if (entry.find("clang") != std::string::npos)
+    // Tie-break on the *target*, not on the compiler's name.
+    //
+    // Meson emits one entry per (source, target), so every source that a
+    // host-native test target also compiles -- d3d12_copy_footprint.cpp,
+    // d3d12_subresource_geometry.cpp, d3d12_tile_copy_plan.cpp,
+    // d3d12_tile_mapping.cpp, d3d12_indirect_topology.cpp, dxmt_format.cpp --
+    // appears twice: once for the shipped Windows DLL through llvm-mingw, once
+    // for the macOS test binary through /usr/bin/clang++.  Preferring whichever
+    // command mentioned "clang" picked the host entry, and the audit's
+    // clang-tidy is the managed llvm-mingw one, which has no implicit macOS
+    // sysroot: replaying a host command line made <type_traits>, <cstdint> and
+    // <cstddef> unreachable, so each of those units died on a
+    // clang-diagnostic-error at its first standard include and was never
+    // analysed at all.  The only host command lines the audit can replay are
+    // the src/winemetal4/unix ones, because that is where run_tidy adds
+    // -isysroot.
+    const bool host_command = entry.find("mingw32") == std::string::npos;
+    const bool host_is_replayable =
+        IsPathWithin(path, repo_root / "src/winemetal4/unix");
+    if (host_command == host_is_replayable)
       score += 10;
     const auto current = selected.find(path);
     if (current == selected.end() || score > current->second.score)
@@ -3214,11 +3234,50 @@ struct AuditDiagnostic {
   std::string level;
   std::string message;
   std::string check;
+  // How many translation units reported this exact location.  Reported for
+  // information -- it measures how far a header reaches -- and deliberately
+  // never used as a threshold.
+  std::size_t reporting_units = 1;
 
   std::string Fingerprint() const {
     return check + "|" + path + "|" + message;
   }
+
+  std::tuple<const std::string &, std::size_t, std::size_t,
+             const std::string &, const std::string &>
+  Location() const {
+    return std::tie(path, line, column, check, message);
+  }
 };
+
+// One source location is one diagnostic, however many units saw it.
+//
+// clang-tidy analyses a translation unit at a time, so a finding inside a
+// header comes back once per unit that includes the header: three lines in
+// src/dxmt/dxmt_context.hpp produced 402 of the 664 reports in a 175-unit deep
+// scan.  Left uncollapsed that multiplier defeats the "no new diagnostics"
+// gate for headers exactly where it matters most -- one new line in a widely
+// included header buries every other finding under hundreds of copies of
+// itself, and the reviewer reading the tail sees noise instead of signal.
+// Collapse to unique (path, line, column, check, message) and keep the
+// multiplicity as reporting_units.
+std::vector<AuditDiagnostic>
+DeduplicateAuditDiagnostics(std::vector<AuditDiagnostic> diagnostics) {
+  std::sort(diagnostics.begin(), diagnostics.end(),
+            [](const AuditDiagnostic &left, const AuditDiagnostic &right) {
+              return left.Location() < right.Location();
+            });
+  std::vector<AuditDiagnostic> unique;
+  unique.reserve(diagnostics.size());
+  for (auto &diagnostic : diagnostics) {
+    if (!unique.empty() && unique.back().Location() == diagnostic.Location()) {
+      ++unique.back().reporting_units;
+      continue;
+    }
+    unique.push_back(std::move(diagnostic));
+  }
+  return unique;
+}
 
 struct AuditTidyOutput {
   fs::path path;
@@ -3339,6 +3398,14 @@ ParseAuditDiagnostic(const fs::path &repo_root, std::string_view line) {
   };
 }
 
+// `count` is a number of *unique source locations* sharing this fingerprint --
+// not a number of clang-tidy reports.  The fingerprint deliberately omits the
+// line and column so that shifting code does not invalidate an accepted
+// finding, so a fingerprint can still cover several locations; what it can no
+// longer do is grow with the number of translation units that happen to
+// include the header the finding lives in.  (Both baselines were empty when
+// the semantics changed, so no entry was ever written under the old meaning
+// and there is nothing to migrate.)
 struct AuditBaselineEntry {
   std::size_t count = 0;
   std::string reason;
@@ -5075,13 +5142,8 @@ private:
         if (!diagnostic)
           continue;
         parsed = true;
-        if (diagnostic->level == "error") {
+        if (diagnostic->level == "error")
           tool_errors = true;
-          std::cerr << diagnostic->path << ":" << diagnostic->line << ":"
-                    << diagnostic->column << ": error: "
-                    << diagnostic->message << " [" << diagnostic->check
-                    << "]\n";
-        }
         diagnostics.push_back(std::move(*diagnostic));
       }
       if (output.result.status != 0 && !parsed) {
@@ -5093,6 +5155,24 @@ private:
       }
     }
 
+    std::size_t diagnostic_reports = diagnostics.size();
+    diagnostics = DeduplicateAuditDiagnostics(std::move(diagnostics));
+    // Errors are printed once per location too: a missing include reported by
+    // twenty units is one broken include path, not twenty.
+    for (const auto &diagnostic : diagnostics) {
+      if (diagnostic.level != "error")
+        continue;
+      std::cerr << diagnostic.path << ":" << diagnostic.line << ":"
+                << diagnostic.column << ": error: " << diagnostic.message
+                << " [" << diagnostic.check << "]";
+      if (diagnostic.reporting_units > 1)
+        std::cerr << " (" << diagnostic.reporting_units
+                  << " translation units)";
+      std::cerr << '\n';
+    }
+
+    // Counted over unique locations, so a header finding weighs the same as a
+    // finding in a .cpp instead of once per including unit.
     std::map<std::string, std::size_t> counts;
     for (const auto &diagnostic : diagnostics) {
       if (diagnostic.level != "error" &&
@@ -5108,18 +5188,17 @@ private:
       WriteAuditBaseline(baseline_path, counts, baseline_reason);
       std::cout << "updated "
                 << baseline_path.lexically_relative(repo_root_).generic_string()
-                << " with " << diagnostics.size() << " diagnostics\n";
+                << " with " << diagnostics.size()
+                << " unique diagnostics (" << diagnostic_reports
+                << " reports)\n";
       return !policy_errors.empty() || tool_errors ? 1 : 0;
     }
 
     auto baseline = LoadAuditBaseline(baseline_path);
     std::vector<AuditDiagnostic> new_diagnostics;
     std::size_t baseline_hits = 0;
-    std::sort(diagnostics.begin(), diagnostics.end(),
-              [](const auto &left, const auto &right) {
-                return std::tie(left.path, left.line, left.column) <
-                       std::tie(right.path, right.line, right.column);
-              });
+    // Already ordered by (path, line, column, check, message): the
+    // deduplication sorts on that key and nothing has been appended since.
     for (const auto &diagnostic : diagnostics) {
       if (diagnostic.level == "error")
         continue;
@@ -5134,10 +5213,15 @@ private:
       }
       new_diagnostics.push_back(diagnostic);
     }
-    for (const auto &diagnostic : new_diagnostics)
+    for (const auto &diagnostic : new_diagnostics) {
       std::cout << diagnostic.path << ":" << diagnostic.line << ":"
                 << diagnostic.column << ": " << diagnostic.level << ": "
-                << diagnostic.message << " [" << diagnostic.check << "]\n";
+                << diagnostic.message << " [" << diagnostic.check << "]";
+      if (diagnostic.reporting_units > 1)
+        std::cout << " (" << diagnostic.reporting_units
+                  << " translation units)";
+      std::cout << '\n';
+    }
 
     constexpr uint64_t kAuditScheduleSeed = 0xd3124d4554414c34ull;
     std::vector<std::string> sanitizer_errors;
@@ -5292,8 +5376,12 @@ private:
         (deep ? "audit-dx12-metal4-deep.json"
               : "audit-dx12-metal4.json"));
     std::ostringstream report;
+    // schema 2: "diagnostics" holds one entry per unique source location with
+    // a "reporting_units" multiplicity, where schema 1 held one entry per
+    // clang-tidy report.  Anything counting the array length means something
+    // different now, so the version has to say so.
     report << "{\n"
-           << "  \"schema\": 1,\n"
+           << "  \"schema\": 2,\n"
            << "  \"scope\": \"dx12-metal4\",\n"
            << "  \"profile\": \"" << JsonEscape(name) << "\",\n"
            << "  \"toolchain_fingerprint\": \""
@@ -5351,14 +5439,20 @@ private:
              << ",\"level\":\"" << JsonEscape(diagnostic.level)
              << "\",\"check\":\"" << JsonEscape(diagnostic.check)
              << "\",\"message\":\"" << JsonEscape(diagnostic.message)
-             << "\"}";
+             // Informational: how many units reported this one location, i.e.
+             // how far the header holding it reaches.  Never a threshold.
+             << "\",\"reporting_units\":" << diagnostic.reporting_units
+             << "}";
     }
     if (!diagnostics.empty())
       report << '\n';
     const bool success = policy_errors.empty() && !tool_errors &&
                          new_diagnostics.empty() &&
                          sanitizer_errors.empty();
-    report << "  ],\n  \"baseline_hits\": " << baseline_hits
+    // Total clang-tidy reports behind the deduplicated list above.  Kept as a
+    // coverage number only; the gate counts unique locations.
+    report << "  ],\n  \"diagnostic_reports\": " << diagnostic_reports
+           << ",\n  \"baseline_hits\": " << baseline_hits
            << ",\n  \"sanitizer_seed\": " << kAuditScheduleSeed
            << ",\n  \"sanitizer_profiles_passed\": [";
     for (std::size_t index = 0; index < sanitizer_passed.size(); ++index)
@@ -5379,7 +5473,8 @@ private:
 
     std::cout << "DXMT audit scanned " << database.files.size()
               << " translation units: " << diagnostics.size()
-              << " diagnostics, " << new_diagnostics.size() << " new, "
+              << " unique diagnostics (" << diagnostic_reports
+              << " reports), " << new_diagnostics.size() << " new, "
               << policy_errors.size() << " policy errors\n";
     if (!success)
       return 1;
@@ -5910,10 +6005,14 @@ private:
         throw std::runtime_error(
             "d3d12-model supports only unit or all mode");
       RequireSuccess(
+          // The d3d12-model suite contains both native test binaries; meson test
+          // runs the whole suite with --no-rebuild, so every member has to be
+          // compiled here or the run aborts on the missing executable.
           RunCommand({"meson", "compile", "-C", profile.build.string(),
-                      "src/d3d12/dxmt-d3d12-submission-model-tests"},
+                      "src/d3d12/dxmt-d3d12-submission-model-tests",
+                      "src/d3d12/dxmt-d3d12-copy-geometry-tests"},
                      BuildEnvironment()),
-          "native D3D12 submission model build");
+          "native D3D12 model test build");
       RequireSuccess(
           RunCommand({"meson", "test", "-C", profile.build.string(),
                       "--no-rebuild", "--suite", "d3d12-model",
@@ -5939,10 +6038,14 @@ private:
 
     if (mode == "all" || mode == "unit") {
       RequireSuccess(
+          // The d3d12-model suite contains both native test binaries; meson test
+          // runs the whole suite with --no-rebuild, so every member has to be
+          // compiled here or the run aborts on the missing executable.
           RunCommand({"meson", "compile", "-C", profile.build.string(),
-                      "src/d3d12/dxmt-d3d12-submission-model-tests"},
+                      "src/d3d12/dxmt-d3d12-submission-model-tests",
+                      "src/d3d12/dxmt-d3d12-copy-geometry-tests"},
                      BuildEnvironment()),
-          "native D3D12 submission model build");
+          "native D3D12 model test build");
       RequireSuccess(
           RunCommand({"meson", "test", "-C", profile.build.string(),
                       "--no-rebuild", "--suite", "d3d12-model",
@@ -6633,6 +6736,33 @@ AuditDx12Metal4Policy(const fs::path &repo_root) {
 bool AuditDiagnosticMayBeBaselined(std::string_view path,
                                    std::string_view check) {
   return AuditDiagnosticMayBeBaselinedImpl(path, check);
+}
+
+std::string AuditCacheKey(const fs::path &translation_unit,
+                          const fs::path &repo_root,
+                          const std::vector<std::string> &command,
+                          std::string_view tool_identity,
+                          std::string_view config_contents) {
+  return dxmt::builder::AuditCacheKey(translation_unit, repo_root, command,
+                                      tool_identity, config_contents);
+}
+
+std::vector<std::string>
+DeduplicateAuditDiagnosticLines(const fs::path &repo_root,
+                                const std::vector<std::string> &lines) {
+  std::vector<AuditDiagnostic> parsed;
+  for (const auto &line : lines) {
+    if (auto diagnostic = ParseAuditDiagnostic(repo_root, line))
+      parsed.push_back(std::move(*diagnostic));
+  }
+  std::vector<std::string> collapsed;
+  for (const auto &diagnostic : DeduplicateAuditDiagnostics(std::move(parsed)))
+    collapsed.push_back(diagnostic.path + ":" + std::to_string(diagnostic.line) +
+                        ":" + std::to_string(diagnostic.column) + ": " +
+                        diagnostic.level + ": " + diagnostic.message + " [" +
+                        diagnostic.check + "] x" +
+                        std::to_string(diagnostic.reporting_units));
+  return collapsed;
 }
 
 } // namespace testing
