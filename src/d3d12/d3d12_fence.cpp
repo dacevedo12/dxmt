@@ -6,6 +6,7 @@
 #include "log/log.hpp"
 #include "thread.hpp"
 #include "util_env.hpp"
+#include "util_noexcept.hpp"
 #include "util_string.hpp"
 #include "util_win32_compat.h"
 
@@ -13,76 +14,12 @@
 #include <atomic>
 #include <chrono>
 #include <cstdlib>
-#include <deque>
 #include <memory>
 #include <mutex>
 #include <vector>
 
 namespace dxmt::d3d12 {
 namespace {
-
-class CompletionCallbackRunner {
-public:
-  CompletionCallbackRunner()
-      : worker_([this]() { WorkerThread(); }) {}
-
-  ~CompletionCallbackRunner() {
-    {
-      std::lock_guard lock(mutex_);
-      stopped_ = true;
-    }
-    cond_.notify_all();
-    if (worker_.joinable())
-      worker_.join();
-  }
-
-  void Enqueue(std::vector<std::function<void()>> callbacks) {
-    if (callbacks.empty())
-      return;
-
-    {
-      std::lock_guard lock(mutex_);
-      for (auto &callback : callbacks)
-        callbacks_.push_back(std::move(callback));
-    }
-    cond_.notify_one();
-  }
-
-private:
-  void WorkerThread() {
-    for (;;) {
-      std::function<void()> callback;
-      {
-        std::unique_lock lock(mutex_);
-        cond_.wait(lock, [this]() { return stopped_ || !callbacks_.empty(); });
-        if (stopped_ && callbacks_.empty())
-          return;
-
-        callback = std::move(callbacks_.front());
-        callbacks_.pop_front();
-      }
-
-      callback();
-    }
-  }
-
-  dxmt::mutex mutex_;
-  dxmt::condition_variable cond_;
-  std::deque<std::function<void()>> callbacks_;
-  bool stopped_ = false;
-  dxmt::thread worker_;
-};
-
-static CompletionCallbackRunner &
-GetCompletionCallbackRunner() {
-  static CompletionCallbackRunner runner;
-  return runner;
-}
-
-static void
-RunCompletionCallbacksAsync(std::vector<std::function<void()>> callbacks) {
-  GetCompletionCallbackRunner().Enqueue(std::move(callbacks));
-}
 
 static bool
 D3D12FenceDiagEnabled() {
@@ -117,39 +54,50 @@ struct FencePendingEvent {
   D3D12FenceDiagClock::time_point registered_time;
 };
 
-struct FencePendingCallback {
+struct FencePendingQueueWait {
   UINT64 value;
-  std::function<void()> callback;
+  std::weak_ptr<FenceWaitTarget> target;
   D3D12FenceDiagClock::time_point registered_time;
 };
 
-struct FenceCompletionState {
+struct FenceCompletionState final : DeviceErrorTarget {
   mutable std::mutex mutex;
   std::vector<FencePendingEvent> pending_events;
-  std::vector<FencePendingCallback> pending_callbacks;
+  std::vector<FencePendingQueueWait> pending_queue_waits;
   bool device_removed = false;
+
+  void CompleteDeviceError() noexcept override;
 };
 
 static void
 CompleteFenceForDeviceRemoval(
-    const std::shared_ptr<FenceCompletionState> &state) {
-  std::vector<HANDLE> events_to_signal;
-  std::vector<std::function<void()>> callbacks_to_run;
+    FenceCompletionState &state) {
+  std::vector<FencePendingEvent> events_to_signal;
+  std::vector<std::shared_ptr<FenceWaitTarget>> queue_waits_to_wake;
   {
-    std::lock_guard lock(state->mutex);
-    if (state->device_removed)
+    std::lock_guard lock(state.mutex);
+    if (state.device_removed)
       return;
-    state->device_removed = true;
-    for (const auto &pending : state->pending_events)
-      events_to_signal.push_back(pending.event);
-    state->pending_events.clear();
-    for (auto &pending : state->pending_callbacks)
-      callbacks_to_run.push_back(std::move(pending.callback));
-    state->pending_callbacks.clear();
+    state.device_removed = true;
+    events_to_signal.swap(state.pending_events);
+    for (auto &pending : state.pending_queue_waits) {
+      if (auto target = pending.target.lock())
+        queue_waits_to_wake.push_back(std::move(target));
+    }
+    state.pending_queue_waits.clear();
   }
-  for (HANDLE event : events_to_signal)
-    SetEvent(event);
-  RunCompletionCallbacksAsync(std::move(callbacks_to_run));
+  for (const auto &pending : events_to_signal)
+    SetEvent(pending.event);
+  for (const auto &target : queue_waits_to_wake)
+    target->CompleteFenceWait();
+}
+
+void
+FenceCompletionState::CompleteDeviceError() noexcept {
+  if (!dxmt::invokeNoexcept(
+          "fence device error completion",
+          [this]() { CompleteFenceForDeviceRemoval(*this); }))
+    std::terminate();
 }
 
 #ifdef __ID3D12Fence1_INTERFACE_DEFINED__
@@ -166,13 +114,9 @@ public:
         completed_value_(initial_value), has_manual_completed_value_(false),
         last_signal_was_cpu_(false) {
     event_.signalValue(initial_value);
-    device_error_callback_ = std::make_shared<std::function<void()>>(
-        [state = completion_state_]() {
-          CompleteFenceForDeviceRemoval(state);
-        });
-    device_error_callback_id_ =
-        device_->GetDXMTDevice().queue().RegisterDeviceErrorCallback(
-            device_error_callback_);
+    device_error_target_id_ =
+        device_->GetDXMTDevice().queue().RegisterDeviceErrorTarget(
+            completion_state_);
     static std::atomic<uint32_t> log_count = 0;
     if (D3D12FenceDiagShouldLog(log_count)) {
       WARN_FILE_ONLY("D3D12 fence diagnostic: CreateFence"
@@ -183,27 +127,26 @@ public:
     }
   }
 
-  ~FenceImpl() override {
-    device_->GetDXMTDevice().queue().UnregisterDeviceErrorCallback(
-        device_error_callback_id_);
-    std::vector<HANDLE> events_to_signal;
-    std::vector<std::function<void()>> callbacks_to_run;
+  ~FenceImpl() noexcept override {
+    dxmt::invokeNoexcept("fence error target unregister", [this]() {
+      device_->GetDXMTDevice().queue().UnregisterDeviceErrorTarget(
+          device_error_target_id_);
+    });
+    std::vector<FencePendingEvent> events_to_signal;
+    std::vector<FencePendingQueueWait> queue_waits_to_wake;
     {
       std::lock_guard lock(completion_state_->mutex);
       completed_value_ = UINT64_MAX;
       has_manual_completed_value_ = true;
-      for (const auto &pending : completion_state_->pending_events)
-        events_to_signal.push_back(pending.event);
-      completion_state_->pending_events.clear();
-      for (auto &pending : completion_state_->pending_callbacks) {
-        callbacks_to_run.push_back(std::move(pending.callback));
-      }
-      completion_state_->pending_callbacks.clear();
+      events_to_signal.swap(completion_state_->pending_events);
+      queue_waits_to_wake.swap(completion_state_->pending_queue_waits);
     }
-    for (HANDLE event : events_to_signal)
-      SetEvent(event);
-    for (auto &callback : callbacks_to_run)
-      callback();
+    for (const auto &pending : events_to_signal)
+      SetEvent(pending.event);
+    for (const auto &pending : queue_waits_to_wake) {
+      if (auto target = pending.target.lock())
+        target->CompleteFenceWait();
+    }
   }
 
   HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void **ppvObject) override {
@@ -257,7 +200,7 @@ public:
            " value=", value,
            " manual=", has_manual_completed_value_,
            " pendingEvents=", completion_state_->pending_events.size(),
-           " pendingCallbacks=", completion_state_->pending_callbacks.size());
+           " pendingWaits=", completion_state_->pending_queue_waits.size());
     }
     return value;
   }
@@ -272,7 +215,7 @@ public:
            " value=", value,
            " manual=", has_manual_completed_value_,
            " pendingEvents=", completion_state_->pending_events.size(),
-           " pendingCallbacks=", completion_state_->pending_callbacks.size());
+           " pendingWaits=", completion_state_->pending_queue_waits.size());
     }
     return value;
   }
@@ -340,19 +283,20 @@ public:
            " value=", value);
     }
     std::vector<HANDLE> events_to_signal;
-    std::vector<std::function<void()>> callbacks_to_run;
+    std::vector<std::shared_ptr<FenceWaitTarget>> queue_waits_to_wake;
     {
       std::lock_guard lock(completion_state_->mutex);
       completed_value_ = value;
       has_manual_completed_value_ = true;
       last_signal_was_cpu_ = true;
       pending_gpu_signals_.clear();
-      collectCompletedEventsLocked(events_to_signal, callbacks_to_run);
+      collectCompletedEventsLocked(events_to_signal, queue_waits_to_wake);
     }
     event_.signalValue(value);
     for (HANDLE event : events_to_signal)
       SetEvent(event);
-    RunCompletionCallbacksAsync(std::move(callbacks_to_run));
+    for (const auto &target : queue_waits_to_wake)
+      target->CompleteFenceWait();
     return S_OK;
   }
 
@@ -384,19 +328,20 @@ public:
            " value=", value);
     }
     std::vector<HANDLE> events_to_signal;
-    std::vector<std::function<void()>> callbacks_to_run;
+    std::vector<std::shared_ptr<FenceWaitTarget>> queue_waits_to_wake;
     {
       std::lock_guard lock(completion_state_->mutex);
       completed_value_ = value;
       has_manual_completed_value_ = true;
       last_signal_was_cpu_ = false;
       pruneGpuSignalsLocked(value);
-      collectCompletedEventsLocked(events_to_signal, callbacks_to_run);
+      collectCompletedEventsLocked(events_to_signal, queue_waits_to_wake);
     }
     event_.signalValue(value);
     for (HANDLE event : events_to_signal)
       SetEvent(event);
-    RunCompletionCallbacksAsync(std::move(callbacks_to_run));
+    for (const auto &target : queue_waits_to_wake)
+      target->CompleteFenceWait();
   }
 
   void SignalFromQueue(UINT64 value) override {
@@ -409,38 +354,20 @@ public:
     Signal(value);
   }
 
-  void AddCompletionCallback(UINT64 value, std::function<void()> callback) override {
+  void RegisterQueueWait(
+      UINT64 value,
+      std::weak_ptr<FenceWaitTarget> target) override {
     const auto register_time = D3D12FenceDiagClock::now();
-    static std::atomic<uint32_t> log_count = 0;
-    if (D3D12FenceDiagShouldLog(log_count)) {
-      WARN_FILE_ONLY("D3D12 fence diagnostic: AddCompletionCallback"
-           " fence=", reinterpret_cast<uintptr_t>(this),
-           " target=", value);
-    }
-    bool run_now = false;
     {
       std::lock_guard lock(completion_state_->mutex);
-      if (GetCompletedValueLocked() >= value) {
-        run_now = true;
-      } else {
-        completion_state_->pending_callbacks.push_back(
-            {value, std::move(callback), register_time});
+      if (GetCompletedValueLocked() < value) {
+        completion_state_->pending_queue_waits.push_back(
+            {value, std::move(target), register_time});
+        return;
       }
     }
-
-    if (run_now) {
-      static std::atomic<uint32_t> run_now_log_count = 0;
-      if (D3D12FenceDiagShouldLog(run_now_log_count)) {
-        WARN_FILE_ONLY("D3D12 fence diagnostic: AddCompletionCallback run-now"
-             " fence=", reinterpret_cast<uintptr_t>(this),
-             " target=", value,
-             " elapsedMs=", D3D12FenceDiagDurationMs(D3D12FenceDiagClock::now() - register_time));
-      }
-      std::vector<std::function<void()>> callbacks;
-      callbacks.push_back(std::move(callback));
-      RunCompletionCallbacksAsync(std::move(callbacks));
-      return;
-    }
+    if (auto ready = target.lock())
+      ready->CompleteFenceWait();
   }
 
   bool HasReached(UINT64 value) const override {
@@ -520,7 +447,7 @@ private:
 
   void collectCompletedEventsLocked(
       std::vector<HANDLE> &events,
-      std::vector<std::function<void()>> &callbacks) {
+      std::vector<std::shared_ptr<FenceWaitTarget>> &queue_waits) {
     const UINT64 completed_value = GetCompletedValueLocked();
     const auto completed_time = D3D12FenceDiagClock::now();
     auto it = std::remove_if(completion_state_->pending_events.begin(),
@@ -541,25 +468,18 @@ private:
                              });
     completion_state_->pending_events.erase(
         it, completion_state_->pending_events.end());
-    auto callback_it = std::remove_if(
-        completion_state_->pending_callbacks.begin(),
-        completion_state_->pending_callbacks.end(),
-        [&](FencePendingCallback &pending) {
+    auto queue_wait_it = std::remove_if(
+        completion_state_->pending_queue_waits.begin(),
+        completion_state_->pending_queue_waits.end(),
+        [&](FencePendingQueueWait &pending) {
           if (completed_value < pending.value)
-            return false;
-          callbacks.push_back(std::move(pending.callback));
-          static std::atomic<uint32_t> callback_log_count = 0;
-          if (D3D12FenceDiagShouldLog(callback_log_count)) {
-            WARN_FILE_ONLY("D3D12 fence diagnostic: CompletePendingCallback"
-                 " fence=", reinterpret_cast<uintptr_t>(this),
-                 " target=", pending.value,
-                 " completed=", completed_value,
-                 " ageMs=", D3D12FenceDiagDurationMs(completed_time - pending.registered_time));
-          }
+            return pending.target.expired();
+          if (auto target = pending.target.lock())
+            queue_waits.push_back(std::move(target));
           return true;
         });
-    completion_state_->pending_callbacks.erase(
-        callback_it, completion_state_->pending_callbacks.end());
+    completion_state_->pending_queue_waits.erase(
+        queue_wait_it, completion_state_->pending_queue_waits.end());
   }
 
   void pruneGpuSignalsLocked(UINT64 completed_value) {
@@ -577,8 +497,7 @@ private:
   D3D12_FENCE_FLAGS flags_;
   std::shared_ptr<FenceCompletionState> completion_state_ =
       std::make_shared<FenceCompletionState>();
-  std::shared_ptr<std::function<void()>> device_error_callback_;
-  uint64_t device_error_callback_id_ = 0;
+  uint64_t device_error_target_id_ = 0;
   std::vector<FenceGpuSignal> pending_gpu_signals_;
   UINT64 completed_value_;
   bool has_manual_completed_value_;

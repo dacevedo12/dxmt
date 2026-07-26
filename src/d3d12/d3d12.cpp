@@ -29,6 +29,20 @@ extern "C" BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason,
   if (reason != DLL_PROCESS_ATTACH)
     return TRUE;
 
+  // DXMT_VALIDATION=1 expands dense hang / Metal label / residency diags.
+  // Metal's MTL_DEBUG_LAYER still needs to be set on the host launch env when
+  // possible; we also set it here for late-loaded paths.
+  dxmt::env::applyValidationLayerDefaults();
+  if (dxmt::env::envTruthy("DXMT_VALIDATION") ||
+      dxmt::env::envTruthy("DXMT_DIAG_VALIDATION")) {
+    dxmt::Logger::info(
+        "DXMT validation layer active: dense hang capture, PSO labels, "
+        "residency diags. Host should also set DXMT_LOG_PATH, "
+        "MTL_DEBUG_LAYER=1, MTL_SHADER_VALIDATION=1 for full Metal reports. "
+        "On hang, check stderr + $DXMT_LOG_PATH/dxmt-metal4-native.log and "
+        "dxmt-iogpu-native.log.");
+  }
+
   dxmt::fh4bypass::ApplyBadFiberDataBypass();
   DisableThreadLibraryCalls(instance);
   return TRUE;

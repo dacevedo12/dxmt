@@ -1193,11 +1193,6 @@ std::shared_ptr<SubmittedCompiledCommandListPlan>
 PrepareSubmittedCompiledCommandList(
     std::shared_ptr<const CompiledCommandList> compiled);
 
-struct SubmittedCommandAllocatorUse {
-  Com<CommandAllocatorObject, false> allocator;
-  UINT64 serial = 0;
-};
-
 class GraphicsCommandList {
 public:
   virtual ~GraphicsCommandList() = default;

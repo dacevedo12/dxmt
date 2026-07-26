@@ -84,13 +84,28 @@ public:
       mirror_ = std::make_unique<DescriptorHeapMirror>(
           device_->GetMTLDevice(), desc.NumDescriptors, sampler_heap);
       auto &queue = device_->GetDXMTDevice().queue();
-      queue.AddPersistentResidency(mirror_->buffer());
-      queue.AddPersistentResidency(mirror_->descriptorTableBuffer());
+      auto register_descriptor_allocation =
+          [&](WMT::Object allocation, uint32_t component) {
+            residency_registrations_.push_back(
+                queue.RegisterLifetimeResidency(
+                    dxmt::ResidencyOwnership::Lifetime(
+                        allocation,
+                        dxmt::ResidencyProvenance{
+                            .kind =
+                                dxmt::ResidencyProvenanceKind::DescriptorHeap,
+                            .owner = reinterpret_cast<uintptr_t>(this),
+                            .identity = static_cast<uint64_t>(desc_.Type),
+                            .size = desc_.NumDescriptors,
+                            .component = component,
+                        })));
+          };
+      register_descriptor_allocation(mirror_->buffer(), 0);
+      register_descriptor_allocation(mirror_->descriptorTableBuffer(), 1);
       if (!sampler_heap) {
-        queue.AddPersistentResidency(
-            mirror_->bufferDescriptorRecordBuffer());
-        queue.AddPersistentResidency(
-            mirror_->bufferResourceTableBuffer());
+        register_descriptor_allocation(
+            mirror_->bufferDescriptorRecordBuffer(), 2);
+        register_descriptor_allocation(
+            mirror_->bufferResourceTableBuffer(), 3);
       }
       for (UINT i = 0; i < desc.NumDescriptors; i++)
         records_[i].mirror = mirror_.get();
@@ -115,30 +130,11 @@ public:
     if (!mirror_)
       return;
     auto &queue = device_->GetDXMTDevice().queue();
-    queue.RemovePersistentResidencyAfterCompletion(mirror_->buffer());
-    queue.RemovePersistentResidencyAfterCompletion(
-        mirror_->descriptorTableBuffer());
-    if (!mirror_->isSamplerHeap()) {
-      queue.RemovePersistentResidencyAfterCompletion(
-          mirror_->bufferDescriptorRecordBuffer());
-      queue.RemovePersistentResidencyAfterCompletion(
-          mirror_->bufferResourceTableBuffer());
-    }
     for (auto &target : mirror_->DrainResidencyTargets()) {
-      if (target.allocation)
-        queue.RemovePersistentResidencyAfterCompletion(target.allocation);
-      if (target.secondary_allocation)
-        queue.RemovePersistentResidencyAfterCompletion(
-            target.secondary_allocation);
-      if (target.mirror_allocation)
-        queue.RemovePersistentResidencyAfterCompletion(
-            target.mirror_allocation);
       if (target.sampler)
-        queue.RetainUntilGpuComplete(
-            [sampler = std::move(target.sampler)]() mutable {
-              sampler = nullptr;
-            });
+        queue.RetainGpuOwner(std::move(target.sampler));
     }
+    residency_registrations_.clear();
   }
 
   ULONG STDMETHODCALLTYPE Release() override {
@@ -300,7 +296,9 @@ private:
     if (address < begin || address - begin >= size ||
         (address - begin) % sizeof(DescriptorRecord))
       return nullptr;
-    return records_.data() + (address - begin) / sizeof(DescriptorRecord);
+    const size_t record_index =
+        static_cast<size_t>((address - begin) / sizeof(DescriptorRecord));
+    return &records_[record_index];
   }
 
   const DescriptorRecord *
@@ -313,7 +311,9 @@ private:
     if (address < begin || address - begin >= size ||
         (address - begin) % sizeof(DescriptorRecord))
       return nullptr;
-    return records_.data() + (address - begin) / sizeof(DescriptorRecord);
+    const size_t record_index =
+        static_cast<size_t>((address - begin) / sizeof(DescriptorRecord));
+    return &records_[record_index];
   }
 
   Com<IMTLD3D12Device> device_;
@@ -322,6 +322,8 @@ private:
   std::vector<DescriptorRecord> records_;
   std::string name_;
   std::unique_ptr<DescriptorHeapMirror> mirror_;
+  std::vector<std::shared_ptr<dxmt::LifetimeResidencyRegistration>>
+      residency_registrations_;
   std::atomic<bool> registry_registered_{false};
 };
 

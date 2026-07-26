@@ -12,11 +12,14 @@
 #include "d3d12_agility.hpp"
 #include "d3d12_fence.hpp"
 #include "d3d12_heap.hpp"
+#include "d3d12_indirect_topology.hpp"
 #include "d3d12_pipeline.hpp"
 #include "d3d12_query.hpp"
 #include "d3d12_resource.hpp"
 #include "d3d12_root_signature.hpp"
 #include "d3d12_sampler.hpp"
+#include "d3d12_texture_swizzle.hpp"
+#include "d3d12_texture_view.hpp"
 #include "dxmt_command_queue.hpp"
 #include "dxmt_checked_math.hpp"
 #include "dxmt_d3d12_test_path.hpp"
@@ -28,6 +31,7 @@
 #include "log/log.hpp"
 #include "thread.hpp"
 #include "util_env.hpp"
+#include "util_noexcept.hpp"
 #include "util_string.hpp"
 #include "util_win32_compat.h"
 #include <atomic>
@@ -82,6 +86,116 @@ std::atomic<uint64_t> g_test_metal_buffer_creation_occurrence = 0;
 std::atomic<uint64_t> g_test_metal_texture_creation_occurrence = 0;
 std::atomic<uint64_t> g_test_metal_heap_creation_occurrence = 0;
 std::atomic<uint64_t> g_test_metal_graphics_pipeline_occurrence = 0;
+
+class FencePrivateReference final {
+public:
+  explicit FencePrivateReference(Fence *fence) noexcept
+      : fence_(fence) {
+    fence_->AddRefPrivate();
+  }
+
+  FencePrivateReference(const FencePrivateReference &) = delete;
+  FencePrivateReference &operator=(const FencePrivateReference &) = delete;
+
+  FencePrivateReference(FencePrivateReference &&other) noexcept
+      : fence_(other.fence_) {
+    other.fence_ = nullptr;
+  }
+
+  FencePrivateReference &operator=(FencePrivateReference &&other) noexcept {
+    if (this == &other)
+      return *this;
+    Reset();
+    fence_ = other.fence_;
+    other.fence_ = nullptr;
+    return *this;
+  }
+
+  ~FencePrivateReference() noexcept {
+    Reset();
+  }
+
+  Fence &Get() const noexcept {
+    return *fence_;
+  }
+
+private:
+  void Reset() noexcept {
+    if (!fence_)
+      return;
+    auto *fence = fence_;
+    fence_ = nullptr;
+    fence->ReleasePrivate();
+  }
+
+  Fence *fence_;
+};
+
+static bool
+AreFenceValuesSatisfied(const std::vector<FencePrivateReference> &fences,
+                        const std::vector<UINT64> &values,
+                        D3D12_MULTIPLE_FENCE_WAIT_FLAGS flags) {
+  const bool wait_any = flags & D3D12_MULTIPLE_FENCE_WAIT_FLAG_ANY;
+  for (size_t index = 0; index < fences.size(); index++) {
+    const bool satisfied = fences[index].Get().GetCompletedValue() >= values[index];
+    if (wait_any && satisfied)
+      return true;
+    if (!wait_any && !satisfied)
+      return false;
+  }
+  return !wait_any;
+}
+
+class MultipleFenceWaitState final
+    : public FenceWaitTarget,
+      public std::enable_shared_from_this<MultipleFenceWaitState> {
+public:
+  MultipleFenceWaitState(HANDLE event, bool wait_any,
+                         std::vector<FencePrivateReference> fences) noexcept
+      : event_(event), wait_any_(wait_any), fences_(std::move(fences)) {}
+
+  MultipleFenceWaitState(const MultipleFenceWaitState &) = delete;
+  MultipleFenceWaitState &operator=(const MultipleFenceWaitState &) = delete;
+  ~MultipleFenceWaitState() noexcept override = default;
+
+  void Arm(uint32_t pending_count) {
+    remaining_.store(pending_count, std::memory_order_relaxed);
+    keep_alive_ = shared_from_this();
+  }
+
+  Fence &FenceAt(size_t index) const noexcept {
+    return fences_[index].Get();
+  }
+
+  void CompleteFenceWait() noexcept override {
+    if (wait_any_) {
+      SignalOnce();
+      return;
+    }
+
+    if (remaining_.fetch_sub(1, std::memory_order_acq_rel) == 1)
+      SignalOnce();
+  }
+
+private:
+  void SignalOnce() noexcept {
+    bool expected = false;
+    if (!signaled_.compare_exchange_strong(
+            expected, true, std::memory_order_acq_rel,
+            std::memory_order_acquire))
+      return;
+
+    SetEvent(event_);
+    keep_alive_.reset();
+  }
+
+  HANDLE event_;
+  const bool wait_any_;
+  std::vector<FencePrivateReference> fences_;
+  std::atomic_bool signaled_ = false;
+  std::atomic_uint32_t remaining_ = 0;
+  std::shared_ptr<MultipleFenceWaitState> keep_alive_;
+};
 
 static bool
 ShouldInjectCreationFailure(const char *environment_name,
@@ -582,30 +696,6 @@ GetSmallResource4KTileShape(WMT::Device device,
   }
 
   return true;
-}
-
-static UINT
-IndirectArgumentByteSize(const D3D12_INDIRECT_ARGUMENT_DESC &argument) {
-  switch (argument.Type) {
-  case D3D12_INDIRECT_ARGUMENT_TYPE_DRAW:
-    return sizeof(D3D12_DRAW_ARGUMENTS);
-  case D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED:
-    return sizeof(D3D12_DRAW_INDEXED_ARGUMENTS);
-  case D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH:
-    return sizeof(D3D12_DISPATCH_ARGUMENTS);
-  case D3D12_INDIRECT_ARGUMENT_TYPE_VERTEX_BUFFER_VIEW:
-    return sizeof(D3D12_VERTEX_BUFFER_VIEW);
-  case D3D12_INDIRECT_ARGUMENT_TYPE_INDEX_BUFFER_VIEW:
-    return sizeof(D3D12_INDEX_BUFFER_VIEW);
-  case D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT:
-    return sizeof(UINT) * argument.Constant.Num32BitValuesToSet;
-  case D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT_BUFFER_VIEW:
-  case D3D12_INDIRECT_ARGUMENT_TYPE_SHADER_RESOURCE_VIEW:
-  case D3D12_INDIRECT_ARGUMENT_TYPE_UNORDERED_ACCESS_VIEW:
-    return sizeof(D3D12_GPU_VIRTUAL_ADDRESS);
-  default:
-    return 0;
-  }
 }
 
 static bool
@@ -1652,185 +1742,6 @@ GetBufferUavMaterialization(WMT::Device device, Resource &resource,
   return true;
 }
 
-static WMTTextureSwizzle
-ComposeTextureSwizzleComponent(const WMTTextureSwizzleChannels &base,
-                               WMTTextureSwizzle component) {
-  switch (component) {
-  case WMTTextureSwizzleRed:
-    return base.r;
-  case WMTTextureSwizzleGreen:
-    return base.g;
-  case WMTTextureSwizzleBlue:
-    return base.b;
-  case WMTTextureSwizzleAlpha:
-    return base.a;
-  case WMTTextureSwizzleZero:
-  case WMTTextureSwizzleOne:
-    return component;
-  default:
-    return WMTTextureSwizzleZero;
-  }
-}
-
-static WMTTextureSwizzle
-TextureSwizzleFromD3D12Component(UINT component_mapping,
-                                 UINT component_index) {
-  switch (D3D12_DECODE_SHADER_4_COMPONENT_MAPPING(component_index,
-                                                  component_mapping)) {
-  case D3D12_SHADER_COMPONENT_MAPPING_FROM_MEMORY_COMPONENT_0:
-    return WMTTextureSwizzleRed;
-  case D3D12_SHADER_COMPONENT_MAPPING_FROM_MEMORY_COMPONENT_1:
-    return WMTTextureSwizzleGreen;
-  case D3D12_SHADER_COMPONENT_MAPPING_FROM_MEMORY_COMPONENT_2:
-    return WMTTextureSwizzleBlue;
-  case D3D12_SHADER_COMPONENT_MAPPING_FROM_MEMORY_COMPONENT_3:
-    return WMTTextureSwizzleAlpha;
-  case D3D12_SHADER_COMPONENT_MAPPING_FORCE_VALUE_0:
-    return WMTTextureSwizzleZero;
-  case D3D12_SHADER_COMPONENT_MAPPING_FORCE_VALUE_1:
-    return WMTTextureSwizzleOne;
-  default:
-    return WMTTextureSwizzleZero;
-  }
-}
-
-static WMTTextureSwizzleChannels
-DefaultTextureViewSwizzle() {
-  return {
-      WMTTextureSwizzleRed,
-      WMTTextureSwizzleGreen,
-      WMTTextureSwizzleBlue,
-      WMTTextureSwizzleAlpha,
-  };
-}
-
-static WMTTextureSwizzleChannels
-BaseShaderReadSwizzleForFormat(WMTPixelFormat format) {
-  switch (format) {
-  case WMTPixelFormatA8Unorm:
-    return {
-        WMTTextureSwizzleZero,
-        WMTTextureSwizzleZero,
-        WMTTextureSwizzleZero,
-        WMTTextureSwizzleRed,
-    };
-  case WMTPixelFormatR8Unorm:
-  case WMTPixelFormatR8Unorm_sRGB:
-  case WMTPixelFormatR8Snorm:
-  case WMTPixelFormatR8Uint:
-  case WMTPixelFormatR8Sint:
-  case WMTPixelFormatR16Unorm:
-  case WMTPixelFormatR16Snorm:
-  case WMTPixelFormatR16Uint:
-  case WMTPixelFormatR16Sint:
-  case WMTPixelFormatR16Float:
-  case WMTPixelFormatR32Uint:
-  case WMTPixelFormatR32Sint:
-  case WMTPixelFormatR32Float:
-  case WMTPixelFormatBC4_RUnorm:
-  case WMTPixelFormatBC4_RSnorm:
-  case WMTPixelFormatEAC_R11Unorm:
-  case WMTPixelFormatEAC_R11Snorm:
-  case WMTPixelFormatDepth16Unorm:
-  case WMTPixelFormatDepth32Float:
-    return {
-        WMTTextureSwizzleRed,
-        WMTTextureSwizzleZero,
-        WMTTextureSwizzleZero,
-        WMTTextureSwizzleOne,
-    };
-  case WMTPixelFormatRG8Unorm:
-  case WMTPixelFormatRG8Unorm_sRGB:
-  case WMTPixelFormatRG8Snorm:
-  case WMTPixelFormatRG8Uint:
-  case WMTPixelFormatRG8Sint:
-  case WMTPixelFormatRG16Unorm:
-  case WMTPixelFormatRG16Snorm:
-  case WMTPixelFormatRG16Uint:
-  case WMTPixelFormatRG16Sint:
-  case WMTPixelFormatRG16Float:
-  case WMTPixelFormatRG32Uint:
-  case WMTPixelFormatRG32Sint:
-  case WMTPixelFormatRG32Float:
-  case WMTPixelFormatBC5_RGUnorm:
-  case WMTPixelFormatBC5_RGSnorm:
-  case WMTPixelFormatEAC_RG11Unorm:
-  case WMTPixelFormatEAC_RG11Snorm:
-    return {
-        WMTTextureSwizzleRed,
-        WMTTextureSwizzleGreen,
-        WMTTextureSwizzleZero,
-        WMTTextureSwizzleOne,
-    };
-  case WMTPixelFormatRG11B10Float:
-  case WMTPixelFormatRGB9E5Float:
-  case WMTPixelFormatBC6H_RGBFloat:
-  case WMTPixelFormatBC6H_RGBUfloat:
-  case WMTPixelFormatB5G6R5Unorm:
-  case WMTPixelFormatPVRTC_RGB_2BPP:
-  case WMTPixelFormatPVRTC_RGB_2BPP_sRGB:
-  case WMTPixelFormatPVRTC_RGB_4BPP:
-  case WMTPixelFormatPVRTC_RGB_4BPP_sRGB:
-  case WMTPixelFormatBGRX8Unorm:
-  case WMTPixelFormatBGRX8Unorm_sRGB:
-    return {
-        WMTTextureSwizzleRed,
-        WMTTextureSwizzleGreen,
-        WMTTextureSwizzleBlue,
-        WMTTextureSwizzleOne,
-    };
-  default:
-    return DefaultTextureViewSwizzle();
-  }
-}
-
-static WMTTextureSwizzleChannels
-ShaderResourceViewSwizzle(WMTPixelFormat format, UINT component_mapping) {
-  const auto base = BaseShaderReadSwizzleForFormat(format);
-  return {
-      ComposeTextureSwizzleComponent(
-          base, TextureSwizzleFromD3D12Component(component_mapping, 0)),
-      ComposeTextureSwizzleComponent(
-          base, TextureSwizzleFromD3D12Component(component_mapping, 1)),
-      ComposeTextureSwizzleComponent(
-          base, TextureSwizzleFromD3D12Component(component_mapping, 2)),
-      ComposeTextureSwizzleComponent(
-          base, TextureSwizzleFromD3D12Component(component_mapping, 3)),
-  };
-}
-
-static WMTPixelFormat
-ResolveDescriptorTextureViewFormat(WMT::Device device, Resource &resource,
-                                   DXGI_FORMAT format, UINT plane) {
-  auto *texture = resource.GetTexture(plane);
-  if (!texture)
-    return WMTPixelFormatInvalid;
-  if (format == DXGI_FORMAT_UNKNOWN)
-    return texture->pixelFormat();
-  if (DepthStencilPlanarFlags(texture->pixelFormat())) {
-    switch (format) {
-    case DXGI_FORMAT_R16_UNORM:
-      if (texture->pixelFormat() == WMTPixelFormatDepth16Unorm)
-        return texture->pixelFormat();
-      break;
-    case DXGI_FORMAT_R32_FLOAT:
-      if (texture->pixelFormat() == WMTPixelFormatDepth32Float)
-        return texture->pixelFormat();
-      break;
-    default:
-      break;
-    }
-  }
-
-  MTL_DXGI_FORMAT_DESC format_desc = {};
-  if (FAILED(MTLQueryDXGIFormat(device, format, format_desc)) ||
-      format_desc.PixelFormat == WMTPixelFormatInvalid) {
-    WARN("D3D12Device: unsupported texture view format ", uint32_t(format));
-    return WMTPixelFormatInvalid;
-  }
-  return format_desc.PixelFormat;
-}
-
 static bool
 ValidateDescriptorTextureViewRange(const char *context,
                                    TextureViewDescriptor &view,
@@ -1926,8 +1837,8 @@ CreateDescriptorShaderResourceTextureView(WMT::Device device,
     if (!plane_texture)
       return {};
     view_texture = Rc<Texture>(plane_texture);
-    view.format = ResolveDescriptorTextureViewFormat(device, resource,
-                                                     srv.Format, plane);
+    view.format = ResolveTextureViewFormat(device, resource, srv.Format, plane,
+                                           "D3D12Device");
     if (view.format == WMTPixelFormatInvalid)
       return {};
     view.swizzle =
@@ -2073,8 +1984,8 @@ CreateDescriptorUnorderedAccessTextureView(WMT::Device device,
     if (!plane_texture)
       return {};
     view_texture = Rc<Texture>(plane_texture);
-    view.format = ResolveDescriptorTextureViewFormat(device, resource,
-                                                     uav.Format, plane);
+    view.format = ResolveTextureViewFormat(device, resource, uav.Format, plane,
+                                           "D3D12Device");
     if (view.format == WMTPixelFormatInvalid)
       return {};
 
@@ -2406,14 +2317,8 @@ ClearDescriptorResidencyTarget(
   auto &queue = device->GetDXMTDevice().queue();
   auto transition = record.mirror->ReplaceResidencyTarget(
       mirror_lock, record.heap_index, {});
-  for (uint32_t i = 0; i < transition.removed_count; i++)
-    queue.RemovePersistentResidencyAfterCompletion(
-        transition.removed_allocations[i]);
   if (transition.previous.sampler)
-    queue.RetainUntilGpuComplete(
-        [sampler = std::move(transition.previous.sampler)]() mutable {
-          sampler = nullptr;
-        });
+    queue.RetainGpuOwner(std::move(transition.previous.sampler));
 }
 
 static void
@@ -2436,20 +2341,12 @@ ApplyDescriptorResidencyTarget(IMTLD3D12Device *device,
 
   auto target = GetDescriptorResidencyTarget(record);
   auto &queue = device->GetDXMTDevice().queue();
-  // Keep publication and residency-set insertion atomic with respect to queue
-  // readers. Metal command buffers do not retain these resources.
+  // Descriptor slots retain their payload objects, but residency belongs to
+  // the allocation owner. Updating a descriptor never mutates a residency set.
   auto transition = record.mirror->ReplaceResidencyTarget(
       mirror_lock, record.heap_index, std::move(target));
-  for (uint32_t i = 0; i < transition.added_count; i++)
-    queue.AddPersistentResidency(transition.added_allocations[i]);
-  for (uint32_t i = 0; i < transition.removed_count; i++)
-    queue.RemovePersistentResidencyAfterCompletion(
-        transition.removed_allocations[i]);
   if (transition.previous.sampler)
-    queue.RetainUntilGpuComplete(
-        [sampler = std::move(transition.previous.sampler)]() mutable {
-          sampler = nullptr;
-        });
+    queue.RetainGpuOwner(std::move(transition.previous.sampler));
 }
 
 static void
@@ -2817,6 +2714,35 @@ private:
 };
 #endif
 
+class SetEventQueueSubmission final : public DxmtQueueSubmissionTarget {
+public:
+  SetEventQueueSubmission(WMT::Reference<WMT::SharedEvent> signal,
+                          HANDLE event, uint64_t value) noexcept
+      : signal_(std::move(signal)), event_(event), value_(value) {}
+
+  [[nodiscard]] bool
+  Submit(IMTLD3D12Device &device,
+         uint64_t &submitted_sequence) noexcept override {
+    return dxmt::invokeNoexcept("D3D12 EnqueueSetEvent submission", [&]() {
+      auto &queue = device.GetDXMTDevice().queue();
+      submitted_sequence = queue.CurrentSeqId();
+      MTLSharedEvent_setWin32EventAtValue(
+          signal_.handle, queue.GetSharedEventListener(), event_, value_);
+      queue.CurrentChunk()->emitcc(
+          [signal = std::move(signal_), value = value_](
+              ArgumentEncodingContext &enc) mutable {
+            enc.signalEvent(std::move(signal), value);
+          });
+      queue.CommitCurrentChunk();
+    });
+  }
+
+private:
+  WMT::Reference<WMT::SharedEvent> signal_;
+  HANDLE event_ = nullptr;
+  uint64_t value_ = 0;
+};
+
 class DeviceImpl final : public ComObjectWithInitialRef<IMTLD3D12Device,
                                                         DeviceComBase,
                                                         ID3D12DeviceConfiguration1> {
@@ -3158,19 +3084,15 @@ public:
   HRESULT STDMETHODCALLTYPE EnqueueSetEvent(HANDLE event) override {
     if (!event)
       return WARN_E_INVALIDARG(__func__);
-    auto submission_guard = AcquireDxmtQueueSubmissionGuard(
-        static_cast<IMTLD3D12Device *>(this));
-    auto &queue = device_->queue();
     auto signal = enqueue_set_event_signal_;
     auto value = ++enqueue_set_event_value_;
-    MTLSharedEvent_setWin32EventAtValue(
-        signal.handle, queue.GetSharedEventListener(), event, value);
-    queue.CurrentChunk()->emitcc([signal = std::move(signal), value](
-                                    ArgumentEncodingContext &enc) mutable {
-      enc.signalEvent(std::move(signal), value);
-    });
-    queue.CommitCurrentChunk();
-    return S_OK;
+    uint64_t submitted_sequence = 0;
+    const bool submitted = SubmitDxmtQueueWork(
+        static_cast<IMTLD3D12Device *>(this),
+        std::make_unique<SetEventQueueSubmission>(
+            std::move(signal), event, value),
+        submitted_sequence);
+    return submitted ? S_OK : E_FAIL;
   }
 
   void STDMETHODCALLTYPE Trim() override {}
@@ -4634,6 +4556,8 @@ public:
     }
 
     auto placement_heap = heap_object->GetPlacementHeap();
+    auto placement_heap_residency =
+        heap_object->GetPlacementHeapResidency();
     if (!placement_heap &&
         desc->Dimension != D3D12_RESOURCE_DIMENSION_BUFFER) {
       WARN("D3D12Device: CreatePlacedResource could not create placement heap"
@@ -4703,7 +4627,8 @@ public:
         static_cast<IMTLD3D12Device *>(this), &heap_desc.Properties,
         heap_desc.Flags, desc, initial_state, heap_offset,
         optimized_clear_value, d3d12::ResourceKind::Placed,
-        placed_buffer, placed_buffer_allocation, placement_heap);
+        placed_buffer, placed_buffer_allocation, placement_heap,
+        std::move(placement_heap_residency));
     auto *resource_impl = dynamic_cast<d3d12::Resource *>(resource_object.ptr());
     const bool allocation_valid =
         resource_impl &&
@@ -4967,84 +4892,37 @@ public:
         return WARN_E_INVALIDARG(__func__);
     }
 
-    std::vector<Fence *> wait_fences;
+    std::vector<FencePrivateReference> wait_fences;
     wait_fences.reserve(fence_count);
     std::vector<UINT64> wait_values(values, values + fence_count);
     for (UINT i = 0; i < fence_count; i++) {
       auto *fence = dynamic_cast<Fence *>(fences[i]);
-      fence->AddRefPrivate();
-      wait_fences.push_back(fence);
+      wait_fences.emplace_back(fence);
     }
 
-    auto completed = [wait_fences = wait_fences,
-                      wait_values = wait_values, flags]() {
-      if (flags & D3D12_MULTIPLE_FENCE_WAIT_FLAG_ANY) {
-        for (size_t i = 0; i < wait_fences.size(); i++) {
-          if (wait_fences[i]->GetCompletedValue() >= wait_values[i])
-            return true;
-        }
-        return false;
-      }
-
-      for (size_t i = 0; i < wait_fences.size(); i++) {
-        if (wait_fences[i]->GetCompletedValue() < wait_values[i])
-          return false;
-      }
-      return true;
-    };
-    auto release_wait_fences = [&]() {
-      for (auto *fence : wait_fences)
-        fence->ReleasePrivate();
-      wait_fences.clear();
-    };
-
-    if (completed()) {
+    if (AreFenceValuesSatisfied(wait_fences, wait_values, flags)) {
       if (event) {
         auto signal = device_->device().newSharedEvent();
         MTLSharedEvent_setWin32EventAtValue(
             signal.handle, device_->queue().GetSharedEventListener(), event, 1);
         signal.signalValue(1);
       }
-      release_wait_fences();
       return S_OK;
     }
 
     if (!event) {
-      while (!completed())
+      while (!AreFenceValuesSatisfied(wait_fences, wait_values, flags))
         dxmt::this_thread::yield();
-      release_wait_fences();
       return S_OK;
     }
 
-    struct MultipleFenceWaitState {
-      HANDLE event;
-      std::vector<Fence *> fences;
-      std::atomic_bool signaled = false;
-      std::atomic_uint32_t remaining = 0;
-
-      void signal_once() {
-        bool expected = false;
-        if (!signaled.compare_exchange_strong(expected, true))
-          return;
-
-        SetEvent(event);
-        for (auto *fence : fences)
-          fence->ReleasePrivate();
-        fences.clear();
-      }
-    };
-
-    auto state = std::make_shared<MultipleFenceWaitState>();
-    state->event = event;
-    state->fences = std::move(wait_fences);
-
     const bool wait_any = flags & D3D12_MULTIPLE_FENCE_WAIT_FLAG_ANY;
     std::vector<size_t> pending_indices;
-    pending_indices.reserve(state->fences.size());
-    for (size_t i = 0; i < state->fences.size(); i++) {
-      if (state->fences[i]->GetCompletedValue() >= wait_values[i]) {
+    pending_indices.reserve(wait_fences.size());
+    for (size_t i = 0; i < wait_fences.size(); i++) {
+      if (wait_fences[i].Get().GetCompletedValue() >= wait_values[i]) {
         if (wait_any) {
-          state->signal_once();
+          SetEvent(event);
           return S_OK;
         }
         continue;
@@ -5053,39 +4931,23 @@ public:
     }
 
     if (pending_indices.empty()) {
-      state->signal_once();
+      SetEvent(event);
       return S_OK;
     }
 
-    if (!wait_any)
-      state->remaining.store(static_cast<uint32_t>(pending_indices.size()),
-                             std::memory_order_release);
+    auto state = std::make_shared<MultipleFenceWaitState>(
+        event, wait_any, std::move(wait_fences));
+    state->Arm(static_cast<uint32_t>(pending_indices.size()));
 
     for (size_t index : pending_indices) {
-      auto *fence = state->fences[index];
+      auto &fence = state->FenceAt(index);
       const auto value = wait_values[index];
-      if (fence->GetCompletedValue() >= value) {
-        if (wait_any) {
-          state->signal_once();
-          return S_OK;
-        }
-        if (state->remaining.fetch_sub(1, std::memory_order_acq_rel) == 1) {
-          state->signal_once();
-          return S_OK;
-        }
+      if (fence.GetCompletedValue() >= value) {
+        state->CompleteFenceWait();
         continue;
       }
 
-      if (wait_any) {
-        fence->AddCompletionCallback(value, [state]() {
-          state->signal_once();
-        });
-      } else {
-        fence->AddCompletionCallback(value, [state]() {
-          if (state->remaining.fetch_sub(1, std::memory_order_acq_rel) == 1)
-            state->signal_once();
-        });
-      }
+      fence.RegisterQueueWait(value, std::weak_ptr<FenceWaitTarget>(state));
     }
 
     return S_OK;
@@ -5189,7 +5051,11 @@ public:
         !desc->ByteStride || desc->NodeMask > 1)
       return WARN_E_INVALIDARG(__func__);
 
-    UINT min_stride = 0;
+    // 64-bit: each argument size is already capped at UINT_MAX, but summing
+    // enough of them in 32 bits wraps to a small value and the ByteStride check
+    // below then waves through a stride far too short for the arguments it
+    // claims to describe.
+    UINT64 min_stride = 0;
     UINT operation_count = 0;
     for (UINT i = 0; i < desc->NumArgumentDescs; i++) {
       const auto &argument = desc->pArgumentDescs[i];
@@ -5224,7 +5090,7 @@ public:
       WARN("D3D12Device::CreateCommandSignature: missing indirect operation");
       return WARN_E_INVALIDARG(__func__);
     }
-    if (desc->ByteStride < min_stride)
+    if (min_stride > UINT_MAX || desc->ByteStride < min_stride)
       return WARN_E_INVALIDARG(__func__);
     if (desc->NumArgumentDescs != 1) {
       // State-changing signatures require GPU-side argument preprocessing.
@@ -6504,7 +6370,9 @@ private:
         footprint.Depth = 1;
         footprint.RowPitch =
             static_cast<UINT>(Align(desc->Width, D3D12_TEXTURE_DATA_PITCH_ALIGNMENT));
-        subresource_size = desc->Width;
+        // subresource_size already holds desc->Width from its initializer; a
+        // buffer subresource occupies exactly Width bytes (the 256-byte pitch
+        // alignment applies to the placed footprint, not to the byte count).
       } else {
         if (plane >= plane_count) {
           WARN("D3D12Device: GetCopyableFootprints subresource plane out of range subresource=",

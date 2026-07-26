@@ -5,6 +5,11 @@
 #include "Metal.hpp"
 #include "rc/util_rc_ptr.hpp"
 #include <d3d12.h>
+#include <memory>
+
+namespace dxmt {
+class LifetimeResidencyRegistration;
+}
 
 namespace dxmt::d3d12 {
 
@@ -19,6 +24,8 @@ public:
   virtual dxmt::Buffer *GetBuffer() const = 0;
   virtual dxmt::BufferAllocation *GetAllocation() const = 0;
   virtual WMT::Reference<WMT::Heap> GetPlacementHeap() = 0;
+  virtual std::shared_ptr<dxmt::LifetimeResidencyRegistration>
+  GetPlacementHeapResidency() = 0;
 };
 
 Com<ID3D12Heap> CreateHeap(IMTLD3D12Device *device,

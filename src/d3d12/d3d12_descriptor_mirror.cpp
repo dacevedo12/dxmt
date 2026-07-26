@@ -110,7 +110,9 @@ DescriptorHeapMirror::DescriptorHeapMirror(WMT::Device device, uint32_t num_desc
           table_info.length);
     } else {
       auto *qwords = reinterpret_cast<uint64_t *>(table_mapped_);
-      std::fill(qwords, qwords + table_info.length / sizeof(uint64_t), 0);
+      const size_t qword_count =
+          static_cast<size_t>(table_info.length / sizeof(*qwords));
+      std::fill_n(qwords, qword_count, uint64_t{0});
     }
   }
   table_entries_.assign(num_descriptors_, {});
@@ -629,59 +631,6 @@ DescriptorHeapMirror::CopyTexturePoolSlotFrom(uint32_t dst_index,
                                               src_index, 1, dst_index);
 }
 
-void
-DescriptorHeapMirror::UpdateResidencyRefCountsUnlocked(
-    const DescriptorResidencyTarget &previous,
-    const DescriptorResidencyTarget &target,
-    DescriptorResidencyTransition &transition) {
-  struct AllocationDelta {
-    WMT::Resource resource = {};
-    int32_t delta = 0;
-  };
-  std::array<AllocationDelta, 6> deltas = {};
-  uint32_t delta_count = 0;
-  const auto record = [&](WMT::Resource resource, int32_t delta) {
-    if (!resource)
-      return;
-    for (uint32_t i = 0; i < delta_count; i++) {
-      if (deltas[i].resource.handle == resource.handle) {
-        deltas[i].delta += delta;
-        return;
-      }
-    }
-    deltas[delta_count++] = {resource, delta};
-  };
-
-  record(previous.allocation, -1);
-  record(previous.secondary_allocation, -1);
-  record(previous.mirror_allocation, -1);
-  record(target.allocation, 1);
-  record(target.secondary_allocation, 1);
-  record(target.mirror_allocation, 1);
-
-  for (uint32_t i = 0; i < delta_count; i++) {
-    const auto resource = deltas[i].resource;
-    const auto current_it =
-        residency_allocation_ref_counts_.find(resource.handle);
-    const uint32_t current =
-        current_it == residency_allocation_ref_counts_.end()
-            ? 0
-            : current_it->second;
-    const int64_t next = int64_t(current) + deltas[i].delta;
-    if (next < 0)
-      std::abort();
-    if (!current && next) {
-      transition.added_allocations[transition.added_count++] = resource;
-    } else if (current && !next) {
-      transition.removed_allocations[transition.removed_count++] = resource;
-    }
-    if (next)
-      residency_allocation_ref_counts_[resource.handle] = uint32_t(next);
-    else
-      residency_allocation_ref_counts_.erase(resource.handle);
-  }
-}
-
 DescriptorResidencyTransition
 DescriptorHeapMirror::ReplaceResidencyTarget(
     uint32_t index, DescriptorResidencyTarget target) {
@@ -706,7 +655,6 @@ DescriptorHeapMirror::ReplaceResidencyTarget(
       current.mirror_allocation.handle == target.mirror_allocation.handle &&
       current.sampler.ptr() == target.sampler.ptr())
     return transition;
-  UpdateResidencyRefCountsUnlocked(current, target, transition);
   transition.previous = std::move(current);
   residency_targets_[index] = std::move(target);
   return transition;
@@ -728,7 +676,6 @@ DescriptorHeapMirror::ReplaceMirrorResidencyTargetIfCurrent(
   after.mirror_allocation = target.mirror_allocation;
   after.sampler = target.sampler;
   if (transition) {
-    UpdateResidencyRefCountsUnlocked(current, after, *transition);
     transition->previous.mirror_allocation =
         std::move(current.mirror_allocation);
     transition->previous.sampler = std::move(current.sampler);
@@ -743,7 +690,6 @@ DescriptorHeapMirror::DrainResidencyTargets() {
   std::lock_guard lock(mutex_);
   std::vector<DescriptorResidencyTarget> drained;
   drained.swap(residency_targets_);
-  residency_allocation_ref_counts_.clear();
   std::unordered_set<obj_handle_t> retained_allocations;
   for (auto &target : drained) {
     const auto retain_once = [&](WMT::Reference<WMT::Resource> &allocation) {

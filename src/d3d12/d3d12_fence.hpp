@@ -3,7 +3,7 @@
 #include "d3d12_device.hpp"
 #include "Metal.hpp"
 #include <cstdint>
-#include <functional>
+#include <memory>
 #include <d3d12.h>
 
 namespace dxmt::d3d12 {
@@ -27,6 +27,15 @@ enum class FenceGpuWaitStatus {
   Rewind,
 };
 
+class FenceWaitTarget {
+public:
+  FenceWaitTarget() = default;
+  FenceWaitTarget(const FenceWaitTarget &) = delete;
+  FenceWaitTarget &operator=(const FenceWaitTarget &) = delete;
+  virtual ~FenceWaitTarget() noexcept = default;
+  virtual void CompleteFenceWait() noexcept = 0;
+};
+
 class Fence {
 public:
   virtual ~Fence() = default;
@@ -38,7 +47,8 @@ public:
   virtual UINT64 GetCompletedValue() const = 0;
   virtual void SetCompletedValue(UINT64 value) = 0;
   virtual void SignalFromQueue(UINT64 value) = 0;
-  virtual void AddCompletionCallback(UINT64 value, std::function<void()> callback) = 0;
+  virtual void RegisterQueueWait(
+      UINT64 value, std::weak_ptr<FenceWaitTarget> target) = 0;
   virtual bool HasReached(UINT64 value) const = 0;
   virtual void RegisterQueueSignal(const FenceGpuSignal &signal) = 0;
   virtual FenceGpuWaitStatus TryResolveGpuWait(UINT64 value, FenceGpuSignal &signal) const = 0;

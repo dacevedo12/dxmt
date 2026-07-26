@@ -7,7 +7,7 @@
 #include "dxmt_texture.hpp"
 #include "rc/util_rc_ptr.hpp"
 #include <d3d12.h>
-#include <functional>
+#include <memory>
 #include <vector>
 
 namespace dxmt::d3d12 {
@@ -42,10 +42,19 @@ struct ResourceTileMapping {
   int64_t heap_tile = -1;
 };
 
+class Resource;
+
+class CpuQueryResolveTarget {
+public:
+  CpuQueryResolveTarget() = default;
+  CpuQueryResolveTarget(const CpuQueryResolveTarget &) = delete;
+  CpuQueryResolveTarget &operator=(const CpuQueryResolveTarget &) = delete;
+  virtual ~CpuQueryResolveTarget() noexcept = default;
+  virtual void Resolve(Resource &resource) noexcept = 0;
+};
+
 class Resource {
 public:
-  using PendingCpuQueryResolveFn = std::function<void(Resource *)>;
-
   virtual ~Resource() = default;
 
   virtual ResourceKind GetKind() const = 0;
@@ -82,9 +91,9 @@ public:
   virtual void AddPendingTimestampResolve(UINT64 offset, UINT64 size,
                                           uint64_t seq) = 0;
   virtual bool CanDeferCpuQueryResolve() const = 0;
-  virtual void AddPendingCpuQueryResolve(UINT64 offset, UINT64 size,
-                                         uint64_t seq,
-                                         PendingCpuQueryResolveFn resolve) = 0;
+  [[nodiscard]] virtual bool AddPendingCpuQueryResolve(
+      UINT64 offset, UINT64 size, uint64_t seq,
+      std::unique_ptr<CpuQueryResolveTarget> target) = 0;
   virtual bool HasPendingCpuQueryResolves(UINT64 offset, UINT64 size) = 0;
   virtual bool MaterializePendingCpuQueryResolves(UINT64 offset, UINT64 size,
                                                   const char *context) = 0;
@@ -111,7 +120,9 @@ CreateResource(IMTLD3D12Device *device, const D3D12_HEAP_PROPERTIES *heap_proper
                ResourceKind kind = ResourceKind::Committed,
                dxmt::Buffer *placed_buffer = nullptr,
                dxmt::BufferAllocation *placed_buffer_allocation = nullptr,
-               WMT::Heap placement_heap = {});
+               WMT::Heap placement_heap = {},
+               std::shared_ptr<dxmt::LifetimeResidencyRegistration>
+                   placement_heap_residency = {});
 
 bool IsSupportedResourceDesc(const D3D12_RESOURCE_DESC &desc);
 

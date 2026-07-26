@@ -948,16 +948,36 @@ static void
 UpsertCompiledRootConstants(
     std::vector<CompiledCommandRootConstants> &constants,
     const RootConstantsRecord &record) {
+  // No root signature is reachable from here, but D3D12 caps a whole root
+  // signature at D3D12_MAX_ROOT_COST DWORDs and every 32-bit root constant
+  // costs one DWORD, so no legal (dst_offset, count) pair can reach past that
+  // cap. Evaluating the window in 64-bit and refusing the rest keeps the
+  // std::copy calls below inside `merged`: the previous 32-bit adds wrapped
+  // for a hostile dst_offset, producing a `local_size` far smaller than
+  // `record.dst_offset - local_begin`.
+  const uint64_t record_end =
+      uint64_t(record.dst_offset) + record.values.size();
+  if (record_end > D3D12_MAX_ROOT_COST) {
+    static std::atomic<uint32_t> log_count = 0;
+    if (log_count.fetch_add(1, std::memory_order_relaxed) < 8) {
+      WARN("D3D12CommandList: root constants destination range is outside the"
+           " root signature and was dropped rootParameterIndex=",
+           record.root_parameter_index,
+           " num32BitValuesToSet=", record.values.size(),
+           " destOffsetIn32BitValues=", record.dst_offset);
+    }
+    return;
+  }
   for (auto &entry : constants) {
     if (entry.root_parameter_index == record.root_parameter_index) {
-      const auto local_end =
-          record.dst_offset + static_cast<UINT>(record.values.size());
+      // Every stored entry went through the same cap above, so both ends fit
+      // in D3D12_MAX_ROOT_COST and the merged window cannot overflow.
+      const uint64_t entry_end =
+          uint64_t(entry.dst_offset) + entry.values.size();
       const auto local_begin =
           std::min<UINT>(entry.dst_offset, record.dst_offset);
-      const auto local_size =
-          std::max<UINT>(entry.dst_offset + static_cast<UINT>(entry.values.size()),
-                         local_end) -
-          local_begin;
+      const auto local_size = static_cast<UINT>(
+          std::max<uint64_t>(entry_end, record_end) - local_begin);
       CompiledImmutableVector<UINT> merged;
       merged.resize(local_size, 0);
       std::copy(entry.values.begin(), entry.values.end(),
@@ -1149,9 +1169,10 @@ static void RefreshCompiledInputAssemblerSnapshot(
   CompiledCommandInputAssemblerState result = {};
   result.index_buffer = state.index_buffer;
   for (UINT slot = 0; slot < state.vertex_buffers.size(); slot++) {
-    if (state.vertex_buffers[slot])
+    const auto &vertex_buffer = state.vertex_buffers[slot];
+    if (vertex_buffer)
       result.vertex_buffers.push_back(
-          CompiledCommandVertexBuffer{slot, *state.vertex_buffers[slot]});
+          CompiledCommandVertexBuffer{slot, *vertex_buffer});
   }
   state.input_assembler_snapshot = std::move(result);
 }
@@ -4354,8 +4375,7 @@ public:
 
     submitted_ = true;
     if (allocator_) {
-      allocator_uses.push_back(
-          SubmittedCommandAllocatorUse{allocator_, allocator_->MarkCommandListSubmitted()});
+      allocator_uses.push_back(allocator_->MarkCommandListSubmitted());
     }
     return S_OK;
   }
@@ -4963,6 +4983,9 @@ public:
                                                      UINT dst_offset) override {
     dxmt::perf::ScopedCodeTimer perf_timer(
         dxmt::PerfCodePath::CommandListRootConstants);
+    if (DropOutOfRangeRootConstants("SetComputeRoot32BitConstant",
+                                    root_parameter_index, 1, dst_offset))
+      return;
     g_current_command_record_d3d_sequence =
         dxmt::apitrace::record_set_root_32bit_constants(
             this, true, root_parameter_index, 1, &data, dst_offset);
@@ -4979,6 +5002,9 @@ public:
                                                       UINT dst_offset) override {
     dxmt::perf::ScopedCodeTimer perf_timer(
         dxmt::PerfCodePath::CommandListRootConstants);
+    if (DropOutOfRangeRootConstants("SetGraphicsRoot32BitConstant",
+                                    root_parameter_index, 1, dst_offset))
+      return;
     g_current_command_record_d3d_sequence =
         dxmt::apitrace::record_set_root_32bit_constants(
             this, false, root_parameter_index, 1, &data, dst_offset);
@@ -4995,6 +5021,10 @@ public:
                                                       const void *data, UINT dst_offset) override {
     dxmt::perf::ScopedCodeTimer perf_timer(
         dxmt::PerfCodePath::CommandListRootConstants);
+    if (DropOutOfRangeRootConstants("SetComputeRoot32BitConstants",
+                                    root_parameter_index, constant_count,
+                                    dst_offset))
+      return;
     g_current_command_record_d3d_sequence =
         dxmt::apitrace::record_set_root_32bit_constants(
             this, true, root_parameter_index, constant_count,
@@ -5015,6 +5045,10 @@ public:
                                                        const void *data, UINT dst_offset) override {
     dxmt::perf::ScopedCodeTimer perf_timer(
         dxmt::PerfCodePath::CommandListRootConstants);
+    if (DropOutOfRangeRootConstants("SetGraphicsRoot32BitConstants",
+                                    root_parameter_index, constant_count,
+                                    dst_offset))
+      return;
     g_current_command_record_d3d_sequence =
         dxmt::apitrace::record_set_root_32bit_constants(
             this, false, root_parameter_index, constant_count,
@@ -6115,8 +6149,8 @@ private:
     for (UINT i = 0; i < record.view_count; i++) {
       const auto slot = record.start_slot + i;
       const auto &view = record.views[i];
-      if (!vertex_buffer_cache_[slot] ||
-          !SameVertexBufferView(*vertex_buffer_cache_[slot], view)) {
+      const auto &cached = vertex_buffer_cache_[slot];
+      if (!cached || !SameVertexBufferView(*cached, view)) {
         unchanged = false;
         break;
       }
@@ -6383,6 +6417,30 @@ private:
       return false;
     WARN("D3D12GraphicsCommandList: ", command,
          " is not valid in a bundle and was dropped");
+    return true;
+  }
+
+  // D3D12 requires DestOffsetIn32BitValues + Num32BitValuesToSet to stay
+  // inside the range the root signature declares for the parameter. The bound
+  // root signature is not always known here (a bundle may inherit it), but a
+  // root signature is capped at D3D12_MAX_ROOT_COST DWORDs and each 32-bit
+  // root constant costs one DWORD, so that cap holds for every legal call
+  // regardless of which signature is bound. Beyond it the call is an
+  // application bug -- a debug-layer error on Windows -- and pSrcData is not
+  // trustworthy either, so drop the command before reading or recording it.
+  bool DropOutOfRangeRootConstants(const char *command,
+                                   UINT root_parameter_index,
+                                   UINT constant_count, UINT dst_offset) const {
+    if (uint64_t(dst_offset) + constant_count <= D3D12_MAX_ROOT_COST)
+      return false;
+    static std::atomic<uint32_t> log_count = 0;
+    if (log_count.fetch_add(1, std::memory_order_relaxed) < 8) {
+      WARN("D3D12GraphicsCommandList: ", command,
+           " destination range is outside the root signature and was dropped"
+           " rootParameterIndex=", root_parameter_index,
+           " num32BitValuesToSet=", constant_count,
+           " destOffsetIn32BitValues=", dst_offset);
+    }
     return true;
   }
 

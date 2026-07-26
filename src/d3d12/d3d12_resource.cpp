@@ -6,12 +6,15 @@
 #include "com/com_private_data.hpp"
 #include "d3d12_command_queue.hpp"
 #include "d3d12_heap.hpp"
+#include "d3d12_query_resolve_range.hpp"
+#include "d3d12_queue_view_binding.hpp"
 #include "dxmt_perf_stats.hpp"
 #include "dxmt_format.hpp"
 #include "dxmt_apitrace_d3d.hpp"
 #include "log/log.hpp"
 #include "thread.hpp"
 #include "util_env.hpp"
+#include "util_noexcept.hpp"
 #include "util_string.hpp"
 #include <array>
 #include <algorithm>
@@ -24,6 +27,7 @@
 #include <mutex>
 #include <string_view>
 #include <utility>
+#include <variant>
 #include <vector>
 
 namespace dxmt::d3d12 {
@@ -170,7 +174,7 @@ public:
 private:
   ReservedTextureMaterializer() = default;
 
-  ~ReservedTextureMaterializer() {
+  ~ReservedTextureMaterializer() noexcept {
     {
       std::lock_guard lock(mutex_);
       stopping_ = true;
@@ -179,7 +183,7 @@ private:
     cond_.notify_all();
     for (auto &worker : workers_) {
       if (worker.joinable())
-        worker.join();
+        worker.join_noexcept();
     }
   }
 
@@ -367,37 +371,6 @@ GetTextureBackingPlaneCount(const D3D12_RESOURCE_DESC &desc) {
 static UINT
 GetTextureBackingPlaneIndex(const D3D12_RESOURCE_DESC &desc, UINT plane) {
   return UsesSplitPlaneBacking(desc) ? plane : 0;
-}
-
-static bool
-IsDepthStencilResourceFormat(DXGI_FORMAT format) {
-  return GetDXGIFormatTraits(format).flags & DXGI_FORMAT_TRAIT_DEPTH_STENCIL;
-}
-
-static TextureViewKey
-CreateDepthStencilPlaneReadView(dxmt::Texture *texture, UINT plane, UINT level,
-                                UINT slice) {
-  if (!texture)
-    return {};
-
-  TextureViewDescriptor view = {};
-  switch (texture->textureType()) {
-  case WMTTextureType2D:
-  case WMTTextureType2DArray:
-  case WMTTextureTypeCube:
-  case WMTTextureTypeCubeArray:
-    view.type = WMTTextureType2D;
-    break;
-  default:
-    return {};
-  }
-  view.format = plane ? WMTPixelFormatX32G8X32 : texture->pixelFormat();
-  view.firstMiplevel = level;
-  view.miplevelCount = 1;
-  view.firstArraySlice = slice;
-  view.arraySize = 1;
-  view.intendedUsage = WMTTextureUsageShaderRead;
-  return texture->createView(view);
 }
 
 static UINT64
@@ -835,6 +808,164 @@ CopyTextureRowsToMemory(void *dst_data, UINT64 dst_row_pitch,
   return S_OK;
 }
 
+struct DepthStencilUploadCommand final {
+  Rc<dxmt::Buffer> buffer;
+  Rc<dxmt::Texture> texture;
+  UINT row_pitch = 0;
+  UINT bytes_per_image = 0;
+  UINT dst_slice = 0;
+  UINT dst_level = 0;
+  UINT dst_plane = 0;
+  WMTOrigin origin = {};
+  WMTSize size = {};
+
+  void operator()(ArgumentEncodingContext &enc) {
+    auto allocation = buffer->current();
+    if (allocation && allocation->buffer()) {
+      const auto sequence = enc.currentSeqId();
+      enc.queue().RetainReplayTemporaryResidencyUntilGpuComplete(
+          dxmt::ResidencyOwnership::ReplayTemporary(allocation->buffer()),
+          sequence);
+    }
+    enc.blit_depth_stencil_cmd.copyPlaneFromBuffer(
+        buffer, 0, buffer->length(), row_pitch, bytes_per_image, texture,
+        dst_level, dst_slice, dst_plane == 1, origin, size);
+  }
+};
+
+struct TextureUploadCommand final {
+  WMT::Buffer buffer;
+  Rc<dxmt::Texture> texture;
+  D3D12_BOX box = {};
+  UINT row_pitch = 0;
+  UINT bytes_per_image = 0;
+  UINT dst_slice = 0;
+  UINT dst_level = 0;
+  UINT origin_z = 0;
+  UINT depth_count = 0;
+
+  void operator()(ArgumentEncodingContext &enc) {
+    const auto sequence = enc.currentSeqId();
+    enc.queue().RetainReplayTemporaryResidencyUntilGpuComplete(
+        dxmt::ResidencyOwnership::ReplayTemporary(buffer), sequence);
+    enc.startBlitPass();
+    auto dst =
+        enc.access(texture, dst_level, dst_slice, ResourceAccess::Write);
+    auto &copy =
+        enc.encodeBlitCommand<wmtcmd_blit_copy_from_buffer_to_texture>();
+    copy.type = WMTBlitCommandCopyFromBufferToTexture;
+    copy.src = buffer;
+    copy.src_offset = 0;
+    copy.bytes_per_row = row_pitch;
+    copy.bytes_per_image = bytes_per_image;
+    copy.size = {box.right - box.left, box.bottom - box.top, depth_count};
+    copy.dst = dst;
+    copy.slice = dst_slice;
+    copy.level = dst_level;
+    copy.origin = {box.left, box.top, origin_z};
+    enc.endPass();
+  }
+};
+
+struct DepthStencilReadbackCommand final {
+  Rc<dxmt::Buffer> buffer;
+  Rc<dxmt::Texture> texture;
+  TextureViewKey view = {};
+  UINT row_pitch = 0;
+  UINT bytes_per_image = 0;
+  UINT src_plane = 0;
+  WMTOrigin origin = {};
+  WMTSize size = {};
+
+  void operator()(ArgumentEncodingContext &enc) {
+    auto allocation = buffer->current();
+    if (allocation && allocation->buffer()) {
+      const auto sequence = enc.currentSeqId();
+      enc.queue().RetainReplayTemporaryResidencyUntilGpuComplete(
+          dxmt::ResidencyOwnership::ReplayTemporary(allocation->buffer()),
+          sequence);
+    }
+    enc.blit_depth_stencil_cmd.copyPlaneToBuffer(
+        texture, view, buffer, 0, buffer->length(), row_pitch,
+        bytes_per_image, src_plane == 1, origin, size);
+  }
+};
+
+struct TextureReadbackCommand final {
+  WMT::Buffer buffer;
+  Rc<dxmt::Texture> texture;
+  D3D12_BOX box = {};
+  UINT row_pitch = 0;
+  UINT bytes_per_image = 0;
+  UINT src_slice = 0;
+  UINT src_level = 0;
+  UINT origin_z = 0;
+  UINT depth_count = 0;
+
+  void operator()(ArgumentEncodingContext &enc) {
+    const auto sequence = enc.currentSeqId();
+    enc.queue().RetainReplayTemporaryResidencyUntilGpuComplete(
+        dxmt::ResidencyOwnership::ReplayTemporary(buffer), sequence);
+    enc.startBlitPass();
+    auto src =
+        enc.access(texture, src_level, src_slice, ResourceAccess::Read);
+    auto &copy =
+        enc.encodeBlitCommand<wmtcmd_blit_copy_from_texture_to_buffer>();
+    copy.type = WMTBlitCommandCopyFromTextureToBuffer;
+    copy.src = src;
+    copy.slice = src_slice;
+    copy.level = src_level;
+    copy.origin = {box.left, box.top, origin_z};
+    copy.size = {box.right - box.left, box.bottom - box.top, depth_count};
+    copy.dst = buffer;
+    copy.offset = 0;
+    copy.bytes_per_row = row_pitch;
+    copy.bytes_per_image = bytes_per_image;
+    enc.endPass();
+  }
+};
+
+using SynchronousBlitPayload =
+    std::variant<DepthStencilUploadCommand, TextureUploadCommand,
+                 DepthStencilReadbackCommand, TextureReadbackCommand>;
+
+class SynchronousBlitEmitVisitor final {
+public:
+  explicit SynchronousBlitEmitVisitor(CommandChunk &chunk) noexcept
+      : chunk_(chunk) {}
+
+  template <typename Command>
+  void operator()(Command &command) const {
+    chunk_.emitcc(std::move(command));
+  }
+
+private:
+  CommandChunk &chunk_;
+};
+
+class SynchronousBlitSubmission final
+    : public DxmtQueueSubmissionTarget {
+public:
+  explicit SynchronousBlitSubmission(
+      SynchronousBlitPayload payload) noexcept
+      : payload_(std::move(payload)) {}
+
+  [[nodiscard]] bool
+  Submit(IMTLD3D12Device &device,
+         uint64_t &submitted_sequence) noexcept override {
+    return dxmt::invokeNoexcept("D3D12 synchronous blit submission", [&]() {
+      auto &queue = device.GetDXMTDevice().queue();
+      submitted_sequence = queue.CurrentSeqId();
+      std::visit(SynchronousBlitEmitVisitor(*queue.CurrentChunk()),
+                 payload_);
+      queue.CommitCurrentChunk();
+    });
+  }
+
+private:
+  SynchronousBlitPayload payload_;
+};
+
 class ResourceImpl final : public ComObjectWithInitialRef<ID3D12Resource2>,
                            public Resource {
 public:
@@ -848,14 +979,17 @@ public:
                ResourceKind kind,
                dxmt::Buffer *placed_buffer = nullptr,
                dxmt::BufferAllocation *placed_buffer_allocation = nullptr,
-               WMT::Heap placement_heap = {})
+               WMT::Heap placement_heap = {},
+               std::shared_ptr<dxmt::LifetimeResidencyRegistration>
+                   placement_heap_residency = {})
       : device_(device), heap_properties_(heap_properties),
         heap_flags_(heap_flags), desc_(desc), initial_state_(initial_state),
         heap_offset_(heap_offset), buffer_backing_offset_(heap_offset),
         kind_(kind),
         placed_buffer_(placed_buffer),
         placed_buffer_allocation_(placed_buffer_allocation),
-        placement_heap_(placement_heap) {
+        placement_heap_(placement_heap),
+        placement_heap_residency_(std::move(placement_heap_residency)) {
     if (!heap_properties_.CreationNodeMask)
       heap_properties_.CreationNodeMask = 1;
     if (!heap_properties_.VisibleNodeMask)
@@ -904,14 +1038,8 @@ public:
     LogReservedTextureFaultDiagnostic("destroy", nullptr);
     CancelReservedTextureMaterialization();
     UnregisterBufferGpuVirtualAddress(this);
-    UnregisterLifetimeResidency();
-    // Resource destroyed while Map still outstanding: drop holds so
-    // BufferAllocation can poison then free rather than UAF the host page.
-    if (buffer_map_count_ > 0 || !mapped_allocation_holds_.empty()) {
-      ERR("D3D12Resource: destroy with outstanding Map refs map_count=",
-          buffer_map_count_,
-          " holds=", mapped_allocation_holds_.size());
-    }
+    // GPTK D3DMResource dtor abandons map slots silently (no Unmap, no error).
+    // Drop any rename-safety pin without logging or Shared poison races.
     while (!mapped_allocation_holds_.empty()) {
       auto held = std::move(mapped_allocation_holds_.back());
       mapped_allocation_holds_.pop_back();
@@ -919,6 +1047,7 @@ public:
         held->releaseCpuMapRef();
     }
     buffer_map_count_ = 0;
+    texture_map_count_ = 0;
   }
 
   HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid,
@@ -1010,6 +1139,10 @@ public:
 
   HRESULT STDMETHODCALLTYPE Map(UINT sub_resource, const D3D12_RANGE *read_range,
                                 void **data) override {
+    // GPTK D3DMResource::Map: null ppData returns S_OK without map state.
+    if (!data)
+      return S_OK;
+
     HRESULT hr = S_OK;
     void *mapped = nullptr;
     if (sub_resource >= GetTextureSubresourceCount(desc_)) {
@@ -1027,12 +1160,25 @@ public:
       }
 
       WaitPendingTimestampResolveForMapRead(read_range);
-      mapped = static_cast<char *>(buffer_allocation_->mappedMemory(0)) +
-               buffer_backing_offset_;
-      // Pin host mapping for this Map's lifetime: cpu_map_refs_ + Rc hold so
-      // rename/reclaim cannot destroy the allocation until matching Unmap.
-      buffer_allocation_->addCpuMapRef();
-      mapped_allocation_holds_.push_back(buffer_allocation_);
+      // GPTK buffer Map: cache contents(); nested Map only bumps refcount.
+      // Pin allocation once while any Map is outstanding (rename safety).
+      if (buffer_map_count_ == 0) {
+        mapped = static_cast<char *>(buffer_allocation_->mappedMemory(0)) +
+                 buffer_backing_offset_;
+        buffer_allocation_->addCpuMapRef();
+        mapped_allocation_holds_.clear();
+        mapped_allocation_holds_.push_back(buffer_allocation_);
+      } else if (!mapped_allocation_holds_.empty() &&
+                 mapped_allocation_holds_.back() &&
+                 mapped_allocation_holds_.back()->mappedMemory(0)) {
+        mapped =
+            static_cast<char *>(
+                mapped_allocation_holds_.back()->mappedMemory(0)) +
+            buffer_backing_offset_;
+      } else {
+        mapped = static_cast<char *>(buffer_allocation_->mappedMemory(0)) +
+                 buffer_backing_offset_;
+      }
       buffer_map_count_++;
       goto done;
     }
@@ -1043,9 +1189,6 @@ public:
       WARN(__func__, ": texture subresource is not mappable");
       goto done;
     }
-
-    if (!data)
-      goto done;
 
     if (!texture_allocation_->mappedMemory ||
         !IsCpuLinearTextureSubresource(desc_, sub_resource)) {
@@ -1058,8 +1201,7 @@ public:
     texture_map_count_++;
 
   done:
-    if (data)
-      *data = SUCCEEDED(hr) ? mapped : nullptr;
+    *data = SUCCEEDED(hr) ? mapped : nullptr;
     dxmt::apitrace::record_resource_map(
         this, sub_resource, read_range, SUCCEEDED(hr) && mapped != nullptr,
         mapped, hr);
@@ -1069,11 +1211,11 @@ public:
   void STDMETHODCALLTYPE Unmap(UINT sub_resource,
                                const D3D12_RANGE *written_range) override {
     if (desc_.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
-      if (sub_resource != 0)
+      if (sub_resource != 0 || buffer_map_count_ == 0)
         return;
 
-      // Prefer the allocation actually leased by Map (hold stack), not the
-      // current resource pointer — rename can replace buffer_allocation_.
+      // Prefer the allocation pinned on first Map — rename can replace
+      // buffer_allocation_ while maps are still outstanding.
       Rc<dxmt::BufferAllocation> mapped_alloc;
       if (!mapped_allocation_holds_.empty())
         mapped_alloc = mapped_allocation_holds_.back();
@@ -1103,6 +1245,8 @@ public:
         }
       }
 
+      // GPTK buffer UnmapImpl is empty (Shared coherency). Keep CpuShadow /
+      // GpuManaged publish for DXMT-only paths; no-ops for ordinary Shared.
       if (written_end > written_begin) {
         mapped_alloc->flushCpuShadow(
             buffer_backing_offset_ + written_begin, written_end - written_begin);
@@ -1110,8 +1254,9 @@ public:
             buffer_backing_offset_ + written_begin, written_end - written_begin);
       }
 
-      if (buffer_map_count_ > 0) {
-        buffer_map_count_--;
+      // Nested Map refcount: release the single pin only on the final Unmap.
+      buffer_map_count_--;
+      if (buffer_map_count_ == 0) {
         if (!mapped_allocation_holds_.empty()) {
           auto held = std::move(mapped_allocation_holds_.back());
           mapped_allocation_holds_.pop_back();
@@ -1305,7 +1450,15 @@ public:
   }
 
   bool HasLifetimeResidency() const override {
-    return !lifetime_residency_allocations_.empty();
+    if (kind_ == ResourceKind::Placed && placement_heap_residency_)
+      return true;
+    if (buffer_allocation_ && buffer_allocation_->hasLifetimeResidency())
+      return true;
+    for (const auto &allocation : plane_allocations_) {
+      if (allocation && allocation->hasLifetimeResidency())
+        return true;
+    }
+    return false;
   }
 
   uint64_t GetTileMappingGeneration() const override {
@@ -1429,20 +1582,22 @@ public:
            heap_properties_.Type == D3D12_HEAP_TYPE_READBACK;
   }
 
-  void AddPendingCpuQueryResolve(UINT64 offset, UINT64 size, uint64_t seq,
-                                 PendingCpuQueryResolveFn resolve) override {
-    if (!CanDeferCpuQueryResolve() || !size || !resolve)
-      return;
+  bool AddPendingCpuQueryResolve(
+      UINT64 offset, UINT64 size, uint64_t seq,
+      std::unique_ptr<CpuQueryResolveTarget> target) override {
+    if (!CanDeferCpuQueryResolve() || !size || !target)
+      return false;
 
     PendingCpuQueryResolveRange range = {};
     if (!ClampBufferRange(offset, size, desc_.Width, range.offset,
                           range.size))
-      return;
+      return false;
     range.seq = seq;
-    range.resolve = std::move(resolve);
+    range.target = std::move(target);
 
     std::lock_guard lock(pending_cpu_query_resolve_mutex_);
     pending_cpu_query_resolves_.push_back(std::move(range));
+    return true;
   }
 
   bool HasPendingCpuQueryResolves(UINT64 offset, UINT64 size) override {
@@ -1513,8 +1668,8 @@ public:
     }
 
     for (auto &range : selected) {
-      if (range.resolve)
-        range.resolve(this);
+      if (range.target)
+        range.target->Resolve(*this);
     }
     return true;
   }
@@ -1560,31 +1715,56 @@ private:
   }
 
   void RegisterLifetimeResidency() {
-    auto &queue = device_->GetDXMTDevice().queue();
-    const auto register_allocation = [&](WMT::Resource allocation) {
-      if (!allocation)
-        return;
-      for (const auto &registered : lifetime_residency_allocations_) {
-        if (registered.handle == allocation.handle)
-          return;
-      }
-      queue.AddPersistentResidency(allocation);
-      lifetime_residency_allocations_.emplace_back(allocation);
-    };
-    if (buffer_allocation_)
-      register_allocation(
-          WMT::Resource{buffer_allocation_->buffer().handle});
-    for (const auto &allocation : plane_allocations_) {
-      if (allocation)
-        register_allocation(WMT::Resource{allocation->texture().handle});
-    }
-  }
+    /*
+     * Metal heap allocations inherit residency from their backing heap. Adding
+     * both the MTLHeap and each placed child to the same MTLResidencySet is not
+     * a second ownership edge; Metal validation can fault while processing the
+     * duplicate child allocation. The shared registration also retains the
+     * heap for the complete D3D resource lifetime.
+     */
+    if (kind_ == ResourceKind::Placed && placement_heap_residency_)
+      return;
 
-  void UnregisterLifetimeResidency() {
     auto &queue = device_->GetDXMTDevice().queue();
-    for (auto &allocation : lifetime_residency_allocations_)
-      queue.RemovePersistentResidencyAfterCompletion(allocation);
-    lifetime_residency_allocations_.clear();
+    auto provenance = [this](UINT component) {
+      dxmt::ResidencyProvenanceKind source =
+          dxmt::ResidencyProvenanceKind::Unknown;
+      switch (kind_) {
+      case ResourceKind::Committed:
+        source = dxmt::ResidencyProvenanceKind::CommittedResource;
+        break;
+      case ResourceKind::Placed:
+        source = dxmt::ResidencyProvenanceKind::PlacedResourceChild;
+        break;
+      case ResourceKind::ReservedBuffer:
+      case ResourceKind::ReservedTexture:
+        source = dxmt::ResidencyProvenanceKind::ReservedResource;
+        break;
+      }
+      return dxmt::ResidencyProvenance{
+          .kind = source,
+          .owner = reinterpret_cast<uintptr_t>(this),
+          .identity = descriptor_identity_,
+          .parent = placement_heap_.handle,
+          .heap_offset = heap_offset_,
+          .size = desc_.Width,
+          .dimension = static_cast<uint32_t>(desc_.Dimension),
+          .component = component,
+      };
+    };
+    if (buffer_allocation_) {
+      buffer_allocation_->ensureLifetimeResidency(
+          queue, WMT::Object{buffer_allocation_->buffer().handle},
+          provenance(0));
+    }
+    for (UINT plane = 0; plane < plane_allocations_.size(); ++plane) {
+      const auto &allocation = plane_allocations_[plane];
+      if (allocation) {
+        allocation->ensureLifetimeResidency(
+            queue, WMT::Object{allocation->texture().handle},
+            provenance(plane));
+      }
+    }
   }
 
   HRESULT WriteTextureSubresource(UINT dst_sub_resource,
@@ -1793,19 +1973,16 @@ private:
       const WMTOrigin origin = {box.left, box.top, origin_z};
       const WMTSize size = {box.right - box.left, box.bottom - box.top, 1};
       return SubmitSynchronousDxmtBlit(
-          [buffer = std::move(buffer), texture = std::move(texture),
-           row_pitch = layout.row_pitch, bytes_per_image, dst_slice, dst_level,
-           dst_plane, origin, size](ArgumentEncodingContext &enc) mutable {
-            auto allocation = buffer->current();
-            if (allocation && allocation->buffer()) {
-              const auto sequence = enc.currentSeqId();
-              enc.queue().AddPersistentResidency(allocation->buffer());
-              enc.queue().RemovePersistentResidencyAfterCompletion(
-                  allocation->buffer(), sequence);
-            }
-            enc.blit_depth_stencil_cmd.copyPlaneFromBuffer(
-                buffer, 0, buffer->length(), row_pitch, bytes_per_image,
-                texture, dst_level, dst_slice, dst_plane == 1, origin, size);
+          DepthStencilUploadCommand{
+              .buffer = std::move(buffer),
+              .texture = std::move(texture),
+              .row_pitch = layout.row_pitch,
+              .bytes_per_image = bytes_per_image,
+              .dst_slice = dst_slice,
+              .dst_level = dst_level,
+              .dst_plane = dst_plane,
+              .origin = origin,
+              .size = size,
           });
     }
 
@@ -1826,30 +2003,16 @@ private:
       return copy_hr;
 
     return SubmitSynchronousDxmtBlit(
-        [buffer, texture, box, row_pitch = layout.row_pitch,
-         bytes_per_image, dst_slice, dst_level, origin_z, depth_count](
-            ArgumentEncodingContext &enc) {
-          const auto sequence = enc.currentSeqId();
-          enc.queue().AddPersistentResidency(buffer);
-          enc.queue().RemovePersistentResidencyAfterCompletion(buffer,
-                                                               sequence);
-          enc.startBlitPass();
-          auto dst = enc.access(texture, dst_level, dst_slice,
-                                ResourceAccess::Write);
-          auto &copy =
-              enc.encodeBlitCommand<wmtcmd_blit_copy_from_buffer_to_texture>();
-          copy.type = WMTBlitCommandCopyFromBufferToTexture;
-          copy.src = buffer;
-          copy.src_offset = 0;
-          copy.bytes_per_row = row_pitch;
-          copy.bytes_per_image = bytes_per_image;
-          copy.size = {box.right - box.left, box.bottom - box.top,
-                       depth_count};
-          copy.dst = dst;
-          copy.slice = dst_slice;
-          copy.level = dst_level;
-          copy.origin = {box.left, box.top, origin_z};
-          enc.endPass();
+        TextureUploadCommand{
+            .buffer = buffer,
+            .texture = std::move(texture),
+            .box = box,
+            .row_pitch = layout.row_pitch,
+            .bytes_per_image = bytes_per_image,
+            .dst_slice = dst_slice,
+            .dst_level = dst_level,
+            .origin_z = origin_z,
+            .depth_count = depth_count,
         });
   }
 
@@ -1905,19 +2068,15 @@ private:
       const WMTOrigin origin = {box.left, box.top, origin_z};
       const WMTSize size = {box.right - box.left, box.bottom - box.top, 1};
       HRESULT hr = SubmitSynchronousDxmtBlit(
-          [buffer, texture, view, row_pitch = layout.row_pitch,
-           bytes_per_image, src_plane, origin, size](
-              ArgumentEncodingContext &enc) mutable {
-            auto allocation = buffer->current();
-            if (allocation && allocation->buffer()) {
-              const auto sequence = enc.currentSeqId();
-              enc.queue().AddPersistentResidency(allocation->buffer());
-              enc.queue().RemovePersistentResidencyAfterCompletion(
-                  allocation->buffer(), sequence);
-            }
-            enc.blit_depth_stencil_cmd.copyPlaneToBuffer(
-                texture, view, buffer, 0, buffer->length(), row_pitch,
-                bytes_per_image, src_plane == 1, origin, size);
+          DepthStencilReadbackCommand{
+              .buffer = buffer,
+              .texture = std::move(texture),
+              .view = view,
+              .row_pitch = layout.row_pitch,
+              .bytes_per_image = bytes_per_image,
+              .src_plane = src_plane,
+              .origin = origin,
+              .size = size,
           });
       if (FAILED(hr))
         return hr;
@@ -1936,30 +2095,16 @@ private:
       return E_FAIL;
 
     HRESULT hr = SubmitSynchronousDxmtBlit(
-        [buffer, texture, box, row_pitch = layout.row_pitch, bytes_per_image,
-         src_slice, src_level, origin_z, depth_count](
-            ArgumentEncodingContext &enc) {
-          const auto sequence = enc.currentSeqId();
-          enc.queue().AddPersistentResidency(buffer);
-          enc.queue().RemovePersistentResidencyAfterCompletion(buffer,
-                                                               sequence);
-          enc.startBlitPass();
-          auto src = enc.access(texture, src_level, src_slice,
-                                ResourceAccess::Read);
-          auto &copy =
-              enc.encodeBlitCommand<wmtcmd_blit_copy_from_texture_to_buffer>();
-          copy.type = WMTBlitCommandCopyFromTextureToBuffer;
-          copy.src = src;
-          copy.slice = src_slice;
-          copy.level = src_level;
-          copy.origin = {box.left, box.top, origin_z};
-          copy.size = {box.right - box.left, box.bottom - box.top,
-                       depth_count};
-          copy.dst = buffer;
-          copy.offset = 0;
-          copy.bytes_per_row = row_pitch;
-          copy.bytes_per_image = bytes_per_image;
-          enc.endPass();
+        TextureReadbackCommand{
+            .buffer = buffer,
+            .texture = std::move(texture),
+            .box = box,
+            .row_pitch = layout.row_pitch,
+            .bytes_per_image = bytes_per_image,
+            .src_slice = src_slice,
+            .src_level = src_level,
+            .origin_z = origin_z,
+            .depth_count = depth_count,
         });
     if (FAILED(hr))
       return hr;
@@ -1970,17 +2115,16 @@ private:
                                    depth_count);
   }
 
-  template <typename Encode>
-  HRESULT SubmitSynchronousDxmtBlit(Encode &&encode) {
+  HRESULT SubmitSynchronousDxmtBlit(SynchronousBlitPayload payload) {
     auto &queue = device_->GetDXMTDevice().queue();
-    auto submission_guard =
-        AcquireDxmtQueueSubmissionGuard(device_.ptr());
-    const auto seq = queue.CurrentSeqId();
-    auto *chunk = queue.CurrentChunk();
-    chunk->emitcc(std::forward<Encode>(encode));
-    queue.CommitCurrentChunk();
-    submission_guard.lock.unlock();
-    queue.WaitCPUFence(seq);
+    uint64_t submitted_sequence = 0;
+    if (!SubmitDxmtQueueWork(
+            device_.ptr(),
+            std::make_unique<SynchronousBlitSubmission>(
+                std::move(payload)),
+            submitted_sequence))
+      return E_FAIL;
+    queue.WaitCPUFence(submitted_sequence);
     return S_OK;
   }
 
@@ -2216,8 +2360,8 @@ private:
         " allocation=", uint64_t(allocation),
         " metalTexture=", uint64_t(texture.handle),
         " gpuResourceId=", allocation ? allocation->gpuResourceID : 0,
-        " persistentResidencyCount=",
-        lifetime_residency_allocations_.size(),
+        " persistentResidency=",
+        HasLifetimeResidency() ? 1 : 0,
         " mappingGeneration=", GetTileMappingGeneration(),
         " totalTiles=", tiling_.total_tile_count,
         " width=", desc_.Width,
@@ -2531,7 +2675,7 @@ private:
     UINT64 offset = 0;
     UINT64 size = 0;
     uint64_t seq = 0;
-    PendingCpuQueryResolveFn resolve;
+    std::unique_ptr<CpuQueryResolveTarget> target;
   };
 
   static bool ClampBufferRange(UINT64 offset, UINT64 size, UINT64 limit,
@@ -2544,15 +2688,6 @@ private:
     clamped_offset = offset;
     clamped_size = std::min(size, limit - offset);
     return clamped_size != 0;
-  }
-
-  static bool BufferRangesOverlap(UINT64 a_offset, UINT64 a_size,
-                                  UINT64 b_offset, UINT64 b_size) {
-    if (!a_size || !b_size)
-      return false;
-    if (a_offset <= b_offset)
-      return b_offset - a_offset < a_size;
-    return a_offset - b_offset < b_size;
   }
 
   void WaitPendingTimestampResolveForMapRead(const D3D12_RANGE *read_range) {
@@ -2605,6 +2740,8 @@ private:
   Rc<dxmt::Buffer> placed_buffer_;
   Rc<dxmt::BufferAllocation> placed_buffer_allocation_;
   WMT::Reference<WMT::Heap> placement_heap_;
+  std::shared_ptr<dxmt::LifetimeResidencyRegistration>
+      placement_heap_residency_;
   bool has_tiling_ = false;
   bool uses_placement_sparse_ = false;
   ResourceTiling tiling_ = {};
@@ -2614,20 +2751,17 @@ private:
   Rc<dxmt::Buffer> buffer_;
   Rc<dxmt::BufferAllocation> buffer_allocation_;
   /**
-   * Outstanding Map() count for CPU-visible buffers/textures. Buffer maps also
-   * pin BufferAllocation via addCpuMapRef so rename/free cannot reclaim host
-   * mapping until matching Unmap() calls complete.
+   * GPTK-style Map refcount (D3DMResource slot +8). Nested Map only increments;
+   * pin of BufferAllocation is taken once while count > 0 (rename safety).
    */
   uint32_t buffer_map_count_ = 0;
   uint32_t texture_map_count_ = 0;
-  /** Allocations still held solely because of outstanding Map refs after rename. */
+  /** Single allocation held while buffer_map_count_ > 0 (first Map → last Unmap). */
   std::vector<Rc<dxmt::BufferAllocation>> mapped_allocation_holds_;
   Rc<dxmt::Texture> texture_;
   Rc<dxmt::TextureAllocation> texture_allocation_;
   std::array<Rc<dxmt::Texture>, kMaxTexturePlanes> plane_textures_{};
   std::array<Rc<dxmt::TextureAllocation>, kMaxTexturePlanes> plane_allocations_{};
-  std::vector<WMT::Reference<WMT::Resource>>
-      lifetime_residency_allocations_;
   Flags<dxmt::TextureAllocationFlag> reserved_texture_allocation_flags_;
   dxmt::mutex materialization_mutex_;
   dxmt::condition_variable materialization_cond_;
@@ -2917,12 +3051,14 @@ CreateResource(IMTLD3D12Device *device,
                ResourceKind kind,
                dxmt::Buffer *placed_buffer,
                dxmt::BufferAllocation *placed_buffer_allocation,
-               WMT::Heap placement_heap) {
+               WMT::Heap placement_heap,
+               std::shared_ptr<dxmt::LifetimeResidencyRegistration>
+                   placement_heap_residency) {
   return Com<ID3D12Resource>::transfer(
       new ResourceImpl(device, *heap_properties, heap_flags, *desc,
                        initial_state, heap_offset, optimized_clear_value,
                        kind, placed_buffer, placed_buffer_allocation,
-                       placement_heap));
+                       placement_heap, std::move(placement_heap_residency)));
 }
 
 } // namespace dxmt::d3d12

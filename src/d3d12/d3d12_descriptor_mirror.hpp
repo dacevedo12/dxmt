@@ -144,10 +144,6 @@ struct DescriptorResidencyTarget {
 
 struct DescriptorResidencyTransition {
   DescriptorResidencyTarget previous;
-  std::array<WMT::Resource, 6> added_allocations = {};
-  std::array<WMT::Resource, 6> removed_allocations = {};
-  uint32_t added_count = 0;
-  uint32_t removed_count = 0;
 };
 
 struct DescriptorTextureSlotPayload {
@@ -591,11 +587,6 @@ private:
   bool ClearTextureSlotUnlocked(
       uint32_t index,
       std::optional<dxmt::DescriptorSlotVersion> expected_version);
-  void UpdateResidencyRefCountsUnlocked(
-      const DescriptorResidencyTarget &previous,
-      const DescriptorResidencyTarget &target,
-      DescriptorResidencyTransition &transition);
-
   WMT::Reference<WMT::Buffer> buffer_;
   WMT::Reference<WMT::Buffer> table_buffer_;
   WMT::Reference<WMT::Buffer> buffer_record_buffer_;
@@ -620,8 +611,6 @@ private:
   std::vector<DescriptorBackendResourceRecord> buffer_resources_;
   std::vector<DescriptorSlotMeta> slot_meta_;
   std::vector<DescriptorResidencyTarget> residency_targets_;
-  std::unordered_map<obj_handle_t, uint32_t>
-      residency_allocation_ref_counts_;
   // Per-slot version bookkeeping. Each heap advances its slots independently;
   // the process-wide content revision is a separate cache invalidation clock.
   std::vector<dxmt::DescriptorSlotVersion> stale_versions_;

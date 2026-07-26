@@ -261,8 +261,34 @@ private:
     std::vector<std::shared_ptr<TimestampPage>> pages;
   };
 
+  // Metal/MTL_DEBUG_LAYER rejects MTL4CounterHeapDescriptor.count > 4096
+  // (assert: "entryCount must not be more than 4096"). Cap native heaps and
+  // fall back for D3D indices beyond the cap.
+  static constexpr uint64_t kMaxMetalTimestampCounterHeapEntries = 4096;
+
+  class TimestampSampleOwnerImpl final : public TimestampSampleOwner {
+  public:
+    TimestampSampleOwnerImpl(
+        std::shared_ptr<TimestampPageState> state,
+        std::shared_ptr<TimestampPage> page, uint64_t slot) noexcept
+        : state_(std::move(state)), page_(std::move(page)), slot_(slot) {}
+
+    ~TimestampSampleOwnerImpl() noexcept override {
+      dxmt::invokeNoexcept("timestamp sample release", [this]() {
+        ReleaseTimestampSample(*state_, page_, slot_);
+      });
+    }
+
+  private:
+    std::shared_ptr<TimestampPageState> state_;
+    std::shared_ptr<TimestampPage> page_;
+    uint64_t slot_ = 0;
+  };
+
   void AssignTimestampSample(TimestampQuery &query, UINT d3d_index) {
     if (desc_.Type != D3D12_QUERY_HEAP_TYPE_TIMESTAMP)
+      return;
+    if (d3d_index >= kMaxMetalTimestampCounterHeapEntries)
       return;
 
     auto state = timestamp_pages_;
@@ -275,16 +301,12 @@ private:
     page->occupied[d3d_index] = true;
     query.setSampleIndex(d3d_index);
 
-    // Preserve these arguments before moving the page into the callback.
-    // Function argument evaluation order does not guarantee that page->heap
-    // and page->entry_size are read before the lambda capture moves page.
     auto resolve_heap = page->heap;
     const auto resolve_entry_size = page->entry_size;
     query.setResolveSource(
         resolve_heap, resolve_entry_size,
-        [state = std::move(state), page = std::move(page)](uint64_t slot) {
-          ReleaseTimestampSample(*state, page, slot);
-        });
+        std::make_unique<TimestampSampleOwnerImpl>(
+            std::move(state), std::move(page), d3d_index));
   }
 
   static void ReleaseTimestampSample(TimestampPageState &state,
@@ -323,7 +345,17 @@ private:
       return {};
 
     WMT::Device device = device_->GetMTLDevice();
-    const uint64_t native_count = std::max<uint64_t>(desc_.Count, 2);
+    // Metal hard-caps counter heap entries at 4096 (debug layer asserts above).
+    // Support D3D heaps larger than that only for the first 4096 slots; higher
+    // indices use the per-command-buffer timestamp fallback.
+    const uint64_t requested = std::max<uint64_t>(desc_.Count, 2);
+    const uint64_t native_count =
+        std::min(requested, kMaxMetalTimestampCounterHeapEntries);
+    if (requested > kMaxMetalTimestampCounterHeapEntries) {
+      WARN("D3D12QueryHeap: capping Metal timestamp counter heap"
+           " d3dCount=", desc_.Count, " metalCount=", native_count,
+           " (Metal max ", kMaxMetalTimestampCounterHeapEntries, ")");
+    }
     WMT::Error error = {};
     auto heap = device.newTimestampCounterHeap(native_count, &error);
     const uint64_t entry_size = device.timestampHeapEntrySize();
@@ -345,7 +377,8 @@ private:
     auto page = std::make_shared<TimestampPage>();
     page->heap = std::move(heap);
     page->entry_size = entry_size;
-    page->occupied.assign(desc_.Count, false);
+    // Occupied is indexed by Metal sample slot (== d3d index for capped range).
+    page->occupied.assign(static_cast<size_t>(native_count), false);
     state.pages.push_back(page);
     return page;
   }

@@ -5,10 +5,32 @@
 #include "com/com_private_data.hpp"
 #include "log/log.hpp"
 #include "util_string.hpp"
+#include <algorithm>
 #include <mutex>
 #include <unordered_set>
 
 namespace dxmt::d3d12 {
+
+UINT64 CommandAllocatorSubmissionState::MarkSubmitted() {
+  std::lock_guard lock(mutex_);
+  const UINT64 serial = ++last_submission_serial_;
+  pending_submission_serials_.insert(serial);
+  return serial;
+}
+
+void CommandAllocatorSubmissionState::Complete(UINT64 serial) {
+  std::lock_guard lock(mutex_);
+  if (!serial || !pending_submission_serials_.erase(serial))
+    return;
+  last_completed_submission_serial_ =
+      std::max(last_completed_submission_serial_, serial);
+}
+
+size_t CommandAllocatorSubmissionState::PendingCount() const {
+  std::lock_guard lock(mutex_);
+  return pending_submission_serials_.size();
+}
+
 namespace {
 
 class CommandAllocatorImpl final : public ComObjectWithInitialRef<CommandAllocatorObject> {
@@ -89,21 +111,8 @@ public:
       recording_list_ = nullptr;
   }
 
-  UINT64 MarkCommandListSubmitted() override {
-    std::lock_guard lock(mutex_);
-    const UINT64 serial = ++last_submission_serial_;
-    pending_submission_serials_.insert(serial);
-    pending_submission_count_ = pending_submission_serials_.size();
-    return serial;
-  }
-
-  void CompleteCommandListSubmission(UINT64 serial) override {
-    std::lock_guard lock(mutex_);
-    if (!serial || !pending_submission_serials_.erase(serial))
-      return;
-    last_completed_submission_serial_ =
-        std::max(last_completed_submission_serial_, serial);
-    pending_submission_count_ = pending_submission_serials_.size();
+  SubmittedCommandAllocatorUse MarkCommandListSubmitted() override {
+    return {submission_state_, submission_state_->MarkSubmitted()};
   }
 
   void AddRefPrivate() override {
@@ -120,10 +129,8 @@ private:
   D3D12_COMMAND_LIST_TYPE type_;
   std::mutex mutex_;
   void *recording_list_ = nullptr;
-  UINT64 last_submission_serial_ = 0;
-  UINT64 last_completed_submission_serial_ = 0;
-  size_t pending_submission_count_ = 0;
-  std::unordered_set<UINT64> pending_submission_serials_;
+  std::shared_ptr<CommandAllocatorSubmissionState> submission_state_ =
+      std::make_shared<CommandAllocatorSubmissionState>();
   std::string name_;
 };
 

@@ -59,11 +59,7 @@ public:
   }
 
   ~HeapImpl() {
-    auto &queue = device_->GetDXMTDevice().queue();
-    if (placement_heap_)
-      queue.RemovePersistentResidencyAfterCompletion(placement_heap_);
-    if (allocation_)
-      queue.RemovePersistentResidencyAfterCompletion(allocation_->buffer());
+    placement_heap_residency_.reset();
   }
 
   HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid,
@@ -177,9 +173,16 @@ public:
         allocation_ = buffer_->allocate(GetHeapBufferAllocationFlags(desc_.Properties));
       }
       buffer_->rename(Rc<dxmt::BufferAllocation>(allocation_));
-      if (allocation_)
-        device_->GetDXMTDevice().queue().AddPersistentResidency(
-            allocation_->buffer());
+      if (allocation_) {
+        allocation_->ensureLifetimeResidency(
+            device_->GetDXMTDevice().queue(),
+            WMT::Object{allocation_->buffer().handle},
+            dxmt::ResidencyProvenance{
+                .kind = dxmt::ResidencyProvenanceKind::HeapBacking,
+                .owner = reinterpret_cast<uintptr_t>(this),
+                .size = desc_.SizeInBytes,
+            });
+      }
     }
   }
 
@@ -222,10 +225,26 @@ public:
              " metalHeap=", placement_heap_.handle,
              " count=", n);
       }
-      device_->GetDXMTDevice().queue().AddPersistentResidency(
-          placement_heap_);
+      placement_heap_residency_ =
+          device_->GetDXMTDevice().queue().RegisterLifetimeResidency(
+              dxmt::ResidencyOwnership::Lifetime(
+                  placement_heap_,
+                  dxmt::ResidencyProvenance{
+                      .kind =
+                          dxmt::ResidencyProvenanceKind::PlacementHeap,
+                      .owner = reinterpret_cast<uintptr_t>(this),
+                      .size = desc_.SizeInBytes,
+                  }));
     }
     return placement_heap_;
+  }
+
+  std::shared_ptr<dxmt::LifetimeResidencyRegistration>
+  GetPlacementHeapResidency() override {
+    if (!GetPlacementHeap())
+      return {};
+    std::lock_guard lock(allocation_mutex_);
+    return placement_heap_residency_;
   }
 
 private:
@@ -238,6 +257,8 @@ private:
   mutable Rc<dxmt::Buffer> buffer_;
   mutable Rc<dxmt::BufferAllocation> allocation_;
   WMT::Reference<WMT::Heap> placement_heap_;
+  std::shared_ptr<dxmt::LifetimeResidencyRegistration>
+      placement_heap_residency_;
   mutable std::mutex allocation_mutex_;
   const void *external_address_ = nullptr;
   std::string name_;
