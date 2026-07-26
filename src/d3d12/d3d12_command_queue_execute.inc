@@ -623,9 +623,12 @@
     replay_packet.index_type =
         GetIndexType(packet.input_assembler.index_buffer->Format);
     replay_packet.index_binding_offset = index_binding_offset;
+    // Same 32-bit wrap hazard as the direct indexed-draw encoder: widen before
+    // multiplying so an unbounded StartIndexLocation cannot fold the byte
+    // offset back inside the index buffer.
     replay_packet.index_offset =
         index_binding_offset +
-        draw_indexed.start_index_location *
+        static_cast<UINT64>(draw_indexed.start_index_location) *
             GetIndexSize(packet.input_assembler.index_buffer->Format);
     replay_packet.index_count = draw_indexed.index_count_per_instance;
     replay_packet.start_index = draw_indexed.start_index_location;

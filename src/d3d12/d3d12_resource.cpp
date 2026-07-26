@@ -2582,7 +2582,11 @@ private:
             : 0;
     tiling_.packed_mip_info.StartTileIndexInOverallResource = 0;
 
-    tiling_.subresources.reserve(mip_levels * array_size * plane_count);
+    // GetMipLevels returns desc_.MipLevels verbatim when set, so this triple
+    // product is only bounded by the UINT16 desc fields; widen before
+    // multiplying instead of relying on that.
+    tiling_.subresources.reserve(static_cast<size_t>(mip_levels) * array_size *
+                                 plane_count);
     UINT next_tile = 0;
     bool packed_start_set = false;
     for (UINT plane = 0; plane < plane_count; ++plane) {

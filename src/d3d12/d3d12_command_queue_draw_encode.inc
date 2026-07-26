@@ -845,9 +845,13 @@ private:
     const UINT64 index_binding_offset = resolved_index.binding_offset;
     const UINT64 index_resource_offset =
         index_binding_offset - index_resource->GetHeapOffset();
+    // StartIndexLocation is app-controlled and unbounded; a 32-bit product
+    // wraps past 1G R32 indices and would fold the byte offset back into the
+    // buffer instead of past its end.
     const UINT64 index_offset =
         index_binding_offset +
-        record.start_index_location * GetIndexSize(state.index_buffer->Format);
+        static_cast<UINT64>(record.start_index_location) *
+            GetIndexSize(state.index_buffer->Format);
     RecordReplayBindingSignaturePerf(state);
     const bool rb_draw = ReplayPerfEnabled();
     const auto rb_da0 = rb_draw ? clock::now() : clock::time_point{};

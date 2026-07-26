@@ -94,7 +94,8 @@ struct SubmittedDescriptorRecordStore {
       const SubmittedDescriptorRecordKey key = {
           record.mirror, record.heap_index, record.slot_version};
       if (heap_record_slots.empty() ||
-          (heap_record_count + 1) * 2 > heap_record_slots.size())
+          (static_cast<size_t>(heap_record_count) + 1) * 2 >
+              heap_record_slots.size())
         reserveHeapRecords(std::max<size_t>(16, heap_record_count + 1));
       auto &slot = findHeapRecordSlot(key);
       if (slot.index_plus_one) {

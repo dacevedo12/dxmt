@@ -657,11 +657,16 @@ FindDxbcShaderBlob(const void *data, size_t size,
 
   const auto container_size = ReadLe32(bytes + 24);
   const auto blob_count = ReadLe32(bytes + 28);
-  if (container_size > size || blob_count > (container_size - 32) / 4)
+  // The blob-table budget below is `container_size - 32` in uint32 arithmetic.
+  // Without the lower bound, a container claiming fewer than 32 bytes wraps it
+  // to ~1G entries, so the table walk reads far past the caller's buffer. A
+  // well-formed DXBC container always covers at least its own 32-byte header.
+  if (container_size < 32 || container_size > size ||
+      blob_count > (container_size - 32) / 4)
     return false;
 
   for (uint32_t i = 0; i < blob_count; i++) {
-    const auto offset = ReadLe32(bytes + 32 + i * 4);
+    const auto offset = ReadLe32(bytes + 32 + static_cast<size_t>(i) * 4);
     if (offset > container_size || container_size - offset < 8)
       return false;
 
