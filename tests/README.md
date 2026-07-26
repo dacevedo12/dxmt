@@ -1,11 +1,16 @@
 # DXMT tests
 
-All DXMT correctness tests run through Wine. Meson launches one Windows suite
+All DXMT *correctness* tests run through Wine. Meson launches one Windows suite
 scheduler, which starts API-isolated GoogleTest coordinators with Win32
 `CreateProcessW`. Each coordinator discovers, partitions, and starts its own
 test workers inside the same Wine session. This reuses the Wine prefix, Wine
 server, loaded runtime, and staged DXMT build without loading incompatible
 Metal3 and Metal4 backends into one Windows process.
+
+`tests/metal/` is the one exception: it holds host-side macOS/Metal capability
+probes that assert nothing about a Direct3D API surface, so they build as
+`native: true` executables and run outside Wine. See
+[Host-side Metal capability probes](#host-side-metal-capability-probes).
 
 ## Layout
 
@@ -24,6 +29,8 @@ tests/
   d3d10/*_spec.cpp                  D3D10 correctness tests
   d3d11/*_spec.cpp                  D3D11 correctness tests
   d3d12/*_spec.cpp                  D3D12 correctness tests
+  metal/*.metal                     MSL fixtures for the host-side Metal probes
+  metal/*_spec.cpp                  Host-side macOS/Metal capability probes
 ```
 
 `d3d11/capability_spec.cpp` and `d3d12/capability_spec.cpp` reconstruct the
@@ -86,6 +93,58 @@ The former direct implementation tests were handled by observable scope:
 
 `tests/ci/test_public_api_boundary.py` enforces this boundary in the repository
 test suite.
+
+## Host-side Metal capability probes
+
+`tests/metal/` answers "can this machine's Metal stack do X?", not "does DXMT
+translate D3D correctly?". The probes never load a DXMT DLL, never enter Wine,
+and touch no Direct3D interface, so the public-API boundary above does not
+apply to them; they exist to keep migration feasibility claims reproducible
+instead of living in a scratch directory.
+
+`metal_capability_probe_spec.cpp` covers the bindless descriptor-heap shape:
+
+- an unbounded `device const DescriptorEntry *` array of 24-byte AoS entries
+  (`{uint64 gpuVA, texture2d<float>, uint64 metadata}`) indexed by a value only
+  known at run time, over slots that cross the 128 and 65536 boundaries, with a
+  distinct non-zero expected texel per slot,
+- the same for a sampler heap, including the `supportArgumentBuffers`
+  precondition and an out-of-bounds sample coordinate as the address-mode
+  discriminator, plus a directly bound control group,
+- creation of a large number of distinct `MTLSamplerState` objects, and
+- a negative case: `as_type<texture2d<float>>(uint64_t)` must be rejected by the
+  MSL front end, checked by compiling the stored fixture through
+  `-[MTLDevice newLibraryWithSource:options:error:]` with a positive control
+  compiled the same way.
+
+Each run prints the GPU family, argument-buffer tier, macOS version, and process
+architecture first: every conclusion is scoped to that environment. Note that
+the native machine files build x86_64, so on Apple silicon the probe reports
+`running under Rosetta translation`.
+
+The MSL fixtures are compiled offline through the repository's Builder-cached
+`metal`/`metallib`/`xxd` generators and embedded into the binary. The negative
+fixture is deliberately excluded from that chain and embedded as source text.
+
+Scale is parameterized by `DXMT_METAL_PROBE_SCALE`. The default is CI-sized;
+`extended` runs 1M texture slots, 600K sampler slots, and 200K distinct sampler
+objects:
+
+```sh
+scripts/dxmt-builder build --profile gcc-x64-release-full tests-framework
+scripts/dxmt-builder test --profile gcc-x64-release-full unit --suite d3d12-model
+
+DXMT_METAL_PROBE_SCALE=extended \
+  scripts/dxmt-builder test --profile gcc-x64-release-full unit --suite d3d12-model
+```
+
+The probe joins the existing `native`/`d3d12-model` Meson suites because those
+are the only native (non-Wine) suites Builder's `test` command knows about, and
+it is attached to the `dxmt-wine-tests-framework` and `dxmt-wine-tests` alias
+targets so `build ... tests-framework` and `build ... tests-all` produce it.
+Adding a dedicated `metal-probe` Builder suite would require extending
+`tools/dxmt-builder`; the `metal-probe` Meson suite tag exists for direct
+selection once that happens.
 
 ## Mark slow tests
 

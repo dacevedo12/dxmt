@@ -93,6 +93,10 @@ if get_option('windows_oracle_only')
   subdir_done()
 endif
 
+# Host-side macOS/Metal capability probes.  They run natively rather than under
+# Wine, so they are declared after the Windows-oracle short circuit.
+subdir('metal')
+
 commit_message_policy_test = find_program('../scripts/check-commit-message.sh')
 test(
   'commit-message-policy',
@@ -155,12 +159,17 @@ alias_target(
   dxmt_wine_d3d11_tests,
   dxmt_wine_d3d12_tests,
   d3d12_differential_oracle,
+  metal_capability_probe_test,
 )
 
+# The host-side Metal probes ride along with the framework alias: it is the
+# cheapest target Builder can build (`build --profile ... tests-framework`) and
+# it carries the test-infrastructure images rather than an API suite.
 alias_target(
   'dxmt-wine-tests-framework',
   dxmt_wine_test_scheduler,
   dxmt_wine_framework_tests,
+  metal_capability_probe_test,
 )
 alias_target(
   'dxmt-wine-tests-d3d10',
