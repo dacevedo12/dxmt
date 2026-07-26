@@ -81,6 +81,12 @@ public:
       return _float4;
     }
     assert(0 && "input is not a scalar or not implemented.");
+    // Defensive path: callers only pass _int/_float today.  Falling off the
+    // end here is undefined behaviour once NDEBUG removes the assert, and the
+    // garbage pointer would be fed straight into LLVM IR construction.  Return
+    // a null type instead so a future unhandled scalar fails immediately and
+    // visibly rather than silently emitting a corrupt shader.
+    return nullptr;
   };
 
   llvm::LLVMContext &context;

@@ -670,6 +670,12 @@ inline TextureKind to_air_resource_type(
     break;
   };
   assert(0 && "unreachable");
+  // Only ResourceType::NonApplicable reaches the default label, and every
+  // caller guards against it (buffer-class resources take the DefineBuffer
+  // path instead).  Returning a defined value keeps this from being undefined
+  // behaviour in NDEBUG builds; texture_buffer is the closest kind to the
+  // buffer-class resources NonApplicable stands for.
+  return TextureKind::texture_buffer;
 };
 
 inline MSLScalerType
@@ -682,9 +688,15 @@ to_air_scaler_type(dxmt::shader::common::ScalerDataType type) {
   case shader::common::ScalerDataType::Int:
     return msl_int;
   case shader::common::ScalerDataType::Double:
-    assert(0 && "");
+    // Metal Shading Language has no double type, so DXMT reports
+    // DoublePrecisionFloatShaderOps = FALSE and a conforming application never
+    // submits a double shader.  Nothing in the translator currently produces
+    // ScalerDataType::Double either, making this defensive only -- but falling
+    // off the end was undefined behaviour once NDEBUG dropped the assert.
+    assert(0 && "double is not representable in Metal Shading Language");
     break;
   }
+  return msl_float;
 }
 
 } // namespace dxmt::air

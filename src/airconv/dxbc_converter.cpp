@@ -245,7 +245,13 @@ to_shader_scaler_type(microsoft::D3D10_SB_RESOURCE_RETURN_TYPE type) {
   case microsoft::D3D11_SB_RETURN_TYPE_UNUSED:
     break;
   }
+  // DOUBLE has no Metal Shading Language equivalent (which is why DXMT reports
+  // DoublePrecisionFloatShaderOps = FALSE), and CONTINUED/UNUSED are stream
+  // markers rather than element types. Falling off the end here was undefined
+  // behaviour once NDEBUG dropped the assert; return the same defined fallback
+  // the AIR signature path uses.
   assert(0 && "invalid D3D10_SB_RESOURCE_RETURN_TYPE");
+  return shader::common::ScalerDataType::Float;
 }
 
 uint32_t next_pow2(uint32_t x) {
@@ -3062,6 +3068,17 @@ AIRCONV_API void SM50DestroyBitcode(sm50_bitcode_t pBitcode) {
 }
 
 AIRCONV_API size_t SM50GetErrorMessage(sm50_error_t pError, char *pBuffer, size_t BufferSize) {
+  // A compile can fail before any error object exists (for example when the
+  // marshalling thunks cannot build the argument chain, or when the unixcall
+  // itself fails). Callers pass the nullptr error handle straight through, so
+  // treat it as an empty message instead of dereferencing it. SM50FreeError
+  // already accepts nullptr.
+  if (pBuffer == nullptr || BufferSize == 0)
+    return 0;
+  if (pError == nullptr) {
+    pBuffer[0] = '\0';
+    return 0;
+  }
   auto pInternal = (SM50ErrorInternal *)pError;
   auto str_len = std::min(pInternal->buf.size(), BufferSize - 1);
   memcpy(pBuffer, pInternal->buf.data(), str_len);

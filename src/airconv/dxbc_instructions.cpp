@@ -47,6 +47,15 @@ auto readOperandRelativeIndex(
   default:
     DXASSERT_DXBC(false);
   };
+  // DXBC only allows r# (TEMP) and x#[] (INDEXABLE_TEMP) as the relative part
+  // of an operand index, so a well-formed shader never reaches here.  The
+  // bytecode is application-supplied and therefore untrusted, though, and
+  // falling off the end of this function is undefined behaviour once NDEBUG
+  // drops the assert -- the caller would std::visit a variant with a garbage
+  // discriminant.  Degrade to the constant index 0 instead: it is a defined
+  // OperandIndex alternative, it keeps the malformed shader from corrupting
+  // the translator, and the assert still fires loudly in debug builds.
+  return uint32_t(0);
 };
 
 auto readOperandIndex(
@@ -81,6 +90,14 @@ auto readOperandIndex(
     DXASSERT_DXBC(false);
     break;
   }
+  // The 64-bit index representations are reserved by the DXBC container format
+  // and never emitted by any shader model DXMT accepts, and `indexType` comes
+  // straight out of the (untrusted) application-supplied bytecode, so the two
+  // IMMEDIATE64 labels and the default label are all malformed-input paths.
+  // Falling off the end was undefined behaviour under NDEBUG; return the
+  // constant index 0 so a bad shader produces a defined (if useless) operand
+  // instead of a variant with a garbage discriminant.
+  return uint32_t(0);
 };
 
 auto readDstOperand(
@@ -179,6 +196,18 @@ auto readDstOperand(
   default:
     assert(0 && "Unhandled operand type");
   }
+  // Two paths land here: the D3D11_SB_OPERAND_TYPE_OUTPUT_STENCIL_REF case
+  // above (recognised but not implemented -- DXMT does not expose stencil-ref
+  // output) and the default label (an operand type this translator does not
+  // model, reachable from untrusted application-supplied bytecode).  Falling
+  // off the end was undefined behaviour once NDEBUG dropped the asserts.
+  // DstOperandNull is the variant the DXBC "null" destination already maps to,
+  // so returning it makes the unsupported write be discarded -- a defined,
+  // side-effect-free outcome -- instead of feeding a garbage variant into
+  // codegen.
+  return DstOperandNull{
+    ._ = {.mask = 0, .write_type = write_type},
+  };
 }
 
 auto readSrcOperandSwizzle(const microsoft::D3D10ShaderBinary::COperandBase &O
@@ -203,9 +232,19 @@ auto readSrcOperandSwizzle(const microsoft::D3D10ShaderBinary::COperandBase &O
   case D3D10_SB_OPERAND_4_COMPONENT_MASK_MODE: {
     DXASSERT_DXBC(false && "can not read swizzle from mask");
     // DXASSERT_DXBC(O.m_WriteMask >> 4 == 0b1111);
-    // return swizzle_identity;
+    break;
   }
   }
+  // Mask mode means the operand carries a write mask rather than a swizzle, so
+  // there is nothing to read.  It is reachable: the D3D compiler emits mask
+  // mode for a few source operands (see the OUTPUT_CONTROL_POINT_ID and
+  // INPUT_PRIMITIVEID cases in readSrcOperand, which bypass this helper for
+  // exactly that reason), and the bytecode is untrusted anyway.  Falling off
+  // the end was undefined behaviour under NDEBUG; the identity swizzle is what
+  // the disabled code above already intended to return and what the
+  // hand-written mask-mode call sites use, so it is the behaviour-preserving
+  // fallback.
+  return swizzle_identity;
 }
 
 auto readSrcOperandCommon(
@@ -442,6 +481,17 @@ SrcOperand readSrcOperand(
   default:
     DXASSERT_DXBC(false && "unhandled src operand");
   }
+  // Reachable: `O.m_Type` comes from application-supplied bytecode, and the
+  // switch above only covers the operand types DXMT translates.  Falling off
+  // the end was undefined behaviour under NDEBUG, and the caller would have
+  // std::visit'ed a SrcOperand with a garbage discriminant.  Return an
+  // all-zero 32-bit immediate: it is the simplest fully-defined SrcOperand,
+  // it needs no register file or resource binding to exist, and reading zero
+  // makes the miscompiled shader inert rather than unpredictable.
+  return SrcOperandImmediate32{
+    ._ = {swizzle_identity, false, false, read_type},
+    .uvalue = {0, 0, 0, 0},
+  };
 };
 
 auto readSrcOperandResource(
@@ -464,7 +514,21 @@ auto readSrcOperandResource(
       };
     }
   } else {
+    // Reachable: a non-immediate resource index means dynamic shader linkage
+    // (interface pointers), which DXMT does not implement, and the index type
+    // is read from untrusted bytecode.  Falling out of the `else` was
+    // undefined behaviour under NDEBUG -- the returned struct contains an
+    // OperandIndex variant, so the caller would have visited a garbage
+    // discriminant.  Mirror the shape of the supported path with a constant
+    // index of 0: the caller registers `range_id` in ShaderInfo::srvMap the
+    // same way it does for a normal resource, so codegen stays consistent and
+    // simply produces a wrong-but-defined shader.
     assert(0 && "interface resource is not supported yet");
+    return SrcOperandResource{
+      .range_id = O.m_Index[0].m_RegIndex,
+      .index = uint32_t(0),
+      .read_swizzle = readSrcOperandSwizzle(O)
+    };
   }
 }
 
@@ -553,6 +617,17 @@ std::variant<AtomicDstOperandUAV, AtomicOperandTGSM> readAtomicDst(
     };
   }
   assert(0 && "unexpected atomic operation destination");
+  // Reachable: `O.m_Type` is untrusted bytecode, and only a UAV or TGSM is a
+  // legal atomic destination.  Falling off the end was undefined behaviour
+  // under NDEBUG.  Return the UAV alternative shaped like the branch above --
+  // every call site immediately registers the resulting range_id in
+  // ShaderInfo::uavMap, so the binding codegen later looks up exists and the
+  // malformed shader fails as a wrong shader rather than as memory corruption.
+  return AtomicDstOperandUAV{
+    .range_id = O.m_Index[0].m_RegIndex,
+    .index = uint32_t(0),
+    .mask = O.m_WriteMask >> 4
+  };
 }
 
 std::variant<SrcOperandResource, SrcOperandUAV, SrcOperandTGSM> readTypelessSrc(
@@ -567,6 +642,17 @@ std::variant<SrcOperandResource, SrcOperandUAV, SrcOperandTGSM> readTypelessSrc(
     return readSrcOperandTGSM(O);
   }
   assert(0 && "unexpected typeless load/store operation destination");
+  // Reachable: `O.m_Type` is untrusted bytecode and a typeless load/store may
+  // only name a UAV, an SRV or TGSM.  Falling off the end was undefined
+  // behaviour under NDEBUG.  Fall back to the SRV alternative shaped like
+  // readSrcOperandResource's supported path -- the call sites register
+  // range_id in ShaderInfo::srvMap, so codegen finds a binding and the bad
+  // shader stays merely wrong instead of undefined.
+  return SrcOperandResource{
+    .range_id = O.m_Index[0].m_RegIndex,
+    .index = uint32_t(0),
+    .read_swizzle = readSrcOperandSwizzle(O)
+  };
 }
 
 std::variant<SrcOperandResource, SrcOperandUAV> readSrcResourceOrUAV(
@@ -578,6 +664,14 @@ std::variant<SrcOperandResource, SrcOperandUAV> readSrcResourceOrUAV(
     return readSrcOperandResource(O, phase);
   }
   assert(0 && "unexpected resource operation destination");
+  // Reachable: `O.m_Type` is untrusted bytecode and these instructions may
+  // only name a UAV or an SRV.  Falling off the end was undefined behaviour
+  // under NDEBUG.  Same fallback and same reasoning as readTypelessSrc above.
+  return SrcOperandResource{
+    .range_id = O.m_Index[0].m_RegIndex,
+    .index = uint32_t(0),
+    .read_swizzle = readSrcOperandSwizzle(O)
+  };
 }
 
 auto
@@ -2138,6 +2232,15 @@ Instruction readInstruction(
   default: {
     llvm::outs() << "unhandled dxbc instruction " << Inst.OpCode() << "\n";
     assert(0 && "unhandled dxbc instruction");
+    // Reachable: the opcode comes from application-supplied bytecode, and the
+    // switch above only covers the opcodes DXMT translates (the diagnostic
+    // above exists precisely because this is hit in practice).  Falling off
+    // the end was undefined behaviour once NDEBUG dropped the assert, leaving
+    // the caller to std::visit an Instruction with a garbage discriminant.
+    // InstNop is the already-supported "does nothing" instruction, so the
+    // unknown opcode is skipped -- the shader is wrong, but definedly so, and
+    // the message above still names the opcode.
+    return InstNop{};
   }
   }
 };

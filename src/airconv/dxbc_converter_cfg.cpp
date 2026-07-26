@@ -58,7 +58,14 @@ to_shader_scaler_type(microsoft::D3D10_SB_RESOURCE_RETURN_TYPE type) {
   case microsoft::D3D11_SB_RETURN_TYPE_UNUSED:
     break;
   }
+  // DOUBLE has no Metal Shading Language equivalent (which is why DXMT reports
+  // DoublePrecisionFloatShaderOps = FALSE), and CONTINUED/UNUSED are stream
+  // markers rather than element types.  The return type comes from untrusted
+  // application-supplied bytecode, and falling off the end here was undefined
+  // behaviour once NDEBUG dropped the assert; return the same defined fallback
+  // the AIR signature path uses.
   assert(0 && "invalid D3D10_SB_RESOURCE_RETURN_TYPE");
+  return ScalerDataType::Float;
 };
 
 std::vector<std::unique_ptr<BasicBlock>>
@@ -326,7 +333,15 @@ read_control_flow(
     case D3D10_SB_OPCODE_DCL_CONSTANT_BUFFER: {
       unsigned RangeID = Inst.m_Operands[0].m_Index[0].m_RegIndex;
       unsigned CBufferSize = Inst.m_ConstantBufferDecl.Size;
-      unsigned LB, RangeSize;
+      // Seeded with the SM 5.0- interpretation (a single cbuffer bound at its
+      // own register index).  A declaration may only be 2D (SM 5.0-) or 3D
+      // (SM 5.1), but m_IndexDimension is decoded from untrusted
+      // application-supplied bytecode, so the default label below is
+      // reachable; reading these uninitialised there was undefined behaviour.
+      // Initialising at the declaration makes the malformed case degrade to
+      // the same one-slot range the 2D case produces instead of registering a
+      // cbuffer with a garbage lower bound and size.
+      unsigned LB = RangeID, RangeSize = 1;
       switch (Inst.m_Operands[0].m_IndexDimension) {
       case D3D10_SB_OPERAND_INDEX_2D: // SM 5.0-
         LB = RangeID;
@@ -352,7 +367,11 @@ read_control_flow(
     case D3D10_SB_OPCODE_DCL_SAMPLER: {
       // Root signature bindings.
       unsigned RangeID = Inst.m_Operands[0].m_Index[0].m_RegIndex;
-      unsigned LB, RangeSize;
+      // Seeded with the SM 5.0- interpretation, for the same reason as the
+      // constant buffer declaration above: m_IndexDimension comes from
+      // untrusted bytecode, so the default label is reachable and reading
+      // these uninitialised there was undefined behaviour.
+      unsigned LB = RangeID, RangeSize = 1;
       switch (Inst.m_Operands[0].m_IndexDimension) {
       case D3D10_SB_OPERAND_INDEX_1D: // SM 5.0-
         LB = RangeID;

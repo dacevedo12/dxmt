@@ -27,7 +27,17 @@ to_air_interpolation(microsoft::D3D10_SB_INTERPOLATION_MODE mode) {
     return air::Interpolation::center_no_perspective;
   default:
     assert(0 && "Unexpected D3D10_SB_INTERPOLATION_MODE");
+    break;
   }
+  // The only defined enumerator not handled above is
+  // D3D10_SB_INTERPOLATION_UNDEFINED, and the mode is decoded from untrusted
+  // application-supplied bytecode, so out-of-range values reach here too.
+  // Falling off the end was undefined behaviour once NDEBUG dropped the
+  // assert.  center_perspective is the plain D3D10_SB_INTERPOLATION_LINEAR
+  // behaviour, i.e. the HLSL default when no modifier is written, so an
+  // unspecified mode degrades to the interpolation the shader author would
+  // have got implicitly.
+  return air::Interpolation::center_perspective;
 }
 
 void handle_signature_vs(
@@ -370,8 +380,18 @@ void handle_signature_ps(
       });
       break;
     default:
+      // Reachable: the system-value name is decoded from untrusted
+      // application-supplied bytecode, and the switch only covers the SIVs
+      // DXMT can map onto a Metal fragment input.  There is no meaningful
+      // fallback index -- DefineInput was never called -- so falling through
+      // would queue a prologue handler capturing an uninitialised
+      // `assigned_index`, which was undefined behaviour once NDEBUG dropped
+      // the assert.  Bail out instead: no input is defined and no handler is
+      // queued.  The register is still counted so that later reads of it stay
+      // inside the allocated input register file.
       assert(0 && "Unexpected/unhandled input system value");
-      break;
+      max_input_register = std::max(reg + 1, max_input_register);
+      return;
     }
     signature_handlers.push_back([=](SignatureContext &ctx) {
       ctx.prologue << init_input_reg(
@@ -412,8 +432,15 @@ void handle_signature_ps(
       max_input_register = std::max(reg + 1, max_input_register);
       return;
     default:
+      // Same situation as the DCL_INPUT_PS_SIV default above: an unmappable
+      // system-generated value from untrusted bytecode, with no
+      // `assigned_index` ever produced.  Bail out rather than capture an
+      // uninitialised index in the prologue handler; the PRIMITIVE_ID case
+      // above already returns early from this switch, so this is the
+      // established shape here.
       assert(0 && "Unexpected/unhandled input system value");
-      break;
+      max_input_register = std::max(reg + 1, max_input_register);
+      return;
     }
     signature_handlers.push_back([=](SignatureContext &ctx) {
       ctx.prologue << init_input_reg(assigned_index, reg, mask);
