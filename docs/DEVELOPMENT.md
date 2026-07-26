@@ -71,6 +71,178 @@ Use `scripts/dxmt-builder cache status`, `cache verify`, and `cache prune
 --dry-run` to inspect managed state. There is no automatic capacity eviction in
 the initial implementation.
 
+## Local DX12/Metal4 audit
+
+The repository has a developer-only audit entry point. It is intentionally not
+wired into CI while the rules and baseline are being hardened:
+
+```sh
+# Fast path: prerequisite DX12/Metal4 build, architecture policy, thread
+# contracts, and selected clang-tidy checks.
+scripts/dxmt-builder audit --scope dx12-metal4
+
+# Fast architecture/ownership rules without compiling or running clang-tidy.
+scripts/dxmt-builder audit --scope dx12-metal4 --policy-only
+
+# Verify that every required checker is present and that the deliberately
+# invalid ownership, bounds, allocator, and thread-safety fixtures are found.
+scripts/dxmt-builder audit --scope dx12-metal4 --checker-fixtures-only
+
+# Slower Clang Static Analyzer pass over the ownership-sensitive resource,
+# fence, allocation, and Metal4 unix translation units.
+scripts/dxmt-builder audit --scope dx12-metal4 --deep --jobs 2
+
+# Build and run the platform-independent submission model under ASan+UBSan
+# and TSan in separate Builder-owned native artifacts.
+scripts/dxmt-builder audit --scope dx12-metal4 --sanitizers
+
+# Run the native replay/lifetime state-machine tests or Builder self-tests.
+scripts/dxmt-builder test unit --suite d3d12-model
+scripts/dxmt-builder test unit --suite builder
+```
+
+The audit is implemented directly in the C++ Builder and does not add a Python
+runtime dependency. It uses the managed LLVM/clang-tidy dependency and defaults
+to the `llvm-mingw-x64-debugoptimized` profile so the PE and native compilation
+database is Clang-compatible.
+
+Builds default to `llvm-mingw-x64-release`. Clang is not merely a preference
+here: GCC ignores `-Wthread-safety` entirely, so every `DXMT_CAPABILITY`,
+`DXMT_GUARDED_BY`, `DXMT_REQUIRES` and lock-ordering annotation in the tree is
+unchecked under GCC and only verified during an audit. The project build now
+passes `-Wthread-safety -Wthread-safety-beta -Werror=thread-safety-analysis`
+(dropped automatically by `get_supported_arguments()` on GCC), so a lock
+contract violation fails the build. `-beta` is required for *member* lock
+ordering; without it `DXMT_ACQUIRED_BEFORE`/`_AFTER` silently degrade into
+comments, which is why `audit --checker-fixtures-only` asserts on the exact
+"must be acquired before" diagnostic.
+
+Analyzer results are cached under `<cache-root>/audit-cache`, keyed by the
+clang-tidy identity, its config, the exact command line, and the content of
+every in-repo source the unit can reach (a conservative transitive include
+scan -- over-approximating only costs a needless miss, under-approximating
+would serve a stale verdict). Keys are content-based, so switching branches or
+rebuilding identical files still hits. A no-op deep re-run drops from minutes
+to seconds; editing a shared header correctly invalidates every dependent unit.
+Pass `--no-cache` to force a full re-analysis. The DX12/Metal4 compilation database is filtered
+to select the Metal4 variant of shared sources. Every selected translation unit
+is compiled with `-Wthread-safety`; capability-analysis violations are promoted
+to errors so clang-tidy cannot reduce them to an ignored warning summary.
+
+Repository-specific policy checks enforce explicit `MTLResidencySet`
+ownership domains without introducing a universal per-set lock registry. The
+DX12 device owns and serializes its external lifetime set. Winemetal owns its
+command and sparse sets and mutates them only through helpers annotated with
+`DXMT_REQUIRES(owner_lock)`. One-shot sets that have not been published can use
+the direct backend helpers. The four public residency thunks are deliberately
+thin direct Metal calls used only by the submission owner; acquiring another
+thunk-side lock would create a second lock domain.
+
+The policy rejects a residency lock registry, any lock acquisition in a direct
+backend helper or external thunk, raw `MTL4ArgumentTable` handle casts, and ABI
+layout drift. It also prevents the remaining raw `NSLock` message count from
+increasing. New native owner locks should use `dxmt_nslock_scope`; the legacy
+ceiling is migration-only and should only move downward.
+
+Residency ownership is also structural: raw Metal objects cannot be passed
+directly to a residency API. Callers must construct one of the non-convertible
+`LifetimeResidencyAllocation`, `ReplayAllocatorResidencyAllocation`, or
+`ReplayTemporaryResidencyAllocation` tokens. All three domains register into
+the single device-owned Metal 4 residency set; the non-convertible token types
+only express lifetime policy. Builder restricts allocator tokens to queue-owned
+ring allocator blocks and temporary tokens to explicit temporary-buffer paths.
+Ordinary D3D/DXMT resources must use lifetime residency, while temporary
+registrations must remain retained through their GPU completion sequence.
+
+The external Metal 4 residency set follows D3DMetal's long-lived-set model with
+one Wine-specific adaptation. Resource lifetime events journal individual
+desired membership transitions under `DeviceResidencyMutex`; they never call
+Metal from producer threads. `CommandQueue::CommitChunkInternal` is the sole
+backend writer: it snapshots the journal, issues one synchronous
+`addAllocation:` or `removeAllocation:` Unix call per transition, and calls
+`commit` once immediately before the Metal command-buffer commit. Bulk
+`addAllocations:count:`/`removeAllocations:count:` calls and cross-boundary
+allocation arrays are forbidden.
+
+`DeviceResidencyLock` is a Clang scoped capability; logical membership and the
+journal are `DXMT_GUARDED_BY`. The submission-owner capability is also a real
+device-wide mutex because Direct, Copy, and Compute queues have independent
+submission workers but consume the same residency set. Its scope covers only
+the ordered journal snapshot, its native mutations, the residency-set commit,
+and the immediately following Metal command-buffer commit. The backend owner
+is always acquired first; the PE journal mutex is held inside it only long
+enough to move the snapshot and is released before any Metal call. No path
+acquires those locks in reverse order, and no thunk-side lock is introduced.
+Allocations removed from the backend set are transferred to the submitted
+command chunk and released only after that command buffer completes. This
+provides a concrete feedback-completion retirement boundary without a
+residency mailbox or thunk-side lock.
+
+Builder restricts individual add/remove/commit/request operations to
+`DeviceResidency::ApplyForSubmission`, rejects calls outside the submission
+owner, rejects bulk residency selectors and delta ABIs, and requires retired
+allocation ownership to remain attached to the command chunk.
+
+### Queue decomposition and module isolation
+
+`CommandQueueImpl` is split across `src/d3d12/d3d12_command_queue_*.inc`
+domain fragments that are `#include`d inside the class body. They are not
+translation units and are not listed in `meson.build`; Builder rejects a
+fragment that no longer appears in an `#include` directive of
+`d3d12_command_queue.cpp`, so a fragment cannot silently fall out of the
+build. Architecture rules that need to see the whole class concatenate the
+queue source with every fragment before scanning.
+
+Value-domain modules extracted out of the queue (texture view, texture
+swizzle, shader binding, argument buffer layout, pipeline write policy,
+resource barrier batch, tile mapping, temporal scaler, queue configuration,
+and the diagnostics leaves) are isolated by the build graph rather than by
+banned spellings. `CommandQueueImpl` and its nested replay types live in the
+anonymous namespace of `d3d12_command_queue.cpp` and its fragments, so an
+independent translation unit cannot name them at all — a literal ban on
+`CommandQueueImpl` or `ReplayState` would restate what the language already
+guarantees, and it silently stops holding the moment code moves into a new
+file. The only remaining failure mode is a module pulling the queue back into
+its own include closure, so that is the single check Builder keeps.
+
+These modules are stateless free-function domains: they own no mutable state,
+take no locks, and register no asynchronous callbacks. Ownership, locking, and
+capture discipline are enforced where they can actually be violated — the
+submission model, under `.clang-tidy-model` and the closed-model contracts
+above — not by scanning value-domain sources for spellings.
+
+Two checks were evaluated against the whole tree and deliberately removed
+rather than baselined. `bugprone-multi-level-implicit-pointer-conversion` fired
+16 times, all on the WoW64 thunk layer's `UInt32ToPtr` helper; the
+`sm50_ptr64_t` typedef makes those handles 8 bytes on both sides and
+`COMPATIBLE_STRUCT32` asserts the layouts at compile time, so the check
+restates a guarantee the code already proves, and its count grows with every
+new thunk. `concurrency-mt-unsafe` fired 30 times, all `getenv`/`localtime`; it
+keys on function names rather than on whether a concurrent writer exists, and
+it did not report the one genuine data race in that file (unsynchronised
+`static bool initialized` lazy init). Thread-safety attributes and TSan cover
+that ground far better.
+
+Existing clang-tidy findings are recorded in
+`tools/audit/clang-tidy-baseline.json`. Update it only after reviewing every
+changed diagnostic:
+
+```sh
+scripts/dxmt-builder audit --scope dx12-metal4 --update-baseline \
+  --baseline-reason "reviewed legacy diagnostics"
+```
+
+`--deep` uses its own baseline. Compiler errors and architecture-policy errors
+are never accepted into either baseline.
+
+The deep set includes the command queue, sequencer, retirement, fence,
+allocator, resource, and Metal4 adapter paths. Legacy monolithic translation
+units run serially because the path-sensitive analyzer can take several
+minutes and substantial memory. A timeout, checker crash, missing result, or
+planned/actual TU coverage difference is an audit failure. Once a path moves
+into the independent submission model, it may not be removed from deep
+analysis for performance reasons.
+
 ## Git hooks
 
 Enable the tracked DXMT hooks once per clone:
@@ -262,9 +434,63 @@ export CXXFLAGS='-arch x86_64'
 
 # Debugging
 The following environment variables can be used for **debugging** purposes.
+
+## Validation layer (GPU hang forensics)
+
+One switch for denser hang reports (Metal4 commit feedback classification +
+fence/encoder dumps + IOGPU hooks when `DXMT_LOG_PATH` is set):
+
+```sh
+export DXMT_VALIDATION=1
+export DXMT_LOG_PATH=/tmp/dxmt-logs   # required for native hang/IOGPU files
+mkdir -p "$DXMT_LOG_PATH"
+```
+
+For real GPU-fault reproduction, keep `MTL_DEBUG_LAYER` and
+`MTL_SHADER_VALIDATION` disabled unless explicitly running a validation A/B.
+Apple's validation layers can assert on GPTK/D3DMetal-supported runtime
+patterns and are not a correctness gate for the production path.
+
+`DXMT_VALIDATION=1` (alias `DXMT_DIAG_VALIDATION=1`) expands PE-side defaults
+when `d3d12.dll` loads:
+
+- `DXMT_DIAG_GPU_HANG_DENSE=1` — full fence-edge + encoder dump on the hang CB
+- `DXMT_DIAG_ERROR_SNAPSHOT=1` — retain the last successful Metal completion
+  and dump it beside the first failing CB
+- `DXMT_DIAG_ROOT_CAUSE_DENSE=1` — root-cause PE dumps
+- `DXMT_DIAG_METAL_PSO_LABELS=1` — PSO labels map shader-validation hits
+- `DXMT_DIAG_METAL_RESIDENCY=1` — residency diagnostics
+- `DXMT_DIAG_DXMT_QUEUE=1` / `DXMT_DIAG_METAL4_QUEUE_MONITOR=1`
+- best-effort `MTL_DEBUG_LAYER` / `MTL_SHADER_VALIDATION` if still unset
+
+On GPU hang, look for:
+
+1. stderr block `========== DXMT GPU HANG VALIDATION REPORT ==========`
+   (ranked suspects: reverse-stage, residual waits, self-waits, concurrent CB,
+   sparse, under-bound fences; all encoders; exact reverse edges with resource,
+   allocation, Metal handle, GPU address/resource ID, range/view/access/stage)
+2. `$DXMT_LOG_PATH/dxmt-metal4-native.log` — mirrored hang lines
+3. `$DXMT_LOG_PATH/dxmt-iogpu-native.log` — IOGPU error code + fault address
+4. Metal validation messages on stderr when `MTL_*` layers are on
+
+**GPTK fence stage note:** D3DMetal `UpdateFence` uses `afterStages:17`
+(Vertex|Mesh) for the PreRaster fence. DXMT keeps full `WMTRenderStagePreRaster`
+(25, includes Object) for wait/update — forcing mask 17 caused early soft hangs
+(~frame 12, D3D12 fence spin, no IOGPU error). Metal4 reverse Fragment→PreRaster
+still splits the pass; deptrack re-establishes the Fragment→PreRaster wait.
+
+**Note:** Apple Metal validation layers must be present in the **host Wine
+process environment before Metal initializes**. Prefer setting them in
+GameHub/wine-launch env, not only after PE `d3d12.dll` attach.
+
+Also useful individually:
+
 - `MTL_SHADER_VALIDATION=1` Enable Metal shader validation layer
 - `MTL_DEBUG_LAYER=1` Enable Metal API validation layer
 - `MTL_CAPTURE_ENABLED=1` Enable Metal frame capture
+- `DXMT_DIAG_GPU_HANG_DENSE=1` Dense hang CB fence/encoder dump (without full validation pack)
+- `DXMT_DIAG_ERROR_SNAPSHOT=1` Preserve and dump the final successful completion
+  for direct comparison with the first failing command buffer
 - `DXMT_DIAG_METAL_PSO_LABELS=1`: Labels Metal render/mesh PSOs with the stable DXMT pipeline key so shader-validation errors can be mapped back to pipeline dumps.
 - `DXMT_DIAG_METAL_RESIDENCY=1`: Emits bounded drawable/layer residency diagnostics and labels otherwise unnamed drawable textures.
 - `DXMT_CAPTURE_EXECUTABLE="the executable name without extension"` Must be set to enable Metal frame capture. Press F10 to generate a capture. The captured result will be stored in the same directory as the executable.

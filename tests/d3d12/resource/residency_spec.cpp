@@ -7,7 +7,9 @@
 #include <array>
 #include <atomic>
 #include <memory>
+#include <thread>
 #include <utility>
+#include <vector>
 
 namespace {
 
@@ -80,6 +82,21 @@ protected:
     return heap;
   }
 
+  ComPtr<ID3D12Heap> CreateTextureHeap() {
+    D3D12_HEAP_DESC desc = {};
+    desc.SizeInBytes = 4 * 1024 * 1024;
+    desc.Properties.Type = D3D12_HEAP_TYPE_DEFAULT;
+    desc.Properties.CreationNodeMask = 1;
+    desc.Properties.VisibleNodeMask = 1;
+    desc.Flags = D3D12_HEAP_FLAG_ALLOW_ONLY_NON_RT_DS_TEXTURES;
+    ComPtr<ID3D12Heap> heap;
+    EXPECT_EQ(context_.device()->CreateHeap(
+                  &desc, __uuidof(ID3D12Heap),
+                  reinterpret_cast<void **>(heap.put())),
+              S_OK);
+    return heap;
+  }
+
   ComPtr<ID3D12QueryHeap> CreateQueryHeap() {
     D3D12_QUERY_HEAP_DESC desc = {};
     desc.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
@@ -103,6 +120,25 @@ protected:
     desc.Format = DXGI_FORMAT_UNKNOWN;
     desc.SampleDesc.Count = 1;
     desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    ComPtr<ID3D12Resource> resource;
+    EXPECT_EQ(context_.device()->CreatePlacedResource(
+                  heap, offset, &desc, D3D12_RESOURCE_STATE_COMMON, nullptr,
+                  IID_PPV_ARGS(resource.put())),
+              S_OK);
+    return resource;
+  }
+
+  ComPtr<ID3D12Resource> CreatePlacedTexture(ID3D12Heap *heap,
+                                             UINT64 offset = 0) {
+    D3D12_RESOURCE_DESC desc = {};
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    desc.Width = 128;
+    desc.Height = 128;
+    desc.DepthOrArraySize = 1;
+    desc.MipLevels = 1;
+    desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    desc.SampleDesc.Count = 1;
+    desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
     ComPtr<ID3D12Resource> resource;
     EXPECT_EQ(context_.device()->CreatePlacedResource(
                   heap, offset, &desc, D3D12_RESOURCE_STATE_COMMON, nullptr,
@@ -269,18 +305,21 @@ TEST_F(ResidencySpec,
   EXPECT_EQ(context_.device()->GetDeviceRemovedReason(), S_OK);
 }
 
-TEST_F(ResidencySpec, TracksResourceResidencyReferencesOnAddAndRemove) {
+TEST_F(ResidencySpec, TracksPlacedResourcesThroughBackingHeapResidency) {
+  const auto initial = ReadPersistentStats();
   auto heap = CreateBufferHeap();
   ASSERT_TRUE(heap);
   auto first = CreatePlacedBuffer(heap.get());
   ASSERT_TRUE(first);
   const auto baseline = ReadPersistentStats();
+  EXPECT_EQ(baseline.entry_count, initial.entry_count + 1);
+  EXPECT_EQ(baseline.total_ref_count, initial.total_ref_count + 1);
 
   auto second = CreatePlacedBuffer(heap.get());
   ASSERT_TRUE(second);
   const auto after_second = ReadPersistentStats();
-  EXPECT_EQ(after_second.entry_count, baseline.entry_count + 1);
-  EXPECT_EQ(after_second.total_ref_count, baseline.total_ref_count + 1);
+  EXPECT_EQ(after_second.entry_count, baseline.entry_count);
+  EXPECT_EQ(after_second.total_ref_count, baseline.total_ref_count);
 
   second.reset();
   const auto after_second_remove = ReadPersistentStats();
@@ -289,13 +328,107 @@ TEST_F(ResidencySpec, TracksResourceResidencyReferencesOnAddAndRemove) {
 
   first.reset();
   const auto after_first_remove = ReadPersistentStats();
-  EXPECT_EQ(after_first_remove.entry_count, baseline.entry_count - 1);
-  EXPECT_EQ(after_first_remove.total_ref_count,
-            baseline.total_ref_count - 1);
+  EXPECT_EQ(after_first_remove.entry_count, baseline.entry_count);
+  EXPECT_EQ(after_first_remove.total_ref_count, baseline.total_ref_count);
+
+  heap.reset();
+  const auto after_heap_remove = ReadPersistentStats();
+  EXPECT_EQ(after_heap_remove.entry_count, initial.entry_count);
+  EXPECT_EQ(after_heap_remove.total_ref_count, initial.total_ref_count);
+}
+
+TEST_F(ResidencySpec, DoesNotRegisterPlacedTexturesBesideTheirBackingHeap) {
+  const auto initial = ReadPersistentStats();
+  auto heap = CreateTextureHeap();
+  ASSERT_TRUE(heap);
+  auto first = CreatePlacedTexture(heap.get());
+  ASSERT_TRUE(first);
+  const auto after_first = ReadPersistentStats();
+  EXPECT_EQ(after_first.entry_count, initial.entry_count + 1);
+  EXPECT_EQ(after_first.total_ref_count, initial.total_ref_count + 1);
+
+  auto second = CreatePlacedTexture(
+      heap.get(), D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT);
+  ASSERT_TRUE(second);
+  const auto after_second = ReadPersistentStats();
+  EXPECT_EQ(after_second.entry_count, after_first.entry_count);
+  EXPECT_EQ(after_second.total_ref_count, after_first.total_ref_count);
+
+  first.reset();
+  second.reset();
+  const auto after_resources = ReadPersistentStats();
+  EXPECT_EQ(after_resources.entry_count, after_first.entry_count);
+  EXPECT_EQ(after_resources.total_ref_count, after_first.total_ref_count);
+
+  heap.reset();
+  const auto after_heap = ReadPersistentStats();
+  EXPECT_EQ(after_heap.entry_count, initial.entry_count);
+  EXPECT_EQ(after_heap.total_ref_count, initial.total_ref_count);
 }
 
 TEST_F(ResidencySpec,
-       ReusesCachedTemporaryResidencyAcrossCommandBufferCompletions) {
+       SerializesBackendResidencyWhileResourceLifetimesRaceSubmission) {
+  ASSERT_EQ(context_.ExecuteAndWait(), S_OK);
+  ASSERT_EQ(context_.ResetCommandList(), S_OK);
+
+  std::atomic_bool start = false;
+  std::atomic_bool producer_done = false;
+  std::atomic_bool producer_failed = false;
+  std::thread producer([&] {
+    while (!start.load(std::memory_order_acquire))
+      std::this_thread::yield();
+
+    std::vector<ComPtr<ID3D12Resource>> live_resources;
+    live_resources.reserve(16);
+    for (uint32_t index = 0; index < 512; ++index) {
+      auto resource = context_.CreateBuffer(
+          4096 + index * 16, D3D12_HEAP_TYPE_DEFAULT,
+          D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COMMON);
+      if (!resource) {
+        producer_failed.store(true, std::memory_order_release);
+        break;
+      }
+      live_resources.push_back(std::move(resource));
+      if (live_resources.size() > 8)
+        live_resources.erase(live_resources.begin());
+      if ((index & 7u) == 0)
+        std::this_thread::yield();
+    }
+    live_resources.clear();
+    producer_done.store(true, std::memory_order_release);
+  });
+
+  start.store(true, std::memory_order_release);
+  HRESULT submission_result = S_OK;
+  for (uint32_t submission = 0;
+       submission < 64 ||
+       (!producer_done.load(std::memory_order_acquire) && submission < 512);
+       ++submission) {
+    if (FAILED(submission_result = context_.list()->Close()))
+      break;
+    ID3D12CommandList *lists[] = {context_.list()};
+    context_.queue()->ExecuteCommandLists(1, lists);
+    if (FAILED(submission_result = context_.SignalAndWait()))
+      break;
+    if (FAILED(submission_result = context_.ResetCommandList()))
+      break;
+  }
+  producer.join();
+
+  EXPECT_FALSE(producer_failed.load(std::memory_order_acquire));
+  ASSERT_EQ(submission_result, S_OK);
+  ASSERT_EQ(context_.list()->Close(), S_OK);
+  ID3D12CommandList *final_lists[] = {context_.list()};
+  context_.queue()->ExecuteCommandLists(1, final_lists);
+  ASSERT_EQ(context_.SignalAndWait(), S_OK);
+
+  const auto final_stats = ReadPersistentStats();
+  EXPECT_EQ(final_stats.pending_removal_count, 0u);
+  EXPECT_EQ(context_.device()->GetDeviceRemovedReason(), S_OK);
+}
+
+TEST_F(ResidencySpec,
+       KeepsReplayAllocatorResidencyStableAcrossCommandBufferCompletions) {
   std::array<D3D12_ROOT_PARAMETER, 2> parameters = {};
   parameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
   parameters[0].Descriptor.ShaderRegister = 0;
@@ -344,8 +477,10 @@ TEST_F(ResidencySpec,
   };
   submit();
   const auto first = ReadPersistentStats();
-  ASSERT_GT(first.cached_allocation_count, baseline.cached_allocation_count);
+  ASSERT_GT(first.cached_allocation_count, 0u);
+  EXPECT_GE(first.cached_allocation_count, baseline.cached_allocation_count);
   EXPECT_EQ(first.pending_removal_count, 0u);
+  EXPECT_GT(first.commit_count, baseline.commit_count);
   ASSERT_EQ(context_.ResetCommandList(), S_OK);
 
   submit();
@@ -354,6 +489,7 @@ TEST_F(ResidencySpec,
   EXPECT_EQ(second.entry_count, first.entry_count);
   EXPECT_EQ(second.total_ref_count, first.total_ref_count);
   EXPECT_EQ(second.pending_removal_count, 0u);
+  EXPECT_EQ(second.commit_count, first.commit_count);
 }
 
 TEST_F(ResidencySpec,
@@ -404,6 +540,10 @@ TEST_F(ResidencySpec,
   ASSERT_EQ(context_.SignalAndWait(), S_OK);
 
   const auto mapped = ReadPersistentStats();
+  // The first mapping lazily materializes the native reserved texture and
+  // placement heap. Each native allocation gains exactly one lifetime
+  // registration; the mapping record then retains the heap registration.
+  EXPECT_GT(mapped.entry_count, before.entry_count);
   EXPECT_GT(mapped.total_ref_count, before.total_ref_count);
   heap.reset();
   const auto retained_by_mapping = ReadPersistentStats();
@@ -419,6 +559,140 @@ TEST_F(ResidencySpec,
   const auto unmapped = ReadPersistentStats();
   EXPECT_EQ(unmapped.entry_count + 1, mapped.entry_count);
   EXPECT_EQ(unmapped.total_ref_count + 1, mapped.total_ref_count);
+}
+
+TEST_F(ResidencySpec,
+       ConcurrentLifetimeMutationSharesNativeLockWithSubmission) {
+  constexpr UINT producer_count = 2;
+  constexpr UINT allocations_per_producer = 128;
+  std::atomic_bool start = false;
+  std::atomic_bool failed = false;
+  std::atomic_uint active_producers = producer_count;
+  std::vector<std::thread> producers;
+  producers.reserve(producer_count);
+
+  for (UINT producer = 0; producer < producer_count; ++producer) {
+    producers.emplace_back([&, producer]() {
+      while (!start.load(std::memory_order_acquire))
+        std::this_thread::yield();
+      for (UINT allocation = 0; allocation < allocations_per_producer;
+           ++allocation) {
+        auto resource = context_.CreateBuffer(
+            4096 + 256 * ((producer + allocation) % 8),
+            D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_NONE,
+            D3D12_RESOURCE_STATE_COMMON);
+        if (!resource) {
+          failed.store(true, std::memory_order_release);
+          break;
+        }
+      }
+      active_producers.fetch_sub(1, std::memory_order_acq_rel);
+    });
+  }
+
+  start.store(true, std::memory_order_release);
+  UINT submissions = 0;
+  HRESULT submission_result = S_OK;
+  do {
+    submission_result = context_.SignalAndWait();
+    if (FAILED(submission_result))
+      break;
+    ++submissions;
+  } while (active_producers.load(std::memory_order_acquire) &&
+           submissions < 64);
+
+  for (auto &producer : producers)
+    producer.join();
+  ASSERT_EQ(submission_result, S_OK);
+  ASSERT_FALSE(failed.load(std::memory_order_acquire));
+  ASSERT_EQ(context_.SignalAndWait(), S_OK);
+
+  const auto stats = ReadPersistentStats();
+  EXPECT_EQ(stats.pending_removal_count, 0u);
+}
+
+TEST_F(ResidencySpec,
+       SerializesSharedResidencySetAcrossIndependentCommandQueues) {
+  constexpr std::array queue_types = {
+      D3D12_COMMAND_LIST_TYPE_DIRECT,
+      D3D12_COMMAND_LIST_TYPE_COMPUTE,
+      D3D12_COMMAND_LIST_TYPE_COPY,
+  };
+  struct QueueWorker {
+    ComPtr<ID3D12CommandQueue> queue;
+    ComPtr<ID3D12Fence> fence;
+  };
+  std::array<QueueWorker, queue_types.size()> workers;
+  for (std::size_t index = 0; index < workers.size(); ++index) {
+    D3D12_COMMAND_QUEUE_DESC desc = {};
+    desc.Type = queue_types[index];
+    ASSERT_EQ(context_.device()->CreateCommandQueue(
+                  &desc, IID_PPV_ARGS(workers[index].queue.put())),
+              S_OK);
+    ASSERT_EQ(context_.device()->CreateFence(
+                  0, D3D12_FENCE_FLAG_NONE,
+                  IID_PPV_ARGS(workers[index].fence.put())),
+              S_OK);
+  }
+
+  std::atomic_bool start = false;
+  std::atomic_bool failed = false;
+  std::vector<std::thread> submitters;
+  submitters.reserve(workers.size());
+  for (auto &worker : workers) {
+    auto *worker_ptr = &worker;
+    submitters.emplace_back([&start, &failed, worker_ptr]() {
+      HANDLE event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+      if (!event) {
+        failed.store(true, std::memory_order_release);
+        return;
+      }
+      while (!start.load(std::memory_order_acquire))
+        std::this_thread::yield();
+      for (UINT64 value = 1; value <= 128; ++value) {
+        HRESULT hr =
+            worker_ptr->queue->Signal(worker_ptr->fence.get(), value);
+        if (SUCCEEDED(hr) &&
+            worker_ptr->fence->GetCompletedValue() < value)
+          hr = worker_ptr->fence->SetEventOnCompletion(value, event);
+        if (SUCCEEDED(hr) &&
+            worker_ptr->fence->GetCompletedValue() < value &&
+            WaitForSingleObject(event, 30000) != WAIT_OBJECT_0)
+          hr = HRESULT_FROM_WIN32(ERROR_TIMEOUT);
+        if (FAILED(hr)) {
+          failed.store(true, std::memory_order_release);
+          break;
+        }
+      }
+      CloseHandle(event);
+    });
+  }
+
+  start.store(true, std::memory_order_release);
+  std::vector<ComPtr<ID3D12Resource>> live_resources;
+  live_resources.reserve(32);
+  for (UINT index = 0; index < 1024; ++index) {
+    auto resource = context_.CreateBuffer(
+        4096 + 256 * (index % 16), D3D12_HEAP_TYPE_DEFAULT,
+        D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COMMON);
+    if (!resource) {
+      failed.store(true, std::memory_order_release);
+      break;
+    }
+    live_resources.push_back(std::move(resource));
+    if (live_resources.size() > 16)
+      live_resources.erase(live_resources.begin());
+    if ((index & 15u) == 0)
+      std::this_thread::yield();
+  }
+  live_resources.clear();
+  for (auto &submitter : submitters)
+    submitter.join();
+
+  ASSERT_FALSE(failed.load(std::memory_order_acquire));
+  EXPECT_EQ(context_.device()->GetDeviceRemovedReason(), S_OK);
+  const auto stats = ReadPersistentStats();
+  EXPECT_EQ(stats.pending_removal_count, 0u);
 }
 
 } // namespace

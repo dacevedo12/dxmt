@@ -187,6 +187,7 @@ d3d12_unit_suites = {
       'sync/producer_consumer_execution_spec.cpp',
       'sync/queue_wait_spec.cpp',
       'sync/split_transition_spec.cpp',
+      'sync/submission_timeline_execution_spec.cpp',
       'sync/transition_sequence_spec.cpp',
       'sync/uav_barrier_spec.cpp',
     ),

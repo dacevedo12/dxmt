@@ -154,6 +154,74 @@ TEST_F(MapMatrixSpec, MapSubresourceOneOnBufferFails) {
   EXPECT_EQ(context_.device()->GetDeviceRemovedReason(), S_OK);
 }
 
+// GPTK D3DMResource::Map: null ppData returns S_OK and does not open a map.
+TEST_F(MapMatrixSpec, NullPpDataMapSucceedsWithoutPointer) {
+  auto upload = context_.CreateBuffer(128, D3D12_HEAP_TYPE_UPLOAD,
+                                      D3D12_RESOURCE_FLAG_NONE,
+                                      D3D12_RESOURCE_STATE_GENERIC_READ);
+  ASSERT_TRUE(upload);
+  ASSERT_EQ(upload->Map(0, nullptr, nullptr), S_OK);
+  // Real map still works after null-ppData call (no leftover pin).
+  void *mapped = nullptr;
+  ASSERT_EQ(upload->Map(0, nullptr, &mapped), S_OK);
+  ASSERT_NE(mapped, nullptr);
+  upload->Unmap(0, nullptr);
+  EXPECT_EQ(context_.device()->GetDeviceRemovedReason(), S_OK);
+}
+
+// Nested Map returns the same host pointer (GPTK cached contents + refcount).
+TEST_F(MapMatrixSpec, NestedMapReturnsStablePointer) {
+  auto upload = context_.CreateBuffer(256, D3D12_HEAP_TYPE_UPLOAD,
+                                      D3D12_RESOURCE_FLAG_NONE,
+                                      D3D12_RESOURCE_STATE_GENERIC_READ);
+  ASSERT_TRUE(upload);
+  void *first = nullptr;
+  void *second = nullptr;
+  ASSERT_EQ(upload->Map(0, nullptr, &first), S_OK);
+  ASSERT_EQ(upload->Map(0, nullptr, &second), S_OK);
+  ASSERT_NE(first, nullptr);
+  EXPECT_EQ(second, first);
+  auto *bytes = static_cast<std::uint8_t *>(first);
+  bytes[0] = 0x5a;
+  bytes[1] = 0xa5;
+  D3D12_RANGE written = {0, 2};
+  upload->Unmap(0, &written);
+  upload->Unmap(0, nullptr);
+  void *again = nullptr;
+  ASSERT_EQ(upload->Map(0, nullptr, &again), S_OK);
+  EXPECT_EQ(static_cast<std::uint8_t *>(again)[0], 0x5a);
+  EXPECT_EQ(static_cast<std::uint8_t *>(again)[1], 0xa5);
+  upload->Unmap(0, nullptr);
+  EXPECT_EQ(context_.device()->GetDeviceRemovedReason(), S_OK);
+}
+
+// App may Release without Unmap; GPTK silently abandons map slots.
+TEST_F(MapMatrixSpec, MapWithoutUnmapThenReleaseKeepsDeviceHealthy) {
+  {
+    auto upload = context_.CreateBuffer(64, D3D12_HEAP_TYPE_UPLOAD,
+                                        D3D12_RESOURCE_FLAG_NONE,
+                                        D3D12_RESOURCE_STATE_GENERIC_READ);
+    ASSERT_TRUE(upload);
+    void *mapped = nullptr;
+    ASSERT_EQ(upload->Map(0, nullptr, &mapped), S_OK);
+    ASSERT_NE(mapped, nullptr);
+    *static_cast<std::uint32_t *>(mapped) = 0xdeadbeefu;
+    // Drop last ref while mapped — no Unmap.
+  }
+  EXPECT_EQ(context_.device()->GetDeviceRemovedReason(), S_OK);
+
+  // Subsequent map on a fresh resource still works after abandon path.
+  auto next = context_.CreateBuffer(64, D3D12_HEAP_TYPE_UPLOAD,
+                                    D3D12_RESOURCE_FLAG_NONE,
+                                    D3D12_RESOURCE_STATE_GENERIC_READ);
+  ASSERT_TRUE(next);
+  void *mapped = nullptr;
+  ASSERT_EQ(next->Map(0, nullptr, &mapped), S_OK);
+  ASSERT_NE(mapped, nullptr);
+  next->Unmap(0, nullptr);
+  EXPECT_EQ(context_.device()->GetDeviceRemovedReason(), S_OK);
+}
+
 std::string MapRangeName(const ::testing::TestParamInfo<MapRangeCase> &info) {
   return std::string(info.param.tag) + "S" +
          std::to_string(info.param.buffer_size) + "B" +
