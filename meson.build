@@ -62,6 +62,21 @@ compiler_args = [
   '-Wno-missing-braces',
   '-fblocks',
   '-fmacro-prefix-map=' + source_prefix_path + '/=',
+  # Lock contracts (DXMT_CAPABILITY / DXMT_GUARDED_BY / DXMT_REQUIRES and the
+  # residency lock ordering) are only meaningful if the compiler checks them on
+  # every build.  GCC ignores these entirely, so get_supported_arguments()
+  # drops them there; on clang they turn the annotations into real gates.
+  # -beta is required for member lock *ordering* -- without it acquired_before
+  # /_after silently degrade into comments.
+  '-Wthread-safety',
+  '-Wthread-safety-beta',
+  # The codebase is clean under these today, so a violation is always a new
+  # defect -- fail the build rather than emit a warning that scrolls past.
+  # Promote the whole group, not just -analysis: handing a guarded member to a
+  # helper by reference without the lock is reported under
+  # -Wthread-safety-reference, which -Werror=thread-safety-analysis leaves as a
+  # warning that exits zero.  There is no global -Werror to catch it after that.
+  '-Werror=thread-safety',
 ]
 
 if cpu_family == 'x86'
@@ -80,6 +95,13 @@ native_compiler_args = [
   '-Wno-unused-const-variable',
   '-Wno-missing-braces',
   '-fblocks',
+  # winemetal4/unix carries real DXMT_CAPABILITY / DXMT_REQUIRES contracts on
+  # the residency locks, and it only ever builds as a native target.  Without
+  # these the annotations are dead at compile time and are checked only by
+  # `audit --deep`, which does not run on every build.
+  '-Wthread-safety',
+  '-Wthread-safety-beta',
+  '-Werror=thread-safety',
 ]
 
 link_args = []
