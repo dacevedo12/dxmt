@@ -1,0 +1,20 @@
+---
+Checks: >
+  -*,
+  bugprone-assert-side-effect,
+  bugprone-dangling-handle,
+  bugprone-exception-escape,
+  bugprone-infinite-loop,
+  bugprone-misplaced-widening-cast,
+  bugprone-multiple-statement-macro,
+  bugprone-sizeof-container,
+  bugprone-sizeof-expression,
+  bugprone-suspicious-memset-usage,
+  bugprone-unused-raii,
+  bugprone-use-after-move,
+  performance-noexcept-move-constructor
+WarningsAsErrors: ''
+HeaderFilterRegex: '(^|/)(include|src)/(d3d12|dxmt|winemetal4)/'
+SystemHeaders: false
+FormatStyle: none
+...

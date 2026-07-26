@@ -1,0 +1,30 @@
+---
+Checks: >
+  -*,
+  bugprone-dangling-handle,
+  bugprone-exception-escape,
+  bugprone-narrowing-conversions,
+  bugprone-sizeof-expression,
+  bugprone-unused-raii,
+  bugprone-use-after-move,
+  clang-analyzer-core.*,
+  clang-analyzer-cplusplus.*,
+  clang-analyzer-deadcode.*,
+  clang-analyzer-nullability.*,
+  clang-analyzer-unix.Malloc,
+  clang-analyzer-unix.MismatchedDeallocator,
+  cppcoreguidelines-pro-bounds-array-to-pointer-decay,
+  cppcoreguidelines-pro-bounds-pointer-arithmetic,
+  cppcoreguidelines-pro-type-reinterpret-cast,
+  performance-noexcept-move-constructor,
+  readability-function-cognitive-complexity,
+  readability-function-size
+WarningsAsErrors: '*'
+HeaderFilterRegex: '(^|/)(include/dxmt_d3d12_submission_model\.hpp|src/d3d12/d3d12_submission_model\.(cpp|hpp))$'
+SystemHeaders: false
+FormatStyle: none
+CheckOptions:
+  readability-function-cognitive-complexity.Threshold: '25'
+  readability-function-size.LineThreshold: '120'
+  readability-function-size.StatementThreshold: '60'
+...

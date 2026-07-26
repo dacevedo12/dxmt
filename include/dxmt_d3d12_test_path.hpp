@@ -161,8 +161,8 @@ struct DescriptorHeapSlotRepairConfig {
   std::uint32_t slot = 0;
 };
 
-// Read-only queue residency accounting exposed through ID3D12Device private
-// data. The values are sampled under the queue's residency lock.
+// Read-only device residency accounting exposed through ID3D12Device private
+// data. The values are sampled under the device residency owner's lock.
 struct PersistentResidencyStats {
   std::uint32_t struct_size = sizeof(PersistentResidencyStats);
   std::uint32_t entry_count = 0;
