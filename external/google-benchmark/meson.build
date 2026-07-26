@@ -27,13 +27,22 @@ google_benchmark_sources = files(
   'src/timers.cc',
 )
 
+# The include directories are already marked is_system, which covers every
+# consumer of these headers.  It does not cover the library's own sources: they
+# reach mutex.h through a quoted include resolved relative to the including
+# file, so the project-wide -Werror=thread-safety applies to upstream's
+# CAPABILITY/ACQUIRE annotations and fails four translation units.  We do not
+# audit upstream's lock contracts, so drop the warning for this target only -
+# every DXMT target keeps it.
+google_benchmark_vendor_args = cpp.get_supported_arguments(['-Wno-thread-safety'])
+
 google_benchmark_lib = static_library(
   'dxmt-google-benchmark',
   google_benchmark_sources,
   cpp_args: [
     '-DBENCHMARK_STATIC_DEFINE',
     '-DBENCHMARK_VERSION="1.9.5"',
-  ],
+  ] + google_benchmark_vendor_args,
   dependencies: [google_benchmark_threads_dep] + google_benchmark_platform_deps,
   include_directories: [google_benchmark_include_dirs],
   install: false,
