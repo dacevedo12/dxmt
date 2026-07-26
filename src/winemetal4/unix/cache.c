@@ -5,7 +5,7 @@
 
 @interface WMT4CacheReader : NSObject
 - (instancetype)initWithPath:(NSString *)path version:(uint64_t)version;
-- (dispatch_data_t)get:(NSData *)key;
+- (dispatch_data_t)copyDataForKey:(NSData *)key;
 @end
 
 @interface WMT4CacheWriter : NSObject
@@ -47,15 +47,20 @@ resolve_cache_dir(NSString *path, bool path_is_file) {
     NSString *dbPath = resolve_cache_dir(path, true);
     if (!dbPath) {
       NSLog(@"[WMT4CacheReader] Failed to resolve cache path");
+      [self release];
       return nil;
     }
-    if (![[NSFileManager defaultManager] fileExistsAtPath:dbPath])
+    if (![[NSFileManager defaultManager] fileExistsAtPath:dbPath]) {
+      [self release];
       return nil;
+    }
     NSString *tableName = [NSString stringWithFormat:@"cache_%llu", version];
     if (sqlite3_open_v2([dbPath fileSystemRepresentation], &_db, SQLITE_OPEN_READONLY | SQLITE_OPEN_NOMUTEX, NULL) !=
         SQLITE_OK) {
       NSLog(@"[WMT4CacheReader] Failed to open DB: %s", sqlite3_errmsg(_db));
       sqlite3_close(_db);
+      _db = NULL;
+      [self release];
       return nil;
     }
     _lock = [[NSLock alloc] init];
@@ -65,13 +70,15 @@ resolve_cache_dir(NSString *path, bool path_is_file) {
     if (sqlite3_prepare_v2(_db, sqlGet.UTF8String, -1, &_stmt, NULL) != SQLITE_OK) {
       NSLog(@"[WMT4CacheReader] Failed to prepare SELECT: %s", sqlite3_errmsg(_db));
       sqlite3_close(_db);
+      _db = NULL;
+      [self release];
       return nil;
     }
   }
   return self;
 }
 
-- (dispatch_data_t)get:(NSData *)key {
+- (dispatch_data_t)copyDataForKey:(NSData *)key {
   [_lock lock];
   sqlite3_reset(_stmt);
   sqlite3_clear_bindings(_stmt);
@@ -117,13 +124,15 @@ resolve_cache_dir(NSString *path, bool path_is_file) {
     _lock = [[NSLock alloc] init];
     NSString *dbPath = resolve_cache_dir(path, true);
     if (!dbPath) {
-      NSLog(@"[WMT4CacheReader] Failed to resolve cache path");
+      NSLog(@"[WMT4CacheWriter] Failed to resolve cache path");
+      [self release];
       return nil;
     }
     NSString *lockPath = [dbPath stringByAppendingString:@"-lock"];
     int fd = open([lockPath fileSystemRepresentation], O_RDWR | O_CREAT, 0666);
     if (fd < 0) {
       NSLog(@"[WMT4CacheWriter] Failed to open file for locking %@", lockPath);
+      [self release];
       return nil;
     }
     flock(fd, LOCK_EX);
@@ -135,6 +144,11 @@ resolve_cache_dir(NSString *path, bool path_is_file) {
       NSLog(@"[WMT4CacheWriter] Failed to open DB: %s", sqlite3_errmsg(_db));
       flock(fd, LOCK_UN);
       close(fd);
+      if (_db) {
+        sqlite3_close(_db);
+        _db = NULL;
+      }
+      [self release];
       return nil;
     }
     sqlite3_busy_timeout(_db, 5000);
@@ -161,6 +175,8 @@ resolve_cache_dir(NSString *path, bool path_is_file) {
     if (sqlite3_prepare_v2(_db, sqlSet.UTF8String, -1, &_stmt, NULL) != SQLITE_OK) {
       NSLog(@"[WMT4CacheWriter] Failed to prepare INSERT: %s", sqlite3_errmsg(_db));
       sqlite3_close(_db);
+      _db = NULL;
+      [self release];
       return nil;
     }
   }
@@ -213,7 +229,7 @@ _WMT4CacheReader_get(void *obj) {
   NSData *key =
       [[NSData alloc] initWithBytesNoCopy:(void *)params->key.ptr length:params->key_length freeWhenDone:false];
   WMT4CacheReader *reader = (WMT4CacheReader *)params->cache;
-  params->ret_data = (obj_handle_t)[reader get:key];
+  params->ret_data = (obj_handle_t)[reader copyDataForKey:key];
   [key release];
   return 0;
 }

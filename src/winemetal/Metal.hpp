@@ -245,22 +245,38 @@ public:
 
 class ResidencySet : public Object {
 public:
-  void
+  bool
   addAllocation(Object allocation) {
     (void)allocation;
+    return true;
   }
 
-  void
+  bool
   removeAllocation(Object allocation) {
     (void)allocation;
+    return true;
   }
 
-  void
+  bool
   commit() {
+    return true;
   }
 
-  void
+  bool
   requestResidency() {
+    return true;
+  }
+
+  bool
+  applyDelta(const obj_handle_t *additions, uint64_t addition_count,
+             const obj_handle_t *removals, uint64_t removal_count,
+             bool request_residency) {
+    (void)additions;
+    (void)addition_count;
+    (void)removals;
+    (void)removal_count;
+    (void)request_residency;
+    return true;
   }
 };
 

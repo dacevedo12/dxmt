@@ -7,6 +7,7 @@
 #include "winemetal_thunks.h"
 #include <wineunixlib.h>
 #include "assert.h"
+#include "stdlib.h"
 #include "string.h"
 
 #ifdef NDEBUG
@@ -1710,34 +1711,83 @@ MTLDevice_updateSparseTextureMappings(
   return params.ret != 0;
 }
 
-WINEMETAL_API void
+enum MTLResidencySetOperation {
+  MTLResidencySetOperationAdd,
+  MTLResidencySetOperationRemove,
+  MTLResidencySetOperationCommit,
+  MTLResidencySetOperationRequest,
+};
+
+static bool
+MTLResidencySet_finishOperation(
+    obj_handle_t set, obj_handle_t allocation,
+    enum MTLResidencySetOperation operation, NTSTATUS status,
+    uint32_t native_ret
+) {
+  const char *trace_value = getenv("DXMT_DIAG_RESIDENCY_CALLS");
+  const bool trace_enabled =
+      trace_value && trace_value[0] && strcmp(trace_value, "0") != 0;
+  if (trace_enabled || status || !native_ret) {
+    struct unixcall_mtlresidencyset_operation_log log_params;
+    log_params.set = set;
+    log_params.allocation = allocation;
+    log_params.unix_status = (uint32_t)status;
+    log_params.operation = (uint32_t)operation;
+    log_params.native_ret = native_ret;
+    log_params.reserved = 0;
+    (void)WINE_UNIX_CALL(181, &log_params);
+  }
+  return !status && native_ret;
+}
+
+WINEMETAL_API bool
 MTLResidencySet_addAllocation(obj_handle_t set, obj_handle_t allocation) {
-  struct unixcall_generic_obj_obj_noret params;
-  params.handle = set;
-  params.arg = allocation;
-  UNIX_CALL(163, &params);
+  struct unixcall_mtlresidencyset_mutation params;
+  params.set = set;
+  params.allocation = allocation;
+  params.ret = 0;
+  params.reserved = 0;
+  const NTSTATUS status = WINE_UNIX_CALL(163, &params);
+  return MTLResidencySet_finishOperation(
+      set, allocation, MTLResidencySetOperationAdd, status, params.ret);
 }
 
-WINEMETAL_API void
+WINEMETAL_API bool
 MTLResidencySet_removeAllocation(obj_handle_t set, obj_handle_t allocation) {
-  struct unixcall_generic_obj_obj_noret params;
-  params.handle = set;
-  params.arg = allocation;
-  UNIX_CALL(164, &params);
+  struct unixcall_mtlresidencyset_mutation params;
+  params.set = set;
+  params.allocation = allocation;
+  params.ret = 0;
+  params.reserved = 0;
+  const NTSTATUS status = WINE_UNIX_CALL(164, &params);
+  return MTLResidencySet_finishOperation(
+      set, allocation, MTLResidencySetOperationRemove, status, params.ret);
 }
 
-WINEMETAL_API void
+static bool
+MTLResidencySet_control(
+    obj_handle_t set, enum MTLResidencySetOperation operation,
+    unsigned int unix_call
+) {
+  struct unixcall_mtlresidencyset_control params;
+  params.set = set;
+  params.ret = 0;
+  params.reserved = 0;
+  const NTSTATUS status = WINE_UNIX_CALL(unix_call, &params);
+  return MTLResidencySet_finishOperation(
+      set, 0, operation, status, params.ret);
+}
+
+WINEMETAL_API bool
 MTLResidencySet_commit(obj_handle_t set) {
-  struct unixcall_generic_obj_noret params;
-  params.handle = set;
-  UNIX_CALL(165, &params);
+  return MTLResidencySet_control(
+      set, MTLResidencySetOperationCommit, 165);
 }
 
-WINEMETAL_API void
+WINEMETAL_API bool
 MTLResidencySet_requestResidency(obj_handle_t set) {
-  struct unixcall_generic_obj_noret params;
-  params.handle = set;
-  UNIX_CALL(166, &params);
+  return MTLResidencySet_control(
+      set, MTLResidencySetOperationRequest, 166);
 }
 
 WINEMETAL_API uint64_t

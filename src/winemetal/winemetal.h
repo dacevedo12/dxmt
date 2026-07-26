@@ -1251,6 +1251,13 @@ enum WMTRenderStages : uint8_t {
   WMTRenderStageObject = 8,
   WMTRenderStageMesh = 16,
   WMTRenderStagePreRaster = WMTRenderStageVertex | WMTRenderStageObject | WMTRenderStageMesh,
+  /**
+   * GPTK D3DMCommandEncoder::UpdateFence (IDA, render): first fence uses
+   * afterStages=17 (Vertex|Mesh), second uses Fragment=2. Object is not in the
+   * PreRaster fence mask; use this for waitForFence/updateFence PreRaster edges
+   * so DXMT matches D3DMetal stage visibility.
+   */
+  WMTRenderStageGptkPreRasterFence = WMTRenderStageVertex | WMTRenderStageMesh,
 };
 
 struct wmtcmd_render_useresource {

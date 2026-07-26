@@ -1,5 +1,6 @@
 #include <stdatomic.h>
 #include <dlfcn.h>
+#include <execinfo.h>
 #include <inttypes.h>
 #include <limits.h>
 #include <stdarg.h>
@@ -29,6 +30,7 @@
 #include <bootstrap.h>
 #include <mach/mach_port.h>
 #include <pthread.h>
+#include "dxmt_thread_safety.h"
 #define WINEMETAL_API
 #include "../winemetal_thunks.h"
 #include "../airconv_thunks.h"
@@ -40,6 +42,7 @@
 typedef int NTSTATUS;
 #define STATUS_SUCCESS 0
 #define STATUS_UNSUCCESSFUL 0xC0000001
+#define STATUS_INVALID_PARAMETER 0xC000000D
 
 @class DXMTMetal4CommandQueue;
 
@@ -77,29 +80,249 @@ struct DXMTSparseTextureTileKey {
 static NSLock *dxmt_sparse_texture_residency_lock;
 static NSMapTable *dxmt_sparse_texture_residency;
 static pthread_once_t dxmt_sparse_texture_residency_once = PTHREAD_ONCE_INIT;
-/* Serializes ALL Metal MTLResidencySet userspace mutations (add/remove/commit
- * and the externalPersistentResidencySets list). Metal residency sets are not
- * thread-safe; one global ops lock matches GPTK "single mutex around set ops"
- * and avoids lock-order inversion with encode/register paths.
+/*
+ * Winemetal-owned residency sets are serialized here. External sets are owned
+ * and synchronized by the D3D device and must not acquire a second thunk-side
+ * lock.
  */
-static NSLock *dxmt_residency_set_ops_lock;
-static pthread_once_t dxmt_residency_set_ops_once = PTHREAD_ONCE_INIT;
+typedef id<NSLocking> dxmt_nslock_t DXMT_CAPABILITY("mutex");
+
+struct dxmt_nslock_scope {
+  dxmt_nslock_t lock;
+  BOOL armed;
+};
+
+static struct dxmt_nslock_scope
+dxmt_nslock_scope_acquire(dxmt_nslock_t lock)
+    DXMT_ACQUIRE(lock) DXMT_NO_THREAD_SAFETY_ANALYSIS {
+  [lock lock];
+  return (struct dxmt_nslock_scope){.lock = lock, .armed = YES};
+}
 
 static void
-dxmt_residency_set_ops_init(void) {
-  dxmt_residency_set_ops_lock = [[NSLock alloc] init];
+dxmt_nslock_scope_release(struct dxmt_nslock_scope *scope, dxmt_nslock_t lock)
+    DXMT_RELEASE(lock) DXMT_NO_THREAD_SAFETY_ANALYSIS {
+  if (!scope->armed)
+    return;
+  if (scope->lock != lock) {
+    fprintf(stderr,
+            "err:   DXMT NSLock scope ownership mismatch: scope=%p"
+            " expected=%p actual=%p\n",
+            scope, lock, scope->lock);
+    abort();
+  }
+  scope->armed = NO;
+  [scope->lock unlock];
 }
 
-static NSLock *
-dxmt_residency_set_ops_lock_get(void) {
-  pthread_once(&dxmt_residency_set_ops_once, dxmt_residency_set_ops_init);
-  return dxmt_residency_set_ops_lock;
+static void
+dxmt_nslock_scope_cleanup(struct dxmt_nslock_scope *scope)
+    DXMT_NO_THREAD_SAFETY_ANALYSIS {
+  dxmt_nslock_scope_release(scope, scope->lock);
 }
 
-/* Back-compat name used by older call sites in this file. */
-static NSLock *
-dxmt_residency_membership_lock_get(void) {
-  return dxmt_residency_set_ops_lock_get();
+static pthread_once_t dxmt_residency_call_trace_once = PTHREAD_ONCE_INIT;
+static BOOL dxmt_residency_call_trace_is_enabled = NO;
+
+static void
+dxmt_residency_call_trace_initialize(void) {
+  const char *value = getenv("DXMT_DIAG_RESIDENCY_CALLS");
+  dxmt_residency_call_trace_is_enabled =
+      value && value[0] && strcmp(value, "0") != 0;
+}
+
+static BOOL
+dxmt_residency_call_trace_enabled(void) {
+  pthread_once(&dxmt_residency_call_trace_once,
+               dxmt_residency_call_trace_initialize);
+  return dxmt_residency_call_trace_is_enabled;
+}
+
+static uint64_t
+dxmt_residency_call_thread_id(void) {
+  uint64_t thread_id = 0;
+  pthread_threadid_np(NULL, &thread_id);
+  return thread_id;
+}
+
+static atomic_uint_fast64_t dxmt_residency_call_sequence = 0;
+static _Thread_local uint32_t dxmt_residency_call_depth = 0;
+
+static uint64_t
+dxmt_residency_call_begin(const char *operation, id<MTLResidencySet> set,
+                          id allocation) {
+  if (!dxmt_residency_call_trace_enabled())
+    return 0;
+  const uint64_t sequence =
+      atomic_fetch_add_explicit(&dxmt_residency_call_sequence, 1,
+                                memory_order_relaxed) +
+      1;
+  const uint32_t depth = ++dxmt_residency_call_depth;
+  fprintf(stderr,
+          "info:  DXMT residency call: sequence=%" PRIu64
+          " phase=begin op=%s thread=%" PRIu64
+          " depth=%u set=%p setClass=%s allocation=%p allocationClass=%s\n",
+          sequence, operation, dxmt_residency_call_thread_id(), depth, set,
+          set ? object_getClassName(set) : "nil", allocation,
+          allocation ? object_getClassName(allocation) : "nil");
+  if (depth > 1) {
+    void *frames[64];
+    const int frame_count =
+        backtrace(frames, (int)(sizeof(frames) / sizeof(frames[0])));
+    fprintf(stderr,
+            "err:   DXMT residency reentrant call: sequence=%" PRIu64
+            " op=%s thread=%" PRIu64 " depth=%u set=%p frames=%d\n",
+            sequence, operation, dxmt_residency_call_thread_id(), depth, set,
+            frame_count);
+    backtrace_symbols_fd(frames, frame_count, STDERR_FILENO);
+  }
+  fflush(stderr);
+  return sequence;
+}
+
+static void
+dxmt_residency_call_end(uint64_t sequence, const char *operation,
+                        id<MTLResidencySet> set, id allocation) {
+  if (!sequence)
+    return;
+  fprintf(stderr,
+          "info:  DXMT residency call: sequence=%" PRIu64
+          " phase=end op=%s thread=%" PRIu64
+          " depth=%u set=%p allocation=%p\n",
+          sequence, operation, dxmt_residency_call_thread_id(),
+          dxmt_residency_call_depth, set, allocation);
+  fflush(stderr);
+  if (dxmt_residency_call_depth)
+    --dxmt_residency_call_depth;
+}
+
+/*
+ * These helpers never acquire a lock. The owner of a shared residency set must
+ * serialize the complete add/remove/commit state machine. Keeping the backend
+ * call thin is essential: an ABI thunk must not create a second lock domain.
+ */
+static void
+dxmt_residency_set_add_allocation_direct(id<MTLResidencySet> set,
+                                         id<MTLAllocation> allocation) {
+  if (!set || !allocation)
+    return;
+  const uint64_t sequence =
+      dxmt_residency_call_begin("add", set, allocation);
+  @try {
+    [set addAllocation:allocation];
+  } @finally {
+    dxmt_residency_call_end(sequence, "add", set, allocation);
+  }
+}
+
+static void
+dxmt_residency_set_remove_allocation_direct(id<MTLResidencySet> set,
+                                            id<MTLAllocation> allocation) {
+  if (!set || !allocation)
+    return;
+  const uint64_t sequence =
+      dxmt_residency_call_begin("remove", set, allocation);
+  @try {
+    [set removeAllocation:allocation];
+  } @finally {
+    dxmt_residency_call_end(sequence, "remove", set, allocation);
+  }
+}
+
+static void
+dxmt_residency_set_commit_direct(id<MTLResidencySet> set) {
+  if (!set)
+    return;
+  const uint64_t sequence = dxmt_residency_call_begin("commit", set, nil);
+  @try {
+    [set commit];
+  } @finally {
+    dxmt_residency_call_end(sequence, "commit", set, nil);
+  }
+}
+
+static void
+dxmt_residency_set_request_direct(id<MTLResidencySet> set) {
+  if (!set)
+    return;
+  const uint64_t sequence = dxmt_residency_call_begin("request", set, nil);
+  @try {
+    [set requestResidency];
+  } @finally {
+    dxmt_residency_call_end(sequence, "request", set, nil);
+  }
+}
+
+static void
+dxmt_residency_set_end_direct(id<MTLResidencySet> set) {
+  if (!set)
+    return;
+  const uint64_t sequence = dxmt_residency_call_begin("end", set, nil);
+  [set endResidency];
+  dxmt_residency_call_end(sequence, "end", set, nil);
+}
+
+static BOOL
+dxmt_residency_set_contains_allocation_direct(id<MTLResidencySet> set,
+                                              id<MTLAllocation> allocation) {
+  if (!set || !allocation)
+    return NO;
+  const uint64_t sequence =
+      dxmt_residency_call_begin("contains", set, allocation);
+  const BOOL contains = [set containsAllocation:allocation];
+  dxmt_residency_call_end(sequence, "contains", set, allocation);
+  return contains;
+}
+
+static NSUInteger
+dxmt_residency_set_allocation_count_direct(id<MTLResidencySet> set) {
+  if (!set)
+    return 0;
+  const uint64_t sequence = dxmt_residency_call_begin("count", set, nil);
+  const NSUInteger count = set.allocationCount;
+  dxmt_residency_call_end(sequence, "count", set, nil);
+  return count;
+}
+
+static void
+dxmt_owned_residency_set_add_allocation(
+    dxmt_nslock_t owner_lock, id<MTLResidencySet> set,
+    id<MTLAllocation> allocation) DXMT_REQUIRES(owner_lock) {
+  (void)owner_lock;
+  dxmt_residency_set_add_allocation_direct(set, allocation);
+}
+
+static void
+dxmt_owned_residency_set_remove_allocation(
+    dxmt_nslock_t owner_lock, id<MTLResidencySet> set,
+    id<MTLAllocation> allocation) DXMT_REQUIRES(owner_lock) {
+  (void)owner_lock;
+  dxmt_residency_set_remove_allocation_direct(set, allocation);
+}
+
+static void
+dxmt_owned_residency_set_commit(dxmt_nslock_t owner_lock,
+                                id<MTLResidencySet> set)
+    DXMT_REQUIRES(owner_lock) {
+  (void)owner_lock;
+  dxmt_residency_set_commit_direct(set);
+}
+
+static id<MTL4ArgumentTable>
+dxmt_metal4_argument_table_from_handle(obj_handle_t handle,
+                                       const char *operation) {
+  id object = (id)(uintptr_t)handle;
+  if (!object)
+    return nil;
+  if (![object conformsToProtocol:@protocol(MTL4ArgumentTable)]) {
+    fprintf(stderr,
+            "err:   DXMT Metal4 rejected non-argument-table handle:"
+            " operation=%s handle=%p class=%s\n",
+            operation ? operation : "<unknown>", object,
+            object_getClassName(object));
+    return nil;
+  }
+  return (id<MTL4ArgumentTable>)object;
 }
 
 static void
@@ -119,7 +342,9 @@ dxmt_sparse_texture_residency_for_texture(id<MTLTexture> texture,
     return nil;
   pthread_once(&dxmt_sparse_texture_residency_once,
                dxmt_sparse_texture_residency_init);
-  [dxmt_sparse_texture_residency_lock lock];
+  dxmt_nslock_t lock = dxmt_sparse_texture_residency_lock;
+  __attribute__((cleanup(dxmt_nslock_scope_cleanup)))
+  struct dxmt_nslock_scope scope = dxmt_nslock_scope_acquire(lock);
   DXMTSparseTextureResidency *residency =
       [dxmt_sparse_texture_residency objectForKey:texture];
   if (!residency && create) {
@@ -128,7 +353,7 @@ dxmt_sparse_texture_residency_for_texture(id<MTLTexture> texture,
     [residency release];
   }
   [residency retain];
-  [dxmt_sparse_texture_residency_lock unlock];
+  dxmt_nslock_scope_release(&scope, lock);
   return [residency autorelease];
 }
 
@@ -153,7 +378,9 @@ dxmt_sparse_texture_residency_for_texture(id<MTLTexture> texture,
 - (void)applyOperations:(const struct WMTSparseTextureMappingOperation *)operations
                   count:(uint64_t)count
                    heap:(id<MTLHeap>)heap {
-  [_lock lock];
+  dxmt_nslock_t lock = _lock;
+  __attribute__((cleanup(dxmt_nslock_scope_cleanup)))
+  struct dxmt_nslock_scope scope = dxmt_nslock_scope_acquire(lock);
   for (uint64_t i = 0; i < count; ++i) {
     const struct WMTSparseTextureMappingOperation *operation = &operations[i];
     for (uint32_t z = 0; z < operation->depth; ++z) {
@@ -184,20 +411,25 @@ dxmt_sparse_texture_residency_for_texture(id<MTLTexture> texture,
       }
     }
   }
-  [_lock unlock];
+  dxmt_nslock_scope_release(&scope, lock);
 }
 
 - (void)addMappedHeapsToResidencySet:(id<MTLResidencySet>)residencySet {
-  [_lock lock];
+  dxmt_nslock_t lock = _lock;
+  __attribute__((cleanup(dxmt_nslock_scope_cleanup)))
+  struct dxmt_nslock_scope scope = dxmt_nslock_scope_acquire(lock);
   for (id<MTLHeap> heap in _mappedHeaps)
-    [residencySet addAllocation:(id<MTLAllocation>)heap];
-  [_lock unlock];
+    dxmt_residency_set_add_allocation_direct(
+        residencySet, (id<MTLAllocation>)heap);
+  dxmt_nslock_scope_release(&scope, lock);
 }
 
 - (NSArray *)mappedHeapsSnapshot {
-  [_lock lock];
+  dxmt_nslock_t lock = _lock;
+  __attribute__((cleanup(dxmt_nslock_scope_cleanup)))
+  struct dxmt_nslock_scope scope = dxmt_nslock_scope_acquire(lock);
   NSArray *snapshot = [[_mappedHeaps allObjects] retain];
-  [_lock unlock];
+  dxmt_nslock_scope_release(&scope, lock);
   return [snapshot autorelease];
 }
 @end
@@ -227,16 +459,22 @@ dxmt_env_enabled_default(const char *name, bool default_value) {
 // Heap placement storage-mode diagnostics. Cheap on the happy path (a few
 // integer comparisons per placed allocation). Mismatch logs are rate-limited;
 // verbose success samples require DXMT_DIAG_HEAP_STORAGE=1.
+static pthread_once_t dxmt_metal4_heap_storage_diag_verbose_once =
+    PTHREAD_ONCE_INIT;
+static bool dxmt_metal4_heap_storage_diag_verbose_is_enabled = false;
+
+static void
+dxmt_metal4_heap_storage_diag_verbose_initialize(void) {
+  dxmt_metal4_heap_storage_diag_verbose_is_enabled =
+      dxmt_truthy_env_value(getenv("DXMT_DIAG_HEAP_STORAGE")) ||
+      dxmt_truthy_env_value(getenv("DXMT_DIAG_ROOT_CAUSE_DENSE"));
+}
+
 static bool
 dxmt_metal4_heap_storage_diag_verbose(void) {
-  static bool initialized = false;
-  static bool enabled = false;
-  if (!initialized) {
-    enabled = dxmt_truthy_env_value(getenv("DXMT_DIAG_HEAP_STORAGE")) ||
-              dxmt_truthy_env_value(getenv("DXMT_DIAG_ROOT_CAUSE_DENSE"));
-    initialized = true;
-  }
-  return enabled;
+  pthread_once(&dxmt_metal4_heap_storage_diag_verbose_once,
+               dxmt_metal4_heap_storage_diag_verbose_initialize);
+  return dxmt_metal4_heap_storage_diag_verbose_is_enabled;
 }
 
 static MTLStorageMode
@@ -337,82 +575,117 @@ dxmt_parse_u64_env(const char *name, uint64_t default_value) {
   return parsed;
 }
 
+static pthread_once_t dxmt_metal4_commit_feedback_once = PTHREAD_ONCE_INIT;
+static bool dxmt_metal4_commit_feedback_is_enabled = false;
+static bool dxmt_metal4_commit_feedback_is_sampled = false;
+static uint64_t dxmt_metal4_commit_feedback_sample_rate = 64;
+
+static void
+dxmt_metal4_commit_feedback_initialize(void) {
+  const char *value = getenv("DXMT_METAL4_COMMIT_FEEDBACK");
+  dxmt_metal4_commit_feedback_is_enabled = dxmt_truthy_env_value(value);
+  dxmt_metal4_commit_feedback_is_sampled = value && !strcmp(value, "sampled");
+  dxmt_metal4_commit_feedback_sample_rate =
+      dxmt_parse_u64_env("DXMT_METAL4_COMMIT_FEEDBACK_SAMPLE_RATE", 64);
+  if (!dxmt_metal4_commit_feedback_sample_rate)
+    dxmt_metal4_commit_feedback_sample_rate = 64;
+}
+
 static bool
 dxmt_metal4_commit_feedback_enabled(uint64_t completion_value) {
-  static bool initialized = false;
-  static bool enabled = false;
-  static bool sampled = false;
-  static uint64_t sample_rate = 64;
-  if (!initialized) {
-    const char *value = getenv("DXMT_METAL4_COMMIT_FEEDBACK");
-    enabled = dxmt_truthy_env_value(value);
-    sampled = value && !strcmp(value, "sampled");
-    sample_rate = dxmt_parse_u64_env("DXMT_METAL4_COMMIT_FEEDBACK_SAMPLE_RATE", 64);
-    if (!sample_rate)
-      sample_rate = 64;
-    initialized = true;
-  }
-  if (enabled)
+  pthread_once(&dxmt_metal4_commit_feedback_once,
+               dxmt_metal4_commit_feedback_initialize);
+  if (dxmt_metal4_commit_feedback_is_enabled)
     return true;
-  if (sampled)
-    return completion_value == 0 || (completion_value % sample_rate) == 0;
+  if (dxmt_metal4_commit_feedback_is_sampled)
+    return completion_value == 0 ||
+           (completion_value % dxmt_metal4_commit_feedback_sample_rate) == 0;
   return false;
+}
+
+static pthread_once_t dxmt_metal4_present_ordering_once = PTHREAD_ONCE_INIT;
+static bool dxmt_metal4_present_ordering_is_enabled = true;
+
+static void
+dxmt_metal4_present_ordering_initialize(void) {
+  dxmt_metal4_present_ordering_is_enabled =
+      dxmt_env_enabled_default("DXMT_METAL4_PRESENT_ORDERING", true);
 }
 
 static bool
 dxmt_metal4_present_ordering_enabled(void) {
-  static bool initialized = false;
-  static bool enabled = true;
-  if (!initialized) {
-    enabled = dxmt_env_enabled_default("DXMT_METAL4_PRESENT_ORDERING", true);
-    initialized = true;
-  }
-  return enabled;
+  pthread_once(&dxmt_metal4_present_ordering_once,
+               dxmt_metal4_present_ordering_initialize);
+  return dxmt_metal4_present_ordering_is_enabled;
+}
+
+static pthread_once_t dxmt_metal4_wait_for_drawable_once = PTHREAD_ONCE_INIT;
+static bool dxmt_metal4_wait_for_drawable_is_enabled = true;
+
+static void
+dxmt_metal4_wait_for_drawable_initialize(void) {
+  dxmt_metal4_wait_for_drawable_is_enabled =
+      dxmt_env_enabled_default("DXMT_METAL4_WAIT_FOR_DRAWABLE", true);
 }
 
 static bool
 dxmt_metal4_wait_for_drawable_enabled(void) {
-  static bool initialized = false;
-  static bool enabled = true;
-  if (!initialized) {
-    enabled = dxmt_env_enabled_default("DXMT_METAL4_WAIT_FOR_DRAWABLE", true);
-    initialized = true;
-  }
-  return enabled;
+  pthread_once(&dxmt_metal4_wait_for_drawable_once,
+               dxmt_metal4_wait_for_drawable_initialize);
+  return dxmt_metal4_wait_for_drawable_is_enabled;
+}
+
+static pthread_once_t dxmt_metal4_perf_stats_once = PTHREAD_ONCE_INIT;
+static bool dxmt_metal4_perf_stats_is_enabled = false;
+
+static void
+dxmt_metal4_perf_stats_initialize(void) {
+  dxmt_metal4_perf_stats_is_enabled =
+      dxmt_truthy_env_value(getenv("DXMT_PERF_STATS"));
 }
 
 static bool
 dxmt_metal4_perf_stats_enabled(void) {
-  static bool initialized = false;
-  static bool enabled = false;
-  if (!initialized) {
-    enabled = dxmt_truthy_env_value(getenv("DXMT_PERF_STATS"));
-    initialized = true;
-  }
-  return enabled;
+  pthread_once(&dxmt_metal4_perf_stats_once,
+               dxmt_metal4_perf_stats_initialize);
+  return dxmt_metal4_perf_stats_is_enabled;
+}
+
+static pthread_once_t dxmt_metal4_pso_labels_once = PTHREAD_ONCE_INIT;
+static bool dxmt_metal4_pso_labels_is_enabled = false;
+
+static void
+dxmt_metal4_pso_labels_initialize(void) {
+  dxmt_metal4_pso_labels_is_enabled =
+      dxmt_truthy_env_value(getenv("DXMT_DIAG_METAL_PSO_LABELS")) ||
+      dxmt_truthy_env_value(getenv("DXMT_DIAG_ROOT_CAUSE_DENSE")) ||
+      dxmt_truthy_env_value(getenv("DXMT_VALIDATION")) ||
+      dxmt_truthy_env_value(getenv("DXMT_DIAG_VALIDATION"));
 }
 
 static bool
 dxmt_metal4_pso_labels_enabled(void) {
-  static bool initialized = false;
-  static bool enabled = false;
-  if (!initialized) {
-    enabled = dxmt_truthy_env_value(getenv("DXMT_DIAG_METAL_PSO_LABELS")) ||
-              dxmt_truthy_env_value(getenv("DXMT_DIAG_ROOT_CAUSE_DENSE"));
-    initialized = true;
-  }
-  return enabled;
+  pthread_once(&dxmt_metal4_pso_labels_once,
+               dxmt_metal4_pso_labels_initialize);
+  return dxmt_metal4_pso_labels_is_enabled;
+}
+
+static pthread_once_t dxmt_metal4_residency_diag_once = PTHREAD_ONCE_INIT;
+static bool dxmt_metal4_residency_diag_is_enabled = false;
+
+static void
+dxmt_metal4_residency_diag_initialize(void) {
+  dxmt_metal4_residency_diag_is_enabled =
+      dxmt_truthy_env_value(getenv("DXMT_DIAG_METAL_RESIDENCY")) ||
+      dxmt_truthy_env_value(getenv("DXMT_VALIDATION")) ||
+      dxmt_truthy_env_value(getenv("DXMT_DIAG_VALIDATION"));
 }
 
 static bool
 dxmt_metal4_residency_diag_enabled(void) {
-  static bool initialized = false;
-  static bool enabled = false;
-  if (!initialized) {
-    enabled = dxmt_truthy_env_value(getenv("DXMT_DIAG_METAL_RESIDENCY"));
-    initialized = true;
-  }
-  return enabled;
+  pthread_once(&dxmt_metal4_residency_diag_once,
+               dxmt_metal4_residency_diag_initialize);
+  return dxmt_metal4_residency_diag_is_enabled;
 }
 
 static id<MTLAllocation>
@@ -428,17 +701,53 @@ dxmt_metal4_backing_allocation(id<MTLAllocation> allocation) {
   return (id<MTLAllocation>)texture;
 }
 
+static pthread_once_t dxmt_metal4_dense_hang_diagnostics_once =
+    PTHREAD_ONCE_INIT;
+static bool dxmt_metal4_dense_hang_diagnostics_is_enabled = false;
+
+static void
+dxmt_metal4_dense_hang_diagnostics_initialize(void) {
+  dxmt_metal4_dense_hang_diagnostics_is_enabled =
+      dxmt_truthy_env_value(getenv("DXMT_DIAG_GPU_HANG_DENSE")) ||
+      dxmt_truthy_env_value(getenv("DXMT_DIAG_ROOT_CAUSE_DENSE")) ||
+      dxmt_truthy_env_value(getenv("DXMT_VALIDATION")) ||
+      dxmt_truthy_env_value(getenv("DXMT_DIAG_VALIDATION"));
+}
+
 static bool
 dxmt_metal4_dense_hang_diagnostics_enabled(void) {
-  static bool initialized = false;
-  static bool enabled = false;
-  if (!initialized) {
-    enabled = dxmt_truthy_env_value(getenv("DXMT_DIAG_GPU_HANG_DENSE")) ||
-              dxmt_truthy_env_value(getenv("DXMT_DIAG_ROOT_CAUSE_DENSE"));
-    initialized = true;
-  }
-  return enabled;
+  pthread_once(&dxmt_metal4_dense_hang_diagnostics_once,
+               dxmt_metal4_dense_hang_diagnostics_initialize);
+  return dxmt_metal4_dense_hang_diagnostics_is_enabled;
 }
+
+static pthread_once_t dxmt_metal4_error_snapshot_once = PTHREAD_ONCE_INIT;
+static bool dxmt_metal4_error_snapshot_is_enabled = false;
+
+static void
+dxmt_metal4_error_snapshot_initialize(void) {
+  dxmt_metal4_error_snapshot_is_enabled =
+      dxmt_truthy_env_value(getenv("DXMT_DIAG_ERROR_SNAPSHOT"));
+}
+
+static bool
+dxmt_metal4_error_snapshot_enabled(void) {
+  pthread_once(&dxmt_metal4_error_snapshot_once,
+               dxmt_metal4_error_snapshot_initialize);
+  return dxmt_metal4_error_snapshot_is_enabled;
+}
+
+/* Decode CommandBufferFenceEdgeFlag bits mirrored from dxmt_context.hpp. */
+enum {
+  DXMT_FENCE_EDGE_PRERASTER = 1u << 0,
+  DXMT_FENCE_EDGE_FRAGMENT = 1u << 1,
+  DXMT_FENCE_EDGE_COMPUTE = 1u << 2,
+  DXMT_FENCE_EDGE_BLIT = 1u << 3,
+  DXMT_FENCE_EDGE_OTHER = 1u << 4,
+  DXMT_FENCE_EDGE_PENDING = 1u << 5,
+  DXMT_FENCE_EDGE_PRODUCER_PRERASTER = 1u << 6,
+  DXMT_FENCE_EDGE_PRODUCER_FRAGMENT = 1u << 7,
+};
 
 /*
  * Hang / commit diagnostics.  PE-side WARN often never sees native fprintf
@@ -451,6 +760,253 @@ enum {
   DXMT_METAL4_HANG_LOG_BOTH =
       DXMT_METAL4_HANG_LOG_STDERR | DXMT_METAL4_HANG_LOG_FILE,
 };
+
+static void dxmt_metal4_hang_log(unsigned sinks, const char *fmt, ...);
+
+static const char *
+dxmt_encoder_type_name(uint32_t type) {
+  switch (type) {
+  case 0:
+    return "Null";
+  case 1:
+    return "Render";
+  case 2:
+    return "Compute";
+  case 3:
+    return "Blit";
+  case 4:
+    return "Clear";
+  case 5:
+    return "Resolve";
+  case 6:
+    return "Present";
+  case 7:
+    return "SpatialUpscale";
+  case 8:
+    return "SignalEvent";
+  case 9:
+    return "TemporalUpscale";
+  case 10:
+    return "WaitForEvent";
+  case 11:
+    return "SampleTimestamp";
+  case 12:
+    return "ResolveTimestamp";
+  default:
+    return "Other";
+  }
+}
+
+static void
+dxmt_metal4_emit_hang_validation_report(
+    const struct WMTCommandBufferDiagnosticInfo *diag, NSError *error,
+    uint64_t wait_count, uint64_t inflight_at_commit, double gpu_start,
+    double gpu_end) {
+  if (!diag)
+    return;
+
+  const double gpu_ms =
+      (gpu_end > gpu_start) ? (gpu_end - gpu_start) * 1000.0 : 0.0;
+  const char *metal_debug =
+      dxmt_truthy_env_value(getenv("MTL_DEBUG_LAYER")) ? "on" : "off";
+  const char *metal_shader_val =
+      dxmt_truthy_env_value(getenv("MTL_SHADER_VALIDATION")) ? "on" : "off";
+  const char *log_path = getenv("DXMT_LOG_PATH");
+  if (!log_path || !log_path[0])
+    log_path = "<unset>";
+
+  dxmt_metal4_hang_log(
+      DXMT_METAL4_HANG_LOG_BOTH,
+      "err:   ========== DXMT GPU HANG VALIDATION REPORT ==========\n");
+  dxmt_metal4_hang_log(
+      DXMT_METAL4_HANG_LOG_BOTH,
+      "err:   frame=%" PRIu64 " chunk=%" PRIu64 " d3dSeq=%" PRIu64 "-%" PRIu64
+      " gpuMs=%.3f domain=%s code=%ld\n",
+      diag->frame_id, diag->chunk_id, diag->d3d_sequence_begin,
+      diag->d3d_sequence_end, gpu_ms,
+      error && error.domain ? error.domain.UTF8String : "<none>",
+      error ? (long)error.code : 0L);
+  dxmt_metal4_hang_log(
+      DXMT_METAL4_HANG_LOG_BOTH,
+      "err:   description=%s\n",
+      error && error.localizedDescription
+          ? error.localizedDescription.UTF8String
+          : "<none>");
+
+  dxmt_metal4_hang_log(
+      DXMT_METAL4_HANG_LOG_BOTH,
+      "err:   encoders input=%u encoded=%u (R=%u C=%u B=%u clear=%u resolve=%u "
+      "present=%u other=%u)\n",
+      diag->input_encoder_count, diag->encoded_encoder_count,
+      diag->render_encoder_count, diag->compute_encoder_count,
+      diag->blit_encoder_count, diag->clear_encoder_count,
+      diag->resolve_encoder_count, diag->present_encoder_count,
+      diag->encoded_encoder_count > (diag->render_encoder_count +
+                                     diag->compute_encoder_count +
+                                     diag->blit_encoder_count +
+                                     diag->clear_encoder_count +
+                                     diag->resolve_encoder_count +
+                                     diag->present_encoder_count)
+          ? diag->encoded_encoder_count -
+                (diag->render_encoder_count + diag->compute_encoder_count +
+                 diag->blit_encoder_count + diag->clear_encoder_count +
+                 diag->resolve_encoder_count + diag->present_encoder_count)
+          : 0);
+
+  dxmt_metal4_hang_log(
+      DXMT_METAL4_HANG_LOG_BOTH,
+      "err:   fence localIds=%u boundSlots=%u waits=%u updates=%u "
+      "priorLocal=%u futureLocal=%u sameEnc=%u external=%u reverseStage=%u "
+      "validCross=%u sameStage=%u edgeOverflow=%u encDiagOverflow=%u "
+      "timelineWaitEvents=%llu inflightAtCommit=%llu\n",
+      diag->local_fence_id_count, diag->bound_fence_slot_count,
+      diag->fence_wait_count, diag->fence_update_count,
+      diag->prior_local_fence_wait_count, diag->future_local_fence_wait_count,
+      diag->same_encoder_fence_wait_count, diag->external_fence_wait_count,
+      diag->render_reverse_stage_wait_count,
+      diag->render_valid_cross_stage_count, diag->render_same_stage_wait_count,
+      diag->fence_edge_overflow_count, diag->encoder_diagnostic_overflow_count,
+      (unsigned long long)wait_count, (unsigned long long)inflight_at_commit);
+
+  /* Ranked suspects — order is intentional for triage. */
+  unsigned suspect = 0;
+  if (diag->render_reverse_stage_wait_count) {
+    dxmt_metal4_hang_log(
+        DXMT_METAL4_HANG_LOG_BOTH,
+        "err:   suspect[%u]: reverse-stage fences (Fragment producer → "
+        "PreRaster consumer) count=%u — check waitForFence/updateFence "
+        "stages and same-pass memoryBarrier direction\n",
+        suspect++, diag->render_reverse_stage_wait_count);
+  }
+  if (diag->external_fence_wait_count) {
+    dxmt_metal4_hang_log(
+        DXMT_METAL4_HANG_LOG_BOTH,
+        "err:   suspect[%u]: residual external EncoderId waits count=%u "
+        "(cross-CB deptrack) — rely on timeline wait or tracker epoch reset\n",
+        suspect++, diag->external_fence_wait_count);
+  }
+  if (diag->same_encoder_fence_wait_count) {
+    dxmt_metal4_hang_log(
+        DXMT_METAL4_HANG_LOG_BOTH,
+        "err:   suspect[%u]: same-encoder self-waits count=%u — potential "
+        "MTLFence deadlock (wait before own update)\n",
+        suspect++, diag->same_encoder_fence_wait_count);
+  }
+  if (wait_count == 0 && inflight_at_commit > 1) {
+    dxmt_metal4_hang_log(
+        DXMT_METAL4_HANG_LOG_BOTH,
+        "err:   suspect[%u]: no timeline wait event on this CB while "
+        "inflightAtCommit=%llu — concurrent CB hazard / skip-if-complete race\n",
+        suspect++, (unsigned long long)inflight_at_commit);
+  }
+  if (diag->fence_edge_overflow_count ||
+      diag->encoder_diagnostic_overflow_count) {
+    dxmt_metal4_hang_log(
+        DXMT_METAL4_HANG_LOG_BOTH,
+        "err:   suspect[%u]: diagnostic overflow edges=%u encoders=%u — hang "
+        "graph is incomplete in this report\n",
+        suspect++, diag->fence_edge_overflow_count,
+        diag->encoder_diagnostic_overflow_count);
+  }
+  if (diag->sparse_mapping_failure_count || diag->sparse_access_count) {
+    dxmt_metal4_hang_log(
+        DXMT_METAL4_HANG_LOG_BOTH,
+        "err:   suspect[%u]: sparse activity failures=%u access=%u "
+        "resource=%" PRIu64 "\n",
+        suspect++, diag->sparse_mapping_failure_count, diag->sparse_access_count,
+        diag->sparse_resource_identity);
+  }
+  if (diag->local_fence_id_count != diag->bound_fence_slot_count) {
+    dxmt_metal4_hang_log(
+        DXMT_METAL4_HANG_LOG_BOTH,
+        "err:   suspect[%u]: localFenceIds(%u) != boundFenceSlots(%u) — under- "
+        "or over-bound free-list\n",
+        suspect++, diag->local_fence_id_count, diag->bound_fence_slot_count);
+  }
+  if (!suspect) {
+    dxmt_metal4_hang_log(
+        DXMT_METAL4_HANG_LOG_BOTH,
+        "err:   suspect[0]: no high-confidence fence/sync signature — lean "
+        "toward shader OOB/infinite loop, placement-heap alias, or bindless "
+        "payload; enable MTL_SHADER_VALIDATION + dump pipelines\n");
+  }
+
+  /* Exact Fragment producer -> PreRaster consumer edge list. */
+  unsigned reverse_listed = 0;
+  for (uint32_t i = 0; i < diag->fence_edge_count &&
+                       i < WMT_COMMAND_BUFFER_FENCE_EDGE_CAPACITY;
+       i++) {
+    const struct WMTCommandBufferFenceEdgeDiagnostic *edge =
+        &diag->fence_edges[i];
+    if (!(edge->flags & DXMT_FENCE_EDGE_PRERASTER) ||
+        !(edge->flags & DXMT_FENCE_EDGE_PRODUCER_FRAGMENT))
+      continue;
+    dxmt_metal4_hang_log(
+        DXMT_METAL4_HANG_LOG_BOTH,
+        "err:   reverseEdge[%u]: producer=%" PRIu64 " consumer=%" PRIu64
+        " pIdx=%u cIdx=%u slot=%u flags=0x%x"
+        " resource=0x%" PRIx64 " identity=%" PRIu64
+        " allocation=0x%" PRIx64 " metal=0x%" PRIx64
+        " gpuAddressOrId=0x%" PRIx64
+        " matches=%u matchHash=0x%" PRIx64
+        " producerRange=%" PRIu64 "+%" PRIu64 " view=%" PRIu64
+        " access=0x%x stageKind=0x%x"
+        " consumerRange=%" PRIu64 "+%" PRIu64 " view=%" PRIu64
+        " access=0x%x stageKind=0x%x\n",
+        reverse_listed++, edge->producer_id, edge->consumer_id,
+        edge->producer_index, edge->consumer_index, edge->slot, edge->flags,
+        edge->resource_object, edge->resource_identity,
+        edge->allocation_object, edge->metal_resource_handle,
+        edge->gpu_address_or_resource_id, edge->resource_match_count,
+        edge->resource_match_hash, edge->producer_offset,
+        edge->producer_length, edge->producer_view_id,
+        edge->producer_access, edge->producer_stage_kind,
+        edge->consumer_offset, edge->consumer_length,
+        edge->consumer_view_id, edge->consumer_access,
+        edge->consumer_stage_kind);
+  }
+
+  /* Error-only full encoder list for breadcrumb-like localization. */
+  uint32_t enc_count = diag->encoder_diagnostic_count;
+  if (enc_count > WMT_COMMAND_BUFFER_ENCODER_DIAGNOSTIC_CAPACITY)
+    enc_count = WMT_COMMAND_BUFFER_ENCODER_DIAGNOSTIC_CAPACITY;
+  for (uint32_t i = 0; i < enc_count; i++) {
+    const struct WMTCommandBufferEncoderDiagnostic *enc = &diag->encoders[i];
+    dxmt_metal4_hang_log(
+        DXMT_METAL4_HANG_LOG_BOTH,
+        "err:   encoder[%u]: idx=%u type=%s(%u) id=%" PRIu64
+        " vid=%" PRIu64 " waits=%u updates=%u pso=0x%" PRIx64
+        " argbuf=0x%" PRIx64 "+%" PRIu64 "/%" PRIu64
+        " primary=0x%" PRIx64 " secondary=0x%" PRIx64
+        " plan=%u/0x%" PRIx64 " waitHash=0x%" PRIx64
+        " updateHash=0x%" PRIx64 " d3dSeq=%" PRIu64 "-%" PRIu64
+        " flags=0x%x\n",
+        i, enc->encoder_index, dxmt_encoder_type_name(enc->type), enc->type,
+        enc->encoder_id, enc->vertex_encoder_id, enc->wait_count,
+        enc->update_count, enc->pipeline_handle,
+        enc->argument_buffer_handle, enc->argument_buffer_offset,
+        enc->argument_buffer_size, enc->primary_resource,
+        enc->secondary_resource, enc->resource_plan_count,
+        enc->resource_plan_hash, enc->wait_hash, enc->update_hash,
+        enc->d3d_sequence_begin, enc->d3d_sequence_end, enc->flags);
+  }
+
+  dxmt_metal4_hang_log(
+      DXMT_METAL4_HANG_LOG_BOTH,
+      "err:   env: MTL_DEBUG_LAYER=%s MTL_SHADER_VALIDATION=%s "
+      "DXMT_LOG_PATH=%s\n",
+      metal_debug, metal_shader_val, log_path);
+  dxmt_metal4_hang_log(
+      DXMT_METAL4_HANG_LOG_BOTH,
+      "err:   next: keep Metal validation disabled; re-run with "
+      "DXMT_DIAG_GPU_HANG_DENSE=1 DXMT_DIAG_ERROR_SNAPSHOT=1 "
+      "DXMT_LOG_PATH=<dir>; read "
+      "$DXMT_LOG_PATH/dxmt-metal4-native.log and dxmt-iogpu-native.log "
+      "(fault address / IOGPU error code)\n");
+  dxmt_metal4_hang_log(
+      DXMT_METAL4_HANG_LOG_BOTH,
+      "err:   ========================================================\n");
+}
 
 static FILE *dxmt_metal4_hang_log_file_handle = NULL;
 
@@ -500,17 +1056,21 @@ dxmt_metal4_hang_log(unsigned sinks, const char *fmt, ...) {
   }
 }
 
+static pthread_once_t dxmt_metal4_queue_monitor_once = PTHREAD_ONCE_INIT;
+static bool dxmt_metal4_queue_monitor_is_enabled = false;
+
+static void
+dxmt_metal4_queue_monitor_initialize(void) {
+  dxmt_metal4_queue_monitor_is_enabled =
+      dxmt_truthy_env_value(getenv("DXMT_DIAG_METAL4_QUEUE_MONITOR")) ||
+      dxmt_metal4_dense_hang_diagnostics_enabled();
+}
+
 static bool
 dxmt_metal4_queue_monitor_enabled(void) {
-  static bool initialized = false;
-  static bool enabled = false;
-  if (!initialized) {
-    enabled = dxmt_truthy_env_value(
-                  getenv("DXMT_DIAG_METAL4_QUEUE_MONITOR")) ||
-              dxmt_metal4_dense_hang_diagnostics_enabled();
-    initialized = true;
-  }
-  return enabled;
+  pthread_once(&dxmt_metal4_queue_monitor_once,
+               dxmt_metal4_queue_monitor_initialize);
+  return dxmt_metal4_queue_monitor_is_enabled;
 }
 
 static bool
@@ -1040,6 +1600,7 @@ dxmt_metal4_current_thread_id(void) {
 
 typedef NS_ENUM(uint64_t, DXMTMetal4CommandBufferState) {
   DXMTMetal4CommandBufferStateNotEnqueued = 0,
+  DXMTMetal4CommandBufferStateEnqueued = 1,
   DXMTMetal4CommandBufferStateCommitted = 2,
   DXMTMetal4CommandBufferStateCompleted = 4,
   DXMTMetal4CommandBufferStateError = 5,
@@ -1111,15 +1672,25 @@ struct DXMTMetal4PresentDiagnostic {
 @property(nonatomic, retain) NSMutableArray *pendingWaitEvents;
 @property(nonatomic, retain) NSMutableArray *pendingSignalEvents;
 @property(nonatomic, retain) NSMutableArray *retainedTemporaryResources;
-// Lifetime snapshot handed off by the Metal completion callback and drained by
-// the waiter (dxmt-finish-thr). Never released on com.Metal4.CompletionQueue:
-// that GCD thread has no Wine TEB, and ObjC free of GPU resources there has
-// caused EXC_BAD_ACCESS + ntdll save_context faults.
+// Lifetime snapshot published before Metal submission and drained by the waiter
+// (dxmt-finish-thr) after the queue timeline passes. Never release it on
+// com.Metal4.CompletionQueue: that GCD thread has no Wine TEB, and ObjC free of
+// GPU resources there has caused EXC_BAD_ACCESS + ntdll save_context faults.
 @property(nonatomic, retain) NSArray *pendingLifetimeSnapshot;
 @property(nonatomic, retain) NSMutableArray *queueResidencyAllocations;
 @property(nonatomic, retain) NSMutableSet *queueResidencyAllocationSet;
 @property(nonatomic, retain) NSCondition *feedbackCondition;
 @property(nonatomic, assign) BOOL feedbackComplete;
+// Diagnostics distinguish a normal feedback latch from timeline-authoritative
+// completion when Metal omits or delays a commit feedback callback.
+@property(nonatomic, assign) BOOL feedbackHandlerEntered;
+@property(nonatomic, assign) BOOL feedbackHandlerFinished;
+@property(nonatomic, assign) BOOL completionRecoveredFromTimeline;
+@property(nonatomic, assign) uint64_t feedbackHandlerEnterUs;
+@property(nonatomic, assign) uint64_t feedbackHandlerLatchUs;
+@property(nonatomic, assign) uint64_t commitSubmitUs;
+@property(nonatomic, assign) BOOL commitUsedOptions;
+@property(nonatomic, assign) BOOL completionTimelineSignaledAtSubmit;
 @property(nonatomic, retain) id<MTLDrawable> pendingDrawable;
 @property(nonatomic, assign) BOOL hasPresentDuration;
 @property(nonatomic, assign) double presentDuration;
@@ -1207,6 +1778,393 @@ dxmt_metal4_shared_event_value(id<MTLEvent> event) {
   if (!event || ![event respondsToSelector:@selector(signaledValue)])
     return 0;
   return [(id<MTLSharedEvent>)event signaledValue];
+}
+
+/* Global counters for one-shot hang classification (no recovery side effects). */
+static _Atomic uint64_t dxmt_metal4_commit_submit_total = 0;
+static _Atomic uint64_t dxmt_metal4_feedback_enter_total = 0;
+static _Atomic uint64_t dxmt_metal4_feedback_latch_total = 0;
+static _Atomic uint64_t dxmt_metal4_feedback_stall_report_total = 0;
+static _Atomic uint64_t dxmt_metal4_timeline_recovery_total = 0;
+
+/*
+ * Feedback handlers run on Metal's serial CompletionQueue. Keep breadcrumbs
+ * lock-free and allocation-free so the diagnostic cannot itself block that
+ * queue. The waiter dumps the ring only after timeline-authoritative recovery.
+ */
+enum DXMTMetal4FeedbackCallbackStage {
+  DXMTMetal4FeedbackCallbackStageNone = 0,
+  DXMTMetal4FeedbackCallbackStageEntered,
+  DXMTMetal4FeedbackCallbackStageLatchPublished,
+  DXMTMetal4FeedbackCallbackStagePostLatchDiagnosticsBegin,
+  DXMTMetal4FeedbackCallbackStagePostLatchDiagnosticsEnd,
+  DXMTMetal4FeedbackCallbackStageReleaseLabelBegin,
+  DXMTMetal4FeedbackCallbackStageReleaseLabelEnd,
+  DXMTMetal4FeedbackCallbackStageReleaseSignalsBegin,
+  DXMTMetal4FeedbackCallbackStageReleaseSignalsEnd,
+  DXMTMetal4FeedbackCallbackStageReleaseWaitsBegin,
+  DXMTMetal4FeedbackCallbackStageReleaseWaitsEnd,
+  DXMTMetal4FeedbackCallbackStageReleaseEventBegin,
+  DXMTMetal4FeedbackCallbackStageReleaseEventEnd,
+  DXMTMetal4FeedbackCallbackStageReleaseOwnerBegin,
+  DXMTMetal4FeedbackCallbackStageReleaseOwnerEnd,
+  DXMTMetal4FeedbackCallbackStageReturn,
+};
+
+#define DXMT_METAL4_FEEDBACK_BREADCRUMB_CAPACITY 64u
+
+struct DXMTMetal4FeedbackCallbackBreadcrumb {
+  _Atomic uint64_t serial;
+  _Atomic uint32_t stage;
+  _Atomic uint64_t stage_us;
+  _Atomic uint64_t thread_id;
+  _Atomic uintptr_t command_buffer;
+  _Atomic uintptr_t metal_buffer;
+  _Atomic uintptr_t queue;
+  _Atomic uint64_t completion_value;
+  _Atomic uint64_t frame_id;
+  _Atomic uint64_t chunk_id;
+};
+
+static struct DXMTMetal4FeedbackCallbackBreadcrumb
+    dxmt_metal4_feedback_breadcrumbs
+        [DXMT_METAL4_FEEDBACK_BREADCRUMB_CAPACITY];
+
+static uint64_t
+dxmt_metal4_feedback_callback_thread_id(void) {
+  uint64_t thread_id = 0;
+  pthread_threadid_np(NULL, &thread_id);
+  return thread_id;
+}
+
+static const char *
+dxmt_metal4_feedback_callback_stage_name(uint32_t stage) {
+  switch (stage) {
+  case DXMTMetal4FeedbackCallbackStageEntered:
+    return "entered";
+  case DXMTMetal4FeedbackCallbackStageLatchPublished:
+    return "latch-published";
+  case DXMTMetal4FeedbackCallbackStagePostLatchDiagnosticsBegin:
+    return "post-latch-diagnostics-begin";
+  case DXMTMetal4FeedbackCallbackStagePostLatchDiagnosticsEnd:
+    return "post-latch-diagnostics-end";
+  case DXMTMetal4FeedbackCallbackStageReleaseLabelBegin:
+    return "release-label-begin";
+  case DXMTMetal4FeedbackCallbackStageReleaseLabelEnd:
+    return "release-label-end";
+  case DXMTMetal4FeedbackCallbackStageReleaseSignalsBegin:
+    return "release-signals-begin";
+  case DXMTMetal4FeedbackCallbackStageReleaseSignalsEnd:
+    return "release-signals-end";
+  case DXMTMetal4FeedbackCallbackStageReleaseWaitsBegin:
+    return "release-waits-begin";
+  case DXMTMetal4FeedbackCallbackStageReleaseWaitsEnd:
+    return "release-waits-end";
+  case DXMTMetal4FeedbackCallbackStageReleaseEventBegin:
+    return "release-event-begin";
+  case DXMTMetal4FeedbackCallbackStageReleaseEventEnd:
+    return "release-event-end";
+  case DXMTMetal4FeedbackCallbackStageReleaseOwnerBegin:
+    return "release-owner-begin";
+  case DXMTMetal4FeedbackCallbackStageReleaseOwnerEnd:
+    return "release-owner-end";
+  case DXMTMetal4FeedbackCallbackStageReturn:
+    return "return";
+  default:
+    return "none";
+  }
+}
+
+static void
+dxmt_metal4_feedback_callback_begin(
+    uint64_t serial, uintptr_t command_buffer, uintptr_t metal_buffer,
+    uintptr_t queue, uint64_t completion_value,
+    const struct WMTCommandBufferDiagnosticInfo *diagnostic) {
+  struct DXMTMetal4FeedbackCallbackBreadcrumb *breadcrumb =
+      &dxmt_metal4_feedback_breadcrumbs
+          [serial % DXMT_METAL4_FEEDBACK_BREADCRUMB_CAPACITY];
+  atomic_store_explicit(&breadcrumb->serial, 0, memory_order_release);
+  atomic_store_explicit(&breadcrumb->command_buffer, command_buffer,
+                        memory_order_relaxed);
+  atomic_store_explicit(&breadcrumb->metal_buffer, metal_buffer,
+                        memory_order_relaxed);
+  atomic_store_explicit(&breadcrumb->queue, queue, memory_order_relaxed);
+  atomic_store_explicit(&breadcrumb->completion_value, completion_value,
+                        memory_order_relaxed);
+  atomic_store_explicit(&breadcrumb->frame_id,
+                        diagnostic ? diagnostic->frame_id : 0,
+                        memory_order_relaxed);
+  atomic_store_explicit(&breadcrumb->chunk_id,
+                        diagnostic ? diagnostic->chunk_id : 0,
+                        memory_order_relaxed);
+  atomic_store_explicit(&breadcrumb->thread_id,
+                        dxmt_metal4_feedback_callback_thread_id(),
+                        memory_order_relaxed);
+  atomic_store_explicit(&breadcrumb->stage_us, dxmt_monotonic_us(),
+                        memory_order_relaxed);
+  atomic_store_explicit(&breadcrumb->stage,
+                        DXMTMetal4FeedbackCallbackStageEntered,
+                        memory_order_relaxed);
+  atomic_store_explicit(&breadcrumb->serial, serial, memory_order_release);
+}
+
+static void
+dxmt_metal4_feedback_callback_mark(
+    uint64_t serial, enum DXMTMetal4FeedbackCallbackStage stage) {
+  if (!serial)
+    return;
+  struct DXMTMetal4FeedbackCallbackBreadcrumb *breadcrumb =
+      &dxmt_metal4_feedback_breadcrumbs
+          [serial % DXMT_METAL4_FEEDBACK_BREADCRUMB_CAPACITY];
+  if (atomic_load_explicit(&breadcrumb->serial, memory_order_acquire) != serial)
+    return;
+  /*
+   * Keep stage transitions to one atomic store. Thread and entry timestamp are
+   * immutable for a serial CompletionQueue callback and were captured by
+   * begin(); querying them at every release boundary perturbs the queue we are
+   * trying to observe.
+   */
+  atomic_store_explicit(&breadcrumb->stage, (uint32_t)stage,
+                        memory_order_release);
+}
+
+static void
+dxmt_metal4_dump_feedback_callback_breadcrumbs(uint64_t recovery_completion) {
+  const uint64_t enter_total = atomic_load_explicit(
+      &dxmt_metal4_feedback_enter_total, memory_order_acquire);
+  const uint64_t first_serial = enter_total > 15 ? enter_total - 15 : 1;
+  dxmt_metal4_hang_log(
+      DXMT_METAL4_HANG_LOG_FILE,
+      "warn:  DXMT Metal4 feedback callback breadcrumbs: "
+      "recoveryCompletion=%" PRIu64 " feedbackEnterTotal=%" PRIu64
+      " firstSerial=%" PRIu64 " lastSerial=%" PRIu64 "\n",
+      recovery_completion, enter_total, first_serial, enter_total);
+  for (uint64_t serial = first_serial; serial <= enter_total; serial++) {
+    const struct DXMTMetal4FeedbackCallbackBreadcrumb *breadcrumb =
+        &dxmt_metal4_feedback_breadcrumbs
+            [serial % DXMT_METAL4_FEEDBACK_BREADCRUMB_CAPACITY];
+    const uint64_t recorded_serial =
+        atomic_load_explicit(&breadcrumb->serial, memory_order_acquire);
+    if (recorded_serial != serial) {
+      dxmt_metal4_hang_log(
+          DXMT_METAL4_HANG_LOG_FILE,
+          "warn:  DXMT Metal4 feedback callback breadcrumb missing: "
+          "serial=%" PRIu64 " recordedSerial=%" PRIu64 "\n",
+          serial, recorded_serial);
+      continue;
+    }
+    const uint32_t stage =
+        atomic_load_explicit(&breadcrumb->stage, memory_order_acquire);
+    const uint64_t stage_us =
+        atomic_load_explicit(&breadcrumb->stage_us, memory_order_relaxed);
+    const uint64_t thread_id =
+        atomic_load_explicit(&breadcrumb->thread_id, memory_order_relaxed);
+    const uintptr_t command_buffer = atomic_load_explicit(
+        &breadcrumb->command_buffer, memory_order_relaxed);
+    const uintptr_t metal_buffer =
+        atomic_load_explicit(&breadcrumb->metal_buffer, memory_order_relaxed);
+    const uintptr_t queue =
+        atomic_load_explicit(&breadcrumb->queue, memory_order_relaxed);
+    const uint64_t completion_value = atomic_load_explicit(
+        &breadcrumb->completion_value, memory_order_relaxed);
+    const uint64_t frame_id =
+        atomic_load_explicit(&breadcrumb->frame_id, memory_order_relaxed);
+    const uint64_t chunk_id =
+        atomic_load_explicit(&breadcrumb->chunk_id, memory_order_relaxed);
+    dxmt_metal4_hang_log(
+        DXMT_METAL4_HANG_LOG_FILE,
+        "warn:  DXMT Metal4 feedback callback breadcrumb: "
+        "serial=%" PRIu64 " stage=%s(%u) stageUs=%" PRIu64
+        " thread=%" PRIu64 " commandBuffer=%p metalBuffer=%p queue=%p"
+        " completion=%" PRIu64 " frame=%" PRIu64 " chunk=%" PRIu64 "\n",
+        serial, dxmt_metal4_feedback_callback_stage_name(stage), stage,
+        stage_us, thread_id, (void *)command_buffer, (void *)metal_buffer,
+        (void *)queue, completion_value, frame_id, chunk_id);
+  }
+}
+
+static void
+dxmt_metal4_log_pending_queue_events(
+    unsigned sinks, const char *phase, void *command_buffer, NSArray *events,
+    BOOL is_wait, id timeline_event) {
+  if (!events)
+    return;
+  NSUInteger index = 0;
+  for (DXMTMetal4QueueEvent *op in events) {
+    const uint64_t current = dxmt_metal4_shared_event_value(op.event);
+    const unsigned is_timeline =
+        (timeline_event && op.event == (id)timeline_event) ? 1u : 0u;
+    if (is_wait) {
+      dxmt_metal4_hang_log(
+          sinks,
+          "info:  DXMT Metal4 %s wait: commandBuffer=%p index=%lu event=%p "
+          "target=%" PRIu64 " current=%" PRIu64 " blocked=%d isTimelineEvent=%u\n",
+          phase, command_buffer, (unsigned long)index++, op.event, op.value,
+          current, current < op.value, is_timeline);
+    } else {
+      dxmt_metal4_hang_log(
+          sinks,
+          "info:  DXMT Metal4 %s signal: commandBuffer=%p index=%lu event=%p "
+          "target=%" PRIu64 " current=%" PRIu64 " isTimelineEvent=%u\n",
+          phase, command_buffer, (unsigned long)index++, op.event, op.value,
+          current, is_timeline);
+    }
+  }
+}
+
+static void
+dxmt_metal4_log_encoder_snapshot(unsigned sinks, const char *phase,
+                                 void *command_buffer,
+                                 const struct WMTCommandBufferDiagnosticInfo *diag) {
+  if (!diag)
+    return;
+  dxmt_metal4_hang_log(
+      sinks,
+      "info:  DXMT Metal4 %s encoders: commandBuffer=%p "
+      "input=%u encoded=%u render=%u compute=%u blit=%u other=%u "
+      "present=%u clear=%u resolve=%u scaler=%u timestamps=%u "
+      "signalEvt=%u waitEvt=%u barrierOnly=%u "
+      "fenceWait=%u fenceUpdate=%u priorLocal=%u futureLocal=%u "
+      "sameEncoder=%u external=%u reverseStage=%u "
+      "encodedFenceWait=%u skippedExternal=%u "
+      "fenceEdgeCount=%u fenceEdgeOverflow=%u encoderDiagCount=%u "
+      "initEvent=%" PRIu64 "\n",
+      phase, command_buffer, diag->input_encoder_count,
+      diag->encoded_encoder_count, diag->render_encoder_count,
+      diag->compute_encoder_count, diag->blit_encoder_count,
+      diag->other_encoder_count, diag->present_encoder_count,
+      diag->clear_encoder_count, diag->resolve_encoder_count,
+      diag->scaler_encoder_count, diag->timestamp_encoder_count,
+      diag->signal_event_count, diag->wait_event_count,
+      diag->barrier_only_pass_count, diag->fence_wait_count,
+      diag->fence_update_count, diag->prior_local_fence_wait_count,
+      diag->future_local_fence_wait_count, diag->same_encoder_fence_wait_count,
+      diag->external_fence_wait_count, diag->render_reverse_stage_wait_count,
+      diag->encoded_fence_wait_count, diag->skipped_external_fence_wait_count,
+      diag->fence_edge_count, diag->fence_edge_overflow_count,
+      diag->encoder_diagnostic_count, diag->resource_initializer_event_id);
+  const uint32_t edge_limit =
+      diag->fence_edge_count < WMT_COMMAND_BUFFER_FENCE_EDGE_CAPACITY
+          ? diag->fence_edge_count
+          : WMT_COMMAND_BUFFER_FENCE_EDGE_CAPACITY;
+  for (uint32_t edge_index = 0; edge_index < edge_limit; edge_index++) {
+    const struct WMTCommandBufferFenceEdgeDiagnostic *edge =
+        &diag->fence_edges[edge_index];
+    dxmt_metal4_hang_log(
+        sinks,
+        "info:  DXMT Metal4 %s fence-edge: commandBuffer=%p edge=%u "
+        "producer=%" PRIu64 " consumer=%" PRIu64
+        " producerIndex=%u consumerIndex=%u slot=%u flags=0x%x\n",
+        phase, command_buffer, edge_index, edge->producer_id, edge->consumer_id,
+        edge->producer_index, edge->consumer_index, edge->slot, edge->flags);
+  }
+  const uint32_t enc_limit =
+      diag->encoder_diagnostic_count <
+              WMT_COMMAND_BUFFER_ENCODER_DIAGNOSTIC_CAPACITY
+          ? diag->encoder_diagnostic_count
+          : WMT_COMMAND_BUFFER_ENCODER_DIAGNOSTIC_CAPACITY;
+  /* Cap to keep a single stall report readable while still covering the hang CB. */
+  const uint32_t enc_print =
+      enc_limit > 16u ? 16u : enc_limit;
+  for (uint32_t encoder_index = 0; encoder_index < enc_print; encoder_index++) {
+    const struct WMTCommandBufferEncoderDiagnostic *encoder =
+        &diag->encoders[encoder_index];
+    dxmt_metal4_hang_log(
+        sinks,
+        "info:  DXMT Metal4 %s encoder: commandBuffer=%p idx=%u type=%s(%u) "
+        "encoderId=%" PRIu64 " vertexEncoderId=%" PRIu64
+        " waits=%u updates=%u pso=0x%" PRIx64 " flags=0x%x\n",
+        phase, command_buffer, encoder_index,
+        dxmt_encoder_type_name(encoder->type), encoder->type, encoder->encoder_id,
+        encoder->vertex_encoder_id, encoder->wait_count, encoder->update_count,
+        encoder->pipeline_handle, encoder->flags);
+  }
+  if (enc_limit > enc_print) {
+    dxmt_metal4_hang_log(
+        sinks,
+        "info:  DXMT Metal4 %s encoder: commandBuffer=%p truncated remaining=%u\n",
+        phase, command_buffer, enc_limit - enc_print);
+  }
+}
+
+static void
+dxmt_metal4_log_full_diagnostic_snapshot(
+    unsigned sinks, const char *phase, void *command_buffer,
+    uint64_t completion,
+    const struct WMTCommandBufferDiagnosticInfo *diag) {
+  if (!diag)
+    return;
+  dxmt_metal4_hang_log(
+      sinks,
+      "info:  DXMT Metal4 %s full-snapshot: commandBuffer=%p"
+      " completion=%" PRIu64 " frame=%" PRIu64 " chunk=%" PRIu64
+      " d3dSeq=%" PRIu64 "-%" PRIu64 " encoders=%u/%u edges=%u/%u\n",
+      phase, command_buffer, completion, diag->frame_id, diag->chunk_id,
+      diag->d3d_sequence_begin, diag->d3d_sequence_end,
+      diag->encoder_diagnostic_count,
+      diag->encoder_diagnostic_overflow_count, diag->fence_edge_count,
+      diag->fence_edge_overflow_count);
+
+  const uint32_t edge_limit =
+      diag->fence_edge_count < WMT_COMMAND_BUFFER_FENCE_EDGE_CAPACITY
+          ? diag->fence_edge_count
+          : WMT_COMMAND_BUFFER_FENCE_EDGE_CAPACITY;
+  for (uint32_t i = 0; i < edge_limit; i++) {
+    const struct WMTCommandBufferFenceEdgeDiagnostic *edge =
+        &diag->fence_edges[i];
+    dxmt_metal4_hang_log(
+        sinks,
+        "info:  DXMT Metal4 %s full-edge: commandBuffer=%p edge=%u"
+        " producer=%" PRIu64 " consumer=%" PRIu64
+        " pIdx=%u cIdx=%u slot=%u flags=0x%x"
+        " resource=0x%" PRIx64 " identity=%" PRIu64
+        " allocation=0x%" PRIx64 " metal=0x%" PRIx64
+        " gpuAddressOrId=0x%" PRIx64 " matches=%u matchHash=0x%" PRIx64
+        " producer=%" PRIu64 "+%" PRIu64 "/%" PRIu64 "/0x%x/0x%x"
+        " consumer=%" PRIu64 "+%" PRIu64 "/%" PRIu64 "/0x%x/0x%x\n",
+        phase, command_buffer, i, edge->producer_id, edge->consumer_id,
+        edge->producer_index, edge->consumer_index, edge->slot, edge->flags,
+        edge->resource_object, edge->resource_identity,
+        edge->allocation_object, edge->metal_resource_handle,
+        edge->gpu_address_or_resource_id, edge->resource_match_count,
+        edge->resource_match_hash, edge->producer_offset,
+        edge->producer_length, edge->producer_view_id,
+        edge->producer_access, edge->producer_stage_kind,
+        edge->consumer_offset, edge->consumer_length,
+        edge->consumer_view_id, edge->consumer_access,
+        edge->consumer_stage_kind);
+  }
+
+  const uint32_t encoder_limit =
+      diag->encoder_diagnostic_count <
+              WMT_COMMAND_BUFFER_ENCODER_DIAGNOSTIC_CAPACITY
+          ? diag->encoder_diagnostic_count
+          : WMT_COMMAND_BUFFER_ENCODER_DIAGNOSTIC_CAPACITY;
+  for (uint32_t i = 0; i < encoder_limit; i++) {
+    const struct WMTCommandBufferEncoderDiagnostic *encoder =
+        &diag->encoders[i];
+    dxmt_metal4_hang_log(
+        sinks,
+        "info:  DXMT Metal4 %s full-encoder: commandBuffer=%p"
+        " diagnosticIndex=%u encoderIndex=%u type=%s(%u)"
+        " encoderId=%" PRIu64 " vertexEncoderId=%" PRIu64
+        " waits=%u updates=%u waitHash=0x%" PRIx64
+        " updateHash=0x%" PRIx64 " pso=0x%" PRIx64
+        " argbuf=0x%" PRIx64 "+%" PRIu64 "/%" PRIu64
+        " primary=0x%" PRIx64 " secondary=0x%" PRIx64
+        " resourcePlan=%u/0x%" PRIx64 " d3dSeq=%" PRIu64 "-%" PRIu64
+        " flags=0x%x\n",
+        phase, command_buffer, i, encoder->encoder_index,
+        dxmt_encoder_type_name(encoder->type), encoder->type,
+        encoder->encoder_id, encoder->vertex_encoder_id,
+        encoder->wait_count, encoder->update_count, encoder->wait_hash,
+        encoder->update_hash, encoder->pipeline_handle,
+        encoder->argument_buffer_handle, encoder->argument_buffer_offset,
+        encoder->argument_buffer_size, encoder->primary_resource,
+        encoder->secondary_resource, encoder->resource_plan_count,
+        encoder->resource_plan_hash, encoder->d3d_sequence_begin,
+        encoder->d3d_sequence_end, encoder->flags);
+  }
 }
 
 #if DXMT_APITRACE_METAL
@@ -1607,6 +2565,12 @@ dxmt_metal4_is_buffer(id object) {
   struct DXMTMetal4PresentDiagnostic
       _presentDiagnostics[DXMT_METAL4_PRESENT_DIAGNOSTIC_CAPACITY];
   uint64_t _presentDiagnosticSerial;
+  struct WMTCommandBufferDiagnosticInfo _lastSuccessfulDiagnostic;
+  uintptr_t _lastSuccessfulCommandBuffer;
+  uint64_t _lastSuccessfulCompletion;
+  double _lastSuccessfulGPUStart;
+  double _lastSuccessfulGPUEnd;
+  BOOL _hasLastSuccessfulDiagnostic;
   struct DXMTMetal4QueueMonitorDiagnostic *_monitorDiagnostic;
 }
 @property(nonatomic, retain) id<MTLDevice> device;
@@ -1633,7 +2597,15 @@ dxmt_metal4_is_buffer(id object) {
 @property(nonatomic, retain) NSLock *submissionLock;
 @property(nonatomic, retain) NSLock *errorLock;
 @property(nonatomic, retain) NSLock *sparseResidencyLock;
+@property(nonatomic, retain) NSLock *externalLifetimeResidencySetLock;
 @property(nonatomic, retain) NSMutableArray *externalLifetimeResidencySets;
+@property(nonatomic, assign)
+    struct WMTCommandBufferDiagnosticInfo lastSuccessfulDiagnostic;
+@property(nonatomic, assign) uintptr_t lastSuccessfulCommandBuffer;
+@property(nonatomic, assign) uint64_t lastSuccessfulCompletion;
+@property(nonatomic, assign) double lastSuccessfulGPUStart;
+@property(nonatomic, assign) double lastSuccessfulGPUEnd;
+@property(nonatomic, assign) BOOL hasLastSuccessfulDiagnostic;
 /* GPTK-style MTL4 object pools (returned only after GPU completion). */
 @property(nonatomic, retain) NSLock *metal4ObjectPoolLock;
 @property(nonatomic, retain) NSMutableArray *metal4CommandBufferPool;
@@ -1691,6 +2663,13 @@ dxmt_metal4_is_buffer(id object) {
   _presentEventValue = 0;
   _maxCommandBufferCount = maxCommandBufferCount;
   _commandBufferThrottleWaitCount = 0;
+  memset(&_lastSuccessfulDiagnostic, 0,
+         sizeof(_lastSuccessfulDiagnostic));
+  _lastSuccessfulCommandBuffer = 0;
+  _lastSuccessfulCompletion = 0;
+  _lastSuccessfulGPUStart = 0.0;
+  _lastSuccessfulGPUEnd = 0.0;
+  _hasLastSuccessfulDiagnostic = NO;
   _externalLifetimeResidencySets = [[NSMutableArray alloc] init];
   _eventLock = [[NSLock alloc] init];
   _presentLock = [[NSLock alloc] init];
@@ -1698,6 +2677,7 @@ dxmt_metal4_is_buffer(id object) {
   _submissionLock = [[NSLock alloc] init];
   _errorLock = [[NSLock alloc] init];
   _sparseResidencyLock = [[NSLock alloc] init];
+  _externalLifetimeResidencySetLock = [[NSLock alloc] init];
   _metal4ObjectPoolLock = [[NSLock alloc] init];
   _metal4CommandBufferPool = [[NSMutableArray alloc] init];
   _metal4AllocatorPool = [[NSMutableArray alloc] init];
@@ -1717,6 +2697,15 @@ dxmt_metal4_is_buffer(id object) {
       newResidencySetWithDescriptor:sparseResidencyDescriptor
                               error:&commandResidencyError];
   [sparseResidencyDescriptor release];
+  if (dxmt_residency_call_trace_enabled()) {
+    fprintf(stderr,
+            "info:  DXMT residency set created: kind=queue-sparse set=%p\n",
+            _sparseResidencySet);
+    fprintf(stderr,
+            "info:  DXMT residency set created: kind=queue-command set=%p\n",
+            _commandResidencySet);
+    fflush(stderr);
+  }
   _sparseResidencyAllocationRefs = [[NSCountedSet alloc] init];
   _sparseTrackedTextures = [[NSMutableSet alloc] init];
   _sparseResidencyRetirements = [[NSMutableArray alloc] init];
@@ -1729,18 +2718,18 @@ dxmt_metal4_is_buffer(id object) {
       !_throttleLock || !_submissionLock || !_errorLock ||
       !_sparseResidencyLock || !_commandResidencyAllocationRefs ||
       !_commandResidencyRetirements || !_sparseTrackedTextures ||
-      !_sparseResidencyRetirements || !_externalLifetimeResidencySets ||
+      !_sparseResidencyRetirements ||
+      !_externalLifetimeResidencySetLock ||
+      !_externalLifetimeResidencySets ||
       !_metal4ObjectPoolLock || !_metal4CommandBufferPool ||
       !_metal4AllocatorPool) {
     [self release];
     return nil;
   }
 
-  [_sparseResidencySet commit];
-  [_sparseResidencySet requestResidency];
+  dxmt_residency_set_commit_direct(_sparseResidencySet);
   [_metal4Queue addResidencySet:_sparseResidencySet];
-  [_commandResidencySet commit];
-  [_commandResidencySet requestResidency];
+  dxmt_residency_set_commit_direct(_commandResidencySet);
   [_metal4Queue addResidencySet:_commandResidencySet];
 
   dxmt_iogpu_diagnostics_install();
@@ -1755,8 +2744,6 @@ dxmt_metal4_is_buffer(id object) {
     [_metal4Queue removeResidencySet:_sparseResidencySet];
   if (_metal4Queue && _commandResidencySet)
     [_metal4Queue removeResidencySet:_commandResidencySet];
-  [_sparseResidencySet endResidency];
-  [_commandResidencySet endResidency];
   [_commandResidencyRetirements release];
   [_commandResidencyAllocationRefs release];
   [_commandResidencySet release];
@@ -1769,6 +2756,7 @@ dxmt_metal4_is_buffer(id object) {
   [_metal4AllocatorPool release];
   [_metal4ObjectPoolLock release];
   [_externalLifetimeResidencySets release];
+  [_externalLifetimeResidencySetLock release];
   [_errorLock release];
   [_submissionLock release];
   [_throttleLock release];
@@ -2103,10 +3091,10 @@ enum { DXMT_METAL4_OBJECT_POOL_CAPACITY = 8 };
  * set commit cannot block the whole queue serializer for hundreds of ms.
  */
 - (void)retireCompletedResidency {
-  // Same lock order as prepare: sparseResidencyLock → residency set ops lock.
-  [_sparseResidencyLock lock];
-  NSLock *opsLock = dxmt_residency_set_ops_lock_get();
-  [opsLock lock];
+  dxmt_nslock_t residencyOwnerLock = _sparseResidencyLock;
+  __attribute__((cleanup(dxmt_nslock_scope_cleanup)))
+  struct dxmt_nslock_scope sparseLockScope =
+      dxmt_nslock_scope_acquire(residencyOwnerLock);
   const uint64_t completedValue = _event.signaledValue;
   BOOL sparseChanged = NO;
   BOOL commandChanged = NO;
@@ -2128,7 +3116,8 @@ enum { DXMT_METAL4_OBJECT_POOL_CAPACITY = 8 };
              [retirement objectForKey:@"allocations"]) {
       [_sparseResidencyAllocationRefs removeObject:allocation];
       if ([_sparseResidencyAllocationRefs countForObject:allocation] == 0) {
-        [_sparseResidencySet removeAllocation:allocation];
+        dxmt_owned_residency_set_remove_allocation(
+            residencyOwnerLock, _sparseResidencySet, allocation);
         sparseChanged = YES;
       }
     }
@@ -2154,7 +3143,8 @@ enum { DXMT_METAL4_OBJECT_POOL_CAPACITY = 8 };
       [_commandResidencyAllocationRefs removeObject:allocation];
       if ([_commandResidencyAllocationRefs
               countForObject:allocation] == 0) {
-        [_commandResidencySet removeAllocation:allocation];
+        dxmt_owned_residency_set_remove_allocation(
+            residencyOwnerLock, _commandResidencySet, allocation);
         commandChanged = YES;
       }
     }
@@ -2163,11 +3153,12 @@ enum { DXMT_METAL4_OBJECT_POOL_CAPACITY = 8 };
       removeObjectsAtIndexes:completedRetirements];
 
   if (sparseChanged)
-    [_sparseResidencySet commit];
+    dxmt_owned_residency_set_commit(residencyOwnerLock,
+                                    _sparseResidencySet);
   if (commandChanged)
-    [_commandResidencySet commit];
-  [opsLock unlock];
-  [_sparseResidencyLock unlock];
+    dxmt_owned_residency_set_commit(residencyOwnerLock,
+                                    _commandResidencySet);
+  dxmt_nslock_scope_release(&sparseLockScope, residencyOwnerLock);
 }
 
 - (uint64_t)prepareCommandResidencyForAllocations:(NSArray *)allocations
@@ -2186,16 +3177,16 @@ enum { DXMT_METAL4_OBJECT_POOL_CAPACITY = 8 };
                       aux:(uintptr_t)completionValue
                     count:0
                     flags:DXMT_PREPARE_RESIDENCY_FLAG_STEP_ADD];
-  // Lock order: sparseResidencyLock → residency set ops lock (never reverse).
-  // Serialize Metal set mutations with RenderThread/persistent thunks.
-  [_sparseResidencyLock lock];
-  NSLock *opsLock = dxmt_residency_set_ops_lock_get();
-  [opsLock lock];
+  dxmt_nslock_t residencyOwnerLock = _sparseResidencyLock;
+  __attribute__((cleanup(dxmt_nslock_scope_cleanup)))
+  struct dxmt_nslock_scope sparseLockScope =
+      dxmt_nslock_scope_acquire(residencyOwnerLock);
   BOOL commandChanged = NO;
   if (allocations.count) {
     for (id<MTLAllocation> allocation in allocations) {
       if ([_commandResidencyAllocationRefs countForObject:allocation] == 0) {
-        [_commandResidencySet addAllocation:allocation];
+        dxmt_owned_residency_set_add_allocation(
+            residencyOwnerLock, _commandResidencySet, allocation);
         commandChanged = YES;
         command_added++;
       }
@@ -2210,12 +3201,12 @@ enum { DXMT_METAL4_OBJECT_POOL_CAPACITY = 8 };
     [self monitorSetPhase:
               DXMTMetal4QueueMonitorPhasePrepareResidencyCommandCommit
             commandBuffer:nil];
-    [_commandResidencySet commit];
+    dxmt_owned_residency_set_commit(residencyOwnerLock,
+                                    _commandResidencySet);
   }
-  [opsLock unlock];
   [self monitorSetPhase:DXMTMetal4QueueMonitorPhasePrepareResidencyUnlock
           commandBuffer:nil];
-  [_sparseResidencyLock unlock];
+  dxmt_nslock_scope_release(&sparseLockScope, residencyOwnerLock);
 
   const uint64_t total_us = dxmt_monotonic_us() - begin;
   if (diag && total_us >= slow_total_us) {
@@ -2297,7 +3288,8 @@ enum { DXMT_METAL4_OBJECT_POOL_CAPACITY = 8 };
   diag->hazard_tracking_mode = texture.hazardTrackingMode;
   diag->layer_pixel_format = layer.pixelFormat;
   diag->layer_maximum_drawable_count = layer.maximumDrawableCount;
-  diag->layer_allocation_count = layerSet ? layerSet.allocationCount : 0;
+  diag->layer_allocation_count =
+      dxmt_residency_set_allocation_count_direct(layerSet);
   diag->command_buffer_allocation_count =
       retainedTemporaryResources.count;
   const CGSize drawableSize = layer.drawableSize;
@@ -2308,10 +3300,13 @@ enum { DXMT_METAL4_OBJECT_POOL_CAPACITY = 8 };
   diag->layer_framebuffer_only = layer.framebufferOnly;
   diag->layer_contains_texture =
       layerSet && texture
-          ? [layerSet containsAllocation:(id<MTLAllocation>)texture]
+          ? dxmt_residency_set_contains_allocation_direct(
+                layerSet, (id<MTLAllocation>)texture)
           : NO;
   diag->layer_contains_backing =
-      layerSet && backing ? [layerSet containsAllocation:backing] : NO;
+      layerSet && backing
+          ? dxmt_residency_set_contains_allocation_direct(layerSet, backing)
+          : NO;
   diag->command_buffer_contains_texture =
       texture && [retainedTemporaryResources containsObject:texture];
   diag->command_buffer_contains_backing =
@@ -2411,6 +3406,14 @@ enum { DXMT_METAL4_OBJECT_POOL_CAPACITY = 8 };
   _queueResidencyAllocationSet = [[NSMutableSet alloc] init];
   _feedbackCondition = [[NSCondition alloc] init];
   _feedbackComplete = NO;
+  _feedbackHandlerEntered = NO;
+  _feedbackHandlerFinished = NO;
+  _completionRecoveredFromTimeline = NO;
+  _feedbackHandlerEnterUs = 0;
+  _feedbackHandlerLatchUs = 0;
+  _commitSubmitUs = 0;
+  _commitUsedOptions = NO;
+  _completionTimelineSignaledAtSubmit = NO;
   _completionValue = 0;
   _metal4ObjectsRecycled = NO;
   _internalStatus = DXMTMetal4CommandBufferStateNotEnqueued;
@@ -2474,8 +3477,17 @@ enum { DXMT_METAL4_OBJECT_POOL_CAPACITY = 8 };
       _internalStatus == DXMTMetal4CommandBufferStateCompleted ||
       _internalStatus == DXMTMetal4CommandBufferStateError;
   const BOOL submitted = _completionValue != 0;
+  /*
+   * A queue-timeline signal makes the D3D submission logically complete, but
+   * it does not prove that Metal has finished running the commit feedback
+   * handler or released its internal references to the allocator generation.
+   * In particular, resetting an allocator while that handler is between entry
+   * and latch publication can corrupt Metal's internal placement heaps.
+   */
+  const BOOL metalFeedbackRetired =
+      !_completionRecoveredFromTimeline || _feedbackHandlerFinished;
   [_feedbackCondition unlock];
-  if (!terminal || !submitted)
+  if (!terminal || !submitted || !metalFeedbackRetired)
     return;
   _metal4ObjectsRecycled = YES;
   // Allocator must be reset before the next beginCommandBufferWithAllocator.
@@ -2502,30 +3514,11 @@ enum { DXMT_METAL4_OBJECT_POOL_CAPACITY = 8 };
 }
 
 - (void)registerResourceForCurrentCommandBuffer:(id<MTLAllocation>)allocation {
-  if (!allocation)
-    return;
-
-  // GPTK split (D3DMCommandQueue::RetainResourceForCurrentCommandBuffer):
-  // - PE CommandChunk owns long-lived object retains until GPU complete.
-  // - This method is encode-local bookkeeping for transient command-residency
-  //   membership at prepare/submit only.
-  // - Do NOT take residency ops lock or call containsAllocation/addAllocation:
-  //   those serialized with RenderThread persistent residency and hung BMW.
-  // - Lifetime resources already live in the queue-attached persistent set.
-  id<MTLAllocation> backing = dxmt_metal4_backing_allocation(allocation);
-  if (![_queueResidencyAllocationSet containsObject:backing]) {
-    [_queueResidencyAllocationSet addObject:backing];
-    [_queueResidencyAllocations addObject:backing];
-  }
-  if ([(id)backing conformsToProtocol:@protocol(MTLTexture)]) {
-    DXMTSparseTextureResidency *sparseResidency =
-        dxmt_sparse_texture_residency_for_texture((id<MTLTexture>)backing,
-                                                  false);
-    for (id<MTLAllocation> heap in [sparseResidency mappedHeapsSnapshot]) {
-      if (![_retainedTemporaryResources containsObject:heap])
-        [_retainedTemporaryResources addObject:heap];
-    }
-  }
+  // D3DMetal does not rebuild residency from every encoded resource. DXMT's
+  // CommandChunk retains the owning Allocation through GPU completion, and
+  // that Allocation owns its queue-wide lifetime residency registration.
+  // Reserved-resource mappings independently retain their mapped heaps.
+  (void)allocation;
 }
 
 - (void)retainTemporaryResourceForCurrentCommandBuffer:
@@ -2536,7 +3529,13 @@ enum { DXMT_METAL4_OBJECT_POOL_CAPACITY = 8 };
   // until the generation snapshot is drained after GPU complete.
   if (![_retainedTemporaryResources containsObject:allocation])
     [_retainedTemporaryResources addObject:allocation];
-  [self registerResourceForCurrentCommandBuffer:allocation];
+  id<MTLAllocation> backing = dxmt_metal4_backing_allocation(allocation);
+  if (!backing)
+    return;
+  if (![_queueResidencyAllocationSet containsObject:backing]) {
+    [_queueResidencyAllocationSet addObject:backing];
+    [_queueResidencyAllocations addObject:backing];
+  }
 }
 
 - (id<MTL4ArgumentTable>)newArgumentTableWithLabel:(NSString *)label {
@@ -2582,8 +3581,30 @@ enum { DXMT_METAL4_OBJECT_POOL_CAPACITY = 8 };
 // commits fail fast instead of deadlocking on NSLock.
 static _Thread_local int dxmt_metal4_commit_locked_depth = 0;
 
+static void
+dxmt_metal4_commit_depth_scope_cleanup(volatile int *armed) {
+  if (*armed && dxmt_metal4_commit_locked_depth > 0)
+    dxmt_metal4_commit_locked_depth--;
+}
+
 - (uint64_t)commitLocked {
   if (dxmt_metal4_commit_locked_depth > 0) {
+    [_feedbackCondition lock];
+    if (_internalStatus == DXMTMetal4CommandBufferStateNotEnqueued) {
+      [_feedbackError release];
+      _feedbackError = [[NSError
+          errorWithDomain:@"DXMTMetal4CommitDomain"
+                     code:2
+                 userInfo:@{
+                   NSLocalizedDescriptionKey :
+                       @"Nested Metal4 command-buffer submission rejected"
+                 }] retain];
+      _internalStatus = DXMTMetal4CommandBufferStateError;
+      _feedbackComplete = YES;
+      _feedbackHandlerFinished = YES;
+      [_feedbackCondition broadcast];
+    }
+    [_feedbackCondition unlock];
     dxmt_metal4_hang_log(
         DXMT_METAL4_HANG_LOG_BOTH,
         "err:   DXMT Metal4 reentrant commit rejected: commandBuffer=%p "
@@ -2603,7 +3624,52 @@ static _Thread_local int dxmt_metal4_commit_locked_depth = 0;
     return 0;
   }
   dxmt_metal4_commit_locked_depth++;
+  /*
+   * Keep the ordinary return path independent of Objective-C @finally
+   * lowering across Wine's unix-call boundary. The cleanup attribute remains
+   * armed while an exception unwinds, while the explicit decrement handles
+   * every successful/early Objective-C method return deterministically.
+   */
+  __attribute__((cleanup(dxmt_metal4_commit_depth_scope_cleanup)))
+  volatile int depthScopeArmed = 1;
+  uint64_t residencySubmitUs = 0;
 
+  @try {
+    residencySubmitUs = [self commitUnserialized];
+  } @catch (NSException *exception) {
+    [_feedbackCondition lock];
+    if (_internalStatus == DXMTMetal4CommandBufferStateEnqueued &&
+        !_feedbackComplete) {
+      [_feedbackError release];
+      _feedbackError = [[NSError
+          errorWithDomain:@"DXMTMetal4CommitDomain"
+                     code:3
+                 userInfo:@{
+                   NSLocalizedDescriptionKey :
+                       exception.reason ?: @"Metal4 submission exception"
+                 }] retain];
+      _internalStatus = DXMTMetal4CommandBufferStateError;
+      _feedbackComplete = YES;
+      _feedbackHandlerFinished = YES;
+      [_feedbackCondition broadcast];
+    }
+    [_feedbackCondition unlock];
+    dxmt_metal4_hang_log(
+        DXMT_METAL4_HANG_LOG_BOTH,
+        "err:   DXMT Metal4 commit exception: commandBuffer=%p queue=%p "
+        "name=%s reason=%s frame=%" PRIu64 " chunk=%" PRIu64 "\n",
+        self, _owner.metal4Queue,
+        exception.name ? exception.name.UTF8String : "<unknown>",
+        exception.reason ? exception.reason.UTF8String : "<unknown>",
+        _diagnosticInfo.frame_id, _diagnosticInfo.chunk_id);
+    @throw;
+  }
+  depthScopeArmed = 0;
+  dxmt_metal4_commit_locked_depth--;
+  return residencySubmitUs;
+}
+
+- (uint64_t)commitUnserialized {
   [_feedbackCondition lock];
   if (_internalStatus != DXMTMetal4CommandBufferStateNotEnqueued) {
     const unsigned already_status = (unsigned)_internalStatus;
@@ -2624,10 +3690,10 @@ static _Thread_local int dxmt_metal4_commit_locked_depth = 0;
              commandBuffer:self];
     [_owner monitorWaitEnd:DXMTMetal4QueueMonitorSourceUnixCommitThunk
              commandBuffer:self];
-    dxmt_metal4_commit_locked_depth--;
     return 0;
   }
-  _internalStatus = DXMTMetal4CommandBufferStateCommitted;
+  // Claimed by the submitter, but not yet safe for GPU-completion waiters.
+  _internalStatus = DXMTMetal4CommandBufferStateEnqueued;
   [_feedbackCondition unlock];
 
   [_owner.errorLock lock];
@@ -2671,7 +3737,6 @@ static _Thread_local int dxmt_metal4_commit_locked_depth = 0;
             ? queueError.localizedDescription.UTF8String
             : "<no description>",
         _diagnosticInfo.frame_id, _diagnosticInfo.chunk_id);
-    dxmt_metal4_commit_locked_depth--;
     return 0;
   }
 
@@ -2694,14 +3759,13 @@ static _Thread_local int dxmt_metal4_commit_locked_depth = 0;
   uint64_t completionValue = 0;
   // GPTK WaitUntilSubmission closed-loop bookkeeping:
   // once nextEventValue is taken we own a timeline hole that must be closed on
-  // every exit path; once Metal commit returns the feedback handler owns the
-  // terminal latch.
+  // every exit path. The queue timeline is authoritative for GPU retirement;
+  // commit feedback augments it with status, error, and timing data.
   BOOL completionTimelineOwned = NO;
   BOOL metalSubmitted = NO;
   BOOL completionTimelineSignaled = NO;
-  // Declared outside @try so @finally can reclaim them on pre-submit abort.
+  // Declared outside @try so @finally can destroy unsubmitted options.
   MTL4CommitOptions *options = nil;
-  __block NSArray *feedbackRetainedResources = nil;
 
   // GPTK residency dichotomy: retire completed *transient* memberships off the
   // commit serializer. Lifetime/device sets are not touched here. A residency
@@ -2808,6 +3872,8 @@ static _Thread_local int dxmt_metal4_commit_locked_depth = 0;
 
   const BOOL denseHangDiagnostics =
       dxmt_metal4_dense_hang_diagnostics_enabled();
+  const BOOL errorSnapshotDiagnostics =
+      dxmt_metal4_error_snapshot_enabled();
   const BOOL perfFeedback =
       dxmt_metal4_perf_stats_enabled() || denseHangDiagnostics;
   const BOOL residencyDiagnostics = dxmt_metal4_residency_diag_enabled();
@@ -2837,9 +3903,10 @@ static _Thread_local int dxmt_metal4_commit_locked_depth = 0;
 #else
   (void)traceFeedback;
 #endif
-  // Metal 4 exposes command-buffer failures through commit feedback. Always
-  // install the handler so release builds propagate GPU errors instead of
-  // waiting forever for a completion event that a failed submission skipped.
+  // Metal 4 exposes command-buffer failures and timing through commit feedback.
+  // Always install the handler, but do not make forward progress depend on its
+  // delivery: D3DMetal retires submissions from the queue timeline and handles
+  // feedback asynchronously.
   {
     options = [[MTL4CommitOptions alloc] init];
     const obj_handle_t feedbackCommandBuffer = (obj_handle_t)self;
@@ -2859,22 +3926,82 @@ static _Thread_local int dxmt_metal4_commit_locked_depth = 0;
             ? feedbackCompletionValue - feedbackCompletionAtCommit
             : 0;
     const BOOL feedbackHasDrawable = _pendingDrawable != nil;
-    const struct WMTCommandBufferDiagnosticInfo feedbackDiagnostic =
-        _diagnosticInfo;
-    // Snapshot this generation's temporary resource owners for GPU lifetime.
-    // Recording state advances to a fresh container immediately. The Metal
-    // completion callback only *hands off* the immutable snapshot to the
-    // command buffer; the waiter (dxmt-finish-thr) is the sole releaser.
-    feedbackRetainedResources = [_retainedTemporaryResources copy];
+    /*
+     * Do not capture the expanded diagnostic snapshot by value in every Metal
+     * feedback block. Metal may delay or omit delivery, and retained blocks
+     * would otherwise accumulate one large snapshot per micro-chunk. The block
+     * retains feedbackOwner, so this pointer remains valid; copy it only when
+     * the callback actually executes.
+     */
+    const struct WMTCommandBufferDiagnosticInfo *feedbackDiagnosticSource =
+        &_diagnosticInfo;
+    // Publish this generation's temporary resource owners before submission.
+    // The queue timeline, not feedback delivery, proves GPU retirement. Keeping
+    // the immutable snapshot on the wrapper lets dxmt-finish-thr release it on
+    // a Wine-safe thread even when Metal omits or delays the feedback callback.
+    NSArray *lifetimeSnapshot = [_retainedTemporaryResources copy];
     [_retainedTemporaryResources release];
     _retainedTemporaryResources = [[NSMutableArray alloc] init];
+    [_feedbackCondition lock];
+    [_pendingLifetimeSnapshot release];
+    _pendingLifetimeSnapshot = lifetimeSnapshot;
+    [_feedbackCondition unlock];
     __block id<MTLSharedEvent> feedbackCompletionEvent = [_owner.event retain];
     __block NSArray *feedbackWaitEvents = [_pendingWaitEvents copy];
     __block NSArray *feedbackSignalEvents = [_pendingSignalEvents copy];
     __block NSString *feedbackLabel = [_metal4Buffer.label copy];
     __block DXMTMetal4CommandBuffer *feedbackOwner = [self retain];
     [options addFeedbackHandler:^(id<MTL4CommitFeedback> feedback) {
+      const BOOL trackFeedbackDiagnostics =
+          denseHangDiagnostics || perfFeedback || errorSnapshotDiagnostics;
+      struct WMTCommandBufferDiagnosticInfo feedbackDiagnostic = {0};
+      uint64_t enter_us = 0;
+      uint64_t enter_serial = 0;
+      if (trackFeedbackDiagnostics) {
+        feedbackDiagnostic = *feedbackDiagnosticSource;
+        // First observation that Metal delivered feedback for this generation.
+        enter_us = dxmt_monotonic_us();
+        enter_serial =
+            atomic_fetch_add_explicit(&dxmt_metal4_feedback_enter_total, 1,
+                                      memory_order_relaxed) +
+            1;
+        dxmt_metal4_feedback_callback_begin(
+            enter_serial, (uintptr_t)feedbackCommandBuffer,
+            (uintptr_t)feedbackMetalBuffer, (uintptr_t)feedbackQueue,
+            feedbackCompletionValue, &feedbackDiagnostic);
+      }
+      feedbackOwner.feedbackHandlerEntered = YES;
+      feedbackOwner.feedbackHandlerEnterUs = enter_us;
+      const uint64_t timeline_now = trackFeedbackDiagnostics
+                                        ? dxmt_metal4_shared_event_value(
+                                              feedbackCompletionEvent)
+                                        : 0;
+      const uint64_t submit_us = feedbackOwner.commitSubmitUs;
+      if (denseHangDiagnostics || perfFeedback) {
+        dxmt_metal4_hang_log(
+            DXMT_METAL4_HANG_LOG_BOTH,
+            "info:  DXMT Metal4 feedback handler enter: commandBuffer=%p "
+            "metalBuffer=%p queue=%p completion=%" PRIu64
+            " timelineNow=%" PRIu64 " timelinePast=%u hasError=%u "
+            "enterSerial=%" PRIu64 " sinceSubmitUs=%" PRIu64
+            " frame=%" PRIu64 " chunk=%" PRIu64
+            " gpuStart=%.9f gpuEnd=%.9f\n",
+            (void *)(uintptr_t)feedbackCommandBuffer,
+            (void *)(uintptr_t)feedbackMetalBuffer,
+            (void *)(uintptr_t)feedbackQueue, feedbackCompletionValue,
+            timeline_now, timeline_now >= feedbackCompletionValue ? 1u : 0u,
+            feedback.error ? 1u : 0u, enter_serial,
+            submit_us ? (enter_us - submit_us) : 0,
+            feedbackDiagnostic.frame_id, feedbackDiagnostic.chunk_id,
+            feedback.GPUStartTime, feedback.GPUEndTime);
+      }
       NSError *error = feedback.error;
+      struct WMTCommandBufferDiagnosticInfo previousSuccessfulDiagnostic = {0};
+      uintptr_t previousSuccessfulCommandBuffer = 0;
+      uint64_t previousSuccessfulCompletion = 0;
+      double previousSuccessfulGPUStart = 0.0;
+      double previousSuccessfulGPUEnd = 0.0;
+      BOOL hasPreviousSuccessfulDiagnostic = NO;
       @try {
         BOOL injectTestError = NO;
         if (!error) {
@@ -2903,6 +4030,22 @@ static _Thread_local int dxmt_metal4_commit_locked_depth = 0;
               }
             }
           }
+          if (!injectTestError && denseHangDiagnostics &&
+              !feedbackQueueOwner.firstError &&
+              feedbackCompletionValue >
+                  feedbackQueueOwner.lastSuccessfulCompletion) {
+            feedbackQueueOwner.lastSuccessfulDiagnostic =
+                feedbackDiagnostic;
+            feedbackQueueOwner.lastSuccessfulCommandBuffer =
+                (uintptr_t)feedbackCommandBuffer;
+            feedbackQueueOwner.lastSuccessfulCompletion =
+                feedbackCompletionValue;
+            feedbackQueueOwner.lastSuccessfulGPUStart =
+                feedback.GPUStartTime;
+            feedbackQueueOwner.lastSuccessfulGPUEnd =
+                feedback.GPUEndTime;
+            feedbackQueueOwner.hasLastSuccessfulDiagnostic = YES;
+          }
           [feedbackQueueOwner.errorLock unlock];
         }
         if (injectTestError) {
@@ -2927,6 +4070,20 @@ static _Thread_local int dxmt_metal4_commit_locked_depth = 0;
             feedbackQueueOwner.firstError = error;
             firstQueueError = YES;
           }
+          if ((denseHangDiagnostics || errorSnapshotDiagnostics) &&
+              feedbackQueueOwner.hasLastSuccessfulDiagnostic) {
+            previousSuccessfulDiagnostic =
+                feedbackQueueOwner.lastSuccessfulDiagnostic;
+            previousSuccessfulCommandBuffer =
+                feedbackQueueOwner.lastSuccessfulCommandBuffer;
+            previousSuccessfulCompletion =
+                feedbackQueueOwner.lastSuccessfulCompletion;
+            previousSuccessfulGPUStart =
+                feedbackQueueOwner.lastSuccessfulGPUStart;
+            previousSuccessfulGPUEnd =
+                feedbackQueueOwner.lastSuccessfulGPUEnd;
+            hasPreviousSuccessfulDiagnostic = YES;
+          }
           [feedbackQueueOwner.errorLock unlock];
         }
         if (error && feedbackCompletionEvent.signaledValue <
@@ -2935,9 +4092,24 @@ static _Thread_local int dxmt_metal4_commit_locked_depth = 0;
           // the GPU has finished processing the submission, successfully or
           // not, so advancing it is safe and releases waiters/resource
           // retirement.
+          if (denseHangDiagnostics || perfFeedback) {
+            dxmt_metal4_hang_log(
+                DXMT_METAL4_HANG_LOG_BOTH,
+                "warn:  DXMT Metal4 feedback force-timeline: commandBuffer=%p "
+                "completion=%" PRIu64 " before=%" PRIu64
+                " reason=feedback-error\n",
+                (void *)(uintptr_t)feedbackCommandBuffer,
+                feedbackCompletionValue, feedbackCompletionEvent.signaledValue);
+          }
           feedbackCompletionEvent.signaledValue = feedbackCompletionValue;
         }
-        if (errorDiagnostics && error) {
+        /*
+         * Error-path diagnostics are mandatory. The immutable command-buffer
+         * snapshot is already captured for feedback, so suppressing it when
+         * dense diagnostics are off only removes the evidence needed to fix a
+         * production-speed GPU fault.
+         */
+        if (error) {
         fprintf(stderr,
                 "err:   DXMT Metal4 commit feedback error: commandBuffer=%p metalBuffer=%p"
                 " queue=%p queueDepth=%" PRIu64 " completionTarget=%" PRIu64
@@ -3055,7 +4227,7 @@ static _Thread_local int dxmt_metal4_commit_locked_depth = 0;
               dumpPresentDiagnosticsForErrorCommandBuffer:
                   feedbackCommandBuffer];
 
-        if (denseHangDiagnostics) {
+        if (error) {
           for (uint32_t edge_index = 0;
                edge_index < feedbackDiagnostic.fence_edge_count &&
                edge_index < WMT_COMMAND_BUFFER_FENCE_EDGE_CAPACITY;
@@ -3065,11 +4237,30 @@ static _Thread_local int dxmt_metal4_commit_locked_depth = 0;
             fprintf(stderr,
                     "err:   DXMT Metal4 feedback fence edge: commandBuffer=%p"
                     " edge=%u producer=%" PRIu64 " consumer=%" PRIu64
-                    " producerIndex=%u consumerIndex=%u slot=%u flags=0x%x\n",
+                    " producerIndex=%u consumerIndex=%u slot=%u flags=0x%x"
+                    " resource=0x%" PRIx64 " identity=%" PRIu64
+                    " allocation=0x%" PRIx64 " metal=0x%" PRIx64
+                    " gpuAddressOrId=0x%" PRIx64
+                    " matches=%u matchHash=0x%" PRIx64
+                    " producerRange=%" PRIu64 "+%" PRIu64
+                    " producerView=%" PRIu64 " producerAccess=0x%x"
+                    " producerStageKind=0x%x"
+                    " consumerRange=%" PRIu64 "+%" PRIu64
+                    " consumerView=%" PRIu64 " consumerAccess=0x%x"
+                    " consumerStageKind=0x%x\n",
                     (void *)(uintptr_t)feedbackCommandBuffer, edge_index,
                     edge->producer_id, edge->consumer_id,
                     edge->producer_index, edge->consumer_index, edge->slot,
-                    edge->flags);
+                    edge->flags, edge->resource_object,
+                    edge->resource_identity, edge->allocation_object,
+                    edge->metal_resource_handle,
+                    edge->gpu_address_or_resource_id,
+                    edge->resource_match_count, edge->resource_match_hash,
+                    edge->producer_offset, edge->producer_length,
+                    edge->producer_view_id, edge->producer_access,
+                    edge->producer_stage_kind, edge->consumer_offset,
+                    edge->consumer_length, edge->consumer_view_id,
+                    edge->consumer_access, edge->consumer_stage_kind);
           }
           for (uint32_t encoder_index = 0;
                encoder_index < feedbackDiagnostic.encoder_diagnostic_count &&
@@ -3087,7 +4278,8 @@ static _Thread_local int dxmt_metal4_commit_locked_depth = 0;
                     " pso=0x%" PRIx64
                     " argbuf=0x%" PRIx64 "+%" PRIu64 "/%" PRIu64
                     " primary=0x%" PRIx64 " secondary=0x%" PRIx64
-                    " resourcePlan=%u/0x%" PRIx64 " flags=0x%x\n",
+                    " resourcePlan=%u/0x%" PRIx64
+                    " d3dSeq=%" PRIu64 "-%" PRIu64 " flags=0x%x\n",
                     (void *)(uintptr_t)feedbackCommandBuffer, encoder_index,
                     encoder->encoder_index, encoder->type,
                     encoder->encoder_id, encoder->vertex_encoder_id,
@@ -3100,7 +4292,9 @@ static _Thread_local int dxmt_metal4_commit_locked_depth = 0;
                     encoder->primary_resource,
                     encoder->secondary_resource,
                     encoder->resource_plan_count,
-                    encoder->resource_plan_hash, encoder->flags);
+                    encoder->resource_plan_hash,
+                    encoder->d3d_sequence_begin,
+                    encoder->d3d_sequence_end, encoder->flags);
           }
           NSString *debugDescription = error.debugDescription;
           NSString *userInfoDescription = error.userInfo.description;
@@ -3110,6 +4304,37 @@ static _Thread_local int dxmt_metal4_commit_locked_depth = 0;
                   (void *)(uintptr_t)feedbackCommandBuffer,
                   debugDescription ? debugDescription.UTF8String : "<none>",
                   userInfoDescription ? userInfoDescription.UTF8String : "<none>");
+
+          if (hasPreviousSuccessfulDiagnostic) {
+            dxmt_metal4_hang_log(
+                DXMT_METAL4_HANG_LOG_BOTH,
+                "info:  DXMT Metal4 previous-success timing:"
+                " commandBuffer=%p completion=%" PRIu64
+                " gpuStart=%.9f gpuEnd=%.9f gpuMs=%.3f\n",
+                (void *)previousSuccessfulCommandBuffer,
+                previousSuccessfulCompletion, previousSuccessfulGPUStart,
+                previousSuccessfulGPUEnd,
+                previousSuccessfulGPUEnd > previousSuccessfulGPUStart
+                    ? (previousSuccessfulGPUEnd -
+                       previousSuccessfulGPUStart) *
+                          1000.0
+                    : 0.0);
+            dxmt_metal4_log_full_diagnostic_snapshot(
+                DXMT_METAL4_HANG_LOG_BOTH, "previous-success",
+                (void *)previousSuccessfulCommandBuffer,
+                previousSuccessfulCompletion,
+                &previousSuccessfulDiagnostic);
+          } else {
+            dxmt_metal4_hang_log(
+                DXMT_METAL4_HANG_LOG_BOTH,
+                "info:  DXMT Metal4 previous-success full-snapshot:"
+                " unavailable\n");
+          }
+
+          dxmt_metal4_emit_hang_validation_report(
+              &feedbackDiagnostic, error,
+              (uint64_t)feedbackWaitEvents.count, feedbackInflightAtCommit,
+              feedback.GPUStartTime, feedback.GPUEndTime);
         }
 
         NSUInteger waitIndex = 0;
@@ -3147,11 +4372,10 @@ static _Thread_local int dxmt_metal4_commit_locked_depth = 0;
       }
 #endif
       } @finally {
-        // Publish the completion latch on the Metal CompletionQueue, but do
-        // NOT free temporary GPU resources here. Hand the snapshot to the
-        // command buffer so dxmt-finish-thr can drain it after wait returns
-        // (Wine-safe thread with a TEB). Latch first so waiters never hang if
-        // a later diagnostic free faults.
+        // Publish feedback status on the Metal CompletionQueue, but do not free
+        // temporary GPU resources here. Their pre-submission snapshot remains
+        // owned by the wrapper and dxmt-finish-thr drains it after the queue
+        // timeline passes (Wine-safe thread with a TEB).
         [feedbackOwner.feedbackCondition lock];
         feedbackOwner.feedbackGPUStartTime = feedback.GPUStartTime;
         feedbackOwner.feedbackGPUEndTime = feedback.GPUEndTime;
@@ -3160,24 +4384,104 @@ static _Thread_local int dxmt_metal4_commit_locked_depth = 0;
         feedbackOwner.internalStatus =
             error ? DXMTMetal4CommandBufferStateError
                   : DXMTMetal4CommandBufferStateCompleted;
-        // Transfer temporary lifetime ownership. The retain property setter
-        // takes ownership of the array (and releases any stale snapshot).
-        if (feedbackRetainedResources) {
-          feedbackOwner.pendingLifetimeSnapshot = feedbackRetainedResources;
-          [feedbackRetainedResources release];
-          feedbackRetainedResources = nil;
-        }
         feedbackOwner.feedbackComplete = YES;
+        feedbackOwner.feedbackHandlerFinished = YES;
+        const uint64_t latch_us =
+            trackFeedbackDiagnostics ? dxmt_monotonic_us() : 0;
+        feedbackOwner.feedbackHandlerLatchUs = latch_us;
+        const uint64_t latch_serial =
+            trackFeedbackDiagnostics
+                ? atomic_fetch_add_explicit(&dxmt_metal4_feedback_latch_total,
+                                            1, memory_order_relaxed) +
+                      1
+                : 0;
         [feedbackOwner.feedbackCondition broadcast];
         [feedbackOwner.feedbackCondition unlock];
+        dxmt_metal4_feedback_callback_mark(
+            enter_serial, DXMTMetal4FeedbackCallbackStageLatchPublished);
+        dxmt_metal4_feedback_callback_mark(
+            enter_serial,
+            DXMTMetal4FeedbackCallbackStagePostLatchDiagnosticsBegin);
+        if (denseHangDiagnostics || perfFeedback) {
+          dxmt_metal4_hang_log(
+              DXMT_METAL4_HANG_LOG_BOTH,
+              "info:  DXMT Metal4 feedback handler latch: commandBuffer=%p "
+              "completion=%" PRIu64 " status=%u hasError=%u "
+              "latchSerial=%" PRIu64 " handlerUs=%" PRIu64
+              " sinceSubmitUs=%" PRIu64 " timelineNow=%" PRIu64
+              " frame=%" PRIu64 " chunk=%" PRIu64 "\n",
+              (void *)(uintptr_t)feedbackCommandBuffer, feedbackCompletionValue,
+              (unsigned)feedbackOwner.internalStatus, error ? 1u : 0u,
+              latch_serial,
+              feedbackOwner.feedbackHandlerEnterUs
+                  ? (latch_us - feedbackOwner.feedbackHandlerEnterUs)
+                  : 0,
+              feedbackOwner.commitSubmitUs
+                  ? (latch_us - feedbackOwner.commitSubmitUs)
+                  : 0,
+              dxmt_metal4_shared_event_value(feedbackCompletionEvent),
+              feedbackDiagnostic.frame_id, feedbackDiagnostic.chunk_id);
+        }
+        dxmt_metal4_feedback_callback_mark(
+            enter_serial,
+            DXMTMetal4FeedbackCallbackStagePostLatchDiagnosticsEnd);
         // Diagnostic copies are not GPU resources; safe to free here.
+        dxmt_metal4_feedback_callback_mark(
+            enter_serial, DXMTMetal4FeedbackCallbackStageReleaseLabelBegin);
         [feedbackLabel release];
+        dxmt_metal4_feedback_callback_mark(
+            enter_serial, DXMTMetal4FeedbackCallbackStageReleaseLabelEnd);
+        dxmt_metal4_feedback_callback_mark(
+            enter_serial, DXMTMetal4FeedbackCallbackStageReleaseSignalsBegin);
         [feedbackSignalEvents release];
+        dxmt_metal4_feedback_callback_mark(
+            enter_serial, DXMTMetal4FeedbackCallbackStageReleaseSignalsEnd);
+        dxmt_metal4_feedback_callback_mark(
+            enter_serial, DXMTMetal4FeedbackCallbackStageReleaseWaitsBegin);
         [feedbackWaitEvents release];
+        dxmt_metal4_feedback_callback_mark(
+            enter_serial, DXMTMetal4FeedbackCallbackStageReleaseWaitsEnd);
+        dxmt_metal4_feedback_callback_mark(
+            enter_serial, DXMTMetal4FeedbackCallbackStageReleaseEventBegin);
         [feedbackCompletionEvent release];
+        dxmt_metal4_feedback_callback_mark(
+            enter_serial, DXMTMetal4FeedbackCallbackStageReleaseEventEnd);
+        dxmt_metal4_feedback_callback_mark(
+            enter_serial, DXMTMetal4FeedbackCallbackStageReleaseOwnerBegin);
         [feedbackOwner release];
+        dxmt_metal4_feedback_callback_mark(
+            enter_serial, DXMTMetal4FeedbackCallbackStageReleaseOwnerEnd);
+        dxmt_metal4_feedback_callback_mark(
+            enter_serial, DXMTMetal4FeedbackCallbackStageReturn);
       }
     }];
+  }
+
+  if (denseHangDiagnostics || perfFeedback) {
+    const uint64_t timeline_now =
+        _owner.event ? _owner.event.signaledValue : 0;
+    dxmt_metal4_hang_log(
+        DXMT_METAL4_HANG_LOG_BOTH,
+        "info:  DXMT Metal4 commit pre-submit: commandBuffer=%p metalBuffer=%p "
+        "queue=%p timelineEvent=%p presentEvent=%p completion=%" PRIu64
+        " timelineNow=%" PRIu64 " options=%u drawable=%d "
+        "waitCount=%lu signalCount=%lu presentOrdering=%u waitForDrawable=%u "
+        "frame=%" PRIu64 " chunk=%" PRIu64 " d3dSeq=%" PRIu64 "-%" PRIu64 "\n",
+        self, _metal4Buffer, _owner.metal4Queue, _owner.event,
+        _owner.presentEvent, completionValue, timeline_now, options ? 1u : 0u,
+        _pendingDrawable != nil, (unsigned long)_pendingWaitEvents.count,
+        (unsigned long)_pendingSignalEvents.count, presentOrdering ? 1u : 0u,
+        waitForDrawable ? 1u : 0u, _diagnosticInfo.frame_id,
+        _diagnosticInfo.chunk_id, _diagnosticInfo.d3d_sequence_begin,
+        _diagnosticInfo.d3d_sequence_end);
+    dxmt_metal4_log_encoder_snapshot(DXMT_METAL4_HANG_LOG_BOTH, "commit-pre",
+                                     self, &_diagnosticInfo);
+    dxmt_metal4_log_pending_queue_events(DXMT_METAL4_HANG_LOG_BOTH, "commit-pre",
+                                         self, _pendingWaitEvents, YES,
+                                         _owner.event);
+    dxmt_metal4_log_pending_queue_events(DXMT_METAL4_HANG_LOG_BOTH, "commit-pre",
+                                         self, _pendingSignalEvents, NO,
+                                         _owner.event);
   }
 
   id<MTL4CommandBuffer> commandBuffers[1] = {_metal4Buffer};
@@ -3188,15 +4492,19 @@ static _Thread_local int dxmt_metal4_commit_locked_depth = 0;
   // result. Normal GPU failures arrive through feedback and always publish the
   // completion latch above. Closed-loop in @finally still closes the timeline
   // hole if we abort between nextEventValue and signalEvent.
+  _commitUsedOptions = options != nil;
   if (options)
     [_owner.metal4Queue commit:commandBuffers count:1 options:options];
   else
     [_owner.metal4Queue commit:commandBuffers count:1];
   metalSubmitted = YES;
+  if (denseHangDiagnostics || perfFeedback) {
+    _commitSubmitUs = dxmt_monotonic_us();
+    atomic_fetch_add_explicit(&dxmt_metal4_commit_submit_total, 1,
+                              memory_order_relaxed);
+  }
   // Ownership of options (and the feedback block) transfers to Metal with the
   // successful commit; drop our retain without destroying the in-flight block.
-  // Do NOT nil feedbackRetainedResources here: under MRC the __block storage is
-  // shared with the handler, which must release the snapshot on completion.
   [options release];
   options = nil;
   dxmt_apitrace_record_command_buffer_commit_state(
@@ -3213,6 +4521,16 @@ static _Thread_local int dxmt_metal4_commit_locked_depth = 0;
   if (_pendingDrawable) {
     [_owner.metal4Queue signalEvent:_owner.event value:completionValue];
     completionTimelineSignaled = YES;
+    _completionTimelineSignaledAtSubmit = YES;
+    if (denseHangDiagnostics || perfFeedback) {
+      dxmt_metal4_hang_log(
+          DXMT_METAL4_HANG_LOG_BOTH,
+          "info:  DXMT Metal4 commit timeline-signal: commandBuffer=%p "
+          "event=%p value=%" PRIu64 " path=drawable-present "
+          "frame=%" PRIu64 " chunk=%" PRIu64 "\n",
+          self, _owner.event, completionValue, _diagnosticInfo.frame_id,
+          _diagnosticInfo.chunk_id);
+    }
     [_owner.metal4Queue signalDrawable:_pendingDrawable];
     if (_hasPresentDuration)
       [_pendingDrawable presentAfterMinimumDuration:_presentDuration];
@@ -3245,6 +4563,42 @@ static _Thread_local int dxmt_metal4_commit_locked_depth = 0;
   if (!_pendingDrawable) {
     [_owner.metal4Queue signalEvent:_owner.event value:completionValue];
     completionTimelineSignaled = YES;
+    _completionTimelineSignaledAtSubmit = YES;
+    if (denseHangDiagnostics || perfFeedback) {
+      dxmt_metal4_hang_log(
+          DXMT_METAL4_HANG_LOG_BOTH,
+          "info:  DXMT Metal4 commit timeline-signal: commandBuffer=%p "
+          "event=%p value=%" PRIu64 " path=no-drawable "
+          "frame=%" PRIu64 " chunk=%" PRIu64 "\n",
+          self, _owner.event, completionValue, _diagnosticInfo.frame_id,
+          _diagnosticInfo.chunk_id);
+    }
+  }
+  [_feedbackCondition lock];
+  if (_internalStatus == DXMTMetal4CommandBufferStateEnqueued)
+    _internalStatus = DXMTMetal4CommandBufferStateCommitted;
+  [_feedbackCondition broadcast];
+  [_feedbackCondition unlock];
+  if (denseHangDiagnostics || perfFeedback) {
+    dxmt_metal4_hang_log(
+        DXMT_METAL4_HANG_LOG_BOTH,
+        "info:  DXMT Metal4 commit post-submit: commandBuffer=%p "
+        "completion=%" PRIu64 " metalSubmitted=1 optionsUsed=%u "
+        "timelineSignaled=%u timelineNow=%" PRIu64
+        " handlerEntered=%u feedbackComplete=%u "
+        "submitTotal=%" PRIu64 " feedbackEnterTotal=%" PRIu64
+        " feedbackLatchTotal=%" PRIu64 " frame=%" PRIu64 " chunk=%" PRIu64 "\n",
+        self, completionValue, _commitUsedOptions ? 1u : 0u,
+        completionTimelineSignaled ? 1u : 0u,
+        _owner.event ? _owner.event.signaledValue : 0,
+        _feedbackHandlerEntered ? 1u : 0u, _feedbackComplete ? 1u : 0u,
+        (uint64_t)atomic_load_explicit(&dxmt_metal4_commit_submit_total,
+                                       memory_order_relaxed),
+        (uint64_t)atomic_load_explicit(&dxmt_metal4_feedback_enter_total,
+                                       memory_order_relaxed),
+        (uint64_t)atomic_load_explicit(&dxmt_metal4_feedback_latch_total,
+                                       memory_order_relaxed),
+        _diagnosticInfo.frame_id, _diagnosticInfo.chunk_id);
   }
   } @finally {
     if (holdingSubmissionLock) {
@@ -3258,8 +4612,17 @@ static _Thread_local int dxmt_metal4_commit_locked_depth = 0;
     if (completionTimelineOwned && completionValue != 0) {
       if (!completionTimelineSignaled &&
           _owner.event.signaledValue < completionValue) {
+        dxmt_metal4_hang_log(
+            DXMT_METAL4_HANG_LOG_BOTH,
+            "warn:  DXMT Metal4 commit closed-loop force-timeline: "
+            "commandBuffer=%p completion=%" PRIu64 " before=%" PRIu64
+            " metalSubmitted=%u frame=%" PRIu64 " chunk=%" PRIu64 "\n",
+            self, completionValue, _owner.event.signaledValue,
+            metalSubmitted ? 1u : 0u, _diagnosticInfo.frame_id,
+            _diagnosticInfo.chunk_id);
         _owner.event.signaledValue = completionValue;
         completionTimelineSignaled = YES;
+        _completionTimelineSignaledAtSubmit = YES;
       }
       if (!metalSubmitted) {
         [_feedbackCondition lock];
@@ -3273,13 +4636,9 @@ static _Thread_local int dxmt_metal4_commit_locked_depth = 0;
                              @"Metal4 commit aborted before queue submission"
                        }] retain];
           }
-          // Reclaim the generation snapshot the uninvoked feedback handler
-          // would have owned, then hand it to the waiter drain path.
-          if (!_pendingLifetimeSnapshot && feedbackRetainedResources) {
-            _pendingLifetimeSnapshot = feedbackRetainedResources;
-            feedbackRetainedResources = nil;
-          } else if (!_pendingLifetimeSnapshot &&
-                     _retainedTemporaryResources.count) {
+          // Feedback setup normally publishes the lifetime snapshot before
+          // submission. Cover an earlier setup exception as well.
+          if (!_pendingLifetimeSnapshot && _retainedTemporaryResources.count) {
             _pendingLifetimeSnapshot =
                 [_retainedTemporaryResources copy];
             [_retainedTemporaryResources release];
@@ -3287,13 +4646,11 @@ static _Thread_local int dxmt_metal4_commit_locked_depth = 0;
           }
           _internalStatus = DXMTMetal4CommandBufferStateError;
           _feedbackComplete = YES;
+          // Closed-loop published the latch without Metal feedback delivery.
+          _feedbackHandlerFinished = YES;
           [_feedbackCondition broadcast];
         }
         [_feedbackCondition unlock];
-        if (feedbackRetainedResources) {
-          [feedbackRetainedResources release];
-          feedbackRetainedResources = nil;
-        }
         // Destroy uncommitted options / feedback block (handler never runs).
         if (options) {
           [options release];
@@ -3310,7 +4667,30 @@ static _Thread_local int dxmt_metal4_commit_locked_depth = 0;
             _diagnosticInfo.chunk_id);
       }
     }
-    dxmt_metal4_commit_locked_depth--;
+    /*
+     * Enqueued is an internal submitter-ownership state, never a completed
+     * commit result. Close every exceptional/early exit, including failures
+     * before nextEventValueLocked(), so a waiter cannot observe an abandoned
+     * generation with completionValue == 0.
+     */
+    [_feedbackCondition lock];
+    if (_internalStatus == DXMTMetal4CommandBufferStateEnqueued &&
+        !metalSubmitted) {
+      if (!_feedbackError) {
+        _feedbackError = [[NSError
+            errorWithDomain:@"DXMTMetal4CommitDomain"
+                       code:4
+                   userInfo:@{
+                     NSLocalizedDescriptionKey :
+                         @"Metal4 submission ownership abandoned before commit"
+                   }] retain];
+      }
+      _internalStatus = DXMTMetal4CommandBufferStateError;
+      _feedbackComplete = YES;
+      _feedbackHandlerFinished = YES;
+      [_feedbackCondition broadcast];
+    }
+    [_feedbackCondition unlock];
   }
 
   [_owner monitorSetPhase:DXMTMetal4QueueMonitorPhaseFinalize
@@ -3341,12 +4721,18 @@ static _Thread_local int dxmt_metal4_commit_locked_depth = 0;
 }
 
 - (void)waitUntilCompleted {
+  const uint64_t wait_overall_begin_us = dxmt_monotonic_us();
   [_feedbackCondition lock];
   const unsigned entry_status = (unsigned)_internalStatus;
   const uint64_t entry_completion = _completionValue;
   const BOOL entry_feedback = _feedbackComplete;
+  const BOOL entry_handler_entered = _feedbackHandlerEntered;
+  const BOOL entry_handler_finished = _feedbackHandlerFinished;
   const BOOL needsCommit =
       _internalStatus == DXMTMetal4CommandBufferStateNotEnqueued;
+  const BOOL entry_options = _commitUsedOptions;
+  const BOOL entry_timeline_signaled = _completionTimelineSignaledAtSubmit;
+  const uint64_t entry_submit_us = _commitSubmitUs;
   [_feedbackCondition unlock];
   const uint64_t entry_signaled =
       _owner.event ? _owner.event.signaledValue : 0;
@@ -3356,17 +4742,40 @@ static _Thread_local int dxmt_metal4_commit_locked_depth = 0;
     dxmt_metal4_hang_log(
         DXMT_METAL4_HANG_LOG_BOTH,
         "info:  DXMT Metal4 waitUntilCompleted enter: commandBuffer=%p "
-        "metalBuffer=%p queue=%p status=%u completion=%" PRIu64
-        " signaled=%" PRIu64 " feedbackComplete=%u needsCommit=%u"
+        "metalBuffer=%p queue=%p timelineEvent=%p status=%u completion=%" PRIu64
+        " signaled=%" PRIu64 " timelinePast=%u feedbackComplete=%u "
+        "handlerEntered=%u handlerFinished=%u needsCommit=%u "
+        "optionsUsed=%u timelineSignaledAtSubmit=%u sinceSubmitUs=%" PRIu64
+        " submitTotal=%" PRIu64 " feedbackEnterTotal=%" PRIu64
+        " feedbackLatchTotal=%" PRIu64
         " frame=%" PRIu64 " chunk=%" PRIu64 " d3dSeq=%" PRIu64 "-%" PRIu64
-        " externalWait=%u skippedExternalFenceWait=%u\n",
-        self, _metal4Buffer, _owner.metal4Queue, entry_status,
-        entry_completion, entry_signaled, entry_feedback ? 1u : 0u,
-        needsCommit ? 1u : 0u, _diagnosticInfo.frame_id,
-        _diagnosticInfo.chunk_id, _diagnosticInfo.d3d_sequence_begin,
-        _diagnosticInfo.d3d_sequence_end,
+        " externalWait=%u skippedExternalFenceWait=%u "
+        "waitCount=%lu signalCount=%lu drawable=%d\n",
+        self, _metal4Buffer, _owner.metal4Queue, _owner.event, entry_status,
+        entry_completion, entry_signaled,
+        (entry_completion && entry_signaled >= entry_completion) ? 1u : 0u,
+        entry_feedback ? 1u : 0u, entry_handler_entered ? 1u : 0u,
+        entry_handler_finished ? 1u : 0u, needsCommit ? 1u : 0u,
+        entry_options ? 1u : 0u, entry_timeline_signaled ? 1u : 0u,
+        entry_submit_us ? (wait_overall_begin_us - entry_submit_us) : 0,
+        (uint64_t)atomic_load_explicit(&dxmt_metal4_commit_submit_total,
+                                       memory_order_relaxed),
+        (uint64_t)atomic_load_explicit(&dxmt_metal4_feedback_enter_total,
+                                       memory_order_relaxed),
+        (uint64_t)atomic_load_explicit(&dxmt_metal4_feedback_latch_total,
+                                       memory_order_relaxed),
+        _diagnosticInfo.frame_id, _diagnosticInfo.chunk_id,
+        _diagnosticInfo.d3d_sequence_begin, _diagnosticInfo.d3d_sequence_end,
         _diagnosticInfo.external_fence_wait_count,
-        _diagnosticInfo.skipped_external_fence_wait_count);
+        _diagnosticInfo.skipped_external_fence_wait_count,
+        (unsigned long)_pendingWaitEvents.count,
+        (unsigned long)_pendingSignalEvents.count, _pendingDrawable != nil);
+    dxmt_metal4_log_pending_queue_events(DXMT_METAL4_HANG_LOG_BOTH, "wait-enter",
+                                         self, _pendingWaitEvents, YES,
+                                         _owner.event);
+    dxmt_metal4_log_pending_queue_events(DXMT_METAL4_HANG_LOG_BOTH, "wait-enter",
+                                         self, _pendingSignalEvents, NO,
+                                         _owner.event);
   }
   if (needsCommit)
     [self commit];
@@ -3388,10 +4797,13 @@ static _Thread_local int dxmt_metal4_commit_locked_depth = 0;
         entry_status, entry_completion, needsCommit ? 1u : 0u,
         _diagnosticInfo.frame_id, _diagnosticInfo.chunk_id);
   }
+  uint64_t timeline_wait_us = 0;
   if (completionValue) {
     if (!dxmt_metal4_perf_stats_enabled() &&
         !dxmt_metal4_dense_hang_diagnostics_enabled()) {
+      const uint64_t timeline_begin_us = dxmt_monotonic_us();
       [_owner.event waitUntilSignaledValue:completionValue timeoutMS:UINT64_MAX];
+      timeline_wait_us = dxmt_monotonic_us() - timeline_begin_us;
     } else {
       uint64_t wait_begin_us = dxmt_monotonic_us();
       uint64_t timeout_count = 0;
@@ -3405,154 +4817,200 @@ static _Thread_local int dxmt_metal4_commit_locked_depth = 0;
           [_feedbackCondition lock];
           const unsigned stall_status = (unsigned)_internalStatus;
           const BOOL stall_feedback = _feedbackComplete;
+          const BOOL stall_handler_entered = _feedbackHandlerEntered;
+          const BOOL stall_handler_finished = _feedbackHandlerFinished;
           [_feedbackCondition unlock];
           dxmt_metal4_hang_log(
               DXMT_METAL4_HANG_LOG_BOTH,
-              "warn:  DXMT Metal4 completion stall: commandBuffer=%p metalBuffer=%p queue=%p"
-              " elapsedMs=%" PRIu64 " completionTarget=%" PRIu64 " completionCurrent=%" PRIu64
+              "warn:  DXMT Metal4 completion stall: commandBuffer=%p "
+              "metalBuffer=%p queue=%p timelineEvent=%p elapsedMs=%" PRIu64
+              " completionTarget=%" PRIu64 " completionCurrent=%" PRIu64
               " waitCount=%lu signalCount=%lu drawable=%d presentTarget=%" PRIu64
-              " presentCurrent=%" PRIu64 " status=%u feedbackComplete=%u"
+              " presentCurrent=%" PRIu64 " status=%u feedbackComplete=%u "
+              "handlerEntered=%u handlerFinished=%u "
+              "submitTotal=%" PRIu64 " feedbackEnterTotal=%" PRIu64
+              " feedbackLatchTotal=%" PRIu64
               " frame=%" PRIu64 " chunk=%" PRIu64 "\n",
-              self, _metal4Buffer, _owner.metal4Queue, elapsed_ms,
+              self, _metal4Buffer, _owner.metal4Queue, _owner.event, elapsed_ms,
               completionValue, completion_current,
               (unsigned long)_pendingWaitEvents.count,
               (unsigned long)_pendingSignalEvents.count,
               _pendingDrawable != nil, _owner.presentEventValue,
               present_current, stall_status, stall_feedback ? 1u : 0u,
+              stall_handler_entered ? 1u : 0u,
+              stall_handler_finished ? 1u : 0u,
+              (uint64_t)atomic_load_explicit(&dxmt_metal4_commit_submit_total,
+                                             memory_order_relaxed),
+              (uint64_t)atomic_load_explicit(&dxmt_metal4_feedback_enter_total,
+                                             memory_order_relaxed),
+              (uint64_t)atomic_load_explicit(&dxmt_metal4_feedback_latch_total,
+                                             memory_order_relaxed),
               _diagnosticInfo.frame_id, _diagnosticInfo.chunk_id);
-          const struct WMTCommandBufferDiagnosticInfo *diag = &_diagnosticInfo;
-          dxmt_metal4_hang_log(
-              DXMT_METAL4_HANG_LOG_BOTH,
-              "warn:  DXMT Metal4 completion diagnostic: commandBuffer=%p label=%s"
-              " frame=%" PRIu64 " chunk=%" PRIu64
-              " d3dSequence=%" PRIu64 "..%" PRIu64
-              " inputEncoders=%u encodedEncoders=%u render=%u compute=%u blit=%u other=%u"
-              " present=%u clear=%u resolve=%u scaler=%u timestamps=%u"
-              " barrierOnly=%u fenceWait=%u fenceUpdate=%u"
-              " priorLocal=%u futureLocal=%u sameEncoder=%u external=%u"
-              " repeatedUpdate=%u renderCrossStage=%u renderSameStage=%u"
-              " renderReverseStage=%u localFenceIds=%u boundFenceSlots=%u"
-              " encodedFenceWait=%u skippedExternalFenceWait=%u"
-              " fenceEdgeCount=%u fenceEdgeOverflow=%u"
-              " resourceInitializerEvent=%" PRIu64 "\n",
-              self,
-              _metal4Buffer.label ? _metal4Buffer.label.UTF8String : "<none>",
-              diag->frame_id, diag->chunk_id, diag->d3d_sequence_begin,
-              diag->d3d_sequence_end, diag->input_encoder_count,
-              diag->encoded_encoder_count, diag->render_encoder_count,
-              diag->compute_encoder_count, diag->blit_encoder_count,
-              diag->other_encoder_count, diag->present_encoder_count,
-              diag->clear_encoder_count, diag->resolve_encoder_count,
-              diag->scaler_encoder_count, diag->timestamp_encoder_count,
-              diag->barrier_only_pass_count, diag->fence_wait_count,
-              diag->fence_update_count, diag->prior_local_fence_wait_count,
-              diag->future_local_fence_wait_count,
-              diag->same_encoder_fence_wait_count,
-              diag->external_fence_wait_count,
-              diag->repeated_fence_update_count,
-              diag->render_valid_cross_stage_count,
-              diag->render_same_stage_wait_count,
-              diag->render_reverse_stage_wait_count,
-              diag->local_fence_id_count, diag->bound_fence_slot_count,
-              diag->encoded_fence_wait_count,
-              diag->skipped_external_fence_wait_count,
-              diag->fence_edge_count, diag->fence_edge_overflow_count,
-              diag->resource_initializer_event_id);
-          for (uint32_t edge_index = 0;
-               edge_index < diag->fence_edge_count &&
-               edge_index < WMT_COMMAND_BUFFER_FENCE_EDGE_CAPACITY;
-               edge_index++) {
-            const struct WMTCommandBufferFenceEdgeDiagnostic *edge =
-                &diag->fence_edges[edge_index];
-            dxmt_metal4_hang_log(
-                DXMT_METAL4_HANG_LOG_BOTH,
-                "warn:  DXMT Metal4 completion fence edge: commandBuffer=%p"
-                " edge=%u producer=%" PRIu64 " consumer=%" PRIu64
-                " producerIndex=%u consumerIndex=%u slot=%u flags=0x%x\n",
-                self, edge_index, edge->producer_id, edge->consumer_id,
-                edge->producer_index, edge->consumer_index, edge->slot,
-                edge->flags);
-          }
-          NSUInteger wait_index = 0;
-          for (DXMTMetal4QueueEvent *wait in _pendingWaitEvents) {
-            uint64_t wait_current = dxmt_metal4_shared_event_value(wait.event);
-            dxmt_metal4_hang_log(
-                DXMT_METAL4_HANG_LOG_BOTH,
-                "warn:  DXMT Metal4 completion wait: commandBuffer=%p index=%lu event=%p"
-                " target=%" PRIu64 " current=%" PRIu64 " blocked=%d\n",
-                self, (unsigned long)wait_index++, wait.event, wait.value,
-                wait_current, wait_current < wait.value);
-          }
-          NSUInteger signal_index = 0;
-          for (DXMTMetal4QueueEvent *signal in _pendingSignalEvents) {
-            uint64_t signal_current =
-                dxmt_metal4_shared_event_value(signal.event);
-            dxmt_metal4_hang_log(
-                DXMT_METAL4_HANG_LOG_BOTH,
-                "warn:  DXMT Metal4 completion signal: commandBuffer=%p index=%lu event=%p"
-                " target=%" PRIu64 " current=%" PRIu64 "\n",
-                self, (unsigned long)signal_index++, signal.event,
-                signal.value, signal_current);
-          }
+          dxmt_metal4_log_encoder_snapshot(DXMT_METAL4_HANG_LOG_BOTH,
+                                           "completion-stall", self,
+                                           &_diagnosticInfo);
+          dxmt_metal4_log_pending_queue_events(
+              DXMT_METAL4_HANG_LOG_BOTH, "completion-stall", self,
+              _pendingWaitEvents, YES, _owner.event);
+          dxmt_metal4_log_pending_queue_events(
+              DXMT_METAL4_HANG_LOG_BOTH, "completion-stall", self,
+              _pendingSignalEvents, NO, _owner.event);
         }
       }
+      timeline_wait_us = dxmt_monotonic_us() - wait_begin_us;
       if (timeout_count) {
         dxmt_metal4_hang_log(
             DXMT_METAL4_HANG_LOG_BOTH,
-            "warn:  DXMT Metal4 completion recovered: commandBuffer=%p elapsedMs=%" PRIu64
-            " completionTarget=%" PRIu64 " completionCurrent=%" PRIu64 "\n",
-            self, (dxmt_monotonic_us() - wait_begin_us) / 1000, completionValue,
-            _owner.event.signaledValue);
+            "warn:  DXMT Metal4 completion recovered: commandBuffer=%p "
+            "elapsedMs=%" PRIu64 " completionTarget=%" PRIu64
+            " completionCurrent=%" PRIu64 " timeouts=%" PRIu64 "\n",
+            self, timeline_wait_us / 1000, completionValue,
+            _owner.event.signaledValue, timeout_count);
       }
     }
     // GPU timeline has passed this generation: drop completed *transient*
     // residency memberships without holding the commit serializer.
     [_owner retireCompletedResidency];
+
   }
 
-  // The queue timeline may be signaled before Metal invokes its CPU feedback
-  // handler. Feedback owns final status/timing/error publication; temporary
-  // resource lifetime is handed off via pendingLifetimeSnapshot and drained here
-  // on the waiter thread after the latch is visible.
+  // D3DMetal treats the Metal queue timeline as the forward-progress and GPU
+  // retirement authority. Feedback normally arrives first and augments that
+  // state with error/timing data, but Metal may delay or omit the callback.
+  // Give the normal callback a tiny bounded window so pooled objects can be
+  // reused, then recover from the already-passed timeline instead of hanging.
+  BOOL recoveredFromTimeline = NO;
+  uint64_t recoverySerial = 0;
+  uint64_t recoveryReportSerial = 0;
+  uint64_t feedback_grace_us = 0;
+  BOOL recoveryHandlerEntered = NO;
+  BOOL recoveryHandlerFinished = NO;
+  unsigned recoveryStatus = 0;
+  uint64_t signaled_at_feedback_wait =
+      _owner.event ? _owner.event.signaledValue : 0;
   [_feedbackCondition lock];
-  if (hang_diag) {
-    uint64_t feedback_begin_us = dxmt_monotonic_us();
-    uint64_t feedback_timeouts = 0;
-    while (!_feedbackComplete) {
-      NSDate *deadline =
-          [NSDate dateWithTimeIntervalSinceNow:1.0];
-      if (![_feedbackCondition waitUntilDate:deadline]) {
-        feedback_timeouts++;
-        if (feedback_timeouts <= 5 || (feedback_timeouts % 5) == 0) {
-          const uint64_t elapsed_ms =
-              (dxmt_monotonic_us() - feedback_begin_us) / 1000;
-          const uint64_t signaled =
-              _owner.event ? _owner.event.signaledValue : 0;
-          dxmt_metal4_hang_log(
-              DXMT_METAL4_HANG_LOG_BOTH,
-              "warn:  DXMT Metal4 feedback latch stall: commandBuffer=%p "
-              "queue=%p elapsedMs=%" PRIu64 " completion=%" PRIu64
-              " signaled=%" PRIu64 " status=%u feedbackComplete=0"
-              " frame=%" PRIu64 " chunk=%" PRIu64 "\n",
-              self, _owner.metal4Queue, elapsed_ms, completionValue, signaled,
-              (unsigned)_internalStatus, _diagnosticInfo.frame_id,
-              _diagnosticInfo.chunk_id);
-        }
-      }
-    }
-  } else {
-    while (!_feedbackComplete)
-      [_feedbackCondition wait];
-  }
-  [_feedbackCondition unlock];
+  const uint64_t feedback_begin_us = hang_diag ? dxmt_monotonic_us() : 0;
   if (hang_diag) {
     dxmt_metal4_hang_log(
-        DXMT_METAL4_HANG_LOG_FILE,
+        DXMT_METAL4_HANG_LOG_BOTH,
+        "info:  DXMT Metal4 wait feedback-phase enter: commandBuffer=%p "
+        "completion=%" PRIu64 " signaled=%" PRIu64 " timelinePast=%u "
+        "feedbackComplete=%u handlerEntered=%u handlerFinished=%u "
+        "timelineWaitUs=%" PRIu64 " sinceSubmitUs=%" PRIu64
+        " frame=%" PRIu64 " chunk=%" PRIu64 "\n",
+        self, completionValue, signaled_at_feedback_wait,
+        (completionValue && signaled_at_feedback_wait >= completionValue) ? 1u
+                                                                          : 0u,
+        _feedbackComplete ? 1u : 0u, _feedbackHandlerEntered ? 1u : 0u,
+        _feedbackHandlerFinished ? 1u : 0u, timeline_wait_us,
+        _commitSubmitUs ? (feedback_begin_us - _commitSubmitUs) : 0,
+        _diagnosticInfo.frame_id, _diagnosticInfo.chunk_id);
+  }
+
+  /*
+   * A grace wait is useful only while explicitly diagnosing callback latency.
+   * On the normal/error-snapshot path the queue timeline already proves GPU
+   * retirement; sleeping one millisecond per missing micro-chunk turns delayed
+   * optional feedback into application-visible backpressure.
+   */
+  if (hang_diag && !_feedbackComplete && completionValue &&
+      signaled_at_feedback_wait >= completionValue) {
+    NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:0.001];
+    while (!_feedbackComplete &&
+           [_feedbackCondition waitUntilDate:deadline]) {
+    }
+    feedback_grace_us = dxmt_monotonic_us() - feedback_begin_us;
+  }
+
+  signaled_at_feedback_wait =
+      _owner.event ? _owner.event.signaledValue : 0;
+  if (!_feedbackComplete && completionValue &&
+      signaled_at_feedback_wait >= completionValue) {
+    recoveryHandlerEntered = _feedbackHandlerEntered;
+    recoveryHandlerFinished = _feedbackHandlerFinished;
+    _completionRecoveredFromTimeline = YES;
+    if (_internalStatus != DXMTMetal4CommandBufferStateError)
+      _internalStatus = DXMTMetal4CommandBufferStateCompleted;
+    recoveryStatus = (unsigned)_internalStatus;
+    recoveredFromTimeline = YES;
+    if (hang_diag) {
+      recoverySerial =
+          atomic_fetch_add_explicit(&dxmt_metal4_timeline_recovery_total, 1,
+                                    memory_order_relaxed) +
+          1;
+      recoveryReportSerial =
+          atomic_fetch_add_explicit(&dxmt_metal4_feedback_stall_report_total, 1,
+                                    memory_order_relaxed) +
+          1;
+    }
+  }
+
+  // A zero completion value means nothing was safely submitted to the queue.
+  // The pre-submit closed loop and queue-error path both publish a latch; keep
+  // this wait only as a defensive fallback for those non-GPU paths.
+  while (!_feedbackComplete && !recoveredFromTimeline)
+    [_feedbackCondition wait];
+  [_feedbackCondition unlock];
+
+  if (recoveredFromTimeline && hang_diag) {
+    const uint64_t submit_total = atomic_load_explicit(
+        &dxmt_metal4_commit_submit_total, memory_order_relaxed);
+    const uint64_t enter_total = atomic_load_explicit(
+        &dxmt_metal4_feedback_enter_total, memory_order_relaxed);
+    const uint64_t latch_total = atomic_load_explicit(
+        &dxmt_metal4_feedback_latch_total, memory_order_relaxed);
+    const char *class_tag =
+        !recoveryHandlerEntered
+            ? "A-metal-never-called-feedback"
+            : (!recoveryHandlerFinished ? "B-handler-stuck-before-latch"
+                                        : "C-latch-not-visible-to-waiter");
+    const BOOL report_recovery =
+        recoveryReportSerial <= 2 || (recoveryReportSerial % 64) == 0;
+    if (report_recovery) {
+      dxmt_metal4_hang_log(
+          DXMT_METAL4_HANG_LOG_BOTH,
+          "warn:  DXMT Metal4 timeline-authoritative recovery: "
+          "commandBuffer=%p metalBuffer=%p queue=%p timelineEvent=%p "
+          "completion=%" PRIu64 " signaled=%" PRIu64
+          " status=%u handlerEntered=%u handlerFinished=%u class=%s "
+          "feedbackGraceUs=%" PRIu64 " recoverySerial=%" PRIu64
+          " reportSerial=%" PRIu64 " submitTotal=%" PRIu64
+          " feedbackEnterTotal=%" PRIu64 " feedbackLatchTotal=%" PRIu64
+          " missingEnters=%" PRIu64 " missingLatches=%" PRIu64
+          " frame=%" PRIu64 " chunk=%" PRIu64
+          " d3dSeq=%" PRIu64 "-%" PRIu64
+          " reason=timeline-passed-feedback-missing\n",
+          self, _metal4Buffer, _owner.metal4Queue, _owner.event,
+          completionValue, signaled_at_feedback_wait, recoveryStatus,
+          recoveryHandlerEntered ? 1u : 0u,
+          recoveryHandlerFinished ? 1u : 0u, class_tag, feedback_grace_us,
+          recoverySerial, recoveryReportSerial, submit_total, enter_total,
+          latch_total,
+          submit_total > enter_total ? (submit_total - enter_total) : 0,
+          enter_total > latch_total ? (enter_total - latch_total) : 0,
+          _diagnosticInfo.frame_id, _diagnosticInfo.chunk_id,
+          _diagnosticInfo.d3d_sequence_begin,
+          _diagnosticInfo.d3d_sequence_end);
+    }
+    if (recoveryReportSerial == 2)
+      dxmt_metal4_dump_feedback_callback_breadcrumbs(completionValue);
+    dxmt_metal4_log_encoder_snapshot(DXMT_METAL4_HANG_LOG_BOTH,
+                                     "timeline-recovery", self,
+                                     &_diagnosticInfo);
+  }
+  if (hang_diag) {
+    const uint64_t leave_us = dxmt_monotonic_us();
+    dxmt_metal4_hang_log(
+        DXMT_METAL4_HANG_LOG_BOTH,
         "info:  DXMT Metal4 waitUntilCompleted leave: commandBuffer=%p "
         "queue=%p status=%u completion=%" PRIu64 " signaled=%" PRIu64
+        " handlerEntered=%u handlerFinished=%u "
+        "timelineWaitUs=%" PRIu64 " totalWaitUs=%" PRIu64
         " frame=%" PRIu64 " chunk=%" PRIu64 "\n",
         self, _owner.metal4Queue, (unsigned)_internalStatus, completionValue,
         _owner.event ? _owner.event.signaledValue : 0,
+        _feedbackHandlerEntered ? 1u : 0u, _feedbackHandlerFinished ? 1u : 0u,
+        timeline_wait_us, leave_us - wait_overall_begin_us,
         _diagnosticInfo.frame_id, _diagnosticInfo.chunk_id);
   }
   [self drainPendingLifetimeOwnership];
@@ -3656,9 +5114,11 @@ static _Thread_local int dxmt_metal4_commit_locked_depth = 0;
                 " drawable=%p texture=%p layer=%p set=%p contains=%u allocations=%lu\n",
                 index, drawable, texture, layer, layerSet,
                 layerSet && texture
-                    ? [layerSet containsAllocation:(id<MTLAllocation>)texture]
+                    ? dxmt_residency_set_contains_allocation_direct(
+                          layerSet, (id<MTLAllocation>)texture)
                     : 0,
-                layerSet ? (unsigned long)layerSet.allocationCount : 0ul);
+                (unsigned long)
+                    dxmt_residency_set_allocation_count_direct(layerSet));
         fflush(stderr);
       }
     }
@@ -3700,6 +5160,30 @@ static _Thread_local int dxmt_metal4_commit_locked_depth = 0;
       0,
       0,
       0);
+  if (dxmt_metal4_dense_hang_diagnostics_enabled()) {
+    NSUInteger heap_count = 0;
+    if (heap && [heap respondsToSelector:@selector(count)])
+      heap_count = [(id)heap count];
+    const unsigned oob =
+        (heap_count > 0 && index >= heap_count) ? 1u : 0u;
+    dxmt_metal4_hang_log(
+        DXMT_METAL4_HANG_LOG_BOTH,
+        "info:  DXMT Metal4 writeTimestamp: commandBuffer=%p metalBuffer=%p "
+        "heap=%p index=%lu heapCount=%lu nullHeap=%u oob=%u "
+        "frame=%" PRIu64 " chunk=%" PRIu64 " completion=%" PRIu64 "\n",
+        self, _metal4Buffer, heap, (unsigned long)index,
+        (unsigned long)heap_count, heap ? 0u : 1u, oob,
+        _diagnosticInfo.frame_id, _diagnosticInfo.chunk_id, _completionValue);
+  }
+  if (!heap) {
+    dxmt_metal4_hang_log(
+        DXMT_METAL4_HANG_LOG_BOTH,
+        "err:   DXMT Metal4 writeTimestamp skipped null heap: "
+        "commandBuffer=%p index=%lu frame=%" PRIu64 " chunk=%" PRIu64 "\n",
+        self, (unsigned long)index, _diagnosticInfo.frame_id,
+        _diagnosticInfo.chunk_id);
+    return;
+  }
   [_metal4Buffer writeTimestampIntoHeap:heap atIndex:index];
 }
 
@@ -3710,8 +5194,19 @@ static _Thread_local int dxmt_metal4_commit_locked_depth = 0;
                          length:(uint64_t)length
                       waitFence:(id<MTLFence>)fenceToWait
                     updateFence:(id<MTLFence>)fenceToUpdate {
-  if (!heap || !buffer || !length)
+  if (!heap || !buffer || !length) {
+    if (dxmt_metal4_dense_hang_diagnostics_enabled()) {
+      dxmt_metal4_hang_log(
+          DXMT_METAL4_HANG_LOG_BOTH,
+          "err:   DXMT Metal4 resolveCounterHeap skip: commandBuffer=%p "
+          "heap=%p buffer=%p length=%" PRIu64 " start=%lu count=%lu "
+          "nullHeap=%u nullBuf=%u frame=%" PRIu64 " chunk=%" PRIu64 "\n",
+          self, heap, buffer, length, (unsigned long)range.location,
+          (unsigned long)range.length, heap ? 0u : 1u, buffer ? 0u : 1u,
+          _diagnosticInfo.frame_id, _diagnosticInfo.chunk_id);
+    }
     return;
+  }
   // Defined above helper section; keep a local guard (same crash class).
   if (![(id)buffer respondsToSelector:@selector(gpuAddress)] ||
       ![(id)buffer respondsToSelector:@selector(length)]) {
@@ -3720,6 +5215,36 @@ static _Thread_local int dxmt_metal4_commit_locked_depth = 0;
             buffer, object_getClassName((id)buffer));
     fflush(stderr);
     return;
+  }
+
+  const uint64_t gpu_addr = [buffer gpuAddress];
+  const NSUInteger buf_len = [buffer length];
+  NSUInteger heap_count = 0;
+  if ([heap respondsToSelector:@selector(count)])
+    heap_count = [(id)heap count];
+  const unsigned oob_index =
+      (heap_count > 0 &&
+       (range.location >= heap_count ||
+        range.location + range.length > heap_count))
+          ? 1u
+          : 0u;
+  const unsigned oob_buffer =
+      (offset + length > (uint64_t)buf_len) ? 1u : 0u;
+  if (dxmt_metal4_dense_hang_diagnostics_enabled() || oob_index || oob_buffer) {
+    dxmt_metal4_hang_log(
+        DXMT_METAL4_HANG_LOG_BOTH,
+        "info:  DXMT Metal4 resolveCounterHeap: commandBuffer=%p "
+        "metalBuffer=%p heap=%p heapCount=%lu start=%lu count=%lu end=%lu "
+        "dstBuf=%p gpuAddr=0x%" PRIx64 " bufLen=%lu offset=%" PRIu64
+        " length=%" PRIu64 " oobIndex=%u oobBuffer=%u waitFence=%p "
+        "updateFence=%p frame=%" PRIu64 " chunk=%" PRIu64 " completion=%" PRIu64
+        "\n",
+        self, _metal4Buffer, heap, (unsigned long)heap_count,
+        (unsigned long)range.location, (unsigned long)range.length,
+        (unsigned long)(range.location + range.length), buffer, gpu_addr,
+        (unsigned long)buf_len, offset, length, oob_index, oob_buffer,
+        fenceToWait, fenceToUpdate, _diagnosticInfo.frame_id,
+        _diagnosticInfo.chunk_id, _completionValue);
   }
 
   dxmt_apitrace_record_counter_event(
@@ -3735,7 +5260,7 @@ static _Thread_local int dxmt_metal4_commit_locked_depth = 0;
       (obj_handle_t)fenceToUpdate);
   [_metal4Buffer resolveCounterHeap:heap
                            withRange:range
-                          intoBuffer:MTL4BufferRangeMake([buffer gpuAddress] + offset, length)
+                          intoBuffer:MTL4BufferRangeMake(gpu_addr + offset, length)
                            waitFence:fenceToWait
                          updateFence:fenceToUpdate];
 }
@@ -3843,6 +5368,11 @@ dxmt_metal4_argument_set_buffer(
   if (buffer && !dxmt_metal4_is_mtl_buffer(buffer)) {
     dxmt_diag_bad_buffer_handle("argument_set_buffer", buffer, offset, index,
                                 state->owner);
+    fprintf(stderr,
+            "err:   DXMT Metal4 bad argument binding provenance: buffer=%p "
+            "currentTable=%p sameAsCurrentTable=%u\n",
+            buffer, state->table, buffer == (id)state->table);
+    fflush(stderr);
     // Do not cache a bad pointer; bind slot 0 so encode continues.
     state->buffers[index].buffer = nil;
     state->buffers[index].offset = 0;
@@ -4016,6 +5546,31 @@ dxmt_metal4_render_set_argument_tables(
     [encoder setArgumentTable:state->tile.table atStages:MTLRenderStageTile];
     state->tile_table_bound = true;
   }
+}
+
+static void
+dxmt_metal4_diagnose_missing_vertex_argument(
+    struct dxmt_metal4_render_argument_state *state, uint8_t index,
+    enum WMTRenderCommandType command_type) {
+  if (index >= 31 || (state->vertex.buffer_bound[index] &&
+                      state->vertex.buffers[index].buffer))
+    return;
+  static _Atomic uint32_t count = 0;
+  const uint32_t n =
+      atomic_fetch_add_explicit(&count, 1, memory_order_relaxed) + 1;
+  if (n > 32)
+    return;
+  id buffer = index < 31 ? state->vertex.buffers[index].buffer : nil;
+  fprintf(stderr,
+          "err:   DXMT Metal4 missing vertex argument: command=%u index=%u "
+          "bound=%u buffer=%p bufferClass=%s table=%p tableBound=%u "
+          "owner=%p count=%u\n",
+          (unsigned)command_type, index,
+          index < 31 && state->vertex.buffer_bound[index] ? 1u : 0u,
+          buffer, buffer ? object_getClassName(buffer) : "nil",
+          state->vertex.table, state->vertex_table_bound ? 1u : 0u,
+          state->vertex.owner, n);
+  fflush(stderr);
 }
 
 static void
@@ -6358,9 +7913,24 @@ _MTLDevice_newResidencySet(void *obj) {
   struct unixcall_generic_obj_uint64_obj_ret *params = obj;
   MTLResidencySetDescriptor *descriptor = [[MTLResidencySetDescriptor alloc] init];
   descriptor.initialCapacity = params->arg;
+  static atomic_uint_fast64_t external_residency_set_sequence = 0;
+  const uint64_t sequence = atomic_fetch_add_explicit(
+                                &external_residency_set_sequence, 1,
+                                memory_order_relaxed) +
+                            1;
+  descriptor.label =
+      [NSString stringWithFormat:@"DXMT external residency set %" PRIu64,
+                                 sequence];
   NSError *error = nil;
   params->ret = (obj_handle_t)[(id<MTLDevice>)params->handle newResidencySetWithDescriptor:descriptor
                                                                                      error:&error];
+  if (dxmt_residency_call_trace_enabled()) {
+    fprintf(stderr,
+            "info:  DXMT residency set created: kind=external sequence=%" PRIu64
+            " set=%p capacity=%" PRIu64 "\n",
+            sequence, (void *)(uintptr_t)params->ret, params->arg);
+    fflush(stderr);
+  }
   [descriptor release];
   return STATUS_SUCCESS;
 }
@@ -6408,12 +7978,14 @@ _MTLCommandQueue_addResidencySet(void *obj) {
   id set = (id)params->arg;
   if (!queue || !dxmt_metal4_is_residency_set(set))
     return STATUS_SUCCESS;
-  NSLock *membershipLock = dxmt_residency_membership_lock_get();
-  [membershipLock lock];
+  dxmt_nslock_t membershipLock = queue.externalLifetimeResidencySetLock;
+  __attribute__((cleanup(dxmt_nslock_scope_cleanup)))
+  struct dxmt_nslock_scope lockScope =
+      dxmt_nslock_scope_acquire(membershipLock);
   if (![queue.externalLifetimeResidencySets containsObject:set])
     [queue.externalLifetimeResidencySets addObject:set];
   [queue.metal4Queue addResidencySet:(id<MTLResidencySet>)set];
-  [membershipLock unlock];
+  dxmt_nslock_scope_release(&lockScope, membershipLock);
   return STATUS_SUCCESS;
 }
 
@@ -6424,11 +7996,13 @@ _MTLCommandQueue_removeResidencySet(void *obj) {
   id set = (id)params->arg;
   if (!queue || !dxmt_metal4_is_residency_set(set))
     return STATUS_SUCCESS;
-  NSLock *membershipLock = dxmt_residency_membership_lock_get();
-  [membershipLock lock];
+  dxmt_nslock_t membershipLock = queue.externalLifetimeResidencySetLock;
+  __attribute__((cleanup(dxmt_nslock_scope_cleanup)))
+  struct dxmt_nslock_scope lockScope =
+      dxmt_nslock_scope_acquire(membershipLock);
   [queue.metal4Queue removeResidencySet:(id<MTLResidencySet>)set];
   [queue.externalLifetimeResidencySets removeObject:set];
-  [membershipLock unlock];
+  dxmt_nslock_scope_release(&lockScope, membershipLock);
   return STATUS_SUCCESS;
 }
 
@@ -6502,7 +8076,9 @@ _MTLDevice_newBuffer(void *obj) {
   id<MTLDevice> device = (id<MTLDevice>)params->device;
   struct WMTBufferInfo *info = params->info.ptr;
   id<MTLBuffer> buffer;
+#if DXMT_APITRACE_METAL
   const void *initial_bytes = info->memory.ptr;
+#endif
   if (info->memory.ptr) {
     buffer = [device newBufferWithBytesNoCopy:info->memory.ptr
                                        length:info->length
@@ -6626,7 +8202,8 @@ _MTLDevice_newArgumentTable(void *obj) {
 static NTSTATUS
 _MTL4ArgumentTable_setAddress(void *obj) {
   struct unixcall_mtl4argumenttable_setentry *params = obj;
-  id<MTL4ArgumentTable> table = (id<MTL4ArgumentTable>)params->table;
+  id<MTL4ArgumentTable> table = dxmt_metal4_argument_table_from_handle(
+      params->table, "setAddress");
   if (table)
     [table setAddress:(MTLGPUAddress)params->payload atIndex:params->index];
   return STATUS_SUCCESS;
@@ -6635,7 +8212,8 @@ _MTL4ArgumentTable_setAddress(void *obj) {
 static NTSTATUS
 _MTL4ArgumentTable_setTexture(void *obj) {
   struct unixcall_mtl4argumenttable_setentry *params = obj;
-  id<MTL4ArgumentTable> table = (id<MTL4ArgumentTable>)params->table;
+  id<MTL4ArgumentTable> table = dxmt_metal4_argument_table_from_handle(
+      params->table, "setTexture");
   if (table) {
     MTLResourceID resource_id = { ._impl = params->payload };
     [table setTexture:resource_id atIndex:params->index];
@@ -6646,7 +8224,8 @@ _MTL4ArgumentTable_setTexture(void *obj) {
 static NTSTATUS
 _MTL4ArgumentTable_setSamplerState(void *obj) {
   struct unixcall_mtl4argumenttable_setentry *params = obj;
-  id<MTL4ArgumentTable> table = (id<MTL4ArgumentTable>)params->table;
+  id<MTL4ArgumentTable> table = dxmt_metal4_argument_table_from_handle(
+      params->table, "setSamplerState");
   if (table) {
     MTLResourceID resource_id = { ._impl = params->payload };
     [table setSamplerState:resource_id atIndex:params->index];
@@ -7020,21 +8599,23 @@ _MTLDevice_updateSparseTextureMappings(void *obj) {
       return STATUS_SUCCESS;
     }
 
-    [residencySet addAllocation:(id<MTLAllocation>)texture];
+    dxmt_residency_set_add_allocation_direct(
+        residencySet, (id<MTLAllocation>)texture);
     DXMTSparseTextureResidency *residency =
         dxmt_sparse_texture_residency_for_texture(texture, true);
     [residency addMappedHeapsToResidencySet:residencySet];
     if (heap)
-      [residencySet addAllocation:(id<MTLAllocation>)heap];
-    [residencySet commit];
-    [residencySet requestResidency];
+      dxmt_residency_set_add_allocation_direct(
+          residencySet, (id<MTLAllocation>)heap);
+    dxmt_residency_set_commit_direct(residencySet);
+    dxmt_residency_set_request_direct(residencySet);
     [queue addResidencySet:residencySet];
 
     MTL4UpdateSparseTextureMappingOperation *mtl_ops =
         calloc((size_t)params->operation_count, sizeof(*mtl_ops));
     if (!mtl_ops) {
       [queue removeResidencySet:residencySet];
-      [residencySet endResidency];
+      dxmt_residency_set_end_direct(residencySet);
       [residencySet release];
       [queue release];
       [event release];
@@ -7067,7 +8648,7 @@ _MTLDevice_updateSparseTextureMappings(void *obj) {
     }
 
     [queue removeResidencySet:residencySet];
-    [residencySet endResidency];
+    dxmt_residency_set_end_direct(residencySet);
     [residencySet release];
     free(mtl_ops);
     [queue release];
@@ -7147,53 +8728,63 @@ _MTLCommandQueue_updateSparseTextureMappings(void *obj) {
       [queue monitorSetPhase:
                  DXMTMetal4QueueMonitorPhaseSparseMappingResidencyRefs
                commandBuffer:nil];
-      [queue.sparseResidencyLock lock];
-      const uint64_t completedValue = queue.event.signaledValue;
-      NSIndexSet *completedRetirements =
-          [queue.sparseResidencyRetirements
-              indexesOfObjectsPassingTest:^BOOL(NSDictionary *retirement,
-                                                 NSUInteger index,
-                                                 BOOL *stop) {
-                (void)index;
-                (void)stop;
-                return [[retirement objectForKey:@"completion"]
-                           unsignedLongLongValue] <= completedValue;
-              }];
-      for (NSDictionary *retirement in
-               [queue.sparseResidencyRetirements
-                   objectsAtIndexes:completedRetirements]) {
-        for (id<MTLAllocation> allocation in
-                 [retirement objectForKey:@"allocations"]) {
-          [queue.sparseResidencyAllocationRefs removeObject:allocation];
-          if ([queue.sparseResidencyAllocationRefs
-                  countForObject:allocation] == 0)
-            [queue.sparseResidencySet removeAllocation:allocation];
-        }
-      }
-      [queue.sparseResidencyRetirements
-          removeObjectsAtIndexes:completedRetirements];
-      if (![queue.sparseTrackedTextures containsObject:texture]) {
-        [queue.sparseTrackedTextures addObject:texture];
-        [queue.sparseResidencyAllocationRefs
-            addObject:(id<MTLAllocation>)texture];
-        [queue.sparseResidencySet
-            addAllocation:(id<MTLAllocation>)texture];
-      }
       BOOL heapPrecounted = NO;
-      if (heap) {
-        if ([queue.sparseResidencyAllocationRefs
-                countForObject:(id<MTLAllocation>)heap] == 0)
-          [queue.sparseResidencySet
-              addAllocation:(id<MTLAllocation>)heap];
-        [queue.sparseResidencyAllocationRefs
-            addObject:(id<MTLAllocation>)heap];
-        heapPrecounted = YES;
+      {
+        dxmt_nslock_t residencyOwnerLock = queue.sparseResidencyLock;
+        __attribute__((cleanup(dxmt_nslock_scope_cleanup)))
+        struct dxmt_nslock_scope residencyOwnerScope =
+            dxmt_nslock_scope_acquire(residencyOwnerLock);
+        const uint64_t completedValue = queue.event.signaledValue;
+        NSIndexSet *completedRetirements =
+            [queue.sparseResidencyRetirements
+                indexesOfObjectsPassingTest:^BOOL(NSDictionary *retirement,
+                                                   NSUInteger index,
+                                                   BOOL *stop) {
+                  (void)index;
+                  (void)stop;
+                  return [[retirement objectForKey:@"completion"]
+                             unsignedLongLongValue] <= completedValue;
+                }];
+        for (NSDictionary *retirement in
+                 [queue.sparseResidencyRetirements
+                     objectsAtIndexes:completedRetirements]) {
+          for (id<MTLAllocation> allocation in
+                   [retirement objectForKey:@"allocations"]) {
+            [queue.sparseResidencyAllocationRefs removeObject:allocation];
+            if ([queue.sparseResidencyAllocationRefs
+                    countForObject:allocation] == 0)
+              dxmt_owned_residency_set_remove_allocation(
+                  residencyOwnerLock, queue.sparseResidencySet, allocation);
+          }
+        }
+        [queue.sparseResidencyRetirements
+            removeObjectsAtIndexes:completedRetirements];
+        if (![queue.sparseTrackedTextures containsObject:texture]) {
+          [queue.sparseTrackedTextures addObject:texture];
+          [queue.sparseResidencyAllocationRefs
+              addObject:(id<MTLAllocation>)texture];
+          dxmt_owned_residency_set_add_allocation(
+              residencyOwnerLock, queue.sparseResidencySet,
+              (id<MTLAllocation>)texture);
+        }
+        if (heap) {
+          if ([queue.sparseResidencyAllocationRefs
+                  countForObject:(id<MTLAllocation>)heap] == 0)
+            dxmt_owned_residency_set_add_allocation(
+                residencyOwnerLock, queue.sparseResidencySet,
+                (id<MTLAllocation>)heap);
+          [queue.sparseResidencyAllocationRefs
+              addObject:(id<MTLAllocation>)heap];
+          heapPrecounted = YES;
+        }
+        [queue monitorSetPhase:
+                   DXMTMetal4QueueMonitorPhaseSparseMappingResidencyCommit
+                 commandBuffer:nil];
+        dxmt_owned_residency_set_commit(residencyOwnerLock,
+                                        queue.sparseResidencySet);
+        dxmt_nslock_scope_release(&residencyOwnerScope,
+                                  residencyOwnerLock);
       }
-      [queue monitorSetPhase:
-                 DXMTMetal4QueueMonitorPhaseSparseMappingResidencyCommit
-               commandBuffer:nil];
-      [queue.sparseResidencySet commit];
-      [queue.sparseResidencyLock unlock];
 
       if (waitValue)
         [queue.metal4Queue waitForEvent:queue.event value:waitValue];
@@ -7221,39 +8812,47 @@ _MTLCommandQueue_updateSparseTextureMappings(void *obj) {
       [removedHeaps minusSet:newMappedHeaps];
       NSMutableArray *retiredAllocations = [NSMutableArray array];
 
-      [queue.sparseResidencyLock lock];
-      for (id<MTLAllocation> addedHeap in addedHeaps) {
-        if (heapPrecounted && addedHeap == (id<MTLAllocation>)heap) {
-          heapPrecounted = NO;
-          continue;
+      {
+        dxmt_nslock_t residencyOwnerLock = queue.sparseResidencyLock;
+        __attribute__((cleanup(dxmt_nslock_scope_cleanup)))
+        struct dxmt_nslock_scope residencyOwnerScope =
+            dxmt_nslock_scope_acquire(residencyOwnerLock);
+        for (id<MTLAllocation> addedHeap in addedHeaps) {
+          if (heapPrecounted && addedHeap == (id<MTLAllocation>)heap) {
+            heapPrecounted = NO;
+            continue;
+          }
+          if ([queue.sparseResidencyAllocationRefs
+                  countForObject:addedHeap] == 0)
+            dxmt_owned_residency_set_add_allocation(
+                residencyOwnerLock, queue.sparseResidencySet, addedHeap);
+          [queue.sparseResidencyAllocationRefs addObject:addedHeap];
         }
-        if ([queue.sparseResidencyAllocationRefs
-                countForObject:addedHeap] == 0)
-          [queue.sparseResidencySet addAllocation:addedHeap];
-        [queue.sparseResidencyAllocationRefs addObject:addedHeap];
+        [retiredAllocations addObjectsFromArray:[removedHeaps allObjects]];
+        if (heapPrecounted)
+          [retiredAllocations addObject:(id<MTLAllocation>)heap];
+        if (!newMappedHeaps.count &&
+            [queue.sparseTrackedTextures containsObject:texture]) {
+          /*
+           * Change logical membership immediately, but keep the allocation in
+           * the residency set until this ordered mapping update has completed.
+           * A remap submitted before completion re-adds a reference, so
+           * retiring the old mapping cannot evict the newly mapped texture.
+           */
+          [queue.sparseTrackedTextures removeObject:texture];
+          [retiredAllocations addObject:(id<MTLAllocation>)texture];
+        }
+        if (retiredAllocations.count) {
+          [queue.sparseResidencyRetirements addObject:@{
+            @"completion" : @(mappingCompletionValue),
+            @"allocations" : [[retiredAllocations copy] autorelease]
+          }];
+        }
+        dxmt_owned_residency_set_commit(residencyOwnerLock,
+                                        queue.sparseResidencySet);
+        dxmt_nslock_scope_release(&residencyOwnerScope,
+                                  residencyOwnerLock);
       }
-      [retiredAllocations addObjectsFromArray:[removedHeaps allObjects]];
-      if (heapPrecounted)
-        [retiredAllocations addObject:(id<MTLAllocation>)heap];
-      if (!newMappedHeaps.count &&
-          [queue.sparseTrackedTextures containsObject:texture]) {
-        /*
-         * Change logical membership immediately, but keep the allocation in
-         * the residency set until this ordered mapping update has completed.
-         * A remap submitted before completion re-adds a reference, so retiring
-         * the old mapping cannot evict the newly mapped texture.
-         */
-        [queue.sparseTrackedTextures removeObject:texture];
-        [retiredAllocations addObject:(id<MTLAllocation>)texture];
-      }
-      if (retiredAllocations.count) {
-        [queue.sparseResidencyRetirements addObject:@{
-          @"completion" : @(mappingCompletionValue),
-          @"allocations" : [[retiredAllocations copy] autorelease]
-        }];
-      }
-      [queue.sparseResidencySet commit];
-      [queue.sparseResidencyLock unlock];
       [removedHeaps release];
       [addedHeaps release];
       params->ret = 1;
@@ -7669,7 +9268,8 @@ dxmt_metal4_use_render_attachment(DXMTMetal4CommandBuffer *owner,
             (unsigned long)texture.height, (unsigned long)texture.sampleCount,
             texture.framebufferOnly, backing,
             [owner.retainedTemporaryResources containsObject:texture],
-            [owner.retainedTemporaryResources containsObject:backing],
+            backing &&
+                [owner.retainedTemporaryResources containsObject:backing],
             (unsigned long)owner.retainedTemporaryResources.count);
     fflush(stderr);
   }
@@ -8257,8 +9857,12 @@ _MTLComputeCommandEncoder_encodeCommands(void *obj) {
     case WMTComputeCommandSetArgumentTable: {
       struct wmtcmd_compute_setargumenttable *body =
           (struct wmtcmd_compute_setargumenttable *)next;
-      [encoder setArgumentTable:(id<MTL4ArgumentTable>)body->table];
-      state->argumentTableBound = true;
+      id<MTL4ArgumentTable> table = dxmt_metal4_argument_table_from_handle(
+          body->table, "compute setArgumentTable");
+      if (table) {
+        [encoder setArgumentTable:table];
+        state->argumentTableBound = true;
+      }
       break;
     }
     case WMTComputeCommandUseResource: {
@@ -8370,18 +9974,23 @@ _MTLRenderCommandEncoder_encodeCommands(void *obj) {
     case WMTRenderCommandSetArgumentTable: {
       struct wmtcmd_render_setargumenttable *body =
           (struct wmtcmd_render_setargumenttable *)next;
-      [encoder setArgumentTable:(id<MTL4ArgumentTable>)body->table
-                       atStages:dxmt_metal4_render_argument_stages(body->stages)];
-      if (body->stages & WMTRenderStageVertex)
-        args->vertex_table_bound = true;
-      if (body->stages & WMTRenderStageFragment)
-        args->fragment_table_bound = true;
-      if (body->stages & WMTRenderStageObject)
-        args->object_table_bound = true;
-      if (body->stages & WMTRenderStageMesh)
-        args->mesh_table_bound = true;
-      if (body->stages & WMTRenderStageTile)
-        args->tile_table_bound = true;
+      id<MTL4ArgumentTable> table = dxmt_metal4_argument_table_from_handle(
+          body->table, "render setArgumentTable");
+      if (table) {
+        [encoder
+            setArgumentTable:table
+                    atStages:dxmt_metal4_render_argument_stages(body->stages)];
+        if (body->stages & WMTRenderStageVertex)
+          args->vertex_table_bound = true;
+        if (body->stages & WMTRenderStageFragment)
+          args->fragment_table_bound = true;
+        if (body->stages & WMTRenderStageObject)
+          args->object_table_bound = true;
+        if (body->stages & WMTRenderStageMesh)
+          args->mesh_table_bound = true;
+        if (body->stages & WMTRenderStageTile)
+          args->tile_table_bound = true;
+      }
       break;
     }
     case WMTRenderCommandSetMeshBuffer: {
@@ -8457,6 +10066,8 @@ _MTLRenderCommandEncoder_encodeCommands(void *obj) {
     }
     case WMTRenderCommandDraw: {
       struct wmtcmd_render_draw *body = (struct wmtcmd_render_draw *)next;
+      dxmt_metal4_diagnose_missing_vertex_argument(
+          args, 16, WMTRenderCommandDraw);
       dxmt_metal4_render_set_argument_tables(encoder, args);
       [encoder drawPrimitives:(MTLPrimitiveType)body->primitive_type
                   vertexStart:body->vertex_start
@@ -8801,28 +10412,28 @@ _MTLCommandBuffer_presentDrawableAfterMinimumDuration(void *obj) {
 static NTSTATUS
 _MTLDevice_supportsFamily(void *obj) {
   struct unixcall_generic_obj_uint64_uint64_ret *params = obj;
-  params->ret = [(id<MTLDevice>)params->handle supportsFamily:(MTLGPUFamily)params->arg];
+  params->ret = [(id<MTLDevice>)params->handle supportsFamily:(MTLGPUFamily)params->arg] ? 1 : 0;
   return STATUS_SUCCESS;
 }
 
 static NTSTATUS
 _MTLDevice_supportsBCTextureCompression(void *obj) {
   struct unixcall_generic_obj_uint64_ret *params = obj;
-  params->ret = [(id<MTLDevice>)params->handle supportsBCTextureCompression];
+  params->ret = [(id<MTLDevice>)params->handle supportsBCTextureCompression] ? 1 : 0;
   return STATUS_SUCCESS;
 }
 
 static NTSTATUS
 _MTLDevice_supportsTextureSampleCount(void *obj) {
   struct unixcall_generic_obj_uint64_uint64_ret *params = obj;
-  params->ret = [(id<MTLDevice>)params->handle supportsTextureSampleCount:params->arg];
+  params->ret = [(id<MTLDevice>)params->handle supportsTextureSampleCount:params->arg] ? 1 : 0;
   return STATUS_SUCCESS;
 }
 
 static NTSTATUS
 _MTLDevice_hasUnifiedMemory(void *obj) {
   struct unixcall_generic_obj_uint64_ret *params = obj;
-  params->ret = [(id<MTLDevice>)params->handle hasUnifiedMemory];
+  params->ret = [(id<MTLDevice>)params->handle hasUnifiedMemory] ? 1 : 0;
   return STATUS_SUCCESS;
 }
 
@@ -9103,14 +10714,14 @@ _MetalLayer_nextDrawable(void *obj) {
 static NTSTATUS
 _MTLDevice_supportsFXSpatialScaler(void *obj) {
   struct unixcall_generic_obj_uint64_ret *params = obj;
-  params->ret = [MTLFXSpatialScalerDescriptor supportsDevice:(id<MTLDevice>)params->handle];
+  params->ret = [MTLFXSpatialScalerDescriptor supportsDevice:(id<MTLDevice>)params->handle] ? 1 : 0;
   return STATUS_SUCCESS;
 }
 
 static NTSTATUS
 _MTLDevice_supportsFXTemporalScaler(void *obj) {
   struct unixcall_generic_obj_uint64_ret *params = obj;
-  params->ret = [MTLFXTemporalScalerDescriptor supportsDevice:(id<MTLDevice>)params->handle];
+  params->ret = [MTLFXTemporalScalerDescriptor supportsDevice:(id<MTLDevice>)params->handle] ? 1 : 0;
   return STATUS_SUCCESS;
 }
 
@@ -9266,107 +10877,39 @@ thunk_SM50Destroy(void *args) {
   return STATUS_SUCCESS;
 }
 
-static struct SM50_SHADER_COMPILATION_ARGUMENT_DATA *
-sm50_compilation_argument_copy(const struct SM50_SHADER_COMPILATION_ARGUMENT_DATA *src) {
-  if (!src)
-    return NULL;
-
-  switch (src->type) {
-  case SM50_SHADER_EMULATE_VERTEX_STREAM_OUTPUT: {
-    const struct SM50_SHADER_EMULATE_VERTEX_STREAM_OUTPUT_DATA *data = (const void *)src;
-    struct SM50_SHADER_EMULATE_VERTEX_STREAM_OUTPUT_DATA *copy = calloc(1, sizeof(*copy));
-    if (!copy)
-      return NULL;
-    *copy = *data;
-    copy->next = sm50_compilation_argument_copy(data->next);
-    return (void *)copy;
-  }
-  case SM50_SHADER_COMMON: {
-    const struct SM50_SHADER_COMMON_DATA *data = (const void *)src;
-    struct SM50_SHADER_COMMON_DATA *copy = calloc(1, sizeof(*copy));
-    if (!copy)
-      return NULL;
-    *copy = *data;
-    copy->next = sm50_compilation_argument_copy(data->next);
-    return (void *)copy;
-  }
-  case SM50_SHADER_DIAG_FORCE_FULLSCREEN_POSITION: {
-    const struct SM50_SHADER_DIAG_FORCE_FULLSCREEN_POSITION_DATA *data = (const void *)src;
-    struct SM50_SHADER_DIAG_FORCE_FULLSCREEN_POSITION_DATA *copy = calloc(1, sizeof(*copy));
-    if (!copy)
-      return NULL;
-    *copy = *data;
-    copy->next = sm50_compilation_argument_copy(data->next);
-    return (void *)copy;
-  }
-  case SM50_SHADER_PSO_PIXEL_SHADER: {
-    const struct SM50_SHADER_PSO_PIXEL_SHADER_DATA *data = (const void *)src;
-    struct SM50_SHADER_PSO_PIXEL_SHADER_DATA *copy = calloc(1, sizeof(*copy));
-    if (!copy)
-      return NULL;
-    *copy = *data;
-    copy->next = sm50_compilation_argument_copy(data->next);
-    return (void *)copy;
-  }
-  case SM50_SHADER_IA_INPUT_LAYOUT: {
-    const struct SM50_SHADER_IA_INPUT_LAYOUT_DATA *data = (const void *)src;
-    struct SM50_SHADER_IA_INPUT_LAYOUT_DATA *copy = calloc(1, sizeof(*copy));
-    if (!copy)
-      return NULL;
-    *copy = *data;
-    copy->next = sm50_compilation_argument_copy(data->next);
-    return (void *)copy;
-  }
-  case SM50_SHADER_GS_PASS_THROUGH: {
-    const struct SM50_SHADER_GS_PASS_THROUGH_DATA *data = (const void *)src;
-    struct SM50_SHADER_GS_PASS_THROUGH_DATA *copy = calloc(1, sizeof(*copy));
-    if (!copy)
-      return NULL;
-    *copy = *data;
-    copy->next = sm50_compilation_argument_copy(data->next);
-    return (void *)copy;
-  }
-  case SM50_SHADER_PSO_GEOMETRY_SHADER: {
-    const struct SM50_SHADER_PSO_GEOMETRY_SHADER_DATA *data = (const void *)src;
-    struct SM50_SHADER_PSO_GEOMETRY_SHADER_DATA *copy = calloc(1, sizeof(*copy));
-    if (!copy)
-      return NULL;
-    *copy = *data;
-    copy->next = sm50_compilation_argument_copy(data->next);
-    return (void *)copy;
-  }
-  case SM50_SHADER_PSO_TESSELLATOR: {
-    const struct SM50_SHADER_PSO_TESSELLATOR_DATA *data = (const void *)src;
-    struct SM50_SHADER_PSO_TESSELLATOR_DATA *copy = calloc(1, sizeof(*copy));
-    if (!copy)
-      return NULL;
-    *copy = *data;
-    copy->next = sm50_compilation_argument_copy(data->next);
-    return (void *)copy;
-  }
-  case SM50_SHADER_BINDLESS_MIRROR: {
-    const struct SM50_SHADER_BINDLESS_MIRROR_DATA *data = (const void *)src;
-    struct SM50_SHADER_BINDLESS_MIRROR_DATA *copy = calloc(1, sizeof(*copy));
-    if (!copy)
-      return NULL;
-    *copy = *data;
-    copy->next = sm50_compilation_argument_copy(data->next);
-    return (void *)copy;
-  }
-  case SM50_SHADER_DXMT12_NATIVE_DESCRIPTOR_ABI: {
-    const struct DXMT12_MTL4_NATIVE_DESCRIPTOR_ABI_DATA *data = (const void *)src;
-    struct DXMT12_MTL4_NATIVE_DESCRIPTOR_ABI_DATA *copy = calloc(1, sizeof(*copy));
-    if (!copy)
-      return NULL;
-    *copy = *data;
-    copy->next = sm50_compilation_argument_copy(data->next);
-    return (void *)copy;
-  }
+/*
+ * Size of the concrete argument node behind a SM50_SHADER_COMPILATION_ARGUMENT_
+ * DATA header. Returns 0 for types this thunk does not know how to marshal;
+ * callers must treat that as a hard failure rather than skipping the node,
+ * because a missing node silently changes shader semantics.
+ */
+static size_t
+sm50_compilation_argument_size(enum SM50_SHADER_COMPILATION_ARGUMENT_TYPE type) {
+  switch (type) {
+  case SM50_SHADER_EMULATE_VERTEX_STREAM_OUTPUT:
+    return sizeof(struct SM50_SHADER_EMULATE_VERTEX_STREAM_OUTPUT_DATA);
+  case SM50_SHADER_COMMON:
+    return sizeof(struct SM50_SHADER_COMMON_DATA);
+  case SM50_SHADER_DIAG_FORCE_FULLSCREEN_POSITION:
+    return sizeof(struct SM50_SHADER_DIAG_FORCE_FULLSCREEN_POSITION_DATA);
+  case SM50_SHADER_PSO_PIXEL_SHADER:
+    return sizeof(struct SM50_SHADER_PSO_PIXEL_SHADER_DATA);
+  case SM50_SHADER_IA_INPUT_LAYOUT:
+    return sizeof(struct SM50_SHADER_IA_INPUT_LAYOUT_DATA);
+  case SM50_SHADER_GS_PASS_THROUGH:
+    return sizeof(struct SM50_SHADER_GS_PASS_THROUGH_DATA);
+  case SM50_SHADER_PSO_GEOMETRY_SHADER:
+    return sizeof(struct SM50_SHADER_PSO_GEOMETRY_SHADER_DATA);
+  case SM50_SHADER_PSO_TESSELLATOR:
+    return sizeof(struct SM50_SHADER_PSO_TESSELLATOR_DATA);
+  case SM50_SHADER_BINDLESS_MIRROR:
+    return sizeof(struct SM50_SHADER_BINDLESS_MIRROR_DATA);
+  case SM50_SHADER_DXMT12_NATIVE_DESCRIPTOR_ABI:
+    return sizeof(struct DXMT12_MTL4_NATIVE_DESCRIPTOR_ABI_DATA);
   case SM50_SHADER_ARGUMENT_TYPE_MAX:
     break;
   }
-
-  return NULL;
+  return 0;
 }
 
 static void
@@ -9378,11 +10921,86 @@ sm50_compilation_argument_free(struct SM50_SHADER_COMPILATION_ARGUMENT_DATA *arg
   }
 }
 
+/*
+ * Deep-copies the caller's argument chain into unix-side storage.
+ *
+ * Returns true on success and stores the copied chain in *out (NULL when src is
+ * NULL). On failure it returns false, releases every node copied so far and
+ * leaves *out NULL, so a partially copied chain can never reach airconv: a
+ * truncated chain compiles "successfully" into a semantically different shader,
+ * which is far worse for a translation layer than a failed PSO creation.
+ */
+static bool
+sm50_compilation_argument_copy(
+    const struct SM50_SHADER_COMPILATION_ARGUMENT_DATA *src,
+    struct SM50_SHADER_COMPILATION_ARGUMENT_DATA **out) {
+  struct SM50_SHADER_COMPILATION_ARGUMENT_DATA *head = NULL;
+  struct SM50_SHADER_COMPILATION_ARGUMENT_DATA *tail = NULL;
+
+  *out = NULL;
+
+  for (; src; src = src->next) {
+    const size_t size = sm50_compilation_argument_size(src->type);
+    if (!size) {
+      fprintf(stderr,
+              "err:   DXMT SM50 compilation argument chain carries unknown"
+              " argument type %u; refusing to marshal a truncated chain\n",
+              (unsigned)src->type);
+      sm50_compilation_argument_free(head);
+      return false;
+    }
+
+    struct SM50_SHADER_COMPILATION_ARGUMENT_DATA *copy = calloc(1, size);
+    if (!copy) {
+      fprintf(stderr,
+              "err:   DXMT SM50 compilation argument allocation failed"
+              " (type=%u size=%zu)\n",
+              (unsigned)src->type, size);
+      sm50_compilation_argument_free(head);
+      return false;
+    }
+    memcpy(copy, src, size);
+    copy->next = NULL;
+
+    if (tail)
+      tail->next = copy;
+    else
+      head = copy;
+    tail = copy;
+  }
+
+  *out = head;
+  return true;
+}
+
+/*
+ * Marshalling the argument chain failed. Report a hard compile failure with no
+ * bitcode and no error object instead of letting the compile proceed with an
+ * incomplete argument chain.
+ */
+#define DXMT_SM50_ARGS_MARSHAL_FAILED (-2)
+
+static int
+sm50_compilation_argument_copy_failed(sm50_bitcode_t *bitcode_slot,
+                                      sm50_error_t *error_slot,
+                                      const char *entry_point) {
+  fprintf(stderr,
+          "err:   DXMT %s: failed to marshal shader compilation arguments;"
+          " failing the compile instead of emitting a truncated shader\n",
+          entry_point);
+  dxmt_airconv_store_compile_outputs(bitcode_slot, NULL, error_slot, NULL);
+  return DXMT_SM50_ARGS_MARSHAL_FAILED;
+}
+
 static NTSTATUS
 thunk_SM50Compile(void *args) {
   struct sm50_compile_params *params = args;
-  struct SM50_SHADER_COMPILATION_ARGUMENT_DATA *native_args =
-      sm50_compilation_argument_copy(params->args);
+  struct SM50_SHADER_COMPILATION_ARGUMENT_DATA *native_args = NULL;
+  if (!sm50_compilation_argument_copy(params->args, &native_args)) {
+    params->ret = sm50_compilation_argument_copy_failed(
+        params->bitcode, params->error, "SM50Compile");
+    return STATUS_SUCCESS;
+  }
 
   sm50_bitcode_t native_bitcode = NULL;
   sm50_error_t native_error = NULL;
@@ -9435,8 +11053,13 @@ thunk_SM50FreeError(void *args) {
 static NTSTATUS
 thunk_SM50CompileTessellationPipelineHull(void *args) {
   struct sm50_compile_tessellation_pipeline_hull_params *params = args;
-  struct SM50_SHADER_COMPILATION_ARGUMENT_DATA *native_args =
-      sm50_compilation_argument_copy(params->hull_args);
+  struct SM50_SHADER_COMPILATION_ARGUMENT_DATA *native_args = NULL;
+  if (!sm50_compilation_argument_copy(params->hull_args, &native_args)) {
+    params->ret = sm50_compilation_argument_copy_failed(
+        params->bitcode, params->error,
+        "SM50CompileTessellationPipelineHull");
+    return STATUS_SUCCESS;
+  }
 
   sm50_bitcode_t native_bitcode = NULL;
   sm50_error_t native_error = NULL;
@@ -9455,8 +11078,13 @@ thunk_SM50CompileTessellationPipelineHull(void *args) {
 static NTSTATUS
 thunk_SM50CompileTessellationPipelineDomain(void *args) {
   struct sm50_compile_tessellation_pipeline_domain_params *params = args;
-  struct SM50_SHADER_COMPILATION_ARGUMENT_DATA *native_args =
-      sm50_compilation_argument_copy(params->domain_args);
+  struct SM50_SHADER_COMPILATION_ARGUMENT_DATA *native_args = NULL;
+  if (!sm50_compilation_argument_copy(params->domain_args, &native_args)) {
+    params->ret = sm50_compilation_argument_copy_failed(
+        params->bitcode, params->error,
+        "SM50CompileTessellationPipelineDomain");
+    return STATUS_SUCCESS;
+  }
 
   sm50_bitcode_t native_bitcode = NULL;
   sm50_error_t native_error = NULL;
@@ -9475,8 +11103,13 @@ thunk_SM50CompileTessellationPipelineDomain(void *args) {
 static NTSTATUS
 thunk_SM50CompileGeometryPipelineVertex(void *args) {
   struct sm50_compile_geometry_pipeline_vertex_params *params = args;
-  struct SM50_SHADER_COMPILATION_ARGUMENT_DATA *native_args =
-      sm50_compilation_argument_copy(params->vertex_args);
+  struct SM50_SHADER_COMPILATION_ARGUMENT_DATA *native_args = NULL;
+  if (!sm50_compilation_argument_copy(params->vertex_args, &native_args)) {
+    params->ret = sm50_compilation_argument_copy_failed(
+        params->bitcode, params->error,
+        "SM50CompileGeometryPipelineVertex");
+    return STATUS_SUCCESS;
+  }
 
   sm50_bitcode_t native_bitcode = NULL;
   sm50_error_t native_error = NULL;
@@ -9495,8 +11128,13 @@ thunk_SM50CompileGeometryPipelineVertex(void *args) {
 static NTSTATUS
 thunk_SM50CompileGeometryPipelineGeometry(void *args) {
   struct sm50_compile_geometry_pipeline_geometry_params *params = args;
-  struct SM50_SHADER_COMPILATION_ARGUMENT_DATA *native_args =
-      sm50_compilation_argument_copy(params->geometry_args);
+  struct SM50_SHADER_COMPILATION_ARGUMENT_DATA *native_args = NULL;
+  if (!sm50_compilation_argument_copy(params->geometry_args, &native_args)) {
+    params->ret = sm50_compilation_argument_copy_failed(
+        params->bitcode, params->error,
+        "SM50CompileGeometryPipelineGeometry");
+    return STATUS_SUCCESS;
+  }
 
   sm50_bitcode_t native_bitcode = NULL;
   sm50_error_t native_error = NULL;
@@ -9556,8 +11194,12 @@ thunk_DXILDestroy(void *args) {
 static NTSTATUS
 thunk_DXILCompile(void *args) {
   struct sm50_compile_params *params = args;
-  struct SM50_SHADER_COMPILATION_ARGUMENT_DATA *native_args =
-      sm50_compilation_argument_copy(params->args);
+  struct SM50_SHADER_COMPILATION_ARGUMENT_DATA *native_args = NULL;
+  if (!sm50_compilation_argument_copy(params->args, &native_args)) {
+    params->ret = sm50_compilation_argument_copy_failed(
+        params->bitcode, params->error, "DXILCompile");
+    return STATUS_SUCCESS;
+  }
 
   sm50_bitcode_t native_bitcode = NULL;
   sm50_error_t native_error = NULL;
@@ -9685,7 +11327,34 @@ struct DXMT12_MTL4_NATIVE_DESCRIPTOR_ABI_DATA32 {
   bool enabled;
 };
 
-void
+void sm50_compilation_argument32_free(struct SM50_SHADER_COMPILATION_ARGUMENT_DATA *first_arg);
+
+/*
+ * Allocates one argument node and links it onto the tail of the converted
+ * chain. Returns NULL on allocation failure without touching the chain, so the
+ * caller can abandon the conversion instead of dereferencing a NULL node.
+ */
+static void *
+sm50_compilation_argument32_append(
+    struct SM50_SHADER_COMPILATION_ARGUMENT_DATA **last_arg, size_t size
+) {
+  struct SM50_SHADER_COMPILATION_ARGUMENT_DATA *data = malloc(size);
+  if (!data)
+    return NULL;
+  data->next = NULL;
+  (*last_arg)->next = data;
+  *last_arg = data;
+  return data;
+}
+
+/*
+ * Converts the 32-bit argument chain into native layout. Returns true on
+ * success. On failure the partially converted chain is released and first_arg
+ * is left as an empty head, and the caller must fail the compile: handing
+ * airconv a truncated chain would produce a "successful" but semantically
+ * wrong shader.
+ */
+bool
 sm50_compilation_argument32_convert(
     struct SM50_SHADER_COMPILATION_ARGUMENT_DATA *first_arg, struct SM50_SHADER_COMPILATION_ARGUMENT_DATA32 *args32
 ) {
@@ -9699,10 +11368,10 @@ sm50_compilation_argument32_convert(
     case SM50_SHADER_EMULATE_VERTEX_STREAM_OUTPUT: {
       struct SM50_SHADER_EMULATE_VERTEX_STREAM_OUTPUT_DATA32 *src = (void *)args32;
       struct SM50_SHADER_EMULATE_VERTEX_STREAM_OUTPUT_DATA *data =
-          malloc(sizeof(struct SM50_SHADER_EMULATE_VERTEX_STREAM_OUTPUT_DATA));
-      last_arg->next = data;
-      last_arg = (void *)data;
-      last_arg->next = NULL;
+          sm50_compilation_argument32_append(
+              &last_arg, sizeof(struct SM50_SHADER_EMULATE_VERTEX_STREAM_OUTPUT_DATA));
+      if (!data)
+        goto fail;
       data->type = src->type;
       data->num_output_slots = src->num_output_slots;
       data->num_elements = src->num_elements;
@@ -9715,10 +11384,10 @@ sm50_compilation_argument32_convert(
     }
     case SM50_SHADER_COMMON: {
       struct SM50_SHADER_COMMON_DATA32 *src = (void *)args32;
-      struct SM50_SHADER_COMMON_DATA *data = malloc(sizeof(struct SM50_SHADER_COMMON_DATA));
-      last_arg->next = data;
-      last_arg = (void *)data;
-      last_arg->next = NULL;
+      struct SM50_SHADER_COMMON_DATA *data = sm50_compilation_argument32_append(
+          &last_arg, sizeof(struct SM50_SHADER_COMMON_DATA));
+      if (!data)
+        goto fail;
       data->type = src->type;
       data->metal_version = src->metal_version;
       data->flags = src->flag;
@@ -9727,20 +11396,20 @@ sm50_compilation_argument32_convert(
     case SM50_SHADER_DIAG_FORCE_FULLSCREEN_POSITION: {
       struct SM50_SHADER_DIAG_FORCE_FULLSCREEN_POSITION_DATA32 *src = (void *)args32;
       struct SM50_SHADER_DIAG_FORCE_FULLSCREEN_POSITION_DATA *data =
-          malloc(sizeof(struct SM50_SHADER_DIAG_FORCE_FULLSCREEN_POSITION_DATA));
-      last_arg->next = data;
-      last_arg = (void *)data;
-      last_arg->next = NULL;
+          sm50_compilation_argument32_append(
+              &last_arg, sizeof(struct SM50_SHADER_DIAG_FORCE_FULLSCREEN_POSITION_DATA));
+      if (!data)
+        goto fail;
       data->type = src->type;
       data->enabled = src->enabled;
       break;
     }
     case SM50_SHADER_PSO_PIXEL_SHADER: {
       struct SM50_SHADER_PSO_PIXEL_SHADER_DATA32 *src = (void *)args32;
-      struct SM50_SHADER_PSO_PIXEL_SHADER_DATA *data = malloc(sizeof(struct SM50_SHADER_PSO_PIXEL_SHADER_DATA));
-      last_arg->next = data;
-      last_arg = (void *)data;
-      last_arg->next = NULL;
+      struct SM50_SHADER_PSO_PIXEL_SHADER_DATA *data = sm50_compilation_argument32_append(
+          &last_arg, sizeof(struct SM50_SHADER_PSO_PIXEL_SHADER_DATA));
+      if (!data)
+        goto fail;
       data->type = src->type;
       data->unorm_output_reg_mask = src->unorm_output_reg_mask;
       data->disable_depth_output = src->disable_depth_output;
@@ -9752,10 +11421,10 @@ sm50_compilation_argument32_convert(
     }
     case SM50_SHADER_IA_INPUT_LAYOUT: {
       struct SM50_SHADER_IA_INPUT_LAYOUT_DATA32 *src = (void *)args32;
-      struct SM50_SHADER_IA_INPUT_LAYOUT_DATA *data = malloc(sizeof(struct SM50_SHADER_IA_INPUT_LAYOUT_DATA));
-      last_arg->next = data;
-      last_arg = (void *)data;
-      last_arg->next = NULL;
+      struct SM50_SHADER_IA_INPUT_LAYOUT_DATA *data = sm50_compilation_argument32_append(
+          &last_arg, sizeof(struct SM50_SHADER_IA_INPUT_LAYOUT_DATA));
+      if (!data)
+        goto fail;
       data->type = src->type;
       data->slot_mask = src->slot_mask;
       data->index_buffer_format = src->index_buffer_format;
@@ -9765,10 +11434,10 @@ sm50_compilation_argument32_convert(
     }
     case SM50_SHADER_GS_PASS_THROUGH: {
       struct SM50_SHADER_GS_PASS_THROUGH_DATA32 *src = (void *)args32;
-      struct SM50_SHADER_GS_PASS_THROUGH_DATA *data = malloc(sizeof(struct SM50_SHADER_GS_PASS_THROUGH_DATA));
-      last_arg->next = data;
-      last_arg = (void *)data;
-      last_arg->next = NULL;
+      struct SM50_SHADER_GS_PASS_THROUGH_DATA *data = sm50_compilation_argument32_append(
+          &last_arg, sizeof(struct SM50_SHADER_GS_PASS_THROUGH_DATA));
+      if (!data)
+        goto fail;
       data->type = src->type;
       data->Data = src->Data;
       data->RasterizationDisabled = src->RasterizationDisabled;
@@ -9776,30 +11445,30 @@ sm50_compilation_argument32_convert(
     }
     case SM50_SHADER_PSO_GEOMETRY_SHADER: {
       struct SM50_SHADER_PSO_GEOMETRY_SHADER_DATA32 *src = (void *)args32;
-      struct SM50_SHADER_PSO_GEOMETRY_SHADER_DATA *data = malloc(sizeof(struct SM50_SHADER_PSO_GEOMETRY_SHADER_DATA));
-      last_arg->next = data;
-      last_arg = (void *)data;
-      last_arg->next = NULL;
+      struct SM50_SHADER_PSO_GEOMETRY_SHADER_DATA *data = sm50_compilation_argument32_append(
+          &last_arg, sizeof(struct SM50_SHADER_PSO_GEOMETRY_SHADER_DATA));
+      if (!data)
+        goto fail;
       data->type = src->type;
       data->strip_topology = src->strip_topology;
       break;
     }
     case SM50_SHADER_PSO_TESSELLATOR: {
       struct SM50_SHADER_PSO_TESSELLATOR_DATA32 *src = (void *)args32;
-      struct SM50_SHADER_PSO_TESSELLATOR_DATA *data = malloc(sizeof(struct SM50_SHADER_PSO_TESSELLATOR_DATA));
-      last_arg->next = data;
-      last_arg = (void *)data;
-      last_arg->next = NULL;
+      struct SM50_SHADER_PSO_TESSELLATOR_DATA *data = sm50_compilation_argument32_append(
+          &last_arg, sizeof(struct SM50_SHADER_PSO_TESSELLATOR_DATA));
+      if (!data)
+        goto fail;
       data->type = src->type;
       data->max_potential_tess_factor = src->max_potential_tess_factor;
       break;
     }
     case SM50_SHADER_BINDLESS_MIRROR: {
       struct SM50_SHADER_BINDLESS_MIRROR_DATA32 *src = (void *)args32;
-      struct SM50_SHADER_BINDLESS_MIRROR_DATA *data = malloc(sizeof(struct SM50_SHADER_BINDLESS_MIRROR_DATA));
-      last_arg->next = data;
-      last_arg = (void *)data;
-      last_arg->next = NULL;
+      struct SM50_SHADER_BINDLESS_MIRROR_DATA *data = sm50_compilation_argument32_append(
+          &last_arg, sizeof(struct SM50_SHADER_BINDLESS_MIRROR_DATA));
+      if (!data)
+        goto fail;
       data->type = src->type;
       data->enabled = src->enabled;
       break;
@@ -9807,20 +11476,33 @@ sm50_compilation_argument32_convert(
     case SM50_SHADER_DXMT12_NATIVE_DESCRIPTOR_ABI: {
       struct DXMT12_MTL4_NATIVE_DESCRIPTOR_ABI_DATA32 *src = (void *)args32;
       struct DXMT12_MTL4_NATIVE_DESCRIPTOR_ABI_DATA *data =
-          malloc(sizeof(struct DXMT12_MTL4_NATIVE_DESCRIPTOR_ABI_DATA));
-      last_arg->next = data;
-      last_arg = (void *)data;
-      last_arg->next = NULL;
+          sm50_compilation_argument32_append(
+              &last_arg, sizeof(struct DXMT12_MTL4_NATIVE_DESCRIPTOR_ABI_DATA));
+      if (!data)
+        goto fail;
       data->type = src->type;
       data->version = src->version;
       data->enabled = src->enabled;
       break;
     }
     case SM50_SHADER_ARGUMENT_TYPE_MAX:
-      break;
+    default:
+      fprintf(stderr,
+              "err:   DXMT SM50 32-bit compilation argument chain carries"
+              " unknown argument type %u; refusing to convert a truncated"
+              " chain\n",
+              (unsigned)args32->type);
+      goto fail;
     }
     args32 = UInt32ToPtr(args32->next);
   }
+
+  return true;
+
+fail:
+  sm50_compilation_argument32_free(first_arg);
+  first_arg->next = NULL;
+  return false;
 }
 
 void
@@ -9839,7 +11521,12 @@ thunk32_SM50Compile(void *args) {
   struct sm50_compile_params32 *params = args;
   struct SM50_SHADER_COMPILATION_ARGUMENT_DATA first_arg;
   struct SM50_SHADER_COMPILATION_ARGUMENT_DATA32 *args32 = UInt32ToPtr(params->args);
-  sm50_compilation_argument32_convert(&first_arg, args32);
+  if (!sm50_compilation_argument32_convert(&first_arg, args32)) {
+    params->ret = sm50_compilation_argument_copy_failed(
+        UInt32ToPtr(params->bitcode), UInt32ToPtr(params->error),
+        "SM50Compile");
+    return STATUS_SUCCESS;
+  }
 
   params->ret = SM50Compile(
       params->shader, &first_arg, UInt32ToPtr(params->func_name), UInt32ToPtr(params->bitcode),
@@ -9874,7 +11561,12 @@ thunk32_SM50CompileTessellationPipelineHull(void *args) {
   struct sm50_compile_tessellation_pipeline_hull_params32 *params = args;
   struct SM50_SHADER_COMPILATION_ARGUMENT_DATA first_arg;
   struct SM50_SHADER_COMPILATION_ARGUMENT_DATA32 *args32 = UInt32ToPtr(params->hull_args);
-  sm50_compilation_argument32_convert(&first_arg, args32);
+  if (!sm50_compilation_argument32_convert(&first_arg, args32)) {
+    params->ret = sm50_compilation_argument_copy_failed(
+        UInt32ToPtr(params->bitcode), UInt32ToPtr(params->error),
+        "SM50CompileTessellationPipelineHull");
+    return STATUS_SUCCESS;
+  }
 
   params->ret = SM50CompileTessellationPipelineHull(
       params->vertex, params->hull, &first_arg, UInt32ToPtr(params->func_name), UInt32ToPtr(params->bitcode),
@@ -9891,7 +11583,12 @@ thunk32_SM50CompileTessellationPipelineDomain(void *args) {
   struct sm50_compile_tessellation_pipeline_domain_params32 *params = args;
   struct SM50_SHADER_COMPILATION_ARGUMENT_DATA first_arg;
   struct SM50_SHADER_COMPILATION_ARGUMENT_DATA32 *args32 = UInt32ToPtr(params->domain_args);
-  sm50_compilation_argument32_convert(&first_arg, args32);
+  if (!sm50_compilation_argument32_convert(&first_arg, args32)) {
+    params->ret = sm50_compilation_argument_copy_failed(
+        UInt32ToPtr(params->bitcode), UInt32ToPtr(params->error),
+        "SM50CompileTessellationPipelineDomain");
+    return STATUS_SUCCESS;
+  }
 
   params->ret = SM50CompileTessellationPipelineDomain(
       params->hull, params->domain, &first_arg, UInt32ToPtr(params->func_name), UInt32ToPtr(params->bitcode),
@@ -9908,7 +11605,12 @@ thunk32_SM50CompileGeometryPipelineVertex(void *args) {
   struct sm50_compile_geometry_pipeline_vertex_params32 *params = args;
   struct SM50_SHADER_COMPILATION_ARGUMENT_DATA first_arg;
   struct SM50_SHADER_COMPILATION_ARGUMENT_DATA32 *args32 = UInt32ToPtr(params->vertex_args);
-  sm50_compilation_argument32_convert(&first_arg, args32);
+  if (!sm50_compilation_argument32_convert(&first_arg, args32)) {
+    params->ret = sm50_compilation_argument_copy_failed(
+        UInt32ToPtr(params->bitcode), UInt32ToPtr(params->error),
+        "SM50CompileGeometryPipelineVertex");
+    return STATUS_SUCCESS;
+  }
 
   params->ret = SM50CompileGeometryPipelineVertex(
       params->vertex, params->geometry, &first_arg, UInt32ToPtr(params->func_name), UInt32ToPtr(params->bitcode),
@@ -9925,7 +11627,12 @@ thunk32_SM50CompileGeometryPipelineGeometry(void *args) {
   struct sm50_compile_geometry_pipeline_geometry_params32 *params = args;
   struct SM50_SHADER_COMPILATION_ARGUMENT_DATA first_arg;
   struct SM50_SHADER_COMPILATION_ARGUMENT_DATA32 *args32 = UInt32ToPtr(params->geometry_args);
-  sm50_compilation_argument32_convert(&first_arg, args32);
+  if (!sm50_compilation_argument32_convert(&first_arg, args32)) {
+    params->ret = sm50_compilation_argument_copy_failed(
+        UInt32ToPtr(params->bitcode), UInt32ToPtr(params->error),
+        "SM50CompileGeometryPipelineGeometry");
+    return STATUS_SUCCESS;
+  }
 
   params->ret = SM50CompileGeometryPipelineGeometry(
       params->vertex, params->geometry, &first_arg, UInt32ToPtr(params->func_name), UInt32ToPtr(params->bitcode),
@@ -9963,7 +11670,12 @@ thunk32_DXILCompile(void *args) {
   struct sm50_compile_params32 *params = args;
   struct SM50_SHADER_COMPILATION_ARGUMENT_DATA first_arg;
   struct SM50_SHADER_COMPILATION_ARGUMENT_DATA32 *args32 = UInt32ToPtr(params->args);
-  sm50_compilation_argument32_convert(&first_arg, args32);
+  if (!sm50_compilation_argument32_convert(&first_arg, args32)) {
+    params->ret = sm50_compilation_argument_copy_failed(
+        UInt32ToPtr(params->bitcode), UInt32ToPtr(params->error),
+        "DXILCompile");
+    return STATUS_SUCCESS;
+  }
 
   params->ret = DXMT12DXILCompile(
       params->shader, &first_arg, UInt32ToPtr(params->func_name), UInt32ToPtr(params->bitcode),
@@ -10119,20 +11831,30 @@ typedef struct icc_XYZ_t {
 
 bool
 GetChromaticity_xy(ColorSyncProfileRef profile, CFStringRef tag, float *out_x, float *out_y) {
+  if (!profile || !tag || !out_x || !out_y)
+    return false;
+
   CFDataRef tag_data = ColorSyncProfileCopyTag(profile, tag);
   if (!tag_data)
     return false;
-  if (CFDataGetLength(tag_data) != sizeof(icc_XYZ_t))
-    return false;
-  icc_XYZ_t *data = (icc_XYZ_t *)CFDataGetBytePtr(tag_data);
-  if (data->sig != 0x205a5958)
-    return false;
-  double X = (int32_t)__builtin_bswap32(data->x) / 65536.0;
-  double Y = (int32_t)__builtin_bswap32(data->y) / 65536.0;
-  double Z = (int32_t)__builtin_bswap32(data->z) / 65536.0;
-  *out_x = X / (X + Y + Z);
-  *out_y = Y / (X + Y + Z);
-  return true;
+
+  bool result = false;
+  if (CFDataGetLength(tag_data) == sizeof(icc_XYZ_t)) {
+    const icc_XYZ_t *data = (const icc_XYZ_t *)CFDataGetBytePtr(tag_data);
+    if (data && data->sig == 0x205a5958) {
+      const double X = (int32_t)__builtin_bswap32(data->x) / 65536.0;
+      const double Y = (int32_t)__builtin_bswap32(data->y) / 65536.0;
+      const double Z = (int32_t)__builtin_bswap32(data->z) / 65536.0;
+      const double sum = X + Y + Z;
+      if (sum != 0.0) {
+        *out_x = X / sum;
+        *out_y = Y / sum;
+        result = true;
+      }
+    }
+  }
+  CFRelease(tag_data);
+  return result;
 }
 
 bool
@@ -10167,9 +11889,27 @@ _WMTGetDisplayDescription(void *obj) {
   struct unixcall_generic_obj_ptr_noret *params = obj;
   CGDirectDisplayID display_id = params->handle;
   struct WMTDisplayDescription *desc_out = params->arg.ptr;
+  if (!desc_out)
+    return STATUS_INVALID_PARAMETER;
+
   ColorSyncProfileRef profile = ColorSyncProfileCreateWithDisplayID(display_id);
-  if (!profile || !GetDisplayColorGamut(profile, desc_out))
-    GetDisplayColorGamut(ColorSyncProfileCreateWithName(kColorSyncGenericRGBProfile), desc_out);
+  bool has_gamut = profile && GetDisplayColorGamut(profile, desc_out);
+  if (profile)
+    CFRelease(profile);
+
+  if (!has_gamut) {
+    profile = ColorSyncProfileCreateWithName(kColorSyncGenericRGBProfile);
+    has_gamut = profile && GetDisplayColorGamut(profile, desc_out);
+    if (profile)
+      CFRelease(profile);
+  }
+
+  if (!has_gamut) {
+    memset(desc_out->white_points, 0, sizeof(desc_out->white_points));
+    memset(desc_out->red_primaries, 0, sizeof(desc_out->red_primaries));
+    memset(desc_out->green_primaries, 0, sizeof(desc_out->green_primaries));
+    memset(desc_out->blue_primaries, 0, sizeof(desc_out->blue_primaries));
+  }
   NSScreen *screen = GetNSScreenForDisplayID(display_id);
   if (screen) {
     desc_out->maximum_edr_color_component_value = [screen maximumExtendedDynamicRangeColorComponentValue];
@@ -10729,52 +12469,113 @@ _MTLCommandBuffer_property(void *obj) {
 
 static NTSTATUS
 _MTLResidencySet_addAllocation(void *obj) {
-  struct unixcall_generic_obj_obj_noret *params = obj;
-  id set = (id)params->handle;
-  id allocation = (id)params->arg;
-  if (!dxmt_metal4_is_residency_set(set) || !dxmt_metal4_is_allocation(allocation))
-    return STATUS_SUCCESS;
-  NSLock *membershipLock = dxmt_residency_membership_lock_get();
-  [membershipLock lock];
-  [(id<MTLResidencySet>)set addAllocation:(id<MTLAllocation>)allocation];
-  [membershipLock unlock];
+  struct unixcall_mtlresidencyset_mutation *params = obj;
+  id set = (id)params->set;
+  id allocation = (id)params->allocation;
+  params->ret = 0;
+  if (!dxmt_metal4_is_residency_set(set) ||
+      !dxmt_metal4_is_allocation(allocation))
+    return STATUS_INVALID_PARAMETER;
+  @try {
+    dxmt_residency_set_add_allocation_direct(
+        (id<MTLResidencySet>)set, (id<MTLAllocation>)allocation);
+    params->ret = 1;
+  } @catch (NSException *exception) {
+    fprintf(stderr,
+            "err:   DXMT residency add failed: set=%p allocation=%p"
+            " exception=%s reason=%s\n",
+            set, allocation, exception.name.UTF8String ?: "unknown",
+            exception.reason.UTF8String ?: "unknown Metal exception");
+    fflush(stderr);
+  }
   return STATUS_SUCCESS;
 }
 
 static NTSTATUS
 _MTLResidencySet_removeAllocation(void *obj) {
-  struct unixcall_generic_obj_obj_noret *params = obj;
-  id set = (id)params->handle;
-  id allocation = (id)params->arg;
-  if (!dxmt_metal4_is_residency_set(set) || !dxmt_metal4_is_allocation(allocation))
-    return STATUS_SUCCESS;
-  NSLock *membershipLock = dxmt_residency_membership_lock_get();
-  [membershipLock lock];
-  [(id<MTLResidencySet>)set removeAllocation:(id<MTLAllocation>)allocation];
-  [membershipLock unlock];
+  struct unixcall_mtlresidencyset_mutation *params = obj;
+  id set = (id)params->set;
+  id allocation = (id)params->allocation;
+  params->ret = 0;
+  if (!dxmt_metal4_is_residency_set(set) ||
+      !dxmt_metal4_is_allocation(allocation))
+    return STATUS_INVALID_PARAMETER;
+  @try {
+    dxmt_residency_set_remove_allocation_direct(
+        (id<MTLResidencySet>)set, (id<MTLAllocation>)allocation);
+    params->ret = 1;
+  } @catch (NSException *exception) {
+    fprintf(stderr,
+            "err:   DXMT residency remove failed: set=%p allocation=%p"
+            " exception=%s reason=%s\n",
+            set, allocation, exception.name.UTF8String ?: "unknown",
+            exception.reason.UTF8String ?: "unknown Metal exception");
+    fflush(stderr);
+  }
   return STATUS_SUCCESS;
 }
 
 static NTSTATUS
 _MTLResidencySet_commit(void *obj) {
-  struct unixcall_generic_obj_noret *params = obj;
-  id set = (id)params->handle;
+  struct unixcall_mtlresidencyset_control *params = obj;
+  id set = (id)params->set;
+  params->ret = 0;
   if (!dxmt_metal4_is_residency_set(set))
-    return STATUS_SUCCESS;
-  NSLock *membershipLock = dxmt_residency_membership_lock_get();
-  [membershipLock lock];
-  [(id<MTLResidencySet>)set commit];
-  [membershipLock unlock];
+    return STATUS_INVALID_PARAMETER;
+  @try {
+    dxmt_residency_set_commit_direct((id<MTLResidencySet>)set);
+    params->ret = 1;
+  } @catch (NSException *exception) {
+    fprintf(stderr,
+            "err:   DXMT residency commit failed: set=%p"
+            " exception=%s reason=%s\n",
+            set, exception.name.UTF8String ?: "unknown",
+            exception.reason.UTF8String ?: "unknown Metal exception");
+    fflush(stderr);
+  }
   return STATUS_SUCCESS;
 }
 
 static NTSTATUS
 _MTLResidencySet_requestResidency(void *obj) {
-  struct unixcall_generic_obj_noret *params = obj;
-  id set = (id)params->handle;
+  struct unixcall_mtlresidencyset_control *params = obj;
+  id set = (id)params->set;
+  params->ret = 0;
   if (!dxmt_metal4_is_residency_set(set))
-    return STATUS_SUCCESS;
-  [(id<MTLResidencySet>)set requestResidency];
+    return STATUS_INVALID_PARAMETER;
+  @try {
+    dxmt_residency_set_request_direct((id<MTLResidencySet>)set);
+    params->ret = 1;
+  } @catch (NSException *exception) {
+    fprintf(stderr,
+            "err:   DXMT residency request failed: set=%p"
+            " exception=%s reason=%s\n",
+            set, exception.name.UTF8String ?: "unknown",
+            exception.reason.UTF8String ?: "unknown Metal exception");
+    fflush(stderr);
+  }
+  return STATUS_SUCCESS;
+}
+
+static NTSTATUS
+_MTLResidencySet_logOperation(void *obj) {
+  const struct unixcall_mtlresidencyset_operation_log *params = obj;
+  static const char *const operation_names[] = {
+      "add", "remove", "commit", "request"};
+  const char *operation =
+      params->operation < sizeof(operation_names) / sizeof(operation_names[0])
+          ? operation_names[params->operation]
+          : "unknown";
+  dxmt_metal4_hang_log(
+      DXMT_METAL4_HANG_LOG_BOTH,
+      "%s:  DXMT residency PE operation: op=%s set=0x%" PRIx64
+      " allocation=0x%" PRIx64
+      " unixStatus=0x%08x nativeRet=%u\n",
+      params->unix_status || !params->native_ret ? "err" : "info",
+      operation, params->set, params->allocation, params->unix_status,
+      params->native_ret);
+  if (params->unix_status || !params->native_ret)
+    dxmt_residency_call_depth = 0;
   return STATUS_SUCCESS;
 }
 
@@ -11192,6 +12993,7 @@ const void *__wine_unix_call_funcs[] = {
     &_MTLDevice_queryTimestampFrequency,
     &_MTLDevice_sampleTimestamps,
     &_MTLCommandBuffer_registerResource,
+    &_MTLResidencySet_logOperation,
 };
 
 #ifndef DXMT_NATIVE
@@ -11377,5 +13179,6 @@ const void *__wine_unix_call_wow64_funcs[] = {
     &_MTLDevice_queryTimestampFrequency,
     &_MTLDevice_sampleTimestamps,
     &_MTLCommandBuffer_registerResource,
+    &_MTLResidencySet_logOperation,
 };
 #endif

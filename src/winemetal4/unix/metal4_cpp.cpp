@@ -116,9 +116,18 @@ _MTL4CounterHeap_newTimestampHeap(void *obj) {
   auto *params = static_cast<unixcall_mtl4counterheap_newtimestampheap *>(obj);
   auto *device = fromHandle<MTL::Device>(params->device);
 
+  // MTL_DEBUG_LAYER aborts when entryCount > 4096. Clamp here as a hard backstop
+  // so a PE-side miscount cannot kill the process before the game window opens.
+  constexpr uint64_t kMaxTimestampCounterHeapEntries = 4096;
+  uint64_t count = params->count;
+  if (count > kMaxTimestampCounterHeapEntries)
+    count = kMaxTimestampCounterHeapEntries;
+  if (count < 2)
+    count = 2;
+
   auto *descriptor = MTL4::CounterHeapDescriptor::alloc()->init();
   descriptor->setType(MTL4::CounterHeapTypeTimestamp);
-  descriptor->setCount(static_cast<NS::UInteger>(params->count));
+  descriptor->setCount(static_cast<NS::UInteger>(count));
 
   NS::Error *error = nullptr;
   auto *heap = device->newCounterHeap(descriptor, &error);

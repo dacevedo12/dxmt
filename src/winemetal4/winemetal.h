@@ -3,12 +3,14 @@
 
 #ifdef __cplusplus
 #include <cstdint>
+#include <cstddef>
 #include <cassert>
 #define STATIC_ASSERT(x) static_assert(x)
 #else
+#include <stddef.h>
 #include <stdint.h>
 #include <stdbool.h>
-#define STATIC_ASSERT(x)
+#define STATIC_ASSERT(x) _Static_assert((x), #x)
 #endif
 
 #if defined(_WIN32) && !defined(WINEMETAL_STATIC)
@@ -117,8 +119,8 @@ WINEMETAL_API void MTLCommandBuffer_commitAndGetStats(
 WINEMETAL_API void MTLCommandBuffer_registerResource(
     obj_handle_t cmdbuf, obj_handle_t resource);
 
-#define WMT_COMMAND_BUFFER_FENCE_EDGE_CAPACITY 64
-#define WMT_COMMAND_BUFFER_ENCODER_DIAGNOSTIC_CAPACITY 32
+#define WMT_COMMAND_BUFFER_FENCE_EDGE_CAPACITY 96
+#define WMT_COMMAND_BUFFER_ENCODER_DIAGNOSTIC_CAPACITY 64
 
 struct WMTCommandBufferFenceEdgeDiagnostic {
   uint64_t producer_id;
@@ -127,6 +129,24 @@ struct WMTCommandBufferFenceEdgeDiagnostic {
   uint32_t consumer_index;
   uint32_t slot;
   uint32_t flags;
+  uint64_t resource_object;
+  uint64_t resource_identity;
+  uint64_t allocation_object;
+  uint64_t metal_resource_handle;
+  uint64_t gpu_address_or_resource_id;
+  uint64_t producer_offset;
+  uint64_t producer_length;
+  uint64_t producer_view_id;
+  uint64_t consumer_offset;
+  uint64_t consumer_length;
+  uint64_t consumer_view_id;
+  uint64_t resource_match_hash;
+  uint32_t producer_access;
+  uint32_t consumer_access;
+  uint32_t producer_stage_kind;
+  uint32_t consumer_stage_kind;
+  uint32_t resource_match_count;
+  uint32_t reserved;
 };
 
 struct WMTCommandBufferEncoderDiagnostic {
@@ -141,6 +161,8 @@ struct WMTCommandBufferEncoderDiagnostic {
   uint64_t primary_resource;
   uint64_t secondary_resource;
   uint64_t resource_plan_hash;
+  uint64_t d3d_sequence_begin;
+  uint64_t d3d_sequence_end;
   uint32_t encoder_index;
   uint32_t type;
   uint32_t wait_count;
@@ -214,9 +236,22 @@ struct WMTCommandBufferDiagnosticInfo {
       encoders[WMT_COMMAND_BUFFER_ENCODER_DIAGNOSTIC_CAPACITY];
 };
 
-STATIC_ASSERT(sizeof(struct WMTCommandBufferFenceEdgeDiagnostic) == 32);
-STATIC_ASSERT(sizeof(struct WMTCommandBufferEncoderDiagnostic) == 112);
-STATIC_ASSERT(sizeof(struct WMTCommandBufferDiagnosticInfo) == 5928);
+STATIC_ASSERT(sizeof(struct WMTCommandBufferFenceEdgeDiagnostic) == 152);
+STATIC_ASSERT(offsetof(struct WMTCommandBufferFenceEdgeDiagnostic, flags) == 28);
+STATIC_ASSERT(offsetof(struct WMTCommandBufferFenceEdgeDiagnostic,
+                       resource_object) == 32);
+STATIC_ASSERT(sizeof(struct WMTCommandBufferEncoderDiagnostic) == 128);
+STATIC_ASSERT(offsetof(struct WMTCommandBufferEncoderDiagnostic,
+                       argument_buffer_handle) == 40);
+STATIC_ASSERT(offsetof(struct WMTCommandBufferEncoderDiagnostic,
+                       resource_plan_count) == 124);
+STATIC_ASSERT(sizeof(struct WMTCommandBufferDiagnosticInfo) == 23080);
+STATIC_ASSERT(offsetof(struct WMTCommandBufferDiagnosticInfo,
+                       sparse_resource_identity) == 192);
+STATIC_ASSERT(offsetof(struct WMTCommandBufferDiagnosticInfo, fence_edges) ==
+              296);
+STATIC_ASSERT(offsetof(struct WMTCommandBufferDiagnosticInfo, encoders) ==
+              14888);
 
 WINEMETAL_API void MTLCommandBuffer_setDiagnosticInfo(
     obj_handle_t cmdbuf,
@@ -322,8 +357,8 @@ struct WMTConstMemoryPointer {
 #define WMT_MEMPTR_SET(obj, value) obj.ptr = value
 #endif
 
-STATIC_ASSERT(sizeof(WMTMemoryPointer) == 8);
-STATIC_ASSERT(sizeof(WMTConstMemoryPointer) == 8);
+STATIC_ASSERT(sizeof(struct WMTMemoryPointer) == 8);
+STATIC_ASSERT(sizeof(struct WMTConstMemoryPointer) == 8);
 
 struct WMTBufferInfo {
   uint64_t length;                 // in
@@ -332,7 +367,7 @@ struct WMTBufferInfo {
   uint64_t gpu_address;            // out
 };
 
-STATIC_ASSERT(sizeof(WMTBufferInfo) == 32);
+STATIC_ASSERT(sizeof(struct WMTBufferInfo) == 32);
 
 WINEMETAL_API obj_handle_t MTLDevice_newBuffer(obj_handle_t device, struct WMTBufferInfo *info);
 
@@ -343,7 +378,7 @@ struct WMTArgumentTableInfo {
   bool initialize_bindings;
 };
 
-STATIC_ASSERT(sizeof(WMTArgumentTableInfo) == 16);
+STATIC_ASSERT(sizeof(struct WMTArgumentTableInfo) == 16);
 
 WINEMETAL_API obj_handle_t MTLDevice_newArgumentTable(obj_handle_t device, const struct WMTArgumentTableInfo *info);
 
@@ -357,7 +392,7 @@ struct WMTTextureViewPoolInfo {
   uint64_t initial_count;
 };
 
-STATIC_ASSERT(sizeof(WMTTextureViewPoolInfo) == 8);
+STATIC_ASSERT(sizeof(struct WMTTextureViewPoolInfo) == 8);
 
 WINEMETAL_API obj_handle_t MTLDevice_newTextureViewPool(
     obj_handle_t device, const struct WMTTextureViewPoolInfo *info, obj_handle_t *err_out
@@ -425,7 +460,7 @@ struct WMTSamplerInfo {
   uint64_t gpu_resource_id; // out
 };
 
-STATIC_ASSERT(sizeof(WMTSamplerInfo) == 32);
+STATIC_ASSERT(sizeof(struct WMTSamplerInfo) == 32);
 
 WINEMETAL_API obj_handle_t MTLDevice_newSamplerState(obj_handle_t device, struct WMTSamplerInfo *info);
 
@@ -686,13 +721,13 @@ struct WMTTextureViewDescriptor {
   struct WMTTextureSwizzleChannels swizzle;
 };
 
-STATIC_ASSERT(sizeof(WMTTextureViewDescriptor) == 28);
+STATIC_ASSERT(sizeof(struct WMTTextureViewDescriptor) == 28);
 
 struct WMTTextureBufferViewDescriptor {
   struct WMTTextureInfo texture;
 };
 
-STATIC_ASSERT(sizeof(WMTTextureBufferViewDescriptor) == 48);
+STATIC_ASSERT(sizeof(struct WMTTextureBufferViewDescriptor) == 48);
 
 enum WMTTextureInfoFlag : uint32_t {
   WMTTextureInfoFlagPlacementSparse = 1u << 0,
@@ -1464,6 +1499,13 @@ enum WMTRenderStages : uint8_t {
   WMTRenderStageObject = 8,
   WMTRenderStageMesh = 16,
   WMTRenderStagePreRaster = WMTRenderStageVertex | WMTRenderStageObject | WMTRenderStageMesh,
+  /**
+   * GPTK D3DMCommandEncoder::UpdateFence (IDA, render): first fence uses
+   * afterStages=17 (Vertex|Mesh), second uses Fragment=2. Object is not in the
+   * PreRaster fence mask; use this for waitForFence/updateFence PreRaster edges
+   * so DXMT matches D3DMetal stage visibility.
+   */
+  WMTRenderStageGptkPreRasterFence = WMTRenderStageVertex | WMTRenderStageMesh,
 };
 
 struct wmtcmd_render_useresource {
@@ -2283,13 +2325,13 @@ WINEMETAL_API void MTL4TimestampContext_writeTimestamp(
 
 WINEMETAL_API uint64_t MTLDevice_sizeOfTimestampHeapEntry(obj_handle_t device);
 
-WINEMETAL_API void MTLResidencySet_addAllocation(obj_handle_t set, obj_handle_t allocation);
+WINEMETAL_API bool MTLResidencySet_addAllocation(obj_handle_t set, obj_handle_t allocation);
 
-WINEMETAL_API void MTLResidencySet_removeAllocation(obj_handle_t set, obj_handle_t allocation);
+WINEMETAL_API bool MTLResidencySet_removeAllocation(obj_handle_t set, obj_handle_t allocation);
 
-WINEMETAL_API void MTLResidencySet_commit(obj_handle_t set);
+WINEMETAL_API bool MTLResidencySet_commit(obj_handle_t set);
 
-WINEMETAL_API void MTLResidencySet_requestResidency(obj_handle_t set);
+WINEMETAL_API bool MTLResidencySet_requestResidency(obj_handle_t set);
 
 enum WMTCommandBufferProperty : uint32_t {
   WMTCommandBufferPropertyKernelStartTime,

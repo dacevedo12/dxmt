@@ -173,6 +173,34 @@ struct unixcall_mtldevice_updatesparsetexturemappings {
   uint32_t ret;
 };
 
+struct unixcall_mtlresidencyset_mutation {
+  obj_handle_t set;
+  obj_handle_t allocation;
+  uint32_t ret;
+  uint32_t reserved;
+};
+
+STATIC_ASSERT(sizeof(struct unixcall_mtlresidencyset_mutation) == 24);
+
+struct unixcall_mtlresidencyset_control {
+  obj_handle_t set;
+  uint32_t ret;
+  uint32_t reserved;
+};
+
+STATIC_ASSERT(sizeof(struct unixcall_mtlresidencyset_control) == 16);
+
+struct unixcall_mtlresidencyset_operation_log {
+  obj_handle_t set;
+  obj_handle_t allocation;
+  uint32_t unix_status;
+  uint32_t operation;
+  uint32_t native_ret;
+  uint32_t reserved;
+};
+
+STATIC_ASSERT(sizeof(struct unixcall_mtlresidencyset_operation_log) == 32);
+
 struct unixcall_mtlbuffer_newtexture {
   obj_handle_t buffer;
   struct WMTMemoryPointer info;
