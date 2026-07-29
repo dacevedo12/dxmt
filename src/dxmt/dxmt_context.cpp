@@ -5890,6 +5890,10 @@ ArgumentEncodingContext::flushCommands(
     encoder_head.next = nullptr;
     encoder_last = &encoder_head;
     encoder_count_ = 0;
+    // The fence bindings encoded above do not survive this command buffer, so
+    // every id issued so far is now unresolvable and the shared sets holding
+    // them can drop those entries on next touch.
+    chunk_base_encoder_id_ = encoder_id_;
     perf.cleanup += clock::now() - t0;
   }
 

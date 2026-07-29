@@ -1524,6 +1524,10 @@ private:
   unsigned encoder_count_ = 0;
   
   uint64_t encoder_id_ = kParityLane; // actually important to not start from 0
+  // First encoder id of the command buffer being encoded. Ids below it belong
+  // to command buffers whose fence bindings are already gone, so nothing can be
+  // emitted for them; see FenceSet::pruneBefore.
+  uint64_t chunk_base_encoder_id_ = kParityLane;
   std::vector<WMT::Reference<WMT::Fence>> fence_pool_;
   CommandBufferFenceBindingTable fence_bindings_;
   FenceLocalityCheck fence_locality_;
@@ -1636,6 +1640,7 @@ ArgumentEncodingContext::track(GenericAccessTracker &tracker, int flags) {
   auto current_encoder = currentRenderEncoder();
   auto id = current_encoder->encoder_id_vertex;
   EncoderBarrierState &barrier_state = current_encoder->barrier_state;
+  tracker.pruneShared(chunk_base_encoder_id_);
   if (flags & ResourceAccess::Write)
     tracker.accessExclusivePreRaster(
         id, current_encoder->fence_wait_vertex, barrier_state, flags & ResourceAccess::UAV
@@ -1649,6 +1654,7 @@ inline void
 ArgumentEncodingContext::track<PipelineStage::Compute>(GenericAccessTracker &tracker, int flags) {
   auto current_encoder = currentEncoder();
   EncoderBarrierState &barrier_state = current_encoder->barrier_state;
+  tracker.pruneShared(chunk_base_encoder_id_);
   if (flags & ResourceAccess::Write)
     tracker.accessExclusive(
         currentEncoderId(), current_encoder->fence_wait, barrier_state, flags & ResourceAccess::UAV
@@ -1662,6 +1668,7 @@ inline void
 ArgumentEncodingContext::track<PipelineStage::Pixel>(GenericAccessTracker &tracker, int flags) {
   auto current_encoder = currentRenderEncoder();
   EncoderBarrierState &barrier_state = current_encoder->barrier_state;
+  tracker.pruneShared(chunk_base_encoder_id_);
   if (flags & ResourceAccess::Write)
     tracker.accessExclusiveFragment(
         currentEncoderId(), current_encoder->fence_wait, barrier_state, flags & ResourceAccess::UAV

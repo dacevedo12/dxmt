@@ -60,6 +60,42 @@ public:
     return true;
   }
 
+  // Collapses the entries that predate the command buffer being encoded down
+  // to the newest one.
+  //
+  // This is what bounds the set. A shared set is only ever emptied by an
+  // exclusive access, so a resource that is sampled every frame and never
+  // written accumulates one entry per encoder that ever read it. Left alone
+  // that reached 15472 entries, and the cost was not searching them but
+  // holding them: around 121KB per resource, untouched long enough between
+  // frames for the host to compress it, so a single access paid a fault storm
+  // and ran for over a second.
+  //
+  // One entry has to survive rather than none. Such an id can no longer
+  // resolve to a fence, since fence bindings are rebuilt per command buffer,
+  // but prepareFencePool counts exactly these unresolvable waits, and a blit
+  // or explicit-barrier wait among them makes the submission serialize behind
+  // the previous one. Ordinary render and compute external edges deliberately
+  // do not, so this is not "every external edge serializes". Dropping the
+  // whole prefix would retract the cases that do, which for an untracked
+  // resource is the only thing ordering it across the boundary. The counts are
+  // never compared against anything but zero, so the newest external id
+  // preserves every decision the whole prefix would have driven.
+  void
+  pruneBefore(EncoderId first_live) {
+    // Tests the SECOND entry, not the first. Once collapsed the set keeps one
+    // entry below the bound, so a front() test would be false on every later
+    // access and walk the whole set to discover there is nothing to do, which
+    // is the memory traffic this exists to avoid. Entries are sorted, so a
+    // second entry at or above the bound means the set is already collapsed.
+    if (entries_.size() < 2 || entries_[1] >= first_live)
+      return;
+    auto newest_external = std::lower_bound(entries_.begin(), entries_.end(), first_live) - 1;
+    const size_t remaining = static_cast<size_t>(entries_.end() - newest_external);
+    std::move(newest_external, entries_.end(), entries_.begin());
+    entries_.resize(remaining);
+  }
+
   void
   unset(EncoderId id) {
     auto entry = std::lower_bound(entries_.begin(), entries_.end(), id);
@@ -420,6 +456,11 @@ public:
   void accessExclusivePreRaster(EncoderId id, FenceSet &wait_fences, EncoderBarrierState &barrier_state, bool uav);
   void accessSharedFragment(EncoderId id, FenceSet &wait_fences, EncoderBarrierState &barrier_state);
   void accessExclusiveFragment(EncoderId id, FenceSet &wait_fences, EncoderBarrierState &barrier_state, bool uav);
+
+  // Called before an access rather than at the command buffer boundary: the
+  // trackers live on the resources, so there is no point that can walk them
+  // all, and a resource nobody touches costs nothing to leave stale.
+  void pruneShared(EncoderId first_live) { shared_.pruneBefore(first_live); }
 
 private:
   /**
