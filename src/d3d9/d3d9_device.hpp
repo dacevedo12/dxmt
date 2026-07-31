@@ -801,15 +801,14 @@ public:
     // pins; VB/IB need explicit pins. Migration: 17 slots per-draw, 23 on device.
     Com<class MTLD3D9VertexBuffer, false> resolved_vb_pins[D3D9_MAX_VERTEX_STREAMS];
     Com<class MTLD3D9IndexBuffer, false> resolved_ib_pin;
-    // BUFFER-mode streams only: the tracked Private allocation to register
-    // a Vertex-stage read access against so the fence tracker orders the
-    // staged upload copy ahead of this draw. Copied from cap.vb_slots[].alloc
-    // (frozen on the calling thread at BuildDrawCapture), NOT re-read from
-    // immediateName() here, so the read tracks the same allocation the
-    // binding was frozen against even after a later Lock(DISCARD) renames
-    // the buffer. Null for DIRECT-mode and override (UP) streams, which bind by
-    // raw handle and need no read tracking. The wrapper pins above keep the
-    // wrapper alive; the Rc keeps the allocation alive through GPU read.
+    // The tracked allocation to register a Vertex-stage read access against.
+    // Copied from cap.vb_slots[].alloc (frozen on the calling thread at
+    // BuildDrawCapture), NOT re-read from immediateName() here, so the read
+    // tracks the same allocation the binding was frozen against even after a
+    // later Lock(DISCARD) renames the buffer. Null for override (UP) streams,
+    // which bind by raw handle and need no read tracking. The wrapper pins
+    // above keep the wrapper alive; the Rc keeps the allocation alive through
+    // GPU read.
     Rc<dxmt::BufferAllocation> resolved_vb_dxmt[D3D9_MAX_VERTEX_STREAMS];
     Rc<dxmt::BufferAllocation> resolved_ib_dxmt;
     // VS/PS f/i/b register-file + clip-plane constant uploads. Resolve
@@ -868,12 +867,11 @@ public:
     // Stretch / format-convert path: render-pass sample/store vs copy.
     // Copy is same-extent bit copy ignoring filter (Metal semantics);
     // Stretch viewport spans dst sub-rect (differs from src under scaling).
-    // BufferCopy stages a locked BUFFER-mode buffer's dirty range from an
-    // upload-ring block into its Private buffer; its access<Compute> write
-    // is what the draw's read access synchronises against. BufferToTexture is
-    // the texture analogue: a mirror-backed level's dirty bytes staged from an
-    // upload-ring block into the Private texture, riding the same arrival-order
-    // stream so a draw queued before the Lock samples the pre-upload contents.
+    // BufferToTexture stages a mirror-backed level's dirty bytes from an
+    // upload-ring block into the Private texture; its access<Compute> write is
+    // what a sampling draw's read access synchronises against, and it rides the
+    // same arrival-order stream so a draw queued before the Lock samples the
+    // pre-upload contents.
     // GenerateMipmaps rides the op stream (dst_tex = the texture) so the AUTOGEN
     // mip-gen is ordered AFTER the level-0 upload/StretchRect that feeds it
     // (those are op-stream writes too now); emitting it directly at flush would
@@ -883,10 +881,9 @@ public:
       Copy = 0,
       Stretch = 1,
       Resolve = 2,
-      BufferCopy = 3,
-      BufferToTexture = 4,
-      GenerateMipmaps = 5,
-      DepthResolve = 6
+      BufferToTexture = 3,
+      GenerateMipmaps = 4,
+      DepthResolve = 5
     };
     Kind kind = Kind::Copy;
     WMTSize dst_size = {};
@@ -901,24 +898,13 @@ public:
     WMTTextureSwizzleChannels src_swizzle = {
         WMTTextureSwizzleRed, WMTTextureSwizzleGreen, WMTTextureSwizzleBlue, WMTTextureSwizzleAlpha
     };
-    // BufferCopy fields. buf_dst_alloc is the tracked destination
-    // allocation, frozen from the DynamicBuffer's immediateName() when
-    // flushDirty recorded the copy (calling thread) rather than re-read at
-    // emit: a later Lock(DISCARD) renames the buffer, and the draw that
-    // reads this upload froze the same allocation, so the write must land
-    // on it too. Its write is registered via access<Compute> so the fence
-    // tracker orders the copy against draws reading the allocation;
-    // buf_src_handle / buf_src_offset name the upload-ring source block.
-    Rc<dxmt::BufferAllocation> buf_dst_alloc;
-    obj_handle_t buf_src_handle = 0;
-    uint64_t buf_src_offset = 0;
-    uint64_t buf_dst_offset = 0;
-    uint64_t buf_length = 0;
     // BufferToTexture fields. The destination texture level is dst_tex /
     // dst_mip / dst_slice / dst_origin / size (shared with the texture blit
-    // kinds); tex_src_pitch is the source bytes-per-row and tex_bytes_per_image
-    // the per-slice stride of the staged upload-ring block (buf_src_handle /
-    // buf_src_offset).
+    // kinds); buf_src_handle / buf_src_offset name the upload-ring source
+    // block, and tex_src_pitch is the source bytes-per-row with
+    // tex_bytes_per_image the per-slice stride within it.
+    obj_handle_t buf_src_handle = 0;
+    uint64_t buf_src_offset = 0;
     uint32_t tex_src_pitch = 0;
     uint32_t tex_bytes_per_image = 0;
   };
@@ -2013,12 +1999,6 @@ public:
       WMTSize size, const void *src, uint32_t src_pitch, bool is_compressed, uint32_t src_slice_pitch = 0
   );
 
-  // Stage a BUFFER-mode buffer's dirty range into its Private allocation.
-  // Copies src into an m_uploadRing block on the calling thread, then
-  // queues a BufferCopy blit op (arrival-order, so it interleaves with
-  // draws). The op's access<Compute> write against dst is what orders the
-  // copy against draws that register a read on the same allocation; see
-  // MTLD3D9VertexBuffer::flushDirty and the op-stream walker.
   // A ring block that has been checked before anything writes through it. A
   // ring hands back a block it could not back rather than reporting the
   // failure, and a 32-bit address space reaches that under pressure, so every
@@ -2085,15 +2065,6 @@ public:
     });
     return span;
   }
-
-  // Stage a BUFFER-mode buffer's dirty range into its Private allocation.
-  // Copies src into an m_uploadRing block on the calling thread, then
-  // queues a BufferCopy blit op (arrival-order, so it interleaves with
-  // draws). The op's access<Compute> write against dst is what orders the
-  // copy against draws that register a read on the same allocation; see
-  // MTLD3D9VertexBuffer::flushDirty and the op-stream walker.
-  void
-  stageBufferUpload(const Rc<dxmt::BufferAllocation> &dst_alloc, uint64_t dst_offset, const void *src, uint64_t length);
 
   // Synchronous GPU -> host-mirror readback for a lockable render
   // target's LockRect: drain queued draws, blit the surface's texture

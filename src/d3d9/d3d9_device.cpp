@@ -1519,8 +1519,8 @@ MTLD3D9Device::stageTextureUpload(
   // Ride the arrival-order op stream instead of emitting the blit directly:
   // a draw queued before this Lock (still un-flushed in m_pendingOps) must
   // sample the pre-upload contents, which only holds if the upload is emitted
-  // at its arrival position by FlushDrawBatch. Same shape as stageBufferUpload;
-  // no seq bump, the block recycles when the chunk that reads it retires.
+  // at its arrival position by FlushDrawBatch. Same shape as the buffer upload
+  // below; no seq bump, the block recycles when the chunk that reads it retires.
   PendingBlitOp op;
   op.kind = PendingBlitOp::Kind::BufferToTexture;
   op.dst_tex = dst_alloc;
@@ -1532,41 +1532,6 @@ MTLD3D9Device::stageTextureUpload(
   op.buf_src_offset = span.offset;
   op.tex_src_pitch = src_pitch;
   op.tex_bytes_per_image = bytes_per_image;
-  QueueBlitOp(std::move(op));
-}
-
-void
-MTLD3D9Device::stageBufferUpload(
-    const Rc<dxmt::BufferAllocation> &dst_alloc, uint64_t dst_offset, const void *src, uint64_t length
-) {
-  if (dst_alloc == nullptr || src == nullptr || length == 0)
-    return;
-  // Calling-thread staging cost: the ring alloc + memcpy + queue.
-  auto *perf_stats = frameStats();
-  dxmt::perf::ScopedFrameDuration _upload_timer(perf_stats, &dxmt::FrameStatistics::frame_staging_upload_interval);
-  dxmt::perf::addFrameCounter(perf_stats, &dxmt::FrameStatistics::frame_staging_upload_bytes, length);
-  // Copy the dirty range into an upload-ring block on the calling thread.
-  // Tagged with the open chunk's seq (as the const/upload rings are), so
-  // the block recycles only after the chunk whose BufferCopy op reads it
-  // retires. No seq bump: the op rides the arrival-order stream and is
-  // emitted by FlushDrawBatch, not directly like stageTextureUpload.
-  uint64_t coherent_id = m_cachedSignaled.load(std::memory_order_acquire);
-  auto span = tryRingAllocate(m_uploadRing, m_currentCmdSeq, coherent_id, length, 16);
-  if (!span)
-    return;
-  std::memcpy(span.host, src, length);
-  PendingBlitOp op;
-  op.kind = PendingBlitOp::Kind::BufferCopy;
-  // The destination allocation was frozen from the DynamicBuffer's
-  // immediateName() on the calling thread by the caller (flushDirty). A
-  // BUFFER-mode buffer renames on Lock(DISCARD), and the draw that
-  // consumes this upload froze the same allocation at record time, so the
-  // frozen name is carried through here rather than re-read at emit.
-  op.buf_dst_alloc = dst_alloc;
-  op.buf_dst_offset = dst_offset;
-  op.buf_src_handle = span.handle;
-  op.buf_src_offset = span.offset;
-  op.buf_length = length;
   QueueBlitOp(std::move(op));
 }
 
@@ -3297,16 +3262,19 @@ MTLD3D9Device::CreateCubeTexture(
   return D3D_OK;
 }
 // Storage for a d3d9 vertex / index buffer; the buffer object wraps the
-// returned dxmt::Buffer in a dxmt::DynamicBuffer. A GpuPrivate allocation the
-// GPU reads, plus a process-owned host mirror the app writes and Unlock or
-// the consuming draw uploads. The mirror is never registered with Metal, so
-// the lockable pointer stays in the 32-bit guest address space and no
-// unix-side host-mapping path is involved. dxmt::Buffer::allocate builds its
-// own WMTBufferInfo per newBuffer, so no info is reused across calls.
+// returned dxmt::Buffer in a dxmt::DynamicBuffer. A CPU-writable allocation the
+// GPU reads, plus a process-owned host mirror the app writes and the consuming
+// draw stores into that allocation. The class must match the one DynamicBuffer
+// hands to later generations, since a refresh stores into whichever name is
+// current. The mirror is never registered with Metal, so the lockable pointer
+// stays in the 32-bit guest address space and no unix-side host-mapping path is
+// involved; the allocation is Metal-owned and the application never sees it.
+// dxmt::Buffer::allocate builds its own WMTBufferInfo per newBuffer, so no info
+// is reused across calls.
 static bool
 allocateD3D9BufferStorage(WMT::Device device, UINT length, Rc<dxmt::Buffer> &out_buffer, void *&out_mirror) {
   Rc<dxmt::Buffer> buffer = new dxmt::Buffer(length, device);
-  auto allocation = buffer->allocate(BufferAllocationFlag::GpuPrivate);
+  auto allocation = buffer->allocate(BufferAllocationFlag::CpuWriteCombined);
   if (allocation == nullptr || allocation->buffer().handle == 0)
     return false;
   buffer->rename(std::move(allocation));
@@ -3385,9 +3353,9 @@ MTLD3D9Device::CreateVertexBuffer(
     return D3DERR_INVALIDCALL;
   }
 
-  // Storage (d3d9_buffer_map.hpp): a GpuPrivate allocation wrapped in a
+  // Storage (d3d9_buffer_map.hpp): a CPU-writable allocation wrapped in a
   // DynamicBuffer inside the buffer object, plus a host mirror the app writes
-  // and Unlock or the consuming draw uploads.
+  // and the consuming draw stores into that allocation.
   void *host_ptr = nullptr;
   Rc<dxmt::Buffer> dxmt_buffer{};
   if (!allocateD3D9BufferStorage(m_metalDevice, Length, dxmt_buffer, host_ptr))
@@ -7013,7 +6981,6 @@ MTLD3D9Device::DrawIndexedPrimitive(
     UINT PrimitiveCount
 ) {
   D9DeviceLock lock = LockDevice();
-  (void)MinVertexIndex;
   dxmt::perf::addFrameCounter(frameStats(), &dxmt::FrameStatistics::frame_draw_issue_count);
   // wined3d d3d9_device_DrawIndexedPrimitive (device.c) gates on
   // vertex_declaration AND index_buffer; no BeginScene gate, no
@@ -7137,14 +7104,27 @@ MTLD3D9Device::DrawIndexedPrimitive(
 // UP build at queue time ensures validation sees shader/RT bindings from draw thread, not FlushDrawBatch thread.
 MTLD3D9Device::D3D9DrawCapture
 MTLD3D9Device::BuildDrawCapture() {
-  // Per-draw capture cost (paired with QueueBatchedDraw below); includes any
-  // draw-time flushDirty of a bound staged buffer, which also self-times as
-  // upload, so the two axes overlap on that draw.
+  // Bring every bound buffer's device copy up to date before the record timer
+  // starts. The refresh charges itself to the staging axis, so timing it here as
+  // well would count it on two axes that the frontend total adds together, and
+  // that total would then exceed the frame wall. Each refresh is a no-op when the
+  // cache is current, and refreshing every stream before any is frozen still
+  // leaves each rename ahead of the freeze that names it. The pre-draw sweeps in
+  // QueueBatchedDraw sit outside their timer for the same reason.
+  for (uint32_t s = 0; s < D3D9_MAX_VERTEX_STREAMS; ++s) {
+    if (auto *vb = m_vertexBuffers[s].ptr())
+      vb->refreshWholeMirror();
+  }
+  if (m_indexBuffer.ptr() != nullptr)
+    m_indexBuffer->refreshWholeMirror();
+
+  // Per-draw capture cost (paired with QueueBatchedDraw below).
   dxmt::perf::ScopedFrameDuration _record_timer(frameStats(), &dxmt::FrameStatistics::frame_draw_record_interval);
   // POD state read by Resolve from D9EncodingState; setter-flush invariant ensures batch shares one snapshot.
   // Ref-counted state via setter ops into m_encodeSideRefs.
   // BuildDrawCapture must freeze per-draw rename cursors (gpu_address/currentOffset advance on Lock(DISCARD)).
   D3D9DrawCapture cap;
+
   // vb_slots is value-initialized (zero-filled) by the struct default
   // ctor (= {}), so unbound slots already report buffer=0,gpu_address=0.
   // The bound buffer pointer is the single source of truth for stream
@@ -7155,27 +7135,19 @@ MTLD3D9Device::BuildDrawCapture() {
     auto *vb = m_vertexBuffers[s].ptr();
     if (!vb)
       continue;
-    // Flush a bound staged buffer's dirty range before recording the
-    // draw, so the copy op lands in the arrival-order stream ahead of
-    // this draw (DXVK flushes bound dirty buffers at draw time). No-op in
-    // DIRECT mode or with an empty dirty range.
-    vb->flushDirty();
     cap.vb_slots[s].offset = m_streamOffsets[s];
     cap.vb_slots[s].stride = m_streamStrides[s];
     // Freeze the handle, gpu_address, and the tracked allocation from ONE
-    // immediateName() read. Both map modes now rename on Lock(DISCARD)
-    // through DynamicBuffer, so all three must name the same allocation:
-    // the emit binds cap.vb_slots[].buffer / gpu_address and fence-tracks
-    // cap.vb_slots[].alloc, and a split read could straddle a rename. The
-    // frozen alloc also gives a DIRECT in-place backing the same
-    // allocation-level Vertex-read fence a BUFFER upload dest gets.
+    // immediateName() read, taken AFTER the refresh so all three name the
+    // allocation the refresh renamed to: the emit binds
+    // cap.vb_slots[].buffer / gpu_address and fence-tracks
+    // cap.vb_slots[].alloc, and a split read could straddle a rename.
     Rc<dxmt::BufferAllocation> alloc = vb->immediateAllocation();
     cap.vb_slots[s].buffer = alloc->buffer().handle;
     cap.vb_slots[s].gpu_address = alloc->gpuAddress();
     cap.vb_slots[s].alloc = std::move(alloc);
   }
   if (m_indexBuffer.ptr() != nullptr) {
-    m_indexBuffer->flushDirty();
     // Single immediateName() read freeze; see the vertex-stream branch above.
     Rc<dxmt::BufferAllocation> alloc = m_indexBuffer->immediateAllocation();
     cap.ib_buffer = alloc->buffer().handle;
@@ -7187,6 +7159,7 @@ MTLD3D9Device::BuildDrawCapture() {
     cap.ib_offset = 0;
     cap.ib_format = D3DFMT_UNKNOWN;
   }
+
   return cap;
 }
 
@@ -7728,10 +7701,12 @@ EmitCommonRenderSetup_d9(
     obj_handle_t h = bd.resolved_vs_resident_handles[slot];
     if (!h)
       continue;
-    // Register a Vertex-stage read on the stream's tracked allocation. For
-    // BUFFER this orders the staged upload copy ahead of this draw (the copy
-    // registers the matching write); for DIRECT it fences the in-place
-    // backing against a later plain/DISCARD Lock. Only override (UP) streams
+    // Register a Vertex-stage read on the stream's tracked allocation and
+    // retain it for the chunk, alongside the Rc the draw already holds.
+    // Nothing writes these allocations on the GPU, so the read has no
+    // counterpart to order against, and a refresh renames rather than
+    // overwriting a name a recorded draw already froze. Only override (UP)
+    // streams
     // carry no tracked allocation and skip this; the per-encoder fence set
     // collapses repeats within an encoder and retainAllocation dedups within
     // the chunk. Runs before the resident dedup so a new encoder after a copy
@@ -8057,27 +8032,6 @@ EmitBlitOp_d9(ArgumentEncodingContext &ctx, MTLD3D9Device::PendingBlitOp &op) {
   cmd.dst_slice = op.dst_slice;
   cmd.dst_level = op.dst_mip;
   cmd.dst_origin = op.dst_origin;
-}
-
-// Copy a BUFFER-mode buffer's dirty range from an upload-ring block into
-// its Private allocation. The access<Compute> write registers the
-// destination in the fence tracker so the encoder scheduler keeps this
-// copy ordered against draws that register a Vertex-stage read on the
-// same allocation; without it a same-RT render merge would fold across
-// the blit and let a later update overwrite an earlier draw's source.
-inline void
-EmitBufferCopyOp_d9(ArgumentEncodingContext &ctx, MTLD3D9Device::PendingBlitOp &op) {
-  auto [dst_alloc, dst_base] = ctx.access<PipelineStage::Compute>(
-      op.buf_dst_alloc, static_cast<unsigned>(op.buf_dst_offset), static_cast<unsigned>(op.buf_length),
-      ResourceAccess::Write
-  );
-  auto &cmd = ctx.encodeBlitCommand<wmtcmd_blit_copy_from_buffer_to_buffer>();
-  cmd.type = WMTBlitCommandCopyFromBufferToBuffer;
-  cmd.src = op.buf_src_handle;
-  cmd.src_offset = op.buf_src_offset;
-  cmd.dst = dst_alloc->buffer().handle;
-  cmd.dst_offset = dst_base + op.buf_dst_offset;
-  cmd.copy_length = op.buf_length;
 }
 
 // Copy a mirror-backed texture level's staged bytes from an upload-ring block
@@ -10362,14 +10316,6 @@ MTLD3D9Device::FlushDrawBatch() {
           }
           EmitBlitOp_d9(ctx, op);
           break;
-        case MTLD3D9Device::PendingBlitOp::Kind::BufferCopy:
-          if (pass != D9PassKind::Blit) {
-            end_current_pass();
-            ctx.startBlitPass();
-            pass = D9PassKind::Blit;
-          }
-          EmitBufferCopyOp_d9(ctx, op);
-          break;
         case MTLD3D9Device::PendingBlitOp::Kind::BufferToTexture:
           if (pass != D9PassKind::Blit) {
             end_current_pass();
@@ -10400,9 +10346,9 @@ MTLD3D9Device::FlushDrawBatch() {
   // cmdbuf faulted), advancing the rings' coherent watermark so their
   // placed host blocks can be reused. Without it the rings only recycle
   // at Present and grow without bound in the 32-bit address space during a
-  // no-Present burst. The watermark only ever moves forward (targets may
-  // retire out of order relative to this seq under encoder coalescing). The
-  // device pointer stays valid across teardown: ~CommandQueue joins the finish
+  // no-Present burst. The watermark only ever moves forward: targets are
+  // folded with a max, so a later completion can never lower it. The device
+  // pointer stays valid across teardown: ~CommandQueue joins the finish
   // thread and runs any residual completion targets before m_dxmtQueue (an
   // earlier-declared member) is destroyed, so none can outlive the device. The
   // target also only touches m_cachedSignaled, a trivially destructible atomic

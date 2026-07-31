@@ -15,9 +15,9 @@ namespace dxmt {
 class MTLD3D9Device;
 
 // IDirect3DVertexBuffer9 backed by a dxmt::DynamicBuffer recycling wrapper
-// (the same one d3d11 uses) over a GpuPrivate allocation, plus a host mirror
-// the app writes and Unlock or the consuming draw copies the dirty range
-// into. A Lock therefore never waits on the GPU, and never hands out memory
+// (the same one d3d11 uses) over a CPU-writable allocation, plus a host mirror
+// the app writes and the consuming draw copies whole into that allocation.
+// A Lock therefore never waits on the GPU, and never hands out memory
 // Metal has wrapped: d3d9_buffer_map.hpp records why that is the only
 // storage offered. A Lock(DISCARD) recycles a GPU-idle allocation from the
 // FIFO. No sub-resources; standalone shape (self-pin in ctor, AddRef/Release
@@ -74,11 +74,17 @@ public:
   immediateAllocation() const {
     return m_dynamic->immediateName();
   }
-  // Copy any pending dirty range from the host mirror into the Private
-  // buffer through the device upload path. No-op with an empty dirty range.
-  // Called by the outer Unlock and by draw recording for a bound dirty
-  // buffer.
-  void flushDirty();
+  // Whether the GPU-side cache is stale with respect to the mirror.
+  bool
+  isDirty() const {
+    return m_dirty;
+  }
+  // Rename to a fresh allocation and copy the WHOLE mirror into it, then mark
+  // the cache current. Renaming rather than updating in place is what keeps an
+  // already-recorded draw reading the contents it was recorded with, and it is
+  // also what lets the copy be hoisted ahead of a render pass instead of
+  // splitting one.
+  void refreshWholeMirror();
   // Raw access to the owning device: same rationale as
   // MTLD3D9Surface / MTLD3D9Texture: SetStreamSource's cross-device
   // check needs identity, not a public ref, on a hot path.
@@ -89,6 +95,12 @@ public:
   UINT
   size() const {
     return m_size;
+  }
+  // Host-mapped pointer to the authoritative vertex data. Callers must
+  // null-check.
+  const void *
+  hostPointer() const {
+    return m_hostPtr;
   }
   // FVF the buffer was created with (0 for a non-FVF buffer). ProcessVertices
   // reads it to synthesise the destination layout when the caller passes no
@@ -103,18 +115,25 @@ private:
   // The dxmt::Buffer the DynamicBuffer wraps, held only to anchor the raw
   // Buffer pointer m_dynamic keeps (same role as d3d11's
   // D3D11Buffer::buffer_ behind its dynamic_); the current allocation and
-  // the GPU-idle recycle FIFO live in m_dynamic. Its current() allocation
-  // is GpuPrivate. Declared before m_dynamic so it outlives the wrapper's
-  // raw pointer at teardown.
+  // the GPU-idle recycle FIFO live in m_dynamic. Declared before m_dynamic so
+  // it outlives the wrapper's raw pointer at teardown.
   Rc<dxmt::Buffer> m_dxmtBuffer;
   // The DynamicBuffer recycling wrapper (the same one d3d11 uses,
   // d3d11_buffer.cpp:123). Owns the current allocation name and a FIFO of
   // retired allocations a Lock(DISCARD) recycles once the GPU has passed
-  // them. The staged copy uploads into the current name and draws read it.
+  // them. A refresh stores the mirror into the current name and draws read it.
   Rc<dxmt::DynamicBuffer> m_dynamic;
-  // Byte span the app's Locks have written into the host mirror that a
-  // subsequent Unlock or draw must copy into m_dynamic's current allocation.
-  D3D9BufferRange m_dirtyRange;
+  // The mirror is authoritative. This says only that the GPU-side cache no
+  // longer matches it; WHICH bytes differ is deliberately not tracked, because
+  // the application does not truthfully say (d3d9_buffer_map.hpp).
+  bool m_dirty = false;
+  // A write lock that is still outstanding. An application may hold a buffer
+  // mapped across many draws and write each region just before the draw that
+  // reads it, without ever re-locking, so the lock is the only announcement we
+  // get and it arrives once. Clearing the dirty flag on the first refresh would
+  // then leave every later write unpublished. While this is set, a refresh
+  // re-uploads unconditionally.
+  bool m_writeLocked = false;
   // Nested Lock/Unlock depth; the upload fires on the outer Unlock only.
   D3D9BufferLockCount m_lockCount;
   // The process-owned host mirror, never registered with Metal; the dtor
@@ -192,8 +211,12 @@ public:
   immediateAllocation() const {
     return m_dynamic->immediateName();
   }
-  // See MTLD3D9VertexBuffer::flushDirty.
-  void flushDirty();
+  // See MTLD3D9VertexBuffer for the refresh model.
+  bool
+  isDirty() const {
+    return m_dirty;
+  }
+  void refreshWholeMirror();
   // Host-mapped pointer to the current index data: the host mirror, which is
   // authoritative. The index fan-remap path in d3d9_device.cpp reads the
   // source indices through it to remap them; callers must null-check.
@@ -218,7 +241,17 @@ private:
   Rc<dxmt::Buffer> m_dxmtBuffer;
   Rc<dxmt::DynamicBuffer> m_dynamic;
   void *m_hostPtr;
-  D3D9BufferRange m_dirtyRange;
+  // The mirror is authoritative. This says only that the GPU-side cache no
+  // longer matches it; WHICH bytes differ is deliberately not tracked, because
+  // the application does not truthfully say (d3d9_buffer_map.hpp).
+  bool m_dirty = false;
+  // A write lock that is still outstanding. An application may hold a buffer
+  // mapped across many draws and write each region just before the draw that
+  // reads it, without ever re-locking, so the lock is the only announcement we
+  // get and it arrives once. Clearing the dirty flag on the first refresh would
+  // then leave every later write unpublished. While this is set, a refresh
+  // re-uploads unconditionally.
+  bool m_writeLocked = false;
   D3D9BufferLockCount m_lockCount;
   UINT m_size;
   DWORD m_usage;
