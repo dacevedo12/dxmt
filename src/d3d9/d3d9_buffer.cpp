@@ -12,57 +12,8 @@ namespace dxmt {
 
 namespace {
 
-// GPU-sync gate for a plain DIRECT-mode Lock (neither DISCARD nor
-// NOOVERWRITE nor READONLY). A DIRECT buffer's lock pointer aliases the
-// DynamicBuffer's current CpuPlaced allocation the GPU reads in place, so
-// the returned pointer aliases memory queued draws may still read; DXVK's
-// LockBuffer routes the same case through WaitForResource
-// (d3d9_device.cpp). BUFFER-mode buffers never reach here: their Lock
-// writes a host mirror, never the GPU-read backing. Returns false when
-// D3DLOCK_DONOTWAIT is set and the current allocation's last GPU use
-// hasn't retired (the caller answers D3DERR_WASSTILLDRAWING). last_use_seq
-// comes from BuildDrawCapture's per-draw stamp of the current allocation;
-// a DISCARD resets it to 0 because the recycled/fresh allocation is
-// GPU-idle by the FIFO invariant. The common never-drawn-since-last-fence
-// case costs one atomic load.
-template <typename ForceCommit>
-bool
-lockSyncLastGpuUse(
-    uint64_t last_use_seq, std::atomic<uint64_t> &cached_signaled, WMT::SharedEvent &completion_event, DWORD flags,
-    ForceCommit force_commit
-) {
-  uint64_t coherent = cached_signaled.load(std::memory_order_acquire);
-  if (last_use_seq <= coherent)
-    return true;
-  // The cached floor can lag; pay one signaledValue() refresh before
-  // deciding to stall (same trust-the-cache-first shape as the DISCARD
-  // recycle in DynamicBuffer::allocate).
-  uint64_t fresh = completion_event.signaledValue();
-  if (fresh > coherent) {
-    cached_signaled.store(fresh, std::memory_order_release);
-    if (last_use_seq <= fresh)
-      return true;
-  }
-  // The stamped seq is NOT guaranteed to have a committed tail signal
-  // behind it: FlushDrawBatch consumes seqs without signaling, and the
-  // sync paths emit their signals into a chunk that can stay open
-  // until the next Present. Waiting before committing would block the
-  // only thread that can commit. Flush + commit unconditionally, and
-  // do it on the DONOTWAIT arm too so spinning apps observe forward
-  // progress: DXVK's WaitForResource (d3d9_device.cpp) flushes on both
-  // arms the same way.
-  force_commit();
-  if (flags & D3DLOCK_DONOTWAIT)
-    return false;
-  completion_event.waitUntilSignaledValue(last_use_seq, UINT64_MAX);
-  uint64_t prev = cached_signaled.load(std::memory_order_relaxed);
-  if (last_use_seq > prev)
-    cached_signaled.store(last_use_seq, std::memory_order_release);
-  return true;
-}
-
-// Lock(DISCARD) rename shared by the vertex/index DIRECT and BUFFER arms:
-// recycle a GPU-idle allocation (or mint one) and install it as the current
+// Lock(DISCARD) rename shared by the vertex and index buffers: recycle a
+// GPU-idle allocation (or mint one) and install it as the current
 // name. Metal returns a null buffer on video-memory exhaustion, and a placed
 // allocation keeps a non-null CPU pointer even then, so the plain immediate-
 // memory null check downstream would not catch it. Reject the fresh
@@ -85,7 +36,6 @@ MTLD3D9VertexBuffer::MTLD3D9VertexBuffer(
     Rc<dxmt::Buffer> dxmt_buffer
 ) :
     m_device(device),
-    m_mapMode(determine_buffer_map_mode(pool, usage)),
     m_dxmtBuffer(std::move(dxmt_buffer)),
     m_hostPtr(host_ptr),
     m_size(size),
@@ -96,19 +46,13 @@ MTLD3D9VertexBuffer::MTLD3D9VertexBuffer(
   // same one d3d11 uses, d3d11_buffer.cpp:123). m_dxmtBuffer anchors the
   // Buffer whose raw pointer the wrapper holds; the wrapper's initial name
   // is the Buffer's current() allocation set at create time. The allocation
-  // flavour matches the map mode: CpuPlaced (DIRECT, the app writes it in
-  // place and the GPU reads it) or GpuPrivate (BUFFER, uploaded from a
-  // mirror). A Lock(DISCARD) recycles a GPU-idle allocation of this flavour.
-  m_dynamic = new dxmt::DynamicBuffer(
-      m_dxmtBuffer.ptr(),
-      m_mapMode == D3D9BufferMapMode::Buffer ? BufferAllocationFlag::GpuPrivate : BufferAllocationFlag::CpuPlaced
-  );
-  // A non-DEFAULT staged buffer is dirty over its whole extent from
-  // creation so its first bind or Unlock uploads the mirror; DEFAULT
-  // contents are undefined until the app writes them (DXVK
-  // d3d9_common_buffer.cpp). DIRECT is DEFAULT-only, so it never starts
-  // dirty (and has no mirror).
-  if (m_mapMode == D3D9BufferMapMode::Buffer && m_pool != D3DPOOL_DEFAULT)
+  // is GPU-private: nothing the application touches is ever the allocation a
+  // draw reads (d3d9_buffer_map.hpp). A Lock(DISCARD) recycles a GPU-idle one.
+  m_dynamic = new dxmt::DynamicBuffer(m_dxmtBuffer.ptr(), BufferAllocationFlag::GpuPrivate);
+  // A non-DEFAULT buffer is dirty over its whole extent from creation so its
+  // first bind or Unlock uploads the mirror; DEFAULT contents are undefined
+  // until the app writes them (DXVK d3d9_common_buffer.cpp).
+  if (m_pool != D3DPOOL_DEFAULT)
     m_dirtyRange = {0, m_size};
   // Self-pin: same shape as MTLD3D9Surface / MTLD3D9Texture. The
   // override Release path drops the device pin after ComObject::
@@ -123,12 +67,11 @@ MTLD3D9VertexBuffer::~MTLD3D9VertexBuffer() {
   // binds this buffer registers an access<> read against the frozen
   // allocation and pins the wrapper through the chunk's resolved pins
   // (BatchedDraw::resolved_vb_pins) until the GPU retires that chunk. So the
-  // dtor runs only once no in-flight cmdbuf still reads them, in either map
-  // mode. m_dynamic (declared after m_dxmtBuffer) destructs first and drops
-  // those allocations; each BufferAllocation frees its own placed / private
-  // backing. The BUFFER-mode host mirror was never registered with Metal
-  // and the GPU never reads it, so free it directly; m_hostPtr is null in
-  // DIRECT mode (the app wrote the placed allocation in place).
+  // dtor runs only once no in-flight cmdbuf still reads them. m_dynamic
+  // (declared after m_dxmtBuffer) destructs first and drops those
+  // allocations; each BufferAllocation frees its own private backing. The
+  // host mirror was never registered with Metal and the GPU never reads it,
+  // so free it directly.
   if (m_hostPtr)
     wsi::aligned_free(m_hostPtr);
   if (m_isLosable)
@@ -137,7 +80,7 @@ MTLD3D9VertexBuffer::~MTLD3D9VertexBuffer() {
 
 void
 MTLD3D9VertexBuffer::flushDirty() {
-  if (m_mapMode != D3D9BufferMapMode::Buffer || m_dirtyRange.empty())
+  if (m_dirtyRange.empty())
     return;
   // Freeze the DynamicBuffer's current allocation as the copy destination
   // on the calling thread. A draw recording this flush freezes the same
@@ -286,84 +229,45 @@ MTLD3D9VertexBuffer::Lock(UINT OffsetToLock, UINT SizeToLock, void **ppbData, DW
   if (m_device->isDeviceLost())
     Flags &= ~D3DLOCK_DISCARD;
   Flags = sanitize_buffer_lock_flags(Flags, m_pool, m_usage, m_device->canOnlySWVP());
-  if (m_mapMode == D3D9BufferMapMode::Direct) {
-    // The lock pointer aliases the DynamicBuffer's current CpuPlaced
-    // allocation the GPU reads in place. D3DLOCK_DISCARD renames it to a
-    // GPU-idle allocation the FIFO recycles (or mints), so the app writes a
-    // region no queued draw reads (sanitisation guarantees DEFAULT pool
-    // here; DXVK discards any DEFAULT-pool buffer); the recycle floor and
-    // the will_free_at retire are exactly the BUFFER-mode DISCARD shape
-    // below. A plain map instead overwrites the CURRENT allocation the GPU
-    // may still read, so it waits on that allocation's last captured GPU
-    // use (the write-after-read gate); NOOVERWRITE / READONLY skip the wait
-    // (the app promises no GPU-read region is written).
-    if (Flags & D3DLOCK_DISCARD) {
-      if (HRESULT hr = discardRenameDynamicBuffer(
-              m_dynamic.ptr(), m_device->m_currentCmdSeq,
-              m_device->m_cachedSignaled.load(std::memory_order_acquire)
-          );
-          FAILED(hr))
-        return hr;
-      // The renamed-in allocation is GPU-idle, so the pre-rename use stamp
-      // no longer applies.
-      m_lastUseSeq = 0;
-    } else if (!(Flags & (D3DLOCK_NOOVERWRITE | D3DLOCK_READONLY))) {
-      if (!lockSyncLastGpuUse(
-              m_lastUseSeq, m_device->m_cachedSignaled, m_device->m_completionEvent, Flags,
-              [this] { m_device->forceFlushAndCommit(); }
-          ))
-        return D3DERR_WASSTILLDRAWING;
-    }
-  } else {
-    // The lock pointer is the host mirror, disjoint from the GPU-read
-    // allocation, so a Lock never waits and never returns WASSTILLDRAWING.
-    // On DISCARD, install a fresh current name from the DynamicBuffer:
-    // allocate() recycles a FIFO allocation the GPU has passed (will_free_at
-    // <= the signaled floor) or mints one, and updateImmediateName retires
-    // the old name tagged with the open cmdbuf's seq. The whole-buffer dirty
-    // span conjoined below re-uploads the mirror into the fresh name, while
-    // in-flight draws that froze the old allocation keep reading it
-    // undisturbed: it stays alive on those draws' captured Rc plus the FIFO
-    // entry and recycles only once provably GPU-idle. Without the fresh name
-    // the re-upload clobbers the same allocation a queued draw still reads
-    // (write-after-read tearing). Ports d3d11_context_imm.cpp
-    // MapDynamicBuffer's WRITE_DISCARD arm (minus the view rename d3d9
-    // buffers do not use). NOOVERWRITE / plain never rename: they write
-    // disjoint mirror bytes no in-flight draw reads.
-    if (!m_hostPtr)
-      return D3DERR_INVALIDCALL;
-    if (Flags & D3DLOCK_DISCARD) {
-      if (HRESULT hr = discardRenameDynamicBuffer(
-              m_dynamic.ptr(), m_device->m_currentCmdSeq,
-              m_device->m_cachedSignaled.load(std::memory_order_acquire)
-          );
-          FAILED(hr))
-        return hr;
-    }
-    // Track the dirty span the outer Unlock (or a bind) uploads into the
-    // current allocation.
-    if (buffer_lock_updates_dirty(Flags))
-      m_dirtyRange.conjoin(buffer_lock_dirty_range(Flags, OffsetToLock, SizeToLock, m_size, m_pool, m_usage));
-    m_lockCount.increment();
-  }
-  // Lockable base: DIRECT hands out the current in-place allocation's mapped
-  // memory (a DISCARD rename above just advanced it); BUFFER hands out the
-  // host mirror.
-  void *base = m_mapMode == D3D9BufferMapMode::Direct ? m_dynamic->immediateMappedMemory() : m_hostPtr;
-  if (!base)
+  // The lock pointer is the host mirror, disjoint from the GPU-read
+  // allocation, so a Lock never waits and never returns WASSTILLDRAWING.
+  // On DISCARD, install a fresh current name from the DynamicBuffer:
+  // allocate() recycles a FIFO allocation the GPU has passed (will_free_at
+  // <= the signaled floor) or mints one, and updateImmediateName retires
+  // the old name tagged with the open cmdbuf's seq. The whole-buffer dirty
+  // span conjoined below re-uploads the mirror into the fresh name, while
+  // in-flight draws that froze the old allocation keep reading it
+  // undisturbed: it stays alive on those draws' captured Rc plus the FIFO
+  // entry and recycles only once provably GPU-idle. Without the fresh name
+  // the re-upload clobbers the same allocation a queued draw still reads
+  // (write-after-read tearing). Ports d3d11_context_imm.cpp
+  // MapDynamicBuffer's WRITE_DISCARD arm (minus the view rename d3d9
+  // buffers do not use). NOOVERWRITE / plain never rename: they write
+  // disjoint mirror bytes no in-flight draw reads.
+  if (!m_hostPtr)
     return D3DERR_INVALIDCALL;
-  *ppbData = static_cast<char *>(base) + OffsetToLock;
+  if (Flags & D3DLOCK_DISCARD) {
+    if (HRESULT hr = discardRenameDynamicBuffer(
+            m_dynamic.ptr(), m_device->m_currentCmdSeq,
+            m_device->m_cachedSignaled.load(std::memory_order_acquire)
+        );
+        FAILED(hr))
+      return hr;
+  }
+  // Track the dirty span the outer Unlock (or a bind) uploads into the
+  // current allocation.
+  if (buffer_lock_updates_dirty(Flags))
+    m_dirtyRange.conjoin(buffer_lock_dirty_range(Flags, OffsetToLock, SizeToLock, m_size, m_pool, m_usage));
+  m_lockCount.increment();
+  *ppbData = static_cast<char *>(m_hostPtr) + OffsetToLock;
   return D3D_OK;
 }
 
 HRESULT STDMETHODCALLTYPE
 MTLD3D9VertexBuffer::Unlock() {
   D9DeviceLock lock = m_device->LockDevice();
-  // DIRECT buffers were written in place; nothing to do. A BUFFER-mode
-  // buffer uploads its dirty range on the outer Unlock only (D3D9 permits
+  // A buffer uploads its dirty range on the outer Unlock only (D3D9 permits
   // nested locks).
-  if (m_mapMode != D3D9BufferMapMode::Buffer)
-    return D3D_OK;
   if (m_lockCount.decrement() != 0)
     return D3D_OK;
   flushDirty();
@@ -393,7 +297,6 @@ MTLD3D9IndexBuffer::MTLD3D9IndexBuffer(
     Rc<dxmt::Buffer> dxmt_buffer
 ) :
     m_device(device),
-    m_mapMode(determine_buffer_map_mode(pool, usage)),
     m_dxmtBuffer(std::move(dxmt_buffer)),
     m_hostPtr(host_ptr),
     m_size(size),
@@ -401,15 +304,10 @@ MTLD3D9IndexBuffer::MTLD3D9IndexBuffer(
     m_format(format),
     m_pool(pool) {
   // See MTLD3D9VertexBuffer's ctor: wrap the underlying Buffer in the
-  // DynamicBuffer recycling wrapper with the map mode's allocation flavour
-  // (CpuPlaced for DIRECT, GpuPrivate for BUFFER).
-  m_dynamic = new dxmt::DynamicBuffer(
-      m_dxmtBuffer.ptr(),
-      m_mapMode == D3D9BufferMapMode::Buffer ? BufferAllocationFlag::GpuPrivate : BufferAllocationFlag::CpuPlaced
-  );
-  // See MTLD3D9VertexBuffer's ctor: a non-DEFAULT staged buffer starts
-  // wholly dirty (DIRECT is DEFAULT-only and never starts dirty).
-  if (m_mapMode == D3D9BufferMapMode::Buffer && m_pool != D3DPOOL_DEFAULT)
+  // DynamicBuffer recycling wrapper over a GPU-private allocation.
+  m_dynamic = new dxmt::DynamicBuffer(m_dxmtBuffer.ptr(), BufferAllocationFlag::GpuPrivate);
+  // See MTLD3D9VertexBuffer's ctor: a non-DEFAULT buffer starts wholly dirty.
+  if (m_pool != D3DPOOL_DEFAULT)
     m_dirtyRange = {0, m_size};
   AddRefPrivate();
 }
@@ -417,8 +315,7 @@ MTLD3D9IndexBuffer::MTLD3D9IndexBuffer(
 MTLD3D9IndexBuffer::~MTLD3D9IndexBuffer() {
   // See MTLD3D9VertexBuffer::~MTLD3D9VertexBuffer: same shape. The
   // DynamicBuffer allocations release via m_dynamic (before m_dxmtBuffer);
-  // only the BUFFER-mode host mirror is freed here, and m_hostPtr is null
-  // in DIRECT mode.
+  // only the host mirror is freed here.
   if (m_hostPtr)
     wsi::aligned_free(m_hostPtr);
   if (m_isLosable)
@@ -427,7 +324,7 @@ MTLD3D9IndexBuffer::~MTLD3D9IndexBuffer() {
 
 void
 MTLD3D9IndexBuffer::flushDirty() {
-  if (m_mapMode != D3D9BufferMapMode::Buffer || m_dirtyRange.empty())
+  if (m_dirtyRange.empty())
     return;
   // See MTLD3D9VertexBuffer::flushDirty: freeze the current allocation as
   // the copy destination on the calling thread.
@@ -560,45 +457,23 @@ MTLD3D9IndexBuffer::Lock(UINT OffsetToLock, UINT SizeToLock, void **ppbData, DWO
   if (m_device->isDeviceLost())
     Flags &= ~D3DLOCK_DISCARD;
   Flags = sanitize_buffer_lock_flags(Flags, m_pool, m_usage, m_device->canOnlySWVP());
-  if (m_mapMode == D3D9BufferMapMode::Direct) {
-    if (Flags & D3DLOCK_DISCARD) {
-      if (HRESULT hr = discardRenameDynamicBuffer(
-              m_dynamic.ptr(), m_device->m_currentCmdSeq,
-              m_device->m_cachedSignaled.load(std::memory_order_acquire)
-          );
-          FAILED(hr))
-        return hr;
-      // See MTLD3D9VertexBuffer::Lock: the renamed-in allocation is GPU-idle.
-      m_lastUseSeq = 0;
-    } else if (!(Flags & (D3DLOCK_NOOVERWRITE | D3DLOCK_READONLY))) {
-      if (!lockSyncLastGpuUse(
-              m_lastUseSeq, m_device->m_cachedSignaled, m_device->m_completionEvent, Flags,
-              [this] { m_device->forceFlushAndCommit(); }
-          ))
-        return D3DERR_WASSTILLDRAWING;
-    }
-  } else {
-    // On DISCARD, install a fresh current name from the DynamicBuffer; see
-    // MTLD3D9VertexBuffer::Lock for the recycle / write-after-read
-    // rationale and the old-allocation lifetime.
-    if (!m_hostPtr)
-      return D3DERR_INVALIDCALL;
-    if (Flags & D3DLOCK_DISCARD) {
-      if (HRESULT hr = discardRenameDynamicBuffer(
-              m_dynamic.ptr(), m_device->m_currentCmdSeq,
-              m_device->m_cachedSignaled.load(std::memory_order_acquire)
-          );
-          FAILED(hr))
-        return hr;
-    }
-    if (buffer_lock_updates_dirty(Flags))
-      m_dirtyRange.conjoin(buffer_lock_dirty_range(Flags, OffsetToLock, SizeToLock, m_size, m_pool, m_usage));
-    m_lockCount.increment();
-  }
-  void *base = m_mapMode == D3D9BufferMapMode::Direct ? m_dynamic->immediateMappedMemory() : m_hostPtr;
-  if (!base)
+  // On DISCARD, install a fresh current name from the DynamicBuffer; see
+  // MTLD3D9VertexBuffer::Lock for the recycle / write-after-read
+  // rationale and the old-allocation lifetime.
+  if (!m_hostPtr)
     return D3DERR_INVALIDCALL;
-  *ppbData = static_cast<char *>(base) + OffsetToLock;
+  if (Flags & D3DLOCK_DISCARD) {
+    if (HRESULT hr = discardRenameDynamicBuffer(
+            m_dynamic.ptr(), m_device->m_currentCmdSeq,
+            m_device->m_cachedSignaled.load(std::memory_order_acquire)
+        );
+        FAILED(hr))
+      return hr;
+  }
+  if (buffer_lock_updates_dirty(Flags))
+    m_dirtyRange.conjoin(buffer_lock_dirty_range(Flags, OffsetToLock, SizeToLock, m_size, m_pool, m_usage));
+  m_lockCount.increment();
+  *ppbData = static_cast<char *>(m_hostPtr) + OffsetToLock;
   return D3D_OK;
 }
 
@@ -606,8 +481,6 @@ HRESULT STDMETHODCALLTYPE
 MTLD3D9IndexBuffer::Unlock() {
   D9DeviceLock lock = m_device->LockDevice();
   // See MTLD3D9VertexBuffer::Unlock.
-  if (m_mapMode != D3D9BufferMapMode::Buffer)
-    return D3D_OK;
   if (m_lockCount.decrement() != 0)
     return D3D_OK;
   flushDirty();

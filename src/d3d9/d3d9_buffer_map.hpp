@@ -12,35 +12,40 @@
 
 namespace dxmt {
 
-// How a buffer's app-locked pointer relates to the memory the GPU reads.
-// Direct: the pointer aliases the placed Shared backing the GPU samples;
-// a plain Lock of an in-flight backing must sync against the GPU. Buffer:
-// the app writes a host mirror not registered with Metal, and Unlock
-// copies the dirty range into a GPU-only backing, so a Lock never waits.
-enum class D3D9BufferMapMode : uint8_t {
-  Direct,
-  Buffer,
-};
-
-// Every buffer is staged. DXVK's DetermineMapMode (d3d9_common_buffer.cpp)
-// sends DEFAULT+DYNAMIC down its allowDirectBufferMapping arm instead, aliasing
-// the app's Lock pointer onto the backing queued draws read in place, and we
-// followed that shape until it proved unusable here.
+// THE STORAGE CONTRACT, and it admits no exceptions: no pointer this
+// implementation hands the application ever aliases memory the GPU can wire.
+// Every buffer is staged. Lock returns a host mirror we own and Metal has
+// never seen; the allocation a draw reads is GPU-private and is refreshed from
+// that mirror.
 //
-// A Lock pointer into memory Metal wraps is a livelock on this platform. Once
-// the GPU has used the wrapping buffer the pages are wired, and a store from
-// translated code into a wired page that carries translation state is rejected
-// and re-executed at fault-service cadence for as long as the wrap lives:
-// measured at 5,979 ns per store against 0.25 ns for the same store when any
-// one of those conditions is absent. The app is the one writer whose pages we
-// cannot vet, so its Lock pointer must never be wrapped memory. Staging costs a
-// copy per Lock and removes the condition outright.
-inline D3D9BufferMapMode
-determine_buffer_map_mode(D3DPOOL pool, DWORD usage) {
-  (void)pool;
-  (void)usage;
-  return D3D9BufferMapMode::Buffer;
-}
+// DXVK's DetermineMapMode (d3d9_common_buffer.cpp) sends DEFAULT+DYNAMIC down
+// its allowDirectBufferMapping arm instead, aliasing the Lock pointer onto the
+// backing queued draws read in place, and we followed that shape until two
+// platform facts ruled it out.
+//
+// First, such a pointer livelocks. Once the GPU has used the wrapping buffer
+// its pages are wired, and a store from translated code into a wired page that
+// carries translation state is rejected and re-executed at fault-service
+// cadence for as long as the wrap lives: 5,979 ns per store, against 0.25 ns
+// for the same store once any one of those conditions is absent. The
+// application is the one writer whose pages cannot be vetted, and it keeps
+// writing after Unlock, so there is no window in which handing it wrapped
+// memory is safe.
+//
+// Second, the alternative that would avoid the wrap is unreachable here.
+// Aliasing memory Metal itself allocates is what DXVK effectively does through
+// Vulkan, but Metal never allocates below 4 GB (measured: zero of ten
+// allocations across sizes and storage modes), so a 32-bit guest cannot
+// address it. Giving that guest a lock pointer at all requires wrapping pages
+// it can address, which is exactly the livelock. The divergence from DXVK is
+// forced by the address space, not chosen.
+//
+// Staging costs one copy per Lock, which on unified memory is DRAM bandwidth
+// rather than a transfer, and it buys back guest address space: mirrors are
+// GPU-private and cost none, where in-place renames charged it per allocation
+// in flight. Should a native or 64-bit guest ever remove both premises,
+// shared-storage direct mapping becomes the correct answer again and this is
+// the comment to re-examine.
 
 // Lock-flag sanitisation. The runtime silently drops flags that the
 // pool/usage/device combination does not honour before any of them take
