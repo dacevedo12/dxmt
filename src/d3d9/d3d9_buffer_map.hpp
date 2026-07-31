@@ -22,16 +22,23 @@ enum class D3D9BufferMapMode : uint8_t {
   Buffer,
 };
 
-// A DEFAULT-pool DYNAMIC buffer maps Direct; every other pool/usage is
-// staged (BUFFER). Direct lets the app's Lock pointer be the placed Shared
-// backing queued draws read in place, so a rewrite never double-moves through
-// a host mirror, which is what a per-frame streaming vertex/index buffer
-// wants. This is the shape of DXVK's DetermineMapMode (d3d9_common_buffer
-// .cpp), whose allowDirectBufferMapping arm sends DEFAULT+DYNAMIC direct.
+// Every buffer is staged. DXVK's DetermineMapMode (d3d9_common_buffer.cpp)
+// sends DEFAULT+DYNAMIC down its allowDirectBufferMapping arm instead, aliasing
+// the app's Lock pointer onto the backing queued draws read in place, and we
+// followed that shape until it proved unusable here.
+//
+// A Lock pointer into memory Metal wraps is a livelock on this platform. Once
+// the GPU has used the wrapping buffer the pages are wired, and a store from
+// translated code into a wired page that carries translation state is rejected
+// and re-executed at fault-service cadence for as long as the wrap lives:
+// measured at 5,979 ns per store against 0.25 ns for the same store when any
+// one of those conditions is absent. The app is the one writer whose pages we
+// cannot vet, so its Lock pointer must never be wrapped memory. Staging costs a
+// copy per Lock and removes the condition outright.
 inline D3D9BufferMapMode
 determine_buffer_map_mode(D3DPOOL pool, DWORD usage) {
-  if (pool == D3DPOOL_DEFAULT && (usage & D3DUSAGE_DYNAMIC))
-    return D3D9BufferMapMode::Direct;
+  (void)pool;
+  (void)usage;
   return D3D9BufferMapMode::Buffer;
 }
 
