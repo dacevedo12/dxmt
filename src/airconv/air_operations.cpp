@@ -162,11 +162,20 @@ AIRBuilderResult unpack_fvec4_from_addr(
     dst_type = types._float4;
     break;
   case MTLAttributeFormat::Int1010102Normalized:
-    assert(0 && "unused");
-    // op = "unorm.rgb10a2.v4f32";
-    // src_type = types._int;
-    // align = 4;
-    // dst_type = types._float4;
+    // D3DDECLTYPE_DEC3N: signed 10-10-10 normalized plus a 2-bit signed w, and
+    // D3DDTCAPS_DEC3N is advertised, so a title may use it. Left unreachable
+    // this fell through with an empty op and null operand types, which in a
+    // release build (where the assert is a no-op) emitted an undefined air.unpack
+    // intrinsic: garbage vertex IR for anything packing normals or tangents
+    // here, with no diagnostic. The signed sibling of the unsigned path above;
+    // __metal_unpack_snorm_rgb10a2 is in the Metal stdlib, so there is no
+    // undefined symbol at metallib link. DXVK maps DEC3N to
+    // A2B10G10R10_SNORM_PACK32 and wined3d to R10G10B10X2_SNORM, both signed
+    // normalized, so the channel order needs no shuffle.
+    op = "snorm.rgb10a2.v4f32";
+    src_type = types._int;
+    align = 4;
+    dst_type = types._float4;
     break;
   case MTLAttributeFormat::FloatRG11B10:
     op = "unorm.rg11b10f.v3f32";
