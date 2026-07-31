@@ -1286,8 +1286,31 @@ compile_dxso(
       // recovering the raw 0-indexed vertex number for stream-output
       // emulation; without re-shuffling input indices.
       (void)base_vertex_arg_idx;
-      auto *byte_offset =
-          builder.CreateAdd(builder.CreateMul(stride, index), builder.getInt32(element.aligned_byte_offset));
+      // Clamp the fetch into the binding. `length` is the third member of the
+      // table entry and had never been consulted: the offset was unguarded
+      // pointer arithmetic into device memory. A stream fed from a transient
+      // slice holds only the vertices the draw declared it reads, so a draw that
+      // under-reports its vertex count would otherwise fetch whatever the shared
+      // block holds next. MinVertexIndex / NumVertices set the lower bound of what
+      // must be fresh, never an upper bound on what the draw may address, so the
+      // bound is enforced here rather than assumed.
+      //
+      // Clamp to the start of the last WHOLE vertex the binding holds, not to a
+      // fixed slack from the end. A declaration keeps every attribute inside its
+      // own stride, so anything reached from that base is in range, and no
+      // per-format size is needed. Subtracting a fixed 16 instead would clamp
+      // legitimate reads of any attribute lying in the final bytes, corrupting the
+      // last vertex of every binding. A zero stride yields no clamp, which is what
+      // an instanced or constant stream wants.
+      auto *vbuf_length = builder.CreateExtractValue(vbuf_entry, {2});
+      auto *last_vertex_base = builder.CreateSelect(
+          builder.CreateICmpUGE(vbuf_length, stride), builder.CreateSub(vbuf_length, stride), builder.getInt32(0)
+      );
+      auto *vertex_base = builder.CreateMul(stride, index);
+      vertex_base = builder.CreateSelect(
+          builder.CreateICmpULT(vertex_base, last_vertex_base), vertex_base, last_vertex_base
+      );
+      auto *byte_offset = builder.CreateAdd(vertex_base, builder.getInt32(element.aligned_byte_offset));
       air::AIRBuilderContext abctx{
           .llvm = context,
           .module = module,
