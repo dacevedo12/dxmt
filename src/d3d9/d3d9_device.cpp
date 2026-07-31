@@ -3296,33 +3296,24 @@ MTLD3D9Device::CreateCubeTexture(
   *ppCubeTexture = tex;
   return D3D_OK;
 }
-// Per-map-mode storage for a d3d9 vertex / index buffer; the buffer object
-// wraps the returned dxmt::Buffer in a dxmt::DynamicBuffer. BUFFER: a
-// GpuPrivate allocation the GPU reads plus a process-owned host mirror the
-// app writes and Unlock uploads. The mirror is never registered with Metal,
-// so the lockable pointer stays in the 32-bit guest address space and no
-// unix-side host-mapping path is involved. DIRECT: a CpuPlaced allocation
-// the app writes in place and the GPU reads (a wsi::aligned_malloc'd <4 GB
-// backing behind newBufferWithBytesNoCopy, dxmt_buffer.cpp), with no mirror.
-// Either way dxmt::Buffer::allocate builds its own WMTBufferInfo per
-// newBuffer, so no info is reused across calls.
+// Storage for a d3d9 vertex / index buffer; the buffer object wraps the
+// returned dxmt::Buffer in a dxmt::DynamicBuffer. A GpuPrivate allocation the
+// GPU reads, plus a process-owned host mirror the app writes and Unlock or
+// the consuming draw uploads. The mirror is never registered with Metal, so
+// the lockable pointer stays in the 32-bit guest address space and no
+// unix-side host-mapping path is involved. dxmt::Buffer::allocate builds its
+// own WMTBufferInfo per newBuffer, so no info is reused across calls.
 static bool
-allocateD3D9BufferStorage(
-    WMT::Device device, UINT length, D3D9BufferMapMode mode, Rc<dxmt::Buffer> &out_buffer, void *&out_mirror
-) {
+allocateD3D9BufferStorage(WMT::Device device, UINT length, Rc<dxmt::Buffer> &out_buffer, void *&out_mirror) {
   Rc<dxmt::Buffer> buffer = new dxmt::Buffer(length, device);
-  auto flags = mode == D3D9BufferMapMode::Buffer ? BufferAllocationFlag::GpuPrivate : BufferAllocationFlag::CpuPlaced;
-  auto allocation = buffer->allocate(flags);
+  auto allocation = buffer->allocate(BufferAllocationFlag::GpuPrivate);
   if (allocation == nullptr || allocation->buffer().handle == 0)
     return false;
   buffer->rename(std::move(allocation));
-  void *mirror = nullptr;
-  if (mode == D3D9BufferMapMode::Buffer) {
-    mirror = wsi::aligned_malloc(length, DXMT_PAGE_SIZE);
-    if (!mirror)
-      return false;
-    std::memset(mirror, 0, length);
-  }
+  void *mirror = wsi::aligned_malloc(length, DXMT_PAGE_SIZE);
+  if (!mirror)
+    return false;
+  std::memset(mirror, 0, length);
   out_buffer = std::move(buffer);
   out_mirror = mirror;
   return true;
@@ -3394,17 +3385,12 @@ MTLD3D9Device::CreateVertexBuffer(
     return D3DERR_INVALIDCALL;
   }
 
-  // Storage per map mode (d3d9_buffer_map.hpp). Both modes wrap a
-  // dxmt::Buffer in a DynamicBuffer inside the buffer object; the mode
-  // only selects the allocation flavour and whether a host mirror exists.
-  // DIRECT (DEFAULT + DYNAMIC): CpuPlaced placed backing the GPU reads in
-  // place (a <4 GB lockable pointer, no mirror). BUFFER (every other
-  // pool/usage): GpuPrivate allocation plus a host mirror the app writes
-  // and Unlock/bind uploads.
-  D3D9BufferMapMode map_mode = determine_buffer_map_mode(Pool, Usage);
+  // Storage (d3d9_buffer_map.hpp): a GpuPrivate allocation wrapped in a
+  // DynamicBuffer inside the buffer object, plus a host mirror the app writes
+  // and Unlock or the consuming draw uploads.
   void *host_ptr = nullptr;
   Rc<dxmt::Buffer> dxmt_buffer{};
-  if (!allocateD3D9BufferStorage(m_metalDevice, Length, map_mode, dxmt_buffer, host_ptr))
+  if (!allocateD3D9BufferStorage(m_metalDevice, Length, dxmt_buffer, host_ptr))
     return D3DERR_OUTOFVIDEOMEMORY;
 
   auto *vb = new MTLD3D9VertexBuffer(this, Length, Usage, FVF, Pool, host_ptr, std::move(dxmt_buffer));
@@ -3472,12 +3458,10 @@ MTLD3D9Device::CreateIndexBuffer(
     return D3DERR_INVALIDCALL;
   }
 
-  // Storage per map mode: see CreateVertexBuffer for the DIRECT CpuPlaced
-  // in-place backing vs BUFFER host-mirror + GpuPrivate allocation split.
-  D3D9BufferMapMode map_mode = determine_buffer_map_mode(Pool, Usage);
+  // Storage: see CreateVertexBuffer.
   void *host_ptr = nullptr;
   Rc<dxmt::Buffer> dxmt_buffer{};
-  if (!allocateD3D9BufferStorage(m_metalDevice, Length, map_mode, dxmt_buffer, host_ptr))
+  if (!allocateD3D9BufferStorage(m_metalDevice, Length, dxmt_buffer, host_ptr))
     return D3DERR_OUTOFVIDEOMEMORY;
 
   auto *ib = new MTLD3D9IndexBuffer(this, Length, Usage, Format, Pool, host_ptr, std::move(dxmt_buffer));
@@ -7189,10 +7173,6 @@ MTLD3D9Device::BuildDrawCapture() {
     cap.vb_slots[s].buffer = alloc->buffer().handle;
     cap.vb_slots[s].gpu_address = alloc->gpuAddress();
     cap.vb_slots[s].alloc = std::move(alloc);
-    // Stamp the open chunk's seq: the buffer's last GPU read lands in
-    // a chunk <= this one, so a DIRECT plain-map Lock's WAR sync can gate
-    // on it.
-    vb->markPendingGpuUse(m_currentCmdSeq);
   }
   if (m_indexBuffer.ptr() != nullptr) {
     m_indexBuffer->flushDirty();
@@ -7202,7 +7182,6 @@ MTLD3D9Device::BuildDrawCapture() {
     cap.ib_alloc = std::move(alloc);
     cap.ib_offset = m_indexBuffer->currentOffset();
     cap.ib_format = m_indexBuffer->indexFormat();
-    m_indexBuffer->markPendingGpuUse(m_currentCmdSeq);
   } else {
     cap.ib_buffer = 0;
     cap.ib_offset = 0;
