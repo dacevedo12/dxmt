@@ -574,6 +574,12 @@ struct FrameStatistics {
   clock::duration frame_draw_emit_interval{};
   uint64_t frame_resource_lock_count = 0;
   uint64_t frame_staging_upload_bytes = 0;
+  // Buffer cache maintenance: a refresh moves a whole mirror into a renamed
+  // allocation. This is what decides whether tracking a dirty bit instead of a
+  // dirty range costs anything measurable, so it is the tripwire for the
+  // storage model as a whole.
+  uint64_t frame_buffer_refresh_bytes = 0;
+  uint64_t frame_buffer_refresh_count = 0;
   uint64_t frame_chunk_commit_count = 0;
   uint64_t frame_draw_resolve_count = 0;
   // Entry counts for two intervals that predate these fields. An interval
@@ -978,6 +984,8 @@ struct FrameStatistics {
     frame_draw_emit_interval = {};
     frame_resource_lock_count = 0;
     frame_staging_upload_bytes = 0;
+    frame_buffer_refresh_bytes = 0;
+    frame_buffer_refresh_count = 0;
     frame_chunk_commit_count = 0;
     frame_draw_resolve_count = 0;
     frame_create_resource_count = 0;
@@ -1438,6 +1446,8 @@ public:
       average_.frame_draw_emit_interval += frames_[i].frame_draw_emit_interval;
       average_.frame_resource_lock_count += frames_[i].frame_resource_lock_count;
       average_.frame_staging_upload_bytes += frames_[i].frame_staging_upload_bytes;
+      average_.frame_buffer_refresh_bytes += frames_[i].frame_buffer_refresh_bytes;
+      average_.frame_buffer_refresh_count += frames_[i].frame_buffer_refresh_count;
       average_.frame_chunk_commit_count += frames_[i].frame_chunk_commit_count;
       average_.frame_draw_resolve_count += frames_[i].frame_draw_resolve_count;
       average_.frame_create_resource_count += frames_[i].frame_create_resource_count;
@@ -1814,6 +1824,8 @@ public:
     average_.frame_draw_emit_interval /= (kFrameStatisticsCount - 1);
     average_.frame_resource_lock_count /= (kFrameStatisticsCount - 1);
     average_.frame_staging_upload_bytes /= (kFrameStatisticsCount - 1);
+    average_.frame_buffer_refresh_bytes /= (kFrameStatisticsCount - 1);
+    average_.frame_buffer_refresh_count /= (kFrameStatisticsCount - 1);
     average_.frame_chunk_commit_count /= (kFrameStatisticsCount - 1);
     average_.frame_draw_resolve_count /= (kFrameStatisticsCount - 1);
     average_.frame_create_resource_count /= (kFrameStatisticsCount - 1);

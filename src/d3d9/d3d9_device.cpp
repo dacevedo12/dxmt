@@ -6947,7 +6947,6 @@ MTLD3D9Device::DrawIndexedPrimitive(
     UINT PrimitiveCount
 ) {
   D9DeviceLock lock = LockDevice();
-  (void)MinVertexIndex;
   dxmt::perf::addFrameCounter(frameStats(), &dxmt::FrameStatistics::frame_draw_issue_count);
   // wined3d d3d9_device_DrawIndexedPrimitive (device.c) gates on
   // vertex_declaration AND index_buffer; no BeginScene gate, no
@@ -7064,13 +7063,14 @@ MTLD3D9Device::DrawIndexedPrimitive(
 MTLD3D9Device::D3D9DrawCapture
 MTLD3D9Device::BuildDrawCapture() {
   // Per-draw capture cost (paired with QueueBatchedDraw below); includes any
-  // draw-time flushDirty of a bound staged buffer, which also self-times as
-  // upload, so the two axes overlap on that draw.
+  // cache refresh this draw pays for, which also self-times as upload, so the
+  // two axes overlap on that draw.
   dxmt::perf::ScopedFrameDuration _record_timer(frameStats(), &dxmt::FrameStatistics::frame_draw_record_interval);
   // POD state read by Resolve from D9EncodingState; setter-flush invariant ensures batch shares one snapshot.
   // Ref-counted state via setter ops into m_encodeSideRefs.
   // BuildDrawCapture must freeze per-draw rename cursors (gpu_address/currentOffset advance on Lock(DISCARD)).
   D3D9DrawCapture cap;
+
   // vb_slots is value-initialized (zero-filled) by the struct default
   // ctor (= {}), so unbound slots already report buffer=0,gpu_address=0.
   // The bound buffer pointer is the single source of truth for stream
@@ -7081,27 +7081,23 @@ MTLD3D9Device::BuildDrawCapture() {
     auto *vb = m_vertexBuffers[s].ptr();
     if (!vb)
       continue;
-    // Flush a bound staged buffer's dirty range before recording the
-    // draw, so the copy op lands in the arrival-order stream ahead of
-    // this draw (DXVK flushes bound dirty buffers at draw time). No-op in
-    // DIRECT mode or with an empty dirty range.
-    vb->flushDirty();
+    // Bring the cache up to date before the draw is recorded, so the copy lands
+    // in the arrival-order stream ahead of it. No-op when the cache is current.
+    vb->refreshWholeMirror();
     cap.vb_slots[s].offset = m_streamOffsets[s];
     cap.vb_slots[s].stride = m_streamStrides[s];
     // Freeze the handle, gpu_address, and the tracked allocation from ONE
-    // immediateName() read. Both map modes now rename on Lock(DISCARD)
-    // through DynamicBuffer, so all three must name the same allocation:
-    // the emit binds cap.vb_slots[].buffer / gpu_address and fence-tracks
-    // cap.vb_slots[].alloc, and a split read could straddle a rename. The
-    // frozen alloc also gives a DIRECT in-place backing the same
-    // allocation-level Vertex-read fence a BUFFER upload dest gets.
+    // immediateName() read, taken AFTER the refresh so all three name the
+    // allocation the refresh renamed to: the emit binds
+    // cap.vb_slots[].buffer / gpu_address and fence-tracks
+    // cap.vb_slots[].alloc, and a split read could straddle a rename.
     Rc<dxmt::BufferAllocation> alloc = vb->immediateAllocation();
     cap.vb_slots[s].buffer = alloc->buffer().handle;
     cap.vb_slots[s].gpu_address = alloc->gpuAddress();
     cap.vb_slots[s].alloc = std::move(alloc);
   }
   if (m_indexBuffer.ptr() != nullptr) {
-    m_indexBuffer->flushDirty();
+    m_indexBuffer->refreshWholeMirror();
     // Single immediateName() read freeze; see the vertex-stream branch above.
     Rc<dxmt::BufferAllocation> alloc = m_indexBuffer->immediateAllocation();
     cap.ib_buffer = alloc->buffer().handle;
@@ -7113,6 +7109,7 @@ MTLD3D9Device::BuildDrawCapture() {
     cap.ib_offset = 0;
     cap.ib_format = D3DFMT_UNKNOWN;
   }
+
   return cap;
 }
 

@@ -71,69 +71,21 @@ sanitize_buffer_lock_flags(DWORD flags, D3DPOOL pool, DWORD usage, bool swvp_onl
   return flags;
 }
 
-// The byte span of a staged buffer that Lock calls have dirtied and
-// Unlock must upload.
-struct D3D9BufferRange {
-  uint32_t min = 0;
-  uint32_t max = 0;
-
-  bool
-  empty() const {
-    return min == max;
-  }
-
-  void
-  clear() {
-    min = 0;
-    max = 0;
-  }
-
-  // Grow to also cover r. A previously empty range becomes exactly r.
-  void
-  conjoin(D3D9BufferRange r) {
-    if (empty()) {
-      *this = r;
-    } else {
-      min = std::min(r.min, min);
-      max = std::max(r.max, max);
-    }
-  }
-};
-
-// Whether a staged Lock honours the app's [offset, size) sub-range for
-// dirty tracking. A DISCARD or a zero SizeToLock dirties the whole
-// buffer; otherwise only MANAGED and DYNAMIC respect the sub-range.
-inline bool
-buffer_lock_respects_bounds(DWORD flags, UINT size_to_lock, D3DPOOL pool, DWORD usage) {
-  return !(flags & D3DLOCK_DISCARD) && size_to_lock != 0 &&
-         (pool == D3DPOOL_MANAGED || (usage & D3DUSAGE_DYNAMIC));
-}
-
-// The range a single staged Lock dirties, before conjoining with any
-// prior dirty range. Post-sanitisation flags. OffsetToLock / SizeToLock
-// are neither clamped nor validated by the runtime, so the offset is
-// clamped to the buffer end (a past-end lock degenerates to an empty
-// range) and the size to what remains; without this an offset past the
-// end wraps the subtraction and the upload runs off the buffer.
-inline D3D9BufferRange
-buffer_lock_dirty_range(
-    DWORD flags, UINT offset_to_lock, UINT size_to_lock, UINT buffer_size, D3DPOOL pool, DWORD usage
-) {
-  if (buffer_lock_respects_bounds(flags, size_to_lock, pool, usage)) {
-    uint32_t offset = std::min<uint32_t>(offset_to_lock, buffer_size);
-    uint32_t size = std::min<uint32_t>(size_to_lock, buffer_size - offset);
-    return {offset, offset + size};
-  }
-  return {0, buffer_size};
-}
-
-// Whether a staged Lock updates the dirty range at all. Post-sanitisation
-// flags, so READONLY here is already the effective (MANAGED-only) flag.
+// SizeToLock IS NOT TRACKED, deliberately. The runtime hands back
+// base + OffsetToLock and validates nothing, and shipped titles lock a small
+// window then write far past it: one such title lost 233,077 of 524,288 index
+// bytes that way, rendering a black world with no error anywhere. Windows
+// tolerates it because the system-memory copy the application writes IS the
+// buffer there, so a write outside the announced window still reaches the draw.
+// Applications also keep writing after Unlock, which no bookkeeping finalised at
+// Unlock can survive. So a write lock marks the buffer dirty and nothing more;
+// what a draw reads is decided from the draw, not from what the lock announced.
+//
+// Whether a Lock dirties the buffer at all. Post-sanitisation flags, so
+// READONLY here is already the effective (MANAGED-only) flag.
 // D3DLOCK_NO_DIRTY_UPDATE is a texture-only flag: D3D9 buffers always mark a
-// write-lock dirty regardless of it (wined3d buffer.c invalidates the range on
-// any write map and never consults the flag; only the texture map path checks
-// it). dxmt's staged buffers upload and clear the dirty range eagerly at Unlock,
-// so honouring the flag here would drop the write outright.
+// write-lock dirty regardless of it (wined3d buffer.c invalidates on any write
+// map and never consults the flag; only the texture map path checks it).
 inline bool
 buffer_lock_updates_dirty(DWORD flags) {
   return !(flags & D3DLOCK_READONLY);
@@ -157,13 +109,5 @@ struct D3D9BufferLockCount {
     return --count;
   }
 };
-
-// Whether Unlock should upload the dirty range: only on the outer unlock
-// (the decrement returned the count to zero) and only if some Lock
-// actually dirtied a span.
-inline bool
-buffer_unlock_should_upload(uint32_t lock_count_after_decrement, bool dirty_empty) {
-  return lock_count_after_decrement == 0 && !dirty_empty;
-}
 
 } // namespace dxmt
