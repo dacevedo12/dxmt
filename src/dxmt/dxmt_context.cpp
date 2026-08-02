@@ -6734,19 +6734,28 @@ ArgumentEncodingContext::checkEncoderRelation(EncoderData *former, EncoderData *
         break;
 
       if (clear->clear_dsv) {
+        // Consume a plane only when the clear was actually applied to it. The
+        // load action is Load when the pass is built and moves to Clear only
+        // because an earlier fold already installed one, so a matched
+        // attachment that is not Load means this clear cannot be expressed in
+        // the pass descriptor. Retiring the bit anyway dropped the clear
+        // outright, and a dropped depth clear is invisible at the point it
+        // happens: the pass loads the previous contents, and whatever the app
+        // draws next is depth-tested against a stale buffer, so geometry simply
+        // fails to appear while every draw is still issued.
         if (auto depth_attachment = isClearDepthSignatureMatched(clear, render)) {
           if (depth_attachment->load_action == WMTLoadActionLoad) {
             depth_attachment->clear_depth = clear->depth_stencil.first;
             depth_attachment->load_action = WMTLoadActionClear;
+            clear->clear_dsv &= ~1;
           }
-          clear->clear_dsv &= ~1;
         }
         if (auto stencil_attachment = isClearStencilSignatureMatched(clear, render)) {
           if (stencil_attachment->load_action == WMTLoadActionLoad) {
             stencil_attachment->clear_stencil = clear->depth_stencil.second;
             stencil_attachment->load_action = WMTLoadActionClear;
+            clear->clear_dsv &= ~2;
           }
-          clear->clear_dsv &= ~2;
         }
         if (clear->clear_dsv == 0) {
           render->fence_update.merge(clear->fence_update);
@@ -6760,10 +6769,15 @@ ArgumentEncodingContext::checkEncoderRelation(EncoderData *former, EncoderData *
         }
       } else {
         if (auto attachment = isClearColorSignatureMatched(clear, render)) {
-          if (attachment->load_action == WMTLoadActionLoad) {
-            attachment->load_action = WMTLoadActionClear;
-            attachment->clear_color = clear->color;
-          }
+          // Same rule as the depth/stencil planes above: a matched attachment
+          // that is no longer Load already carries someone else's clear, so
+          // this one cannot be folded in. Leave it standing as its own encoder
+          // rather than destroying it, which costs one pass in a case that
+          // needs two clears before a single pass, and never loses one.
+          if (attachment->load_action != WMTLoadActionLoad)
+            break;
+          attachment->load_action = WMTLoadActionClear;
+          attachment->clear_color = clear->color;
           render->fence_update.merge(clear->fence_update);
           render->fence_wait.merge(clear->fence_wait);
           render->fence_wait.subtract(clear->fence_update);
