@@ -3500,9 +3500,58 @@ _MTLBuffer_didModifyRange(void *obj) {
   return STATUS_SUCCESS;
 }
 
+// Presentation cadence instrument, DXMT_DIAG_PRESENT_TIMING=1.
+//
+// Every pacing decision above this layer keys off command buffer completion,
+// which is a different clock from the one the display scans out on, so nothing
+// in the frame statistics can say whether a frame reached the glass or when.
+// presentedTime is the only reading that can, and it has to be taken here: the
+// handler fires on a Metal-internal thread well after the call that enqueued it
+// returned, so there is no caller left to report it to. Writing to stderr keeps
+// it out of the thunk table entirely, which is worth more than tidy routing for
+// something only a diagnostic run switches on.
+static int
+dxmt_present_timing_enabled(void) {
+  static int cached = -1;
+  if (cached < 0) {
+    const char *value = getenv("DXMT_DIAG_PRESENT_TIMING");
+    cached = (value && (value[0] == '1' || value[0] == 'y' || value[0] == 't')) ? 1 : 0;
+  }
+  return cached;
+}
+
+static pthread_mutex_t dxmt_present_timing_lock = PTHREAD_MUTEX_INITIALIZER;
+static double dxmt_present_timing_previous = 0.0;
+static uint64_t dxmt_present_timing_index = 0;
+
+static void
+dxmt_track_presented(id<MTLDrawable> drawable, double after) {
+  if (!dxmt_present_timing_enabled())
+    return;
+  double enqueued = CACurrentMediaTime();
+  [drawable addPresentedHandler:^(id<MTLDrawable> presented) {
+    double presented_time = presented.presentedTime;
+    pthread_mutex_lock(&dxmt_present_timing_lock);
+    double previous = dxmt_present_timing_previous;
+    uint64_t index = dxmt_present_timing_index++;
+    dxmt_present_timing_previous = presented_time;
+    pthread_mutex_unlock(&dxmt_present_timing_lock);
+    // A zero presentedTime means the drawable was dropped rather than shown,
+    // which is the single most useful thing this can report and is invisible
+    // from every other vantage point in the process.
+    fprintf(
+        stderr, "dxmt present-timing: n=%llu presentedMs=%.3f deltaMs=%.3f enqueueToPresentMs=%.3f afterMs=%.3f\n",
+        (unsigned long long)index, presented_time * 1000.0,
+        (previous > 0.0 && presented_time > 0.0) ? (presented_time - previous) * 1000.0 : 0.0,
+        presented_time > 0.0 ? (presented_time - enqueued) * 1000.0 : 0.0, after * 1000.0
+    );
+  }];
+}
+
 static NTSTATUS
 _MTLCommandBuffer_presentDrawable(void *obj) {
   struct unixcall_generic_obj_obj_noret *params = obj;
+  dxmt_track_presented((id<MTLDrawable>)params->arg, 0.0);
   [(id<MTLCommandBuffer>)params->handle presentDrawable:(id<MTLDrawable>)params->arg];
   return STATUS_SUCCESS;
 }
@@ -3510,6 +3559,7 @@ _MTLCommandBuffer_presentDrawable(void *obj) {
 static NTSTATUS
 _MTLCommandBuffer_presentDrawableAfterMinimumDuration(void *obj) {
   struct unixcall_generic_obj_obj_double_noret *params = obj;
+  dxmt_track_presented((id<MTLDrawable>)params->arg0, params->arg1);
   [(id<MTLCommandBuffer>)params->handle presentDrawable:(id<MTLDrawable>)params->arg0
                                    afterMinimumDuration:params->arg1];
   return STATUS_SUCCESS;

@@ -7152,6 +7152,7 @@ MTLD3D9Device::QueueBatchedDraw(BatchedDraw &&draw) {
     // as a small offset from null and passes the test. Losing a draw beats
     // writing through the pointer in the case we can see.
     if (snap == nullptr) {
+      dxmt::perf::addFrameCounter(frameStats(), &dxmt::FrameStatistics::frame_draw_dropped_snapshot_count);
       static std::once_flag warned;
       std::call_once(warned, []() {
         Logger::warn("d3d9: out of memory for a draw state snapshot; the draw is dropped");
@@ -10173,8 +10174,10 @@ MTLD3D9Device::FlushDrawBatch() {
               perf_stats, &dxmt::FrameStatistics::frame_draw_resolve_interval,
               &dxmt::FrameStatistics::frame_draw_resolve_count
           );
-          if (!this->ResolveBatchedDrawForChunk(bd, chunk_seq, chunk_coherent_id, const_cache, resolve_cache))
+          if (!this->ResolveBatchedDrawForChunk(bd, chunk_seq, chunk_coherent_id, const_cache, resolve_cache)) {
+            dxmt::perf::addFrameCounter(perf_stats, &dxmt::FrameStatistics::frame_draw_dropped_unresolved_count);
             continue;
+          }
         }
         // Encode-thread PSO readiness. The cold compile runs on m_psoScheduler;
         // if the link is not hot yet, WAIT for it here and then render. Every
@@ -10202,8 +10205,10 @@ MTLD3D9Device::FlushDrawBatch() {
             bd.resolved_pso_task->Wait();
           }
           bd.resolved_pso = bd.resolved_pso_task->state().handle;
-          if (bd.resolved_pso == 0)
+          if (bd.resolved_pso == 0) {
+            dxmt::perf::addFrameCounter(perf_stats, &dxmt::FrameStatistics::frame_draw_dropped_pipeline_count);
             continue; // link failed: skip
+          }
         }
         bool need_new_pass = pass != D9PassKind::Render || !prev_draw || !RtDsAttachmentsMatch(*prev_draw, bd);
         if (need_new_pass) {

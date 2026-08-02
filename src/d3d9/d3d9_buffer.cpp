@@ -24,10 +24,19 @@ namespace {
 // host blocks on. The refresh overwrites the recycled allocation with the CPU,
 // so a reader draw that is encoded but not yet retired would be torn.
 HRESULT
-discardRenameDynamicBuffer(DynamicBuffer *dynamic, uint64_t current_seq, uint64_t coherent_seq) {
-  auto fresh = dynamic->allocate(coherent_seq);
+discardRenameDynamicBuffer(MTLD3D9Device *device, DynamicBuffer *dynamic, uint64_t current_seq, uint64_t coherent_seq) {
+  bool minted_fresh = false;
+  auto fresh = dynamic->allocate(coherent_seq, &minted_fresh);
   if (!fresh.ptr() || !fresh->buffer())
     return D3DERR_OUTOFVIDEOMEMORY;
+  dxmt::perf::addFrameCounter(
+      device->frameStats(), minted_fresh ? &dxmt::FrameStatistics::frame_dynamic_rename_fresh_count
+                                         : &dxmt::FrameStatistics::frame_dynamic_rename_recycled_count
+  );
+  // Only a mint adds to the footprint the next commit has to relieve; a recycle
+  // reuses memory already accounted for.
+  if (minted_fresh)
+    device->noteDynamicRenameBytes(fresh->length());
   dynamic->updateImmediateName(current_seq, std::move(fresh), 0, false);
   return D3D_OK;
 }
@@ -98,7 +107,8 @@ MTLD3D9VertexBuffer::refreshWholeMirror() {
   // The whole mirror goes, not a tracked span: the application does not
   // truthfully report what it wrote, and may still be writing.
   if (FAILED(discardRenameDynamicBuffer(
-          m_dynamic.ptr(), m_device->m_currentCmdSeq, m_device->m_cachedSignaled.load(std::memory_order_acquire)
+          m_device, m_dynamic.ptr(), m_device->m_currentCmdSeq,
+          m_device->m_cachedSignaled.load(std::memory_order_acquire)
       )))
     return;
   // The name installed above is GPU-idle by construction, so it takes the
@@ -279,7 +289,8 @@ MTLD3D9VertexBuffer::Lock(UINT OffsetToLock, UINT SizeToLock, void **ppbData, DW
     return D3DERR_INVALIDCALL;
   if (Flags & D3DLOCK_DISCARD) {
     if (HRESULT hr = discardRenameDynamicBuffer(
-            m_dynamic.ptr(), m_device->m_currentCmdSeq, m_device->m_cachedSignaled.load(std::memory_order_acquire)
+            m_device, m_dynamic.ptr(), m_device->m_currentCmdSeq,
+            m_device->m_cachedSignaled.load(std::memory_order_acquire)
         );
         FAILED(hr))
       return hr;
@@ -364,7 +375,8 @@ MTLD3D9IndexBuffer::refreshWholeMirror() {
   // See MTLD3D9VertexBuffer::refreshWholeMirror: rename first, then the whole
   // mirror rather than a span the application described.
   if (FAILED(discardRenameDynamicBuffer(
-          m_dynamic.ptr(), m_device->m_currentCmdSeq, m_device->m_cachedSignaled.load(std::memory_order_acquire)
+          m_device, m_dynamic.ptr(), m_device->m_currentCmdSeq,
+          m_device->m_cachedSignaled.load(std::memory_order_acquire)
       )))
     return;
   // See MTLD3D9VertexBuffer::refreshWholeMirror for why the store goes straight
@@ -513,7 +525,8 @@ MTLD3D9IndexBuffer::Lock(UINT OffsetToLock, UINT SizeToLock, void **ppbData, DWO
     return D3DERR_INVALIDCALL;
   if (Flags & D3DLOCK_DISCARD) {
     if (HRESULT hr = discardRenameDynamicBuffer(
-            m_dynamic.ptr(), m_device->m_currentCmdSeq, m_device->m_cachedSignaled.load(std::memory_order_acquire)
+            m_device, m_dynamic.ptr(), m_device->m_currentCmdSeq,
+            m_device->m_cachedSignaled.load(std::memory_order_acquire)
         );
         FAILED(hr))
       return hr;

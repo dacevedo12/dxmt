@@ -103,6 +103,31 @@ allocLockableBackBufferMirror(
   pitch = p;
 }
 
+// The whole swap configuration, reported wherever the chain is built. Both the
+// ctor path and the reset path call this, so a windowed<->fullscreen flip emits
+// a line per side and the two can be diffed. Worth carrying because
+// BackBufferCount and SwapEffect select behaviour rather than just extent
+// (together they arm the content rotation in Present), and an app may request a
+// different pair per mode, which makes "it only misbehaves fullscreen" a
+// statement about the parameters rather than about the mode.
+static void
+logSwapParams(const D3DPRESENT_PARAMETERS &params, const char *when) {
+  if (!d9PresentDbgEnabled())
+    return;
+  const UINT count = std::max<UINT>(1u, params.BackBufferCount);
+  Logger::warn(
+      str::format(
+          "d9 swap params (", when, "): ", params.BackBufferWidth, "x", params.BackBufferHeight,
+          " fmt=", static_cast<uint32_t>(params.BackBufferFormat), " count=", params.BackBufferCount,
+          " swapEffect=", static_cast<uint32_t>(params.SwapEffect), " windowed=", params.Windowed ? 1 : 0,
+          " presentInterval=", static_cast<uint32_t>(params.PresentationInterval),
+          " flags=", static_cast<uint32_t>(params.Flags), " msaaType=", static_cast<uint32_t>(params.MultiSampleType),
+          " msaaQuality=", params.MultiSampleQuality, " refreshHz=", params.FullScreen_RefreshRateInHz,
+          " rotation=", (count > 1 && params.SwapEffect != D3DSWAPEFFECT_COPY) ? "on" : "off"
+      )
+  );
+}
+
 // Backbuffer texture descriptor + D3DSURFACE_DESC derived from a
 // PRESENT_PARAMETERS. Used identically by buildBackBuffer (ctor
 // path) and ResetForDeviceReset (resolution-change path); pull into
@@ -194,12 +219,39 @@ layerDrawableExtent(
   out_w = win_w > 0 ? (double)win_w * current.contents_scale : (double)params.BackBufferWidth;
   out_h = win_h > 0 ? (double)win_h * current.contents_scale : (double)params.BackBufferHeight;
 
-  if (DXMT_LOG_ENABLED(dxmt::LogLevel::Trace))
-    TRACE(
-        "layer extent: backbuffer ", params.BackBufferWidth, "x", params.BackBufferHeight, " window-client ", win_w,
-        "x", win_h, " pinned-drawable ", (uint64_t)current.drawable_width, "x", (uint64_t)current.drawable_height,
-        " contents_scale ", current.contents_scale, " -> drawable ", (uint64_t)out_w, "x", (uint64_t)out_h
-    );
+  // Deduped to one line per distinct extent decision. This runs per Present, so
+  // the dedupe is what makes it affordable, and it is also what makes it worth
+  // reading: a stable configuration emits a line per mode change, while an
+  // extent that disagrees with itself from frame to frame emits a flood. The
+  // difference matters because the drawable extent decides both which present
+  // pipeline runs (1:1 blit or scaled) and, when it moves, whether the layer
+  // rebuilds its drawable pool underneath presents already in flight.
+  if (d9PresentDbgEnabled()) {
+    static uint32_t last_win_w = 0, last_win_h = 0;
+    static uint64_t last_out_w = 0, last_out_h = 0;
+    static uint32_t last_bb_w = 0, last_bb_h = 0;
+    static uint64_t repeats = 0;
+    if (win_w != last_win_w || win_h != last_win_h || (uint64_t)out_w != last_out_w || (uint64_t)out_h != last_out_h ||
+        params.BackBufferWidth != last_bb_w || params.BackBufferHeight != last_bb_h) {
+      Logger::warn(
+          str::format(
+              "d9 layer extent: backbuffer ", params.BackBufferWidth, "x", params.BackBufferHeight, " window-client ",
+              win_w, "x", win_h, " pinned-drawable ", (uint64_t)current.drawable_width, "x",
+              (uint64_t)current.drawable_height, " contents_scale ", current.contents_scale, " -> drawable ",
+              (uint64_t)out_w, "x", (uint64_t)out_h, " present=",
+              ((uint64_t)out_w == params.BackBufferWidth && (uint64_t)out_h == params.BackBufferHeight) ? "blit"
+                                                                                                        : "scale",
+              " afterPresents=", repeats
+          )
+      );
+      last_win_w = win_w, last_win_h = win_h;
+      last_out_w = (uint64_t)out_w, last_out_h = (uint64_t)out_h;
+      last_bb_w = params.BackBufferWidth, last_bb_h = params.BackBufferHeight;
+      repeats = 0;
+    } else {
+      ++repeats;
+    }
+  }
 }
 
 // The monitor a window currently lives on, or null (headless / non-Win32).
@@ -367,6 +419,8 @@ MTLD3D9SwapChain::buildBackBuffer() {
   m_rotationScratch = nullptr;
   const UINT count = std::max<UINT>(1u, m_params.BackBufferCount);
 
+  logSwapParams(m_params, "create");
+
   const uint32_t sampleCount = m_device->metalSampleCount(m_params.MultiSampleType, m_params.MultiSampleQuality);
   WMTTextureInfo info = {};
   D3DSURFACE_DESC desc;
@@ -435,6 +489,7 @@ MTLD3D9SwapChain::ResetForDeviceReset(const D3DPRESENT_PARAMETERS &params, HWND 
   // (wine's d3d9ex tests pin the contract). Only an Ex app can observe the
   // detach; the non-Ex Reset fails while implicit surfaces are app-held.
   // Allocate textures first; only swap on success to keep chain coherent on OOM.
+  logSwapParams(params, "reset");
   const UINT new_count = std::max<UINT>(1u, params.BackBufferCount);
   const uint32_t sampleCount = m_device->metalSampleCount(params.MultiSampleType, params.MultiSampleQuality);
   WMTTextureInfo info = {};

@@ -1,6 +1,11 @@
 #include "d3d9_surface.hpp"
 
+#include <mutex>
+#include <set>
+#include <tuple>
+
 #include "d3d9_cube_texture.hpp"
+#include "d3d9_debug.hpp"
 #include "d3d9_device.hpp"
 #include "d3d9_format.hpp"
 #include "d3d9_image_lock.hpp"
@@ -670,6 +675,35 @@ MTLD3D9Surface::UnlockRect() {
 HRESULT STDMETHODCALLTYPE
 MTLD3D9Surface::GetDC(HDC *phdc) {
   D9DeviceLock lock = m_device->LockDevice();
+  dxmt::perf::addFrameCounter(m_device->frameStats(), &dxmt::FrameStatistics::frame_gdi_dc_count);
+  // Which surfaces a title paints through GDI decides which lock sub-path runs,
+  // and the sub-paths differ in kind: a DEFAULT-pool surface is GPU-authoritative
+  // and reads back under a full sync before the pointer goes out, while the CPU
+  // pools treat the mirror as the truth and only upload afterwards. Deduped on
+  // the descriptor, so a title that paints the same few surfaces every frame
+  // emits a handful of lines for the whole session.
+  if (d9DebugEnabled()) {
+    static std::mutex seen_mutex;
+    static std::set<std::tuple<uint32_t, uint32_t, uint32_t, uint32_t, uint32_t>> seen;
+    auto key = std::make_tuple(
+        static_cast<uint32_t>(m_desc.Pool), static_cast<uint32_t>(m_desc.Usage), static_cast<uint32_t>(m_desc.Format),
+        m_desc.Width, m_desc.Height
+    );
+    std::lock_guard<std::mutex> guard(seen_mutex);
+    if (seen.insert(key).second)
+      Logger::warn(
+          str::format(
+              "d9 GetDC surface: pool=", static_cast<uint32_t>(m_desc.Pool), " usage=", m_desc.Usage,
+              " fmt=", static_cast<uint32_t>(m_desc.Format), " ", m_desc.Width, "x", m_desc.Height,
+              " lockable=", m_cpu_ptr ? 1 : 0, " hasTexture=", m_texture != nullptr ? 1 : 0,
+              " hasBuffer=", m_buffer != nullptr ? 1 : 0, " readsBack=",
+              (m_buffer == nullptr && m_texture != nullptr && m_desc.Pool == D3DPOOL_DEFAULT &&
+               !(m_desc.Usage & D3DUSAGE_DYNAMIC))
+                  ? 1
+                  : 0
+          )
+      );
+  }
 #ifdef _WIN32
   // GDI text composition: some apps rasterize UI text into a sampled texture by
   // GetDC'ing the surface, drawing glyphs with GDI, then ReleaseDC. wined3d

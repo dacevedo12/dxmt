@@ -597,6 +597,13 @@ struct FrameStatistics {
   // are not written yet, so a per-draw cost for the frame is computable from a
   // single record instead of joining two.
   uint64_t frame_draw_issue_count = 0;
+  // Issued draws the calling thread could not record, because the command-data
+  // ring had no backing for their state snapshot. Its encode-thread siblings
+  // below cover the drops that happen after recording; this one has to sit here
+  // rather than with them because these counters are plain increments and the
+  // two threads must not share a field. Expected to read zero on the same terms
+  // as those: a nonzero value is a defect, not a cost.
+  uint64_t frame_draw_dropped_snapshot_count = 0;
   // CPU the calling thread actually consumed over the frame, against which the
   // frame wall can be split three ways. Wall far above user+kernel means the
   // thread was not running at all, so the cost is a block and not work, and the
@@ -628,6 +635,39 @@ struct FrameStatistics {
   uint64_t frame_query_issue_count = 0;
   uint64_t frame_raster_status_poll_count = 0;
   uint64_t frame_device_status_poll_count = 0;
+  // Draws the app issued that the encode thread then did not emit. Both drop
+  // sites are silent, so a frame that renders without a piece of geometry looks
+  // exactly like a frame the app chose not to draw it in. These separate the
+  // two, which is the first fork a missing-geometry report has to resolve, and
+  // they are kept apart by reason because the reasons have nothing in common: a
+  // draw can arrive without the state needed to resolve it at all, or resolve
+  // fully and lose its pipeline to a failed link. Both are expected to read
+  // zero; a nonzero value is the defect, not a cost.
+  // Encode-thread owned, like the resolve counters and unlike the poll counters
+  // just above, so a present-boundary report carries whatever the encode thread
+  // had reached rather than a closed frame. That skews which frame a drop is
+  // filed under; it does not lose the drop, which is all these are read for.
+  uint64_t frame_draw_dropped_unresolved_count = 0;
+  uint64_t frame_draw_dropped_pipeline_count = 0;
+  // Dynamic-buffer renames, split by whether the recycling FIFO had a retired
+  // allocation to hand back or had to mint a new one. The split is about
+  // CONTENT: a recycled allocation still holds whatever it was last written
+  // with, a fresh one comes up zeroed. So if anything ever reads one of these
+  // before its upload has landed, the recycled case quietly renders the
+  // previous contents while the fresh case renders nothing at all, and only
+  // the fresh case is visible. The fresh rate therefore bounds how often that
+  // whole class of mistake can be seen, and it rises exactly when the coherent
+  // watermark lags demand, which is the deep-pipeline condition.
+  uint64_t frame_dynamic_rename_fresh_count = 0;
+  uint64_t frame_dynamic_rename_recycled_count = 0;
+  // GetDC on a surface, which is how some titles rasterise UI text: take a DC
+  // over the surface's locked bytes, paint glyphs with GDI, release, upload.
+  // Counted because that route reaches the surface through the lock path rather
+  // than through any draw, so it is invisible to every draw and pass counter,
+  // and because it reads back a surface the GPU may still be writing. Knowing
+  // whether it is live in a given scene decides whether readback coherence is
+  // even a candidate there, which is otherwise a guess.
+  uint64_t frame_gdi_dc_count = 0;
 
   void
   reset() {
@@ -991,6 +1031,7 @@ struct FrameStatistics {
     frame_create_resource_count = 0;
     frame_pso_compile_wait_count = 0;
     frame_draw_issue_count = 0;
+    frame_draw_dropped_snapshot_count = 0;
     frame_thread_user_interval = {};
     frame_thread_kernel_interval = {};
     frame_task_fault_count = 0;
@@ -1002,6 +1043,11 @@ struct FrameStatistics {
     frame_query_issue_count = 0;
     frame_raster_status_poll_count = 0;
     frame_device_status_poll_count = 0;
+    frame_draw_dropped_unresolved_count = 0;
+    frame_draw_dropped_pipeline_count = 0;
+    frame_dynamic_rename_fresh_count = 0;
+    frame_dynamic_rename_recycled_count = 0;
+    frame_gdi_dc_count = 0;
   };
 };
 
@@ -1464,6 +1510,15 @@ public:
       average_.frame_query_issue_count += frames_[i].frame_query_issue_count;
       average_.frame_raster_status_poll_count += frames_[i].frame_raster_status_poll_count;
       average_.frame_device_status_poll_count += frames_[i].frame_device_status_poll_count;
+      // Summed, not averaged, unlike every counter above: a dropped draw is a
+      // defect and drops are rare, so dividing by the window would round a real
+      // one away to zero exactly when it matters most.
+      average_.frame_draw_dropped_unresolved_count += frames_[i].frame_draw_dropped_unresolved_count;
+      average_.frame_draw_dropped_pipeline_count += frames_[i].frame_draw_dropped_pipeline_count;
+      average_.frame_draw_dropped_snapshot_count += frames_[i].frame_draw_dropped_snapshot_count;
+      average_.frame_dynamic_rename_fresh_count += frames_[i].frame_dynamic_rename_fresh_count;
+      average_.frame_dynamic_rename_recycled_count += frames_[i].frame_dynamic_rename_recycled_count;
+      average_.frame_gdi_dc_count += frames_[i].frame_gdi_dc_count;
     }
     average_.command_buffer_count /= (kFrameStatisticsCount - 1);
     average_.render_pass_count /= (kFrameStatisticsCount - 1);

@@ -7,6 +7,7 @@
 #include "util_math.hpp"
 #include "util_noexcept.hpp"
 #include <cassert>
+#include <cstdlib>
 #include <cstring>
 #include <functional>
 #include <limits>
@@ -18,6 +19,30 @@
 namespace dxmt {
 
 class ReplayResidencyRegistration;
+
+// Diagnostic: extra retirement margin, in sequence numbers, before a ring block
+// is handed back for reuse.
+//
+// A block becomes reusable, and is then written over by the calling thread, as
+// soon as the coherent watermark passes the sequence it was last used at. So
+// the safety of everything living in these rings rests entirely on that
+// watermark never running ahead of the GPU. When it does, the overwrite lands
+// on vertex or constant data a command buffer is still fetching, and the result
+// is silent corruption rather than a failure: the draw still issues, the
+// geometry just reads whatever the next frame put there.
+//
+// Requiring the watermark to be N sequences further along tests exactly that
+// and nothing else. A symptom that disappears under a margin is a symptom whose
+// cause is the watermark, not the consumer. Zero, the default, is the shipping
+// behaviour.
+inline uint64_t
+ring_retire_margin() {
+  static const uint64_t margin = [] {
+    auto value = env::getEnvVar("DXMT_DIAG_RING_RETIRE_LAG");
+    return value.empty() ? 0ull : std::strtoull(value.c_str(), nullptr, 10);
+  }();
+  return margin;
+}
 
 // Default staging block size. 32 MB suits x86_64 / arm64 where the
 // virtual-address space is effectively unbounded; the d3d9 build under
@@ -514,7 +539,7 @@ RingBumpState<Allocator, BlockSize, mutex>::free_blocks(uint64_t coherent_id) {
   while (!fifo.empty()) {
     auto &front = fifo.front();
     check_guard(front, "free_blocks");
-    if (front.last_used_seq_id > coherent_id) {
+    if (front.last_used_seq_id + ring_retire_margin() > coherent_id) {
       // Unfinished generation: pins remain; do not reclaim past this block.
       break;
     }
@@ -551,7 +576,7 @@ RingBumpState<Allocator, BlockSize, mutex>::allocate_or_reuse_block(
 ) {
   while (!fifo.empty()) {
     auto &front = fifo.front();
-    if (front.last_used_seq_id < coherent_id) {
+    if (front.last_used_seq_id + ring_retire_margin() < coherent_id) {
       check_guard(front, "reuse_front");
       // Do not destroy or reuse a block that still has active host leases
       // for a generation that has not been reclaimed yet.

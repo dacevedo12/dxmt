@@ -3,6 +3,7 @@
 #include "log/log.hpp"
 #include "thread.hpp"
 #include "util_likely.hpp"
+#include "util_env.hpp"
 #include "util_math.hpp"
 #include "wsi_platform.hpp"
 #include <cassert>
@@ -42,6 +43,12 @@ static bool
 ShouldLogBufferTextureViewFailure() {
   static std::atomic<uint32_t> count = 0;
   return count.fetch_add(1, std::memory_order_relaxed) < 32;
+}
+
+static bool
+BufferHazardTrackingForced() {
+  static const bool forced = env::getEnvVar("DXMT_DIAG_TRACKED_BUFFERS") == "1";
+  return forced;
 }
 
 static WMTResourceOptions
@@ -312,6 +319,21 @@ Buffer::allocate(Flags<BufferAllocationFlag> flags) {
   info.memory.set(0);
   info.length = length_;
   info.options = GetBufferResourceOptions(flags);
+  // Diagnostic: hand hazard tracking for standalone buffers back to Metal.
+  //
+  // Every buffer here is allocated Untracked, so all ordering between whatever
+  // writes one and whatever reads it comes from this implementation's own fence
+  // edges, with no backstop underneath. That makes a single unregistered or
+  // mis-staged access a real GPU race rather than a missed optimisation. Asking
+  // Metal to resolve the hazards itself does not fix anything and costs
+  // performance, but it substitutes a known-correct mechanism for the computed
+  // edges, so it answers exactly one question: whether the edges are complete.
+  // Standalone allocations only, which is where the renamed dynamic vertex and
+  // index allocations come from. Placed allocations are deliberately untouched:
+  // their heap decides tracking, so requesting a mode the heap does not carry
+  // would not be a legal request.
+  if (BufferHazardTrackingForced())
+    info.options = static_cast<WMTResourceOptions>(info.options & ~WMTResourceHazardTrackingModeUntracked);
   return new BufferAllocation(device_, info, flags);
 };
 

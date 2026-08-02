@@ -19,9 +19,10 @@ DynamicBuffer::decRef() {
 };
 
 Rc<BufferAllocation>
-DynamicBuffer::allocate(uint64_t coherent_seq_id) {
+DynamicBuffer::allocate(uint64_t coherent_seq_id, bool *out_minted_fresh) {
   std::lock_guard<dxmt::mutex> lock(mutex_);
   Rc<BufferAllocation> ret;
+  bool recycled = false;
   for (;;) {
     if (fifo.empty()) {
       break;
@@ -32,10 +33,13 @@ DynamicBuffer::allocate(uint64_t coherent_seq_id) {
     }
     ret = std::move(entry.allocation);
     fifo.pop();
+    recycled = true;
     break;
   }
   if (!ret.ptr())
     ret = buffer->allocate(flags_);
+  if (out_minted_fresh)
+    *out_minted_fresh = !recycled;
   return ret;
 }
 

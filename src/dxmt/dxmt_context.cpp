@@ -6668,6 +6668,22 @@ ArgumentEncodingContext::planEncoderSubmissionOrder(
   }
 }
 
+// Diagnostic gate: keep every encoder pair in the order it was emitted.
+//
+// This routine reorders encoders outright whenever it finds no fence dependency
+// between them, and the dependency is decided purely by fence-set intersection.
+// So an access that never registered does not merely lose a barrier: it licenses
+// the consumer to be moved in front of its producer. That makes this switch the
+// one measurement that separates "the dependency algebra is missing an edge"
+// from "the algebra is right and the fault is elsewhere", because pinning the
+// order removes the entire degree of freedom rather than any single edge.
+// Diagnostic only, and slow by construction: it forfeits every pass merge.
+static bool
+EncoderReorderDisabled() {
+  static const bool disabled = DebugEnabledEnv("DXMT_DIAG_NO_ENCODER_REORDER");
+  return disabled;
+}
+
 DXMT_ENCODER_LIST_OP
 ArgumentEncodingContext::checkEncoderRelation(EncoderData *former, EncoderData *latter) {
 
@@ -6675,6 +6691,10 @@ ArgumentEncodingContext::checkEncoderRelation(EncoderData *former, EncoderData *
     return DXMT_ENCODER_LIST_OP_SWAP;
   if (latter->type == EncoderType::Null)
     return DXMT_ENCODER_LIST_OP_SWAP;
+  // After the Null folds: a Null encoder is a removed placeholder, not work
+  // whose order means anything.
+  if (EncoderReorderDisabled())
+    return DXMT_ENCODER_LIST_OP_SYNCHRONIZE;
   if (former->type == EncoderType::SignalEvent)
     return DXMT_ENCODER_LIST_OP_SYNCHRONIZE;
   if (latter->type == EncoderType::SignalEvent)
