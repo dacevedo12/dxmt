@@ -286,12 +286,9 @@ MTLD3D9SwapChain::createPresentTarget(HWND hEffectiveWindow) {
           m_device->dxmtQueue(), m_device->metalDevice(), m_layer, m_device->internalCommandLibrary(),
           /*scale_factor=*/1.0f, /*sample_count=*/1
       ));
-      // D3D9 paces vsync in software (PresentationInterval maps to a per-Present
-      // vsync_duration); the CAMetalLayer's hardware displaySync must stay off or
-      // the two compound into stutter at high refresh. The presenter no longer
-      // forces this in its ctor, so set it explicitly, the way each frontend
-      // now drives its own vsync state.
-      m_presenter->setDisplaySyncEnabled(false);
+      // Display sync is not seeded here: Present decides it from the effective
+      // presentation interval every frame, since D3DPRESENT_FORCEIMMEDIATE can
+      // change the answer without the chain being recreated.
       // A D3D9 Present is an opaque copy of the backbuffer to the window.
       // the backbuffer alpha is scene scratch, not a window-coverage value.
       // Present it with DXGI_ALPHA_MODE_IGNORE so the present blit doesn't
@@ -570,9 +567,7 @@ MTLD3D9SwapChain::resolveOverrideTarget(HWND hwnd) {
         m_device->dxmtQueue(), m_device->metalDevice(), target.layer, m_device->internalCommandLibrary(),
         /*scale_factor=*/1.0f, /*sample_count=*/1
     ));
-    // Software-paced vsync (see the device-window presenter): keep the layer's
-    // hardware displaySync off so it doesn't compound with vsync_duration.
-    target.presenter->setDisplaySyncEnabled(false);
+    // Display sync is left to Present, as for the device-window presenter.
     // Same present composite contract as the device window's presenter:
     // the backbuffer alpha is scene scratch, not window coverage.
     target.presenter->setPresentAlphaMode(/*DXGI_ALPHA_MODE_IGNORE=*/3);
@@ -917,23 +912,33 @@ MTLD3D9SwapChain::Present(
   auto *chunk = queue.CurrentChunk();
   const uint64_t frame_latency_seq = queue.CurrentFrameSeq();
   chunk->signal_frame_latency_fence_ = frame_latency_seq;
-  // SyncInterval (IMMEDIATE → 0.0; multiples → N * refresh_period using
-  // m_refreshRateHz). D3DPRESENT_FORCEIMMEDIATE overrides PresentationInterval
-  // per-frame (apps toggle between menus/gameplay without chain recreation).
-  double vsync_duration;
+  // Vsync is the layer's hardware display sync, which is what every reference
+  // available here uses: the d3d11 frontend in this tree drives the same
+  // property off its SyncInterval (d3d11_swapchain.cpp Present1), wined3d's
+  // buffer swap IS the vblank wait, and DXVK asks Vulkan for a FIFO present
+  // mode. The minimum-duration hint is a frame-rate limiter rather than a vsync
+  // mechanism, so it stays zero for a single interval and carries only the
+  // multiple an app asks for at INTERVAL_TWO and above, where one vblank is not
+  // enough dwell. Pacing a single interval through that hint instead left
+  // presentation unlocked from the vblank entirely; a compositor re-imposes its
+  // own timing on a windowed layer and hides that, and nothing hides it once
+  // the layer reaches the display directly. D3DPRESENT_FORCEIMMEDIATE overrides
+  // PresentationInterval per-frame (apps toggle between menus and gameplay
+  // without recreating the chain), so both inputs decide it per Present.
   const DWORD pi = m_params.PresentationInterval;
-  if ((pi & D3DPRESENT_INTERVAL_IMMEDIATE) || (dwFlags & D3DPRESENT_FORCEIMMEDIATE)) {
-    vsync_duration = 0.0;
-  } else {
-    int multiplier = 1; // DEFAULT / ONE
-    if (pi & D3DPRESENT_INTERVAL_FOUR)
-      multiplier = 4;
-    else if (pi & D3DPRESENT_INTERVAL_THREE)
-      multiplier = 3;
-    else if (pi & D3DPRESENT_INTERVAL_TWO)
-      multiplier = 2;
-    vsync_duration = static_cast<double>(multiplier) / active_refresh;
-  }
+  const bool present_immediate = (pi & D3DPRESENT_INTERVAL_IMMEDIATE) || (dwFlags & D3DPRESENT_FORCEIMMEDIATE);
+  int multiplier = 1; // DEFAULT / ONE
+  if (pi & D3DPRESENT_INTERVAL_FOUR)
+    multiplier = 4;
+  else if (pi & D3DPRESENT_INTERVAL_THREE)
+    multiplier = 3;
+  else if (pi & D3DPRESENT_INTERVAL_TWO)
+    multiplier = 2;
+  const double vsync_duration =
+      (present_immediate || multiplier == 1) ? 0.0 : static_cast<double>(multiplier) / active_refresh;
+  // Idempotent inside the presenter, so a per-Present call costs a compare
+  // except on the frame an app actually toggles the interval.
+  active_presenter->setDisplaySyncEnabled(!present_immediate);
   auto bb_dxmt = m_backBuffers[0]->dxmtTexture();
   Rc<dxmt::Texture> resolve_target = m_resolveTarget;
   Rc<dxmt::Texture> canvas = m_frontCanvas;
