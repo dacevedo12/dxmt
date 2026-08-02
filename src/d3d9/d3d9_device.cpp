@@ -2852,91 +2852,34 @@ MTLD3D9Device::CreateTexture(
   info.usage = usage_bits;
   info.options = storage;
 
-  // UMA-correct MANAGED single-buffer: Level=1 uncompressed 2D sampler-only. newTexture aliases level-0; LockRect →
-  // Metal-mapped pBits; on UMA GPU samples host pages directly (no Unlock memcpy).
-  // Depth/stencil FORMATS are excluded even without the DS usage flag: Metal
-  // has no linear depth/stencil texture, so minimumLinearTextureAlignmentFor
-  // PixelFormat asserts on one (a sampleable depth alias like INTZ reaches
-  // here with Usage 0). The mirror path handles those instead.
-  bool buffer_backed_eligible = Pool == D3DPOOL_MANAGED && app_levels == 1 && metal_levels == 1 &&
-                                !(Usage & D3DUSAGE_AUTOGENMIPMAP) && !(Usage & D3DUSAGE_RENDERTARGET) &&
-                                !(Usage & D3DUSAGE_DEPTHSTENCIL) && !(Usage & D3DUSAGE_DYNAMIC) &&
-                                !IsCompressedFormat(Format) && !Is3DcFormat(Format) && !IsDepthStencilFormat(Format);
-  // Zero-copy aliasing exposes Metal's linear-texture row alignment
-  // as the LockRect pitch. wined3d and DXVK hand back (near-)tight
-  // pitches, and shipped titles write rows at width*bpp regardless of
-  // the reported value, so a padded pitch shears every such upload.
-  // Widths whose tight pitch misses the alignment take the mirror
-  // path, where the pitch is unconstrained and tight.
-  uint64_t linear_alignment = 1;
-  if (buffer_backed_eligible) {
-    linear_alignment = m_metalDevice.minimumLinearTextureAlignmentForPixelFormat(pixelFormat);
-    if (linear_alignment == 0)
-      linear_alignment = 1;
-    if ((D3DFormatRowPitch(Format, Width) % linear_alignment) != 0)
-      buffer_backed_eligible = false;
-  }
+  // MANAGED textures are staged, never aliased: the application writes a host
+  // mirror and UnlockRect uploads the locked rect through an ordered blit.
+  // Backing a single-level uncompressed texture with the very host pages
+  // LockRect hands out would cost no upload at all on unified memory, but it
+  // leaves nothing between the application's stores and the GPU's reads of the
+  // same texels. A title that repaints a surface every frame then races the
+  // sampling of the frame before it, and the surface tears between its old and
+  // new contents rather than failing. Metal hazard tracking cannot cover that:
+  // it orders GPU work against GPU work, and a CPU store is not GPU work.
+  //
+  // Both references stage instead, and neither ever hands back memory the GPU
+  // samples: wined3d maps its sysmem copy and uploads on unmap, and DXVK maps
+  // a staging buffer whose only GPU reader is an ordered copy into the image.
+  // This is also the rule the buffer path states without exception
+  // (d3d9_buffer_map.hpp): no pointer handed to the application aliases memory
+  // the GPU can wire. The same second premise applies too, since a translated
+  // store into a Metal-wrapped page is the documented livelock precondition on
+  // this platform.
+  //
+  // The cost is an upload per Unlock, bounded by the locked rect, against a
+  // class of corruption that no amount of ordering work can remove.
 
-  // All textures rooted in Rc<dxmt::Texture> (survives thread boundaries). Buffer-backed: caller-managed page (pool
-  // reuse, pre-fault optimizations); regular: allocate(). Same MTLD3D9Texture ctor; bufferPitch signals mode.
-  Rc<dxmt::Texture> dxmt_texture;
+  // Every texture is rooted in Rc<dxmt::Texture> so it survives thread
+  // boundaries. bufferPitch stays 0: the MTLD3D9Texture ctor reads it as the
+  // signal that level 0 does not alias a caller-owned page.
+  Rc<dxmt::Texture> dxmt_texture = new dxmt::Texture(info, m_metalDevice);
   uint32_t backingPitch = 0;
-  if (buffer_backed_eligible) {
-    // The eligibility gate above guarantees the tight pitch satisfies
-    // linear_alignment, so this round-up is a provable no-op kept for
-    // shape parity with the offscreen-plain branch.
-    const uint64_t row_bytes = static_cast<uint64_t>(D3DFormatRowPitch(Format, Width));
-    backingPitch = static_cast<uint32_t>((row_bytes + linear_alignment - 1) & ~(linear_alignment - 1));
-    const uint64_t backing_bytes = static_cast<uint64_t>(backingPitch) * Height;
-    // Pool hit skips newBuffer XPC + page-fault cliff (pre-fault memset cost). Pool is texture-mirror only since
-    // the buffer unification (VB/IB no longer donate); texture donation deferred for ref_tracker safety
-    // (in-flight chunks retain allocation).
-    WMT::Reference<WMT::Buffer> backingBuffer{};
-    uint64_t backing_gpu_addr = 0;
-    void *backingPtr = nullptr;
-    void *backingHostPtr = nullptr;
-    if (!acquireBufferBacking(
-            static_cast<size_t>(backing_bytes), backingBuffer, backing_gpu_addr, backingHostPtr, backingPtr
-        )) {
-      backingPtr = wsi::aligned_malloc(backing_bytes, DXMT_PAGE_SIZE);
-      if (!backingPtr)
-        return D3DERR_OUTOFVIDEOMEMORY;
-      // Pre-fault every page now so the app's first Lock+memcpy doesn't
-      // pay the 100ms+/page Rosetta x86_32 first-touch cliff streamed
-      // mid-frame. Same pattern as the texture-mirror path.
-      std::memset(backingPtr, 0, backing_bytes);
-
-      WMTBufferInfo binfo{};
-      binfo.length = backing_bytes;
-      // Shared (UMA aliasing), Default cache. Hazard tracking left at
-      // Metal's default (Tracked): Untracked here suppressed barriers
-      // between LockRect-time CPU writes (via the aliased pointer) and
-      // GPU samples within the same cmdbuf, and between blit-encoder
-      // generateMipmaps / replaceRegion fall-throughs and the render
-      // encoder that samples them next.
-      binfo.options = (WMTResourceOptions)(WMTResourceCPUCacheModeDefaultCache | WMTResourceStorageModeShared);
-      binfo.memory.set(backingPtr);
-      backingBuffer = m_metalDevice.newBuffer(binfo);
-      if (backingBuffer == nullptr) {
-        wsi::aligned_free(backingPtr);
-        return D3DERR_OUTOFVIDEOMEMORY;
-      }
-    }
-    info.options = (WMTResourceOptions)(WMTResourceCPUCacheModeDefaultCache | WMTResourceStorageModeShared);
-    dxmt_texture = new dxmt::Texture(
-        static_cast<unsigned>(backing_bytes), static_cast<unsigned>(backingPitch), info, m_metalDevice
-    );
-    dxmt::Flags<dxmt::TextureAllocationFlag> alloc_flags;
-    auto allocation = dxmt_texture->wrapBuffer(std::move(backingBuffer), backingPtr, alloc_flags);
-    if (!allocation || !allocation->texture()) {
-      // dxmt::Texture destructor will run as `dxmt_texture` falls out
-      // of scope; the half-built allocation owns the (buffer, mapped)
-      // pair and tears them down via its dtor's i386 aligned_free.
-      return D3DERR_OUTOFVIDEOMEMORY;
-    }
-    dxmt_texture->rename(std::move(allocation));
-  } else {
-    dxmt_texture = new dxmt::Texture(info, m_metalDevice);
+  {
     dxmt::Flags<dxmt::TextureAllocationFlag> alloc_flags;
     if (Pool == D3DPOOL_DEFAULT)
       alloc_flags.set(dxmt::TextureAllocationFlag::CpuInvisible);
@@ -2951,12 +2894,8 @@ MTLD3D9Device::CreateTexture(
   // uploads only the locked rect, so a MANAGED / SYSTEMMEM texture sampled
   // before it is ever Locked would show that stale content; zero every mip up
   // front for every pool, mirroring the d3d11 texture create (no pool
-  // carve-out). The buffer-backed arm is skipped: its backing was already
-  // zeroed on the cold aligned_malloc path and on a pool hit
-  // (acquireBufferBacking), and its single level aliases that backing, so a
-  // blit-zero here would only redundantly clear the same bytes.
-  if (!buffer_backed_eligible)
-    initTextureWithZero(dxmt_texture.ptr());
+  // carve-out).
+  initTextureWithZero(dxmt_texture.ptr());
 
   // user_memory: level 0 aliases the app pointer (see the ctor). The
   // texture starts fully dirty, so the app's create-time contents reach
