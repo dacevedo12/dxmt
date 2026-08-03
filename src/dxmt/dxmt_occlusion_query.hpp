@@ -28,10 +28,14 @@ public:
     within_encoder = true;
   }
 
+  // draw_sample_bound is the most samples the draw about to be encoded could
+  // add to the counter (the whole render area, every sample). It only decides
+  // when to roll to a fresh slot, so an over-estimate costs a slot, never a
+  // wrong count.
   bool
-  tryGetNextWriteOffset(bool has_active_occlusion_queries, uint64_t &offset) {
+  tryGetNextWriteOffset(bool has_active_occlusion_queries, uint64_t draw_sample_bound, uint64_t &offset) {
     assert(within_encoder);
-    offset = getNextWriteOffset(has_active_occlusion_queries);
+    offset = getNextWriteOffset(has_active_occlusion_queries, draw_sample_bound);
     if (offset == previous_offset) {
       return false;
     }
@@ -73,9 +77,22 @@ public:
 
 private:
   uint64_t
-  getNextWriteOffset(bool has_active_occlusion_queries) {
+  getNextWriteOffset(bool has_active_occlusion_queries, uint64_t draw_sample_bound) {
     if (has_active_occlusion_queries) {
+      // A visibility slot counts in 32 bits, so a long enough run of draws
+      // wraps it and the query reports a count far below what it saw. Roll to
+      // a fresh slot before that can happen: the query already sums its slots
+      // in 64-bit, so the total stays exact across the roll. A clean slot
+      // carries no samples yet, hence the dirty test rather than a reset at
+      // every site that clears it.
+      if (!current_data_is_dirty)
+        slot_sample_bound = 0;
+      else if (slot_sample_bound + draw_sample_bound > 0xFFFFFFFFull) {
+        next_offset++;
+        slot_sample_bound = 0;
+      }
       current_data_is_dirty = true;
+      slot_sample_bound += draw_sample_bound;
       return next_offset;
     }
     return ~0uLL;
@@ -85,6 +102,7 @@ private:
   bool current_data_is_dirty = false;
   uint64_t previous_offset = ~0uLL;
   uint64_t next_offset = 0;
+  uint64_t slot_sample_bound = 0;
 };
 
 class VisibilityResultQuery {

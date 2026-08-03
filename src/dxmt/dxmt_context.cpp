@@ -4701,7 +4701,12 @@ ArgumentEncodingContext::bumpVisibilityResultOffset() {
   render_encoder->use_visibility_result = render_encoder->use_visibility_result || bool(active_visibility_query_count_);
 
   uint64_t offset;
-  if (vro_state_.tryGetNextWriteOffset(active_visibility_query_count_, offset)) {
+  // Ceiling on this draw's contribution to the counter: every sample in the
+  // render area. Rasterization cannot exceed it, so it is a safe roll trigger.
+  uint32_t sample_count = render_encoder->default_raster_sample_count ? render_encoder->default_raster_sample_count : 1;
+  uint64_t draw_sample_bound =
+      uint64_t(render_encoder->render_target_width) * render_encoder->render_target_height * sample_count;
+  if (vro_state_.tryGetNextWriteOffset(active_visibility_query_count_, draw_sample_bound, offset)) {
     auto &cmd = encodeRenderCommand<wmtcmd_render_setvisibilitymode>();
     cmd.type = WMTRenderCommandSetVisibilityMode;
     if (~offset == 0) {
