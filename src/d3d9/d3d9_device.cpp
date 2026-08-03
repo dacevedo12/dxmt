@@ -8987,6 +8987,28 @@ MTLD3D9Device::ResolveBatchedDrawForChunk(
       ds = nullptr;
       bd.resolved_ds_dxmt = nullptr;
     }
+    // A depth-stencil smaller than the colour target cannot cover it: wined3d
+    // detaches it and keeps drawing (context_gl.c find_fbo_entry), surfacing
+    // the pairing only through ValidateDevice. Metal rasterizes a render pass
+    // to its SMALLEST attachment, so an undersized DS left attached silently
+    // crops every draw. Gate on dxmtTexture() too: the pass builder skips a
+    // colour target with no Metal backing, and dropping the DS for one would
+    // leave the pass with no attachment at all.
+    if (ds && rt0 && !IsNullFormat(rt0->desc().Format) && rt0->dxmtTexture() &&
+        (ds->desc().Width < rt0->desc().Width || ds->desc().Height < rt0->desc().Height)) {
+      static bool warned = false;
+      if (!warned) {
+        warned = true;
+        Logger::warn(
+            str::format(
+                "d3d9: depth-stencil ", ds->desc().Width, "x", ds->desc().Height, " is smaller than render target ",
+                rt0->desc().Width, "x", rt0->desc().Height, "; dropping the DS (it cannot cover the target)"
+            )
+        );
+      }
+      ds = nullptr;
+      bd.resolved_ds_dxmt = nullptr;
+    }
     WMTPixelFormat ds_pixel_format = WMTPixelFormatInvalid;
     bool ds_has_stencil = false;
     if (ds) {
