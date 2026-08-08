@@ -4,8 +4,8 @@
 
 // Pure block-rect validation and lock-offset math for surface / volume / cube
 // image locks, factored out of the LockRect / LockBox / AddDirty* paths so the
-// host unit tier can exercise it without a Metal device (the d3d9_buffer_map.hpp
-// shape for the buffer side). References: wined3d resource.c
+// arithmetic stands free of a Metal device (the d3d9_buffer_map.hpp shape for
+// the buffer side). References: wined3d resource.c
 // (wined3d_resource_check_box_dimensions + resource_offset_map_pointer), DXVK
 // d3d9_device.cpp (CalcImageLockOffset).
 

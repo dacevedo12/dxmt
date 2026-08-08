@@ -19,8 +19,8 @@ class MTLD3D9Device;
 // the app writes and the consuming draw copies whole into that allocation.
 // A Lock therefore never waits on the GPU, and never hands out memory
 // Metal has wrapped: d3d9_buffer_map.hpp records why that is the only
-// storage offered. A Lock(DISCARD) recycles a GPU-idle allocation from the
-// FIFO. No sub-resources; standalone shape (self-pin in ctor, AddRef/Release
+// storage offered. The refresh that carries the mirror to the device recycles a
+// GPU-idle allocation from the FIFO, or mints one. No sub-resources; standalone shape (self-pin in ctor, AddRef/Release
 // pin device). References: d3d11_buffer.cpp / d3d11_context_imm.cpp
 // (DynamicBuffer + MapDynamicBuffer), DXVK d3d9_common_buffer.cpp.
 class MTLD3D9VertexBuffer final : public ComObject<IDirect3DVertexBuffer9> {
@@ -51,8 +51,7 @@ public:
   HRESULT STDMETHODCALLTYPE GetDesc(D3DVERTEXBUFFER_DESC *pDesc) override;
 
   // Metal buffer the GPU reads: the DynamicBuffer's current allocation
-  // buffer (a Lock(DISCARD) renames it via updateImmediateName). Both map
-  // modes route through the wrapper, so the arm does not branch.
+  // buffer; the refresh renames it via updateImmediateName.
   WMT::Buffer
   metalBuffer() const {
     return m_dynamic->immediateName()->buffer();
@@ -60,16 +59,16 @@ public:
   // GPU virtual address of the buffer the GPU reads; the manual-fetch VS
   // variant pulls vertex data through this pointer via the [[buffer(16)]]
   // vertex_buffers table, not through a [[buffer(N)]] binding. Read from
-  // the DynamicBuffer's current allocation in either map mode.
+  // the DynamicBuffer's current allocation.
   uint64_t
   gpuAddress() const {
     return m_dynamic->immediateName()->gpuAddress();
   }
-  // Current DynamicBuffer allocation (either map mode). The draw path
-  // freezes this (handle, gpu_address, and the Rc) from ONE read so binding
-  // and the Vertex-stage read the fence tracker registers stay on one
-  // allocation even after a later Lock(DISCARD) rename, which is what orders
-  // the staged upload against it.
+  // Current DynamicBuffer allocation. The draw path freezes the handle, the
+  // GPU address and the Rc from ONE read, so the binding and the access that
+  // retains it name the same allocation even if a later refresh renames the
+  // buffer. Two reads could straddle that rename and bind one allocation while
+  // retaining another.
   Rc<dxmt::BufferAllocation>
   immediateAllocation() const {
     return m_dynamic->immediateName();
@@ -120,8 +119,8 @@ private:
   Rc<dxmt::Buffer> m_dxmtBuffer;
   // The DynamicBuffer recycling wrapper (the same one d3d11 uses,
   // d3d11_buffer.cpp). Owns the current allocation name and a FIFO of
-  // retired allocations a Lock(DISCARD) recycles once the GPU has passed
-  // them. A refresh stores the mirror into the current name and draws read it.
+  // retired allocations the refresh recycles once the GPU has passed them. A refresh stores the mirror into the current
+  // name and draws read it.
   Rc<dxmt::DynamicBuffer> m_dynamic;
   // The mirror is authoritative. This says only that the GPU-side cache no
   // longer matches it; WHICH bytes differ is deliberately not tracked, because

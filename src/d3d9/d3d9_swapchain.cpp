@@ -32,7 +32,7 @@
 #endif
 
 // S_PRESENT_OCCLUDED / S_PRESENT_MODE_CHANGED are D3D9Ex success-status
-// codes (MAKE_D3DSTATUS(2168) / 2169). mingw's bundled d3d9.h omits
+// codes (MAKE_D3DSTATUS(2168) / 2167). mingw's bundled d3d9.h omits
 // them; the dxmt-native d3d9.h defines them but isn't visible in the
 // cross-build. Shim for build parity: values match wine's d3d9.h.
 #ifndef S_PRESENT_OCCLUDED
@@ -861,8 +861,8 @@ MTLD3D9SwapChain::Present(
   // (cmdbuf.commit, presentDrawable, encodeCommands) run on the dxmt
   // encode thread instead of the wow64 main thread. Drain queued batched
   // draws onto a chunk first so the Present chunk observes them through
-  // Metal queue ordering. flushOpenWork() catches any residual sync cmdbuf
-  // work.
+  // Metal queue ordering. flushOpenWork() then drains a Clear that no draw
+  // consumed, so a frame that clears and presents still gets the wipe.
   m_device->FlushDrawBatch();
   m_device->flushOpenWork();
   // Present hDestWindowOverride: retarget this frame to the override

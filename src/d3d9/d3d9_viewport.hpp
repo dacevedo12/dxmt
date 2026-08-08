@@ -7,8 +7,8 @@
 #include <cstdint>
 
 // Pure D3D9 -> Metal viewport / scissor conversion, factored out of the device
-// apply path so the host unit tier can exercise the depth clamp, the half-pixel
-// origin shift, and the scissor/viewport intersect without a Metal device (the
+// apply path, so the depth clamp, the half-pixel origin shift and the
+// scissor/viewport intersect stand free of a Metal device (the
 // d3d9_image_lock.hpp / d3d9_update_mip.hpp shape). References: wined3d (PRIMARY)
 // dlls/wined3d/state.c viewport_miscpart / scissorrect; DXVK (secondary)
 // src/d3d9/d3d9_device.cpp SetViewport / SetScissorRect.

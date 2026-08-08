@@ -29,8 +29,7 @@
 // INVARIANT under the numeric alpha ref and the bump-env values: the
 // numbers ride the uniform, only the bounded alpha FUNC / fog / sampler
 // / dual-source / flat gates may move the key. It is header-only and free
-// of D3D9 / airconv headers so the host unit tier can exercise it without
-// a device.
+// of D3D9 / airconv headers, so it stands free of a device.
 
 namespace dxmt {
 
@@ -55,9 +54,9 @@ ffp_ps_variant_key(
     // bounded axis, so it keys like the fog/alpha FUNC gates, not the ref.
     uint32_t unorm_snap_mask,
     // Accepted only to make the de-specialisation explicit and regression-
-    // proof: the alpha ref rides the bool-buffer tail and must never enter
-    // the key. The device omits it (default); the host test feeds distinct
-    // values and asserts the key never moves.
+    // proof: the alpha ref rides the bool-buffer tail and must never enter the
+    // key. Taking it as an ignored parameter says so at the signature, where a
+    // future caller would otherwise be tempted to fold it in.
     uint32_t /*alpha_ref*/ = 0
 ) {
   uint64_t key = 0xcbf29ce484222325ull;
@@ -103,8 +102,7 @@ programmable_ps_variant_key(
     // Accepted only to make the de-specialisation explicit and regression-
     // proof: the alpha ref and the bump-env matrix / luminance scale +
     // offset ride the shared PS uniform tail and must never enter the key.
-    // The device omits them (defaults); the host test feeds distinct values
-    // and asserts the key never moves.
+    // Taking them as ignored parameters says so at the signature.
     uint32_t /*alpha_test_ref*/ = 0, const float * /*bem_mat*/ = nullptr, const float * /*bem_lum*/ = nullptr
 ) {
   uint64_t key = 0xcbf29ce484222325ull;

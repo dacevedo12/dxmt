@@ -79,8 +79,8 @@ struct D9EncodingState {
   float clip_planes[8][4] = {};
 
   // Stream-source frequency / divider (SetStreamSourceFreq packing).
-  // Pure POD: the stream's buffer/offset/stride is ref-counted state
-  // that lives on BatchedDraw::ref_snapshot.
+  // Pure POD. The stream's offset and stride are snapshotted per draw into the
+  // draw capture; the buffer reference itself lives on the encode-side mirror.
   UINT stream_freq[D9ES_MAX_VERTEX_STREAMS] = {};
 
   // VS/PS constant register files.

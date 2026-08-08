@@ -49,8 +49,8 @@ protected:
   ~D9LazyMirrorHost() = default;
 };
 
-// Scaffold of IDirect3DSurface9: D3DSURFACE_DESC + container IUnknown*
-// (device, texture, or swapchain). No MTLTexture yet.
+// IDirect3DSurface9: a D3DSURFACE_DESC, the container it belongs to (device,
+// texture or swapchain) and the Metal texture it draws from.
 // References: wined3d surface.c.
 class MTLD3D9Surface final : public ComObject<IDirect3DSurface9> {
 public:
@@ -354,8 +354,8 @@ private:
   bool m_ever_locked = false;
   // Per-Lock state read by UnlockRect. The dirty rect is stored in
   // pixel coords (whole-surface if the app passed pRect=NULL). The
-  // readonly bit elides the MANAGED replaceRegion entirely: apps
-  // that promise not to write must not get their data echoed back.
+  // readonly bit elides the MANAGED upload entirely: apps that promise not to
+  // write must not get their data echoed back.
   bool m_locked_readonly = false;
   // D3DLOCK_NO_DIRTY_UPDATE: when set, the parent texture's UnlockRect
   // skips the implicit unionDirtyRect so apps that AddDirtyRect

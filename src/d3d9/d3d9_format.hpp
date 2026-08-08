@@ -57,7 +57,7 @@ uint32_t D3DFormatBytesPerPixel(D3DFORMAT format);
 // compressed formats this is bytes per row of 4x4 BLOCKS, with the
 // width rounded up to a multiple of 4 first. Returns 0 for unsupported
 // formats. Used by MANAGED-pool LockRect mirror sizing and by the
-// replaceRegion bytesPerRow argument on UnlockRect.
+// bytes-per-row argument the unlock upload passes.
 uint32_t D3DFormatRowPitch(D3DFORMAT format, uint32_t width);
 
 // The LockRect pitch the D3D9 runtime reports to apps: the tight row

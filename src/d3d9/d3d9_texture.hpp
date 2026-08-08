@@ -189,9 +189,8 @@ public:
   clearDirty() {
     m_dirty_any = false;
   }
-  // unionDirtyRect(NULL) marks the whole texture; otherwise unions the
-  // supplied level-0 rect. Used by AddDirtyRect and by Lock/Unlock-side
-  // bookkeeping in sub-E.
+  // A null rect marks the whole texture; otherwise this unions the supplied
+  // level-0 rect. Called from AddDirtyRect and from the Lock/Unlock path.
   void unionDirtyRect(const RECT *pRect);
   D3DFORMAT
   d3dFormat() const override {

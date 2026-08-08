@@ -15,8 +15,8 @@
 #include <cstring>
 
 // Pure D3D9 query-contract decisions factored out of MTLD3D9Query / CreateQuery
-// so the host unit tier can pin the per-type data size, the creatable-type
-// matrix, and the CREATED-state poison fill without a Metal device (the
+// so the per-type data size, the creatable-type matrix and the CREATED-state
+// poison fill stand free of a Metal device (the
 // d3d9_viewport.hpp / d3d9_gamma.hpp shape). References: wined3d (PRIMARY)
 // dlls/d3d9/query.c (d3d9_query_init size overrides, the 0xdd CREATED-state
 // rewrite) + dlls/wined3d/query.c (wined3d_query_create support set); DXVK

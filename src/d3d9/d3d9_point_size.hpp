@@ -26,7 +26,7 @@
 // INVARIANT under the numeric point-size render states: the numbers ride
 // the uniform, only the point-vs-nonpoint topology / shader-writes-oPts /
 // POINTSCALEENABLE gates may move the key. It is header-only and free of
-// D3D9 headers so the host unit tier can exercise it without a device.
+// D3D9 headers, so it stands free of a device.
 
 namespace dxmt {
 

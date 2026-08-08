@@ -10,9 +10,9 @@ namespace dxmt {
 // position is carried through the folded world*view*projection, perspective
 // divided, and mapped onto the D3D9 viewport as screen-space XYZRHW. wined3d
 // disables the clip branch in this path (its clip arm is documented-broken and
-// FIXME-gated off), so this is the unclipped transform: the one the wine visual
-// test test_process_vertices (dlls/d3d9/tests/visual.c) pins byte-exact on a
-// plain HARDWARE_VERTEXPROCESSING device. out receives {x, y, z, rhw}.
+// FIXME-gated off), so this is the unclipped transform, which wine's visual
+// suite pins byte-exact on a plain HARDWARE_VERTEXPROCESSING device.
+// out receives {x, y, z, rhw}.
 //
 // The arithmetic mirrors wined3d step for step so the pinned output matches:
 // divide the clip coordinates by w, negate y (D3D screen space grows downward),

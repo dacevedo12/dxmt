@@ -530,7 +530,7 @@ MTLD3D9Surface::LockRect(D3DLOCKED_RECT *pLockedRect, const RECT *pRect, DWORD F
   m_ever_locked = true;
   ++m_lock_state->map_count;
   // Remember the locked rect + READONLY hint so UnlockRect can do a
-  // partial-extent replaceRegion (or skip it entirely on READONLY).
+  // partial-extent upload (or skip it entirely on READONLY).
   // wined3d texture.c d3d9_surface_unmap pushes only the dirty rect.
   m_locked_readonly = (Flags & D3DLOCK_READONLY) != 0;
   m_locked_no_dirty_update = (Flags & D3DLOCK_NO_DIRTY_UPDATE) != 0;

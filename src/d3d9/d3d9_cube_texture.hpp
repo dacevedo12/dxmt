@@ -22,8 +22,8 @@ class MTLD3D9Device;
 // IDirect3DCubeTexture9: one TextureCube (6 faces x N mips) with
 // 6xN pre-created MTLD3D9Surface views. Faces share WMT::Texture;
 // mipLevel+arraySlice select render-pass attachments/samplers.
-// Non-DEFAULT pools: per-face/level sysmem mirror. MANAGED unlocks
-// push data via replaceRegion. References: wined3d texture.c.
+// Non-DEFAULT pools: per-face/level sysmem mirror, staged to the texture by the
+// unlock. References: wined3d texture.c.
 class MTLD3D9CubeTexture final : public ComObject<IDirect3DCubeTexture9>,
                                  public MTLD3D9CommonTexture,
                                  public D9LazyMirrorHost {

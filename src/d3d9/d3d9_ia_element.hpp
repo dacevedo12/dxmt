@@ -7,8 +7,8 @@
 // Pure draw-path decisions (per-element input-assembler fetch layout, plus the
 // triangle-fan index-buffer read bound) that ResolveBatchedDrawForChunk and the
 // indexed-draw remap build from the bound declaration and index buffer, factored
-// out so the host unit tier can exercise them without a Metal device or a live
-// draw (the d3d9_image_lock.hpp / d3d9_update_mip.hpp shape). References:
+// out so they stand free of a Metal device or a live draw (the
+// d3d9_image_lock.hpp / d3d9_update_mip.hpp shape). References:
 // wined3d (PRIMARY) dlls/wined3d/context.c wined3d_stream_info_from_declaration
 // + dlls/wined3d/vertexdeclaration.c (the stream-slot filtering); the generated
 // fixed-function register contract lives in airconv_public.h.

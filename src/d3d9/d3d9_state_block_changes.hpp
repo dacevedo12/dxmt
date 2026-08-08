@@ -14,9 +14,9 @@
 #include <cstdint>
 
 // The per-category + per-render-state change-tracking mask a state block owns,
-// factored out of d3d9_device.hpp so the host unit tier can pin the
-// D3DSBT_PIXELSTATE / D3DSBT_VERTEXSTATE / D3DSBT_ALL membership tables without
-// the device / Metal include surface (the d3d9_viewport.hpp / d3d9_gamma.hpp
+// factored out of d3d9_device.hpp so the D3DSBT_PIXELSTATE /
+// D3DSBT_VERTEXSTATE / D3DSBT_ALL membership tables stand free of the device
+// and Metal include surface (the d3d9_viewport.hpp / d3d9_gamma.hpp
 // shape). A drifted membership list is exactly the bug class markPixelStateSubset
 // / markVertexStateSubset guard against. References: wined3d (PRIMARY)
 // dlls/wined3d/stateblock.c savedstates + pixel_states_* / vertex_states_*

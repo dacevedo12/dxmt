@@ -4,8 +4,8 @@
 #include "d3d9.h"
 
 // Pure map-mode / lock-flag / dirty-range logic for vertex and index
-// buffers, factored out of d3d9_buffer.cpp so the host unit tier can
-// exercise it without a Metal device. References: DXVK
+// buffers, factored out of d3d9_buffer.cpp so it carries no device or Metal
+// include surface. References: DXVK
 // d3d9_common_buffer.h, DXVK d3d9_device.cpp, wined3d buffer.c.
 
 namespace dxmt {
@@ -88,9 +88,10 @@ buffer_lock_updates_dirty(DWORD flags) {
   return !(flags & D3DLOCK_READONLY);
 }
 
-// Nested-lock counter. D3D9 permits nested Lock/Unlock on one buffer; the
-// staged upload fires only when the outer Unlock returns the count to
-// zero. Unlock is clamped so an unbalanced Unlock cannot underflow.
+// Nested-lock counter. D3D9 permits nested Lock/Unlock on one buffer, and only
+// the outer Unlock means the application has stopped writing, which is what the
+// refresh needs to know before it can call the device copy current. Unlock is
+// clamped so an unbalanced one cannot underflow.
 struct D3D9BufferLockCount {
   uint32_t count = 0;
 
