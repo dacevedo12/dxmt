@@ -1314,7 +1314,7 @@ MTLD3D9SwapChain::reapplyGammaRamp() {
   // Gamma is a fullscreen-exclusive display ramp (D3DCAPS2_FULLSCREENGAMMA is
   // the only gamma cap dxmt advertises), and an identity ramp is a no-op. When
   // windowed or identity, clear the presenter LUT so the present blit samples no
-  // gamma, matching DXVK's setGammaRamp(0, nullptr) (d3d9_swapchain.cpp:731-735)
+  // gamma, matching DXVK's setGammaRamp(0, nullptr) (d3d9_swapchain.cpp)
   // and native (a windowed brightness slider is a no-op). changeGammaRamp(null)
   // no-ops when the presenter already runs LUT-free, so a Reset that stays
   // windowed does not churn the present PSO.

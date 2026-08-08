@@ -5,8 +5,6 @@
 #include "com/com_pointer.hpp"
 #include "d3d9.h"
 #include "rc/util_rc_ptr.hpp"
-
-#include <chrono>
 #include <unordered_map>
 #include <vector>
 

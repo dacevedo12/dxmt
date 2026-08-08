@@ -6,11 +6,7 @@
 #include "d3d9_shader.hpp"
 #include "d3d9_surface.hpp"
 #include "d3d9_vertex_declaration.hpp"
-
-#include <array>
 #include <cstring>
-#include <memory>
-
 namespace dxmt {
 
 MTLD3D9StateBlock::MTLD3D9StateBlock(MTLD3D9Device *device, D3DSTATEBLOCKTYPE type) : m_device(device), m_type(type) {

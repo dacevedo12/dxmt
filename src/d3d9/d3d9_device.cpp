@@ -44,7 +44,6 @@
 #include <cfloat>
 #include <chrono>
 #include <cmath>
-#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <limits>
@@ -233,7 +232,7 @@ prim_to_vertex_count(D3DPRIMITIVETYPE pt, UINT count) {
 
 // D3D9 fan with N verts yields N-2 triangles: (0, k+1, k+2).
 // Metal has no fan; synthesise index list as TRIANGLELIST.
-// src may be null (generate 0..N-1) or u16/u32 array; src_idx_size ∈ {0,2,4}.
+// src may be null (generate 0..N-1) or u16/u32 array; src_idx_size is 0, 2 or 4.
 inline void
 fill_fan_to_list_indices(uint32_t *dst, UINT prim_count, const void *src, uint32_t src_idx_size) {
   if (src == nullptr) {

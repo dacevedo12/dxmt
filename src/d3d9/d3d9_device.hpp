@@ -27,14 +27,11 @@
 
 #include <array>
 #include <atomic>
-#include <chrono>
 #include <cstdlib>
 #include <cstring>
-#include <limits>
 #include <memory>
 #include <mutex>
 #include <unordered_map>
-#include <unordered_set>
 #include <vector>
 
 namespace dxmt {
@@ -1632,8 +1629,8 @@ private:
   // SetStreamSourceFreq / GetStreamSourceFreq packed setting per
   // stream. Default 1 = "advance once per vertex, draw 1 instance".
   // Encoding follows the D3D9 spec (matches DXVK m_state.streamFreq):
-  //   Stream 0 ⇒  D3DSTREAMSOURCE_INDEXEDDATA | InstanceCount
-  //   Stream N ⇒  D3DSTREAMSOURCE_INSTANCEDATA | DivisorOrZero
+  //   Stream 0 holds D3DSTREAMSOURCE_INDEXEDDATA | InstanceCount
+  //   Stream N holds D3DSTREAMSOURCE_INSTANCEDATA | DivisorOrZero
   // The draw path inspects bit 30 (INDEXEDDATA) on stream 0 to pull
   // instance_count out of the low 23 bits, and bit 31 (INSTANCEDATA)
   // on streams 1..15 to mark the IA element as per-instance.

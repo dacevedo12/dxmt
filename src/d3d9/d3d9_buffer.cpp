@@ -54,7 +54,7 @@ MTLD3D9VertexBuffer::MTLD3D9VertexBuffer(
     m_fvf(fvf),
     m_pool(pool) {
   // Wrap the underlying Buffer in the DynamicBuffer recycling wrapper (the same
-  // one d3d11 uses, d3d11_buffer.cpp:123). m_dxmtBuffer anchors the Buffer
+  // one d3d11 uses, d3d11_buffer.cpp). m_dxmtBuffer anchors the Buffer
   // whose raw pointer the wrapper holds; the wrapper's initial name is the
   // Buffer's current() allocation set at create time. That allocation is
   // CPU-writable, so a refresh stores the mirror into it without a staging

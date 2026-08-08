@@ -7,8 +7,6 @@
 #include "d3d9_resource_priority.hpp"
 
 #include <algorithm>
-#include <chrono>
-
 namespace dxmt {
 
 MTLD3D9VolumeTexture::MTLD3D9VolumeTexture(

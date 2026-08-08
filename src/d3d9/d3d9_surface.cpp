@@ -12,8 +12,6 @@
 #include "d3d9_private_data.hpp"
 #include "d3d9_texture.hpp"
 #include "wsi_platform.hpp"
-
-#include <chrono>
 #include <cstring>
 
 namespace dxmt {

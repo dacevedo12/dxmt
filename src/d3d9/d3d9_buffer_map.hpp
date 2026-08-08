@@ -1,6 +1,4 @@
 #pragma once
-
-#include <algorithm>
 #include <cstdint>
 
 #include "d3d9.h"

@@ -119,7 +119,7 @@ private:
   // it outlives the wrapper's raw pointer at teardown.
   Rc<dxmt::Buffer> m_dxmtBuffer;
   // The DynamicBuffer recycling wrapper (the same one d3d11 uses,
-  // d3d11_buffer.cpp:123). Owns the current allocation name and a FIFO of
+  // d3d11_buffer.cpp). Owns the current allocation name and a FIFO of
   // retired allocations a Lock(DISCARD) recycles once the GPU has passed
   // them. A refresh stores the mirror into the current name and draws read it.
   Rc<dxmt::DynamicBuffer> m_dynamic;
