@@ -563,8 +563,9 @@ public:
   canOnlySWVP() const {
     return (m_creationParams.BehaviorFlags & D3DCREATE_SOFTWARE_VERTEXPROCESSING) != 0;
   }
-  // A lost device ignores D3DLOCK_DISCARD on a Lock (native drivers keep the
-  // buffer contents; the wine d3d9 tests assert it, DXVK strips it the same way).
+  // A lost device keeps a buffer's contents across a Lock(DISCARD), which the
+  // wine d3d9 tests assert. Nothing has to enforce that here: the mirror holds
+  // the contents and DISCARD does not touch it.
   bool
   isDeviceLost() const {
     return m_deviceState.load(std::memory_order_relaxed) == DeviceState::Lost;
