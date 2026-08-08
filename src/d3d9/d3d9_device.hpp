@@ -113,7 +113,7 @@ class MTLD3D9Interface;
 
 // D3D9StateBlockChanges (the per-category + per-render-state change-tracking
 // mask each MTLD3D9StateBlock owns) lives in d3d9_state_block_changes.hpp,
-// included above, so the host unit tier can pin its PIXELSTATE / VERTEXSTATE /
+// included above, keeping its PIXELSTATE / VERTEXSTATE /
 // ALL membership tables without the device include surface. The device's
 // recording arms mark bits on the in-progress block's instance directly.
 
@@ -250,7 +250,7 @@ public:
   // at tail feeds recycling.
   void emitCmdbufTailSignal();
   // Force-commit the current chunk so its cmdbuf actually reaches the
-  // GPU. Used by Lock(DISCARD) when the rename ring runs dry; we
+  // GPU. Used by the draw queue when minted rename bytes cross the threshold; we
   // need the most recently retired backing's signal_seq to be a
   // signal the GPU will eventually retire, not a chunk still buffered
   // on the encode thread. Drains queued draws, drains the legacy sync
@@ -610,10 +610,9 @@ public:
   struct D3D9DrawCapture;
   // D9EncodingRefs is the per-draw reference-counted state container:
   // shaders, vertex decl, render targets, depth stencil, textures,
-  // vertex buffers, index buffer. Each non-null Com<,false> slot pins
-  // one private ref on the resource it points at; BatchedDraw carries
-  // a std::shared_ptr<D9EncodingRefs> so the resources survive until
-  // every BatchedDraw that referenced them is destroyed.
+  // vertex buffers, index buffer. Each non-null Com<,false> slot pins one
+  // private ref on the resource it points at. There is one mirror, mutated by
+  // the chunk walker in arrival order rather than copied per draw.
   struct D9EncodingRefs {
     Com<class MTLD3D9VertexShader, false> vertex_shader;
     Com<class MTLD3D9PixelShader, false> pixel_shader;
@@ -641,7 +640,7 @@ public:
     // PSO + render-pass identity. POD state (render_states, samplers,
     // streams, constants) on D9EncodingState; ref-counted (textures, VBs)
     // on D9EncodingRefs. Per-draw rename-cursor freeze: gpu_address() /
-    // currentOffset() snapshot at queue time (advance on Lock(DISCARD)).
+    // currentOffset() snapshot at queue time.
     struct VBSlot {
       obj_handle_t buffer = 0;
       uint64_t gpu_address = 0;
@@ -651,7 +650,7 @@ public:
       // frozen from the same immediateName() read that produced buffer /
       // gpu_address above. The emit registers the Vertex-stage read against
       // it, so binding and fence-tracking stay on one allocation even after
-      // a later Lock(DISCARD) renames the buffer. Both map modes populate
+      // a later refresh renames the buffer. Both stream kinds populate
       // it now (BUFFER orders the upload copy, DIRECT fences the in-place
       // backing); null only for unbound streams.
       Rc<dxmt::BufferAllocation> alloc;
@@ -666,7 +665,7 @@ public:
     uint64_t ib_offset = 0;
     D3DFORMAT ib_format = D3DFMT_UNKNOWN;
     // The frozen index-buffer allocation, mirroring VBSlot::alloc; both
-    // map modes populate it, null only for an unbound index buffer.
+    // stream kinds populate it, null only for an unbound index buffer.
     Rc<dxmt::BufferAllocation> ib_alloc;
   };
 
@@ -786,11 +785,10 @@ public:
     // for the per-format table (ports DXVK's d3d9_util.h shape).
     // Default 1.0 = no-op for the no-DS-bound case.
     float resolved_depth_bias_scale = 1.0f;
-    // Indexed-draw IB handle + base offset resolved on the calling
-    // thread so the lambda doesn't dereference cap.ib_ref / its mutable
-    // rename cursor. For UP-indexed draws this is the override buffer
-    // and offset; for bound IBs this is metalBuffer().handle and
-    // currentOffset() snapped at resolve time.
+    // Indexed-draw IB handle and base offset, both snapped on the calling
+    // thread in BuildDrawCapture so the chunk lambda never reads a buffer whose
+    // current allocation may have moved. For UP-indexed draws this is the
+    // override buffer and its offset.
     obj_handle_t resolved_ib_handle = 0;
     uint64_t resolved_ib_base_offset = 0;
     // Lifetime pins on VB / IB wrappers. setVertexBuffer doesn't retain
@@ -803,7 +801,7 @@ public:
     // Copied from cap.vb_slots[].alloc (frozen on the calling thread at
     // BuildDrawCapture), NOT re-read from immediateName() here, so the read
     // tracks the same allocation the binding was frozen against even after a
-    // later Lock(DISCARD) renames the buffer. Null for override (UP) streams,
+    // later refresh renames the buffer. Null for override (UP) streams,
     // which bind by raw handle and need no read tracking. The wrapper pins
     // above keep the wrapper alive; the Rc keeps the allocation alive through
     // GPU read.
@@ -997,7 +995,7 @@ public:
 
 private:
   // BuildDrawCapture freezes per-draw rename cursors (gpu_address/
-  // currentOffset advance on Lock(DISCARD), snapshot at queue time).
+  // currentOffset snapshot at queue time).
   // Ref-counted state travels via setters to D9EncodingState on encode thread;
   // override_* args are per-call, not device state.
   D3D9DrawCapture BuildDrawCapture();
@@ -1214,6 +1212,34 @@ private:
       ResolveCache &resolve_cache
   );
 
+  // What the draw's shader pair looks like to the constant packer: which
+  // stages the fixed-function generator supplies, and which read constants
+  // relatively (c[a0.x + n]), since a relative read decides both the upload
+  // extent and whether the shader's def'd constants have to be stamped in.
+  // Grouped because every field is derived from the same two shaders and the
+  // packer needs all of them together.
+  struct DrawShaderShape {
+    class MTLD3D9VertexShader *vs = nullptr;
+    class MTLD3D9PixelShader *ps = nullptr;
+    bool ffp_vs = false;
+    bool ffp_ps = false;
+    bool vs_uses_relative = false;
+    bool ps_uses_relative = false;
+    bool vs_needs_defs = false;
+    bool ps_needs_defs = false;
+  };
+
+  // Pack this draw's constant buffers into one m_constRingResolve block.
+  // Split out of ResolveBatchedDrawForChunk as its tail phase: it reads the
+  // shader shape the binding resolve derived, but produces nothing that resolve
+  // consumes, so it reaches the rest of the draw only through bd. Returns false
+  // when the ring cannot back the block, which fails the draw.
+  bool PackDrawConstants(
+      BatchedDraw &bd, ConstUploadCache &const_cache, const DrawShaderShape &shape, const uint32_t *ffp_texcoord_width,
+      uint32_t ffp_texcoord_width_key, bool ds_bound, const void *vs_defs_key, const void *ps_defs_key,
+      uint64_t chunk_seq, uint64_t chunk_coherent_id
+  );
+
   // Refresh m_cachedSignaled from m_completionEvent and trim retired
   // blocks out of m_constRing / m_uploadRing. Call after every
   // ++m_currentCmdSeq on the calling thread. All draw/blit paths route
@@ -1228,11 +1254,10 @@ private:
   // alternative; public accessors per category; would pollute the
   // device's external surface for an internal concern.
   friend class MTLD3D9StateBlock;
-  // A DIRECT-mode dynamic VB / IB reads m_currentCmdSeq / m_cachedSignaled
-  // for its DynamicBuffer DISCARD recycle, and a plain in-place Lock may
-  // call m_completionEvent.waitUntilSignaledValue to stall the calling
-  // thread until the current allocation's last GPU read has retired (the
-  // write-after-read gate). See MTLD3D9VertexBuffer::Lock.
+  // The buffer classes read m_currentCmdSeq / m_cachedSignaled when a refresh
+  // recycles an allocation from the FIFO, and reach reserveBufferUpload and the
+  // frame counters. A Lock never waits on the GPU: it hands back the host
+  // mirror. See MTLD3D9VertexBuffer::refreshWholeMirror.
   friend class MTLD3D9VertexBuffer;
   friend class MTLD3D9IndexBuffer;
 
@@ -1286,9 +1311,10 @@ private:
   // keep whatever cursor is current.
   HCURSOR m_hwCursor = nullptr;
 #endif
-  // D3D9 device-state machine: Ok -> S_OK, Lost -> D3DERR_DEVICELOST
-  // (unreachable today), NotReset -> D3DERR_DEVICENOTRESET. Ex devices
-  // return S_OK; use CheckDeviceState instead.
+  // D3D9 device-state machine: Ok -> S_OK, Lost -> D3DERR_DEVICELOST,
+  // NotReset -> D3DERR_DEVICENOTRESET. A non-Ex device enters Lost on
+  // fullscreen focus loss. Ex devices always report S_OK from TestCooperative
+  // Level; CheckDeviceState carries their answer instead.
   enum class DeviceState : uint8_t { Ok, Lost, NotReset };
   std::atomic<DeviceState> m_deviceState{DeviceState::Ok};
   // Live count of app-created D3DPOOL_DEFAULT resources. Bumped by
@@ -1329,9 +1355,10 @@ private:
   // re-derived from the restored LOD-bias in d3d9_state_block.cpp Apply (DXVK
   // handles it there too, its Apply routes through SetStateSamplerState).
   uint16_t m_fetch4Latch = 0;
-  // Generated fixed-function shader cache: vertex functions keyed by
-  // the IA-layout fingerprint (plus the has-diffuse bit), one pixel
-  // function until the stage-combiner milestones add axes. The value is
+  // Generated fixed-function shader cache: vertex functions keyed by the
+  // IA-layout fingerprint plus the has-diffuse bit, pixel functions by the
+  // per-stage combiner table and the render states that change the generated
+  // code rather than a uniform. The value is
   // the async compile task; a task whose function() latches null caches a
   // compile failure the same way the variant caches do. One of the
   // task-owning containers m_psoScheduler must outlive at teardown (see its
@@ -2001,8 +2028,7 @@ public:
   // ring hands back a block it could not back rather than reporting the
   // failure, and a 32-bit address space reaches that under pressure, so every
   // consumer goes through tryRingAllocate instead of dereferencing the block a
-  // ring returns. Mirrors what discardRenameDynamicBuffer already does for a
-  // renamed allocation.
+  // ring returns. The buffer refresh checks its renamed allocation the same way.
   struct RingBlockSpan {
     void *host = nullptr;
     obj_handle_t handle = 0;
