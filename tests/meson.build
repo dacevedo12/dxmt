@@ -165,6 +165,14 @@ test(
 )
 
 test(
+  'd3d9-clang-format',
+  python3_native,
+  args: [files('ci/test_d3d9_format.py')],
+  suite: ['unit', 'repository'],
+  timeout: 60,
+)
+
+test(
   'd3d9-format-table-consistency',
   python3_native,
   args: [files('ci/test_d3d9_format_tables.py')],
