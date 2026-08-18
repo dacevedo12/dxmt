@@ -56,6 +56,7 @@ struct FrameStatistics {
   clock::duration present_latency_interval{};
   ScalerInfo last_scaler_info{};
 
+
   void
   reset() {
     compatibility_flags.clrAll();

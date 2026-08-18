@@ -781,6 +781,11 @@ _MTLBlitCommandEncoder_encodeCommands(void *obj) {
                            withRange:NSMakeRange(body->location, body->length)];
       break;
     }
+    case WMTBlitCommandOptimizeContentsForGPUAccess: {
+      struct wmtcmd_blit_optimize_contents *body = (struct wmtcmd_blit_optimize_contents *)next;
+      [encoder optimizeContentsForGPUAccess:(id<MTLTexture>)body->texture slice:body->slice level:body->level];
+      break;
+    }
     }
 
     next = next->next.ptr;
@@ -992,6 +997,21 @@ _MTLRenderCommandEncoder_encodeCommands(void *obj) {
     case WMTRenderCommandSetStencilRef: {
       struct wmtcmd_render_setstencilref *body = (struct wmtcmd_render_setstencilref *)next;
       [encoder setStencilReferenceValue:body->stencil_ref];
+      break;
+    }
+    case WMTRenderCommandSetFragmentSamplerState: {
+      struct wmtcmd_render_setsamplerstate *body = (struct wmtcmd_render_setsamplerstate *)next;
+      [encoder setFragmentSamplerState:(id<MTLSamplerState>)body->sampler atIndex:body->index];
+      break;
+    }
+    case WMTRenderCommandSetVertexTexture: {
+      struct wmtcmd_render_settexture *body = (struct wmtcmd_render_settexture *)next;
+      [encoder setVertexTexture:(id<MTLTexture>)body->texture atIndex:body->index];
+      break;
+    }
+    case WMTRenderCommandSetVertexSamplerState: {
+      struct wmtcmd_render_setsamplerstate *body = (struct wmtcmd_render_setsamplerstate *)next;
+      [encoder setVertexSamplerState:(id<MTLSamplerState>)body->sampler atIndex:body->index];
       break;
     }
     case WMTRenderCommandSetVisibilityMode: {
@@ -1230,6 +1250,13 @@ static NTSTATUS
 _MTLTexture_pixelFormat(void *obj) {
   struct unixcall_generic_obj_uint64_ret *params = obj;
   params->ret = [(id<MTLTexture>)params->handle pixelFormat];
+  return STATUS_SUCCESS;
+}
+
+static NTSTATUS
+_MTLTexture_usage(void *obj) {
+  struct unixcall_generic_obj_uint64_ret *params = obj;
+  params->ret = [(id<MTLTexture>)params->handle usage];
   return STATUS_SUCCESS;
 }
 
@@ -3102,6 +3129,314 @@ NTSTATUS _CacheWriter_alloc_init(void *obj);
 NTSTATUS _CacheWriter_set(void *obj);
 NTSTATUS _WMTSetMetalShaderCachePath(void *obj);
 
+
+/* DXSO compilation argument chain: same shape as SM50's 32-bit
+   chain conversion (sm50_compilation_argument32_convert). DXSO has
+   its own enum + struct family so the d3d9 caller picks the right
+   types at compile time, but the wire-form is byte-identical to
+   SM50's so we reuse the same UInt32ToPtr unpack pattern. The IA
+   layout's `elements` pointer points at app-side memory: already
+   in the wow64 32-bit address space: so it round-trips through
+   UInt32ToPtr without further translation. */
+struct DXSO_SHADER_COMPILATION_ARGUMENT_DATA32 {
+  uint32_t next;
+  enum DXSO_SHADER_COMPILATION_ARGUMENT_TYPE type;
+};
+
+struct DXSO_SHADER_IA_INPUT_LAYOUT_DATA32 {
+  uint32_t next;
+  enum DXSO_SHADER_COMPILATION_ARGUMENT_TYPE type;
+  enum DXSO_INDEX_BUFFER_FORMAT index_buffer_format;
+  uint32_t slot_mask;
+  uint32_t num_elements;
+  uint32_t elements;
+  uint32_t position_transformed;
+  uint32_t vs_float_const_count;
+};
+
+struct DXSO_SHADER_PSO_PIXEL_SHADER_DATA32 {
+  uint32_t next;
+  enum DXSO_SHADER_COMPILATION_ARGUMENT_TYPE type;
+  uint32_t alpha_test_func;
+  uint32_t dual_source_blending;
+  uint32_t flat_shading;
+  uint32_t emit_sample_mask;
+  uint32_t unorm_output_reg_mask;
+};
+
+struct DXSO_SHADER_PS_SAMPLER_LAYOUT_DATA32 {
+  uint32_t next;
+  enum DXSO_SHADER_COMPILATION_ARGUMENT_TYPE type;
+  uint8_t kinds[16];
+};
+
+struct DXSO_SHADER_PS_POINT_SPRITE_DATA32 {
+  uint32_t next;
+  enum DXSO_SHADER_COMPILATION_ARGUMENT_TYPE type;
+};
+
+struct DXSO_SHADER_PS_FOG_DATA32 {
+  uint32_t next;
+  enum DXSO_SHADER_COMPILATION_ARGUMENT_TYPE type;
+  uint32_t mode;
+  uint32_t coord_is_w;
+};
+
+struct DXSO_SHADER_FFP_KEY_DATA32 {
+  uint32_t next;
+  enum DXSO_SHADER_COMPILATION_ARGUMENT_TYPE type;
+  uint32_t kind;
+  uint32_t has_diffuse;
+  uint32_t has_texcoord0;
+  uint32_t has_specular;
+  uint32_t tex0_mode;
+  uint32_t stages[8][3];
+  uint32_t point_size;
+  uint32_t point_sprite;
+  uint32_t point_scale;
+  uint32_t texcoord_mask;
+  uint32_t texcoord_transform_key;
+  uint32_t lighting_key;
+  uint32_t fog_vertex_mode;
+  uint32_t vertex_blend;
+  uint32_t texgen_key;
+  uint32_t texcoord_index_key;
+  uint32_t sampler_kind_key;
+  uint32_t flat_shading;
+  uint32_t point_size_per_vertex;
+  uint32_t decl_has_diffuse;
+  uint32_t range_fog;
+  uint32_t emit_sample_mask;
+};
+
+struct DXSO_SHADER_VS_POINT_SIZE_DATA32 {
+  uint32_t next;
+  enum DXSO_SHADER_COMPILATION_ARGUMENT_TYPE type;
+};
+
+
+
+void
+dxso_compilation_argument32_convert(
+    struct DXSO_SHADER_COMPILATION_ARGUMENT_DATA *first_arg, struct DXSO_SHADER_COMPILATION_ARGUMENT_DATA32 *args32
+) {
+  struct DXSO_SHADER_COMPILATION_ARGUMENT_DATA *last_arg = first_arg;
+
+  first_arg->type = DXSO_SHADER_ARGUMENT_TYPE_MAX;
+  first_arg->next = NULL;
+
+  while (args32) {
+    /* Make an unhandled arg type a hard error, not a silent drop: a new
+       DXSO_SHADER_* value added to the enum and the 64-bit caller but not to
+       this 32-bit converter would otherwise vanish on WoW64 only (the exact
+       shape of the historical alpha-test arg-drop). -Wswitch already flags it;
+       promote just this switch to an error so the build catches it. */
+#pragma GCC diagnostic push
+#pragma GCC diagnostic error "-Wswitch"
+    switch (args32->type) {
+    case DXSO_SHADER_IA_INPUT_LAYOUT: {
+      struct DXSO_SHADER_IA_INPUT_LAYOUT_DATA32 *src = (void *)args32;
+      struct DXSO_SHADER_IA_INPUT_LAYOUT_DATA *data = malloc(sizeof(struct DXSO_SHADER_IA_INPUT_LAYOUT_DATA));
+      last_arg->next = data;
+      last_arg = (void *)data;
+      last_arg->next = NULL;
+      data->type = src->type;
+      data->index_buffer_format = src->index_buffer_format;
+      data->slot_mask = src->slot_mask;
+      data->num_elements = src->num_elements;
+      data->elements = UInt32ToPtr(src->elements);
+      data->position_transformed = src->position_transformed;
+      data->vs_float_const_count = src->vs_float_const_count;
+      break;
+    }
+    case DXSO_SHADER_PSO_PIXEL_SHADER: {
+      struct DXSO_SHADER_PSO_PIXEL_SHADER_DATA32 *src = (void *)args32;
+      struct DXSO_SHADER_PSO_PIXEL_SHADER_DATA *data = malloc(sizeof(struct DXSO_SHADER_PSO_PIXEL_SHADER_DATA));
+      last_arg->next = data;
+      last_arg = (void *)data;
+      last_arg->next = NULL;
+      data->type = src->type;
+      data->alpha_test_func = src->alpha_test_func;
+      data->dual_source_blending = src->dual_source_blending;
+      data->flat_shading = src->flat_shading;
+      data->emit_sample_mask = src->emit_sample_mask;
+      data->unorm_output_reg_mask = src->unorm_output_reg_mask;
+      break;
+    }
+    case DXSO_SHADER_PS_SAMPLER_LAYOUT: {
+      struct DXSO_SHADER_PS_SAMPLER_LAYOUT_DATA32 *src = (void *)args32;
+      struct DXSO_SHADER_PS_SAMPLER_LAYOUT_DATA *data = malloc(sizeof(struct DXSO_SHADER_PS_SAMPLER_LAYOUT_DATA));
+      last_arg->next = data;
+      last_arg = (void *)data;
+      last_arg->next = NULL;
+      data->type = src->type;
+      memcpy(data->kinds, src->kinds, sizeof(data->kinds));
+      break;
+    }
+    case DXSO_SHADER_PS_POINT_SPRITE: {
+      struct DXSO_SHADER_PS_POINT_SPRITE_DATA *data = malloc(sizeof(struct DXSO_SHADER_PS_POINT_SPRITE_DATA));
+      last_arg->next = data;
+      last_arg = (void *)data;
+      last_arg->next = NULL;
+      data->type = DXSO_SHADER_PS_POINT_SPRITE;
+      break;
+    }
+    case DXSO_SHADER_FFP_KEY: {
+      struct DXSO_SHADER_FFP_KEY_DATA32 *src = (void *)args32;
+      struct DXSO_SHADER_FFP_KEY_DATA *data = malloc(sizeof(struct DXSO_SHADER_FFP_KEY_DATA));
+      last_arg->next = data;
+      last_arg = (void *)data;
+      last_arg->next = NULL;
+      data->type = DXSO_SHADER_FFP_KEY;
+      data->kind = src->kind;
+      data->has_diffuse = src->has_diffuse;
+      data->has_texcoord0 = src->has_texcoord0;
+      data->has_specular = src->has_specular;
+      data->tex0_mode = src->tex0_mode;
+      memcpy(data->stages, src->stages, sizeof(data->stages));
+      data->point_size = src->point_size;
+      data->point_sprite = src->point_sprite;
+      data->point_scale = src->point_scale;
+      data->texcoord_mask = src->texcoord_mask;
+      data->texcoord_transform_key = src->texcoord_transform_key;
+      data->lighting_key = src->lighting_key;
+      data->fog_vertex_mode = src->fog_vertex_mode;
+      data->vertex_blend = src->vertex_blend;
+      data->texgen_key = src->texgen_key;
+      data->texcoord_index_key = src->texcoord_index_key;
+      data->sampler_kind_key = src->sampler_kind_key;
+      data->flat_shading = src->flat_shading;
+      data->point_size_per_vertex = src->point_size_per_vertex;
+      data->decl_has_diffuse = src->decl_has_diffuse;
+      data->range_fog = src->range_fog;
+      data->emit_sample_mask = src->emit_sample_mask;
+      break;
+    }
+    case DXSO_SHADER_VS_POINT_SIZE: {
+      struct DXSO_SHADER_VS_POINT_SIZE_DATA32 *src = (void *)args32;
+      struct DXSO_SHADER_VS_POINT_SIZE_DATA *data = malloc(sizeof(struct DXSO_SHADER_VS_POINT_SIZE_DATA));
+      last_arg->next = data;
+      last_arg = (void *)data;
+      last_arg->next = NULL;
+      data->type = DXSO_SHADER_VS_POINT_SIZE;
+      (void)src;
+      break;
+    }
+    case DXSO_SHADER_PS_BUMP_ENV:
+      /* Reserved: bump-env now rides the shared PS uniform tail, so the
+         host never emits this arg. Skip it if an older caller does. */
+      break;
+    case DXSO_SHADER_PS_FOG: {
+      struct DXSO_SHADER_PS_FOG_DATA32 *src = (void *)args32;
+      struct DXSO_SHADER_PS_FOG_DATA *data = malloc(sizeof(struct DXSO_SHADER_PS_FOG_DATA));
+      last_arg->next = data;
+      last_arg = (void *)data;
+      last_arg->next = NULL;
+      data->type = DXSO_SHADER_PS_FOG;
+      data->mode = src->mode;
+      data->coord_is_w = src->coord_is_w;
+      break;
+    }
+    case DXSO_SHADER_ARGUMENT_TYPE_MAX:
+      break;
+    }
+#pragma GCC diagnostic pop
+    args32 = UInt32ToPtr(args32->next);
+  }
+}
+
+void
+dxso_compilation_argument32_free(struct DXSO_SHADER_COMPILATION_ARGUMENT_DATA *first_arg) {
+  struct DXSO_SHADER_COMPILATION_ARGUMENT_DATA *arg = first_arg->next;
+
+  while (arg) {
+    struct DXSO_SHADER_COMPILATION_ARGUMENT_DATA *next = arg->next;
+    free(arg);
+    arg = next;
+  }
+}
+
+static NTSTATUS
+thunk_DXSOInitialize(void *args) {
+  struct dxso_initialize_params *params = args;
+
+  params->ret = DXSOInitialize(params->bytecode, params->bytecode_size, params->shader);
+
+  return STATUS_SUCCESS;
+}
+
+static NTSTATUS
+thunk_DXSODestroy(void *args) {
+  struct dxso_destroy_params *params = args;
+
+  DXSODestroy(params->shader);
+
+  return STATUS_SUCCESS;
+}
+
+static NTSTATUS
+thunk_DXSOCompile(void *args) {
+  struct dxso_compile_params *params = args;
+
+  params->ret = DXSOCompile(params->shader, params->args, params->func_name, params->bitcode);
+
+  return STATUS_SUCCESS;
+}
+
+static NTSTATUS
+thunk_DXSOGetCompiledBitcode(void *args) {
+  struct dxso_get_compiled_bitcode_params *params = args;
+
+  DXSOGetCompiledBitcode(params->bitcode, params->data_out);
+
+  return STATUS_SUCCESS;
+}
+
+static NTSTATUS
+thunk_DXSODestroyBitcode(void *args) {
+  struct dxso_destroy_bitcode_params *params = args;
+
+  DXSODestroyBitcode(params->bitcode);
+
+  return STATUS_SUCCESS;
+}
+
+static NTSTATUS
+thunk32_DXSOInitialize(void *args) {
+  struct dxso_initialize_params32 *params = args;
+
+  params->ret = DXSOInitialize(
+      UInt32ToPtr(params->bytecode), params->bytecode_size, UInt32ToPtr(params->shader)
+  );
+
+  return STATUS_SUCCESS;
+}
+
+static NTSTATUS
+thunk32_DXSOGetCompiledBitcode(void *args) {
+  struct dxso_get_compiled_bitcode_params32 *params = args;
+
+  DXSOGetCompiledBitcode(params->bitcode, UInt32ToPtr(params->data_out));
+
+  return STATUS_SUCCESS;
+}
+
+static NTSTATUS
+thunk32_DXSOCompile(void *args) {
+  struct dxso_compile_params32 *params = args;
+  struct DXSO_SHADER_COMPILATION_ARGUMENT_DATA first_arg;
+  struct DXSO_SHADER_COMPILATION_ARGUMENT_DATA32 *args32 = UInt32ToPtr(params->args);
+  dxso_compilation_argument32_convert(&first_arg, args32);
+
+  params->ret = DXSOCompile(
+      params->shader, &first_arg, UInt32ToPtr(params->func_name), UInt32ToPtr(params->bitcode)
+  );
+
+  dxso_compilation_argument32_free(&first_arg);
+
+  return STATUS_SUCCESS;
+}
+
 const void *__wine_unix_call_funcs[] = {
     &_NSObject_retain,
     &_NSObject_release,
@@ -3248,6 +3583,12 @@ const void *__wine_unix_call_funcs[] = {
     &_MTLHeap_newTexture,
     &_MTLDevice_newIndirectCommandBuffer,
     &_MTLDevice_newLibraryWithSource,
+    &thunk_DXSOInitialize,
+    &thunk_DXSODestroy,
+    &thunk_DXSOCompile,
+    &thunk_DXSOGetCompiledBitcode,
+    &thunk_DXSODestroyBitcode,
+    &_MTLTexture_usage,
 };
 
 #ifndef DXMT_NATIVE
@@ -3397,5 +3738,11 @@ const void *__wine_unix_call_wow64_funcs[] = {
     &_MTLHeap_newTexture,
     &_MTLDevice_newIndirectCommandBuffer,
     &_MTLDevice_newLibraryWithSource,
+    &thunk32_DXSOInitialize,
+    &thunk_DXSODestroy,
+    &thunk32_DXSOCompile,
+    &thunk32_DXSOGetCompiledBitcode,
+    &thunk_DXSODestroyBitcode,
+    &_MTLTexture_usage,
 };
 #endif

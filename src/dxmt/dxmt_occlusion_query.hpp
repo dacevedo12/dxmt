@@ -20,10 +20,14 @@ public:
     within_encoder = true;
   }
 
+  // draw_sample_bound is the most samples the draw about to be encoded could
+  // add to the counter (the whole render area, every sample). It only decides
+  // when to roll to a fresh slot, so an over-estimate costs a slot, never a
+  // wrong count.
   bool
-  tryGetNextWriteOffset(bool has_active_occlusion_queries, uint64_t &offset) {
+  tryGetNextWriteOffset(bool has_active_occlusion_queries, uint64_t draw_sample_bound, uint64_t &offset) {
     assert(within_encoder);
-    offset = getNextWriteOffset(has_active_occlusion_queries);
+    offset = getNextWriteOffset(has_active_occlusion_queries, draw_sample_bound);
     if (offset == previous_offset) {
       return false;
     }
@@ -65,9 +69,22 @@ public:
 
 private:
   uint64_t
-  getNextWriteOffset(bool has_active_occlusion_queries) {
+  getNextWriteOffset(bool has_active_occlusion_queries, uint64_t draw_sample_bound) {
     if (has_active_occlusion_queries) {
+      // A visibility slot counts in 32 bits, so a long enough run of draws
+      // wraps it and the query reports a count far below what it saw. Roll to
+      // a fresh slot before that can happen: the query already sums its slots
+      // in 64-bit, so the total stays exact across the roll. A clean slot
+      // carries no samples yet, hence the dirty test rather than a reset at
+      // every site that clears it.
+      if (!current_data_is_dirty)
+        slot_sample_bound = 0;
+      else if (slot_sample_bound + draw_sample_bound > 0xFFFFFFFFull) {
+        next_offset++;
+        slot_sample_bound = 0;
+      }
       current_data_is_dirty = true;
+      slot_sample_bound += draw_sample_bound;
       return next_offset;
     }
     return ~0uLL;
@@ -77,6 +94,7 @@ private:
   bool current_data_is_dirty = false;
   uint64_t previous_offset = ~0uLL;
   uint64_t next_offset = 0;
+  uint64_t slot_sample_bound = 0;
 };
 
 class VisibilityResultQuery {
@@ -125,6 +143,18 @@ public:
       start++;
     }
     seq_id_issued = seqId;
+  }
+
+  // Resolve a query whose end chunk carried no visibility results, so no
+  // readback was created to issue it: nothing to accumulate, so stamp the
+  // issued watermark to the query's own end. Must run at finish time in seq
+  // order, since an encode-time stamp would be clobbered backward by the
+  // later finish-thread issue() of an earlier, still in flight chunk that did
+  // carry results. end() already stamps the same-chunk empty window; this
+  // covers the cross-chunk case.
+  void
+  markIssuedEmpty() {
+    seq_id_issued = seq_id_end;
   }
 
   bool
@@ -187,7 +217,7 @@ public:
   uint64_t seq_id;
   uint64_t num_results;
   std::vector<Rc<VisibilityResultQuery>> queries;
-  WMTBufferInfo visibility_result_heap_info;
+  WMTBufferInfo visibility_result_heap_info = {};
   WMT::Reference<WMT::Buffer> visibility_result_heap;
 };
 
@@ -341,6 +371,11 @@ private:
 struct QueryReadbacks {
   std::unique_ptr<VisibilityResultReadback> visibility;
   std::unique_ptr<TimestampReadback> timestamp;
+  // Occlusion queries whose end chunk carried no visibility results, so no
+  // VisibilityResultReadback exists to resolve them. The queue's finish thread
+  // completion handler stamps these in seq order, after earlier chunks'
+  // readbacks have accumulated their slices.
+  std::vector<Rc<VisibilityResultQuery>> visibility_empty_ends;
 };
 
 } // namespace dxmt

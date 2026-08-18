@@ -890,6 +890,7 @@ enum WMTBlitCommandType : uint16_t {
   WMTBlitCommandCopyFromBufferToTextureWithBlitOption,
   WMTBlitCommandCopyFromTextureToBufferWithBlitOption,
   WMTBlitCommandResetCommandsInBuffer,
+  WMTBlitCommandOptimizeContentsForGPUAccess,
 };
 
 enum WMTBlitOption : uint16_t {
@@ -1021,6 +1022,15 @@ struct wmtcmd_blit_fillbuffer {
   uint64_t offset;
   uint64_t length;
   uint8_t value;
+};
+
+struct wmtcmd_blit_optimize_contents {
+  enum WMTBlitCommandType type;
+  uint16_t reserved[3];
+  struct WMTMemoryPointer next;
+  obj_handle_t texture;
+  uint32_t slice;
+  uint32_t level;
 };
 
 struct wmtcmd_blit_resolvecounters {
@@ -1216,6 +1226,9 @@ enum WMTRenderCommandType : uint16_t {
   WMTRenderCommandExecuteCommandsInBuffer,
   WMTRenderCommandSetBlendFactor,
   WMTRenderCommandSetStencilRef,
+  WMTRenderCommandSetFragmentSamplerState,
+  WMTRenderCommandSetVertexTexture,
+  WMTRenderCommandSetVertexSamplerState,
 };
 
 struct wmtcmd_render_nop {
@@ -1265,6 +1278,14 @@ struct wmtcmd_render_settexture {
   uint16_t reserved[3];
   struct WMTMemoryPointer next;
   obj_handle_t texture;
+  uint8_t index;
+};
+
+struct wmtcmd_render_setsamplerstate {
+  enum WMTRenderCommandType type;
+  uint16_t reserved[3];
+  struct WMTMemoryPointer next;
+  obj_handle_t sampler;
   uint8_t index;
 };
 
@@ -1612,6 +1633,7 @@ struct wmtcmd_render_executecommands {
 WINEMETAL_API void MTLRenderCommandEncoder_encodeCommands(obj_handle_t encoder, const struct wmtcmd_base *cmd_head);
 
 WINEMETAL_API enum WMTPixelFormat MTLTexture_pixelFormat(obj_handle_t texture);
+WINEMETAL_API enum WMTTextureUsage MTLTexture_usage(obj_handle_t texture);
 WINEMETAL_API uint64_t MTLTexture_width(obj_handle_t texture);
 WINEMETAL_API uint64_t MTLTexture_height(obj_handle_t texture);
 WINEMETAL_API uint64_t MTLTexture_depth(obj_handle_t texture);

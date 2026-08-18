@@ -1,6 +1,7 @@
 #pragma once
 
 #include "air_signature.hpp"
+#include "airconv_public.h"
 #include "air_type.hpp"
 #include "monad.hpp"
 #include "nt/air_builder.hpp"
@@ -86,6 +87,10 @@ enum class MTLAttributeFormat {
   Half = 53,
   FloatRG11B10 = 54,
   FloatRGB9E5 = 55,
+  // D3DDECLTYPE_UDEC3, whose three 10-bit channels are unsigned and NOT
+  // normalized. Defined once in airconv_public.h beside the element struct
+  // that carries it, since the host side sets it and this side consumes it.
+  UInt1010102 = DXSO_ATTR_FORMAT_UDEC3,
 };
 
 AIRBuilderResult pull_vec4_from_addr(

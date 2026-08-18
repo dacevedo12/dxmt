@@ -20,6 +20,7 @@
 #include "dxmt_format.hpp"
 #include "thread.hpp"
 #include "util_likely.hpp"
+#include "util_env.hpp"
 #include "util_math.hpp"
 #include "wsi_platform.hpp"
 #include <cassert>
@@ -160,7 +161,7 @@ Buffer::allocate(Flags<BufferAllocationFlag> flags) {
   if (flags.test(BufferAllocationFlag::GpuManaged)) {
     options |= WMTResourceStorageModeManaged;
   }
-  WMTBufferInfo info;
+  WMTBufferInfo info = {};
   info.memory.set(0);
   info.length = length_;
   info.options = options;

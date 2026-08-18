@@ -969,6 +969,14 @@ WMTGetOSVersion(uint64_t *major, uint64_t *minor, uint64_t *patch) {
     *patch = params.ret_patch;
 }
 
+WINEMETAL_API enum WMTTextureUsage
+MTLTexture_usage(obj_handle_t texture) {
+  struct unixcall_generic_obj_uint64_ret params;
+  params.handle = texture;
+  UNIX_CALL(150, &params);
+  return (enum WMTTextureUsage)params.ret;
+}
+
 WINEMETAL_API obj_handle_t
 MTLDevice_newBinaryArchive(obj_handle_t device, const char *url, obj_handle_t *err_out) {
   struct unixcall_mtldevice_newbinaryarchive params;

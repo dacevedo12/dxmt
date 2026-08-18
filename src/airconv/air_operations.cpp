@@ -162,11 +162,20 @@ AIRBuilderResult unpack_fvec4_from_addr(
     dst_type = types._float4;
     break;
   case MTLAttributeFormat::Int1010102Normalized:
-    assert(0 && "unused");
-    // op = "unorm.rgb10a2.v4f32";
-    // src_type = types._int;
-    // align = 4;
-    // dst_type = types._float4;
+    // D3DDECLTYPE_DEC3N: signed 10-10-10 normalized plus a 2-bit signed w, and
+    // D3DDTCAPS_DEC3N is advertised, so a title may use it. Left unreachable
+    // this fell through with an empty op and null operand types, which in a
+    // release build (where the assert is a no-op) emitted an undefined air.unpack
+    // intrinsic: garbage vertex IR for anything packing normals or tangents
+    // here, with no diagnostic. The signed sibling of the unsigned path above;
+    // __metal_unpack_snorm_rgb10a2 is in the Metal stdlib, so there is no
+    // undefined symbol at metallib link. DXVK maps DEC3N to
+    // A2B10G10R10_SNORM_PACK32 and wined3d to R10G10B10X2_SNORM, both signed
+    // normalized, so the channel order needs no shuffle.
+    op = "snorm.rgb10a2.v4f32";
+    src_type = types._int;
+    align = 4;
+    dst_type = types._float4;
     break;
   case MTLAttributeFormat::FloatRG11B10:
     op = "unorm.rg11b10f.v3f32";
@@ -193,6 +202,14 @@ AIRBuilderResult unpack_fvec4_from_addr(
   );
   if (format == MTLAttributeFormat::UChar4Normalized_BGRA) {
     ret = builder.CreateShuffleVector(ret, {2, 1, 0, 3});
+  }
+  if (format == MTLAttributeFormat::Int1010102Normalized) {
+    // D3DDECLTYPE_DEC3N expands to (x, y, z, 1). Its two high bits are not a w
+    // channel: both references declare three components and mark the fourth
+    // unused. Metal's unpack has no way to know that and hands back the 2-bit
+    // field, so put the D3D9 default there. The x, y and z lanes need nothing:
+    // D3D9 normalizes by 511 and so does Metal's 10-bit signed rule.
+    ret = builder.CreateInsertElement(ret, co_yield get_float(1), (int)3);
   }
   if (dst_type == types._float) {
     ret = builder.CreateInsertElement(
@@ -417,6 +434,32 @@ AIRBuilderResult pull_vec4_from_addr_checked(
     value = builder.CreateShuffleVector(value, {0, 1, 2, -1});
     value = builder.CreateInsertElement(value, co_yield get_int(1), (int)3);
     break;
+  case MTLAttributeFormat::UInt1010102: {
+    // D3DDECLTYPE_UDEC3: three unsigned 10-bit integers expanded to
+    // (x, y, z, 1), NOT normalized, so the bits arrive as a plain word and the
+    // channels shift out here. The caller's integer to float conversion then
+    // presents them the way D3D9 does, the same route UBYTE4 takes.
+    //
+    // Unpacking as unorm and scaling by 1023 would look equivalent and is not:
+    // it divides and remultiplies in float, and the canonical payload here is a
+    // blend index that a consumer truncates, so a result a fraction below the
+    // integer selects the wrong bone. The two high bits are not a w channel;
+    // both references treat the fourth channel as unused, so w is the constant 1.
+    pvalue bits = co_yield load_from_device_buffer(
+      types._int, base_addr, byte_offset, 0, 4
+    );
+    value = builder.CreateInsertElement(
+      llvm::PoisonValue::get(types._int4), builder.CreateAnd(bits, 0x3ffu), (int)0
+    );
+    value = builder.CreateInsertElement(
+      value, builder.CreateAnd(builder.CreateLShr(bits, 10), 0x3ffu), (int)1
+    );
+    value = builder.CreateInsertElement(
+      value, builder.CreateAnd(builder.CreateLShr(bits, 20), 0x3ffu), (int)2
+    );
+    value = builder.CreateInsertElement(value, co_yield get_int(1), (int)3);
+    break;
+  }
   case MTLAttributeFormat::UInt4:
   case MTLAttributeFormat::Int4:
     value = co_yield load_from_device_buffer(

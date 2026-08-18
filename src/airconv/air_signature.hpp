@@ -514,6 +514,13 @@ struct InputPrimitiveID {};
 struct InputFrontFacing {};
 struct InputInputCoverage {};
 struct InputSampleIndex {};
+// Fragment-stage [[point_coord]]: float2 with the rasterizer-derived
+// UV of the current pixel within a point primitive (D3DPT_POINTLIST
+// with D3DRS_POINTSPRITEENABLE). Defined unconditionally on the PS
+// signature when point_sprite variant compilation is requested;
+// dxso_compile substitutes PS TEXCOORD<N> input reads with float4(
+// point_coord.x, point_coord.y, 0, 1) under the same flag.
+struct InputPointCoord {};
 
 struct InputPayload {
   uint32_t size;
@@ -594,7 +601,7 @@ using FunctionInput = template_concat_t<
     InputVertexStageIn,
     /* fragment */
     InputPrimitiveID, InputViewportArrayIndex, InputRenderTargetArrayIndex,
-    InputFrontFacing, InputPosition, InputSampleIndex, //
+    InputFrontFacing, InputPosition, InputSampleIndex, InputPointCoord, //
     InputFragmentStageIn, InputInputCoverage,
     /* object & mesh */
     InputPayload, InputMeshGridProperties, InputMesh,
@@ -605,7 +612,7 @@ using FunctionInput = template_concat_t<
 
 using FunctionOutput = std::variant<
   /* vertex */
-  OutputVertex, OutputPosition, OutputClipDistance,
+  OutputVertex, OutputPosition, OutputClipDistance, OutputPointSize,
   OutputRenderTargetArrayIndex, OutputViewportArrayIndex,
   /* fragment */
   OutputRenderTarget, OutputDepth, OutputCoverageMask, OutputStencilRef>;

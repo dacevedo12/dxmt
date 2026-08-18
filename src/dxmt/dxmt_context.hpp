@@ -113,12 +113,14 @@ enum class EncoderType {
   Blit,
   Clear,
   Resolve,
+  StretchBlit,
   Present,
   SpatialUpscale,
   SignalEvent,
   TemporalUpscale,
   WaitForEvent,
   SampleTimestamp,
+  ResolveTimestamp,
 };
 
 struct EncoderData {
@@ -242,6 +244,34 @@ struct ClearEncoderData : EncoderData {
 struct ResolveEncoderData : EncoderData {
   TextureViewRef src;
   TextureViewRef dst;
+  WMT::RenderPipelineState pso;
+  std::optional<WMTScissorRect> src_rect;
+  WMTOrigin dst_origin;
+  WMTSize resolve_size;
+  // Destination is a single-sample depth target reached through a depth
+  // attachment + depth-write pipeline rather than a colour one (see the
+  // Resolve case in the encoder executor).
+  bool is_depth = false;
+};
+
+// Render-pass sample/store blit for StretchRect when the fast blit-copy
+// path doesn't fit (size mismatch or format aliases that share storage
+// but use distinct Metal pixel formats). The PSO is built from
+// vs_blit_quad / fs_blit_quad (dxmt_command.metal); the fragment stage
+// samples `src` with `sampler` at slot 0 over the normalized sub-rect
+// `src_uv_origin` + `src_uv_size`. Viewport is set to (dst_origin,
+// dst_size) on the encoder side. Sibling of ResolveEncoderData: same
+// shape, different sampler-shaped shader.
+struct StretchBlitEncoderData : EncoderData {
+  TextureViewRef src;
+  TextureViewRef dst;
+  WMT::RenderPipelineState pso;
+  WMT::SamplerState sampler;
+  // Normalized [0,1] sub-rect within the bound source texture/view.
+  float src_uv_origin[2];
+  float src_uv_size[2];
+  WMTOrigin dst_origin;
+  WMTSize dst_size;
 };
 
 class Presenter;
@@ -354,6 +384,19 @@ public:
     auto allocation = buffer->current();
     trackBuffer<stage>(allocation, flags);
     return {allocation, allocation->currentSuballocationOffset()};
+  }
+
+  // Track a specific allocation captured at draw-record time rather than
+  // re-reading current(). A BUFFER-mode buffer renames on Lock(DISCARD),
+  // so the calling thread freezes the allocation per draw and both the
+  // binding and this fence tracking must reference that same frozen
+  // allocation; re-reading current() on the encode thread would track a
+  // later rename.
+  template<PipelineStage stage = PipelineStage::Compute>
+  std::pair<BufferAllocation *, uint64_t>
+  access(Rc<BufferAllocation> const &allocation, unsigned offset, unsigned length, int flags) {
+    trackBuffer<stage>(allocation.ptr(), flags);
+    return {allocation.ptr(), allocation->currentSuballocationOffset()};
   }
 
   template<PipelineStage stage = PipelineStage::Compute>
@@ -673,9 +716,63 @@ public:
       Rc<Texture> &input, Rc<Texture> &output, Rc<Texture> &depth, Rc<Texture> &motion_vector, TextureViewKey mvViewId,
       Rc<Texture> &exposure, Rc<TemporalScaler> &scaler, const WMTFXTemporalScalerProps &props
   );
+  // Depth variant of the shader resolve: the destination is a single-sample depth
+  // target driven through a depth attachment and a depth-write pipeline (the
+  // multisampled source binds as a fragment depth texture), so it needs its own
+  // render-pass shape rather than the colour path above.
+  void resolveDepthTexture(
+      Rc<Texture> &&src, TextureViewKey src_view, Rc<Texture> &&dst, TextureViewKey dst_view,
+      WMT::RenderPipelineState pso, std::optional<WMTScissorRect> src_rect, WMTOrigin dst_origin,
+      WMTSize resolve_size
+  );
+  // Stretch-blit via render-pass sample/store. The caller (typically
+  // StretchBlitContext) supplies the PSO + sampler; this method computes
+  // normalized uv from pixel-space src_origin/src_size against the bound
+  // src texture's level dimensions and records the encoder data. The
+  // execute-time encoder body lives in EncoderType::StretchBlit's case
+  // in the main encoder dispatch loop.
+  void stretchBlit(
+      Rc<Texture> &&src, TextureViewKey src_view, Rc<Texture> &&dst, TextureViewKey dst_view,
+      WMT::RenderPipelineState pso, WMT::SamplerState sampler,
+      WMTOrigin src_origin, WMTSize src_size,
+      WMTOrigin dst_origin, WMTSize dst_size
+  );
+
+  // Blit-encoder 1:1 texture-to-texture copy of one subresource region, in its
+  // own blit pass. Matched sample count (single-sample or MSAA alike, unlike the
+  // sampler-based stretchBlit which cannot source an MSAA texture), matched
+  // format. The access(src, Read) + access(dst, Write) register the pass in the
+  // fence trackers so the encoder scheduler orders it against prior/later readers
+  // and writers of the same subresource. Same primitive as the d3d9 StretchRect
+  // Copy path (EmitBlitOp_d9).
+  void copyTexture(
+      const Rc<Texture> &src, unsigned src_level, unsigned src_slice, WMTOrigin src_origin,
+      const Rc<Texture> &dst, unsigned dst_level, unsigned dst_slice, WMTOrigin dst_origin,
+      WMTSize size
+  );
+
+  // optimizeContentsForGPUAccess on one texture subresource, as its own blit
+  // pass. A DEFAULT-pool (Private, GPU-optimized) texture written by a blit or
+  // fill can be left in a GPU-compressed layout that a render-pass sampler
+  // misreads; this re-tiles that subresource for GPU access so a subsequent
+  // sample (the StretchRect render-pass scale) reads the real texels. The Metal
+  // analogue of Vulkan's TRANSFER_DST -> SHADER_READ_ONLY transition. It is a
+  // no-op when the contents are already GPU-optimal (e.g. a render-written
+  // source), so the scaled-blit path issues it unconditionally rather than
+  // tracking each source's last-write kind.
+  void optimizeTextureForGPUAccess(const Rc<Texture> &texture, unsigned level, unsigned slice);
 
   void signalEvent(uint64_t value);
   void signalEvent(WMT::Reference<WMT::Event> &&event, uint64_t value);
+  // Handle-only variant: keeps the retain (one wine_unix_call) off
+  // the calling thread by deferring the Reference construction to the
+  // encode-thread emit. Use it when the event lifetime is owned by an
+  // outer object that outlives every chunk that ends up signalling it
+  // (e.g. the d3d9 device's m_completionEvent across its own chunks).
+  // Named distinctly from the Reference overload because
+  // WMT::Reference<WMT::Event> implicitly converts to obj_handle_t,
+  // which would make `signalEvent(std::move(ref), v)` ambiguous.
+  void signalEventByHandle(obj_handle_t event_handle, uint64_t value);
   void waitEvent(WMT::Reference<WMT::Event> &&event, uint64_t value);
 
   uint64_t
@@ -687,7 +784,11 @@ public:
   void clearDepthStencil(
       Rc<Texture> &&texture, uint64_t viewId, unsigned arrayLength, unsigned flag, float depth, uint8_t stencil
   );
-  void resolveTexture(Rc<Texture> &&src, TextureViewKey src_view, Rc<Texture> &&dst, TextureViewKey dst_view);
+  void resolveTexture(
+      Rc<Texture> &&src, TextureViewKey src_view, Rc<Texture> &&dst, TextureViewKey dst_view,
+      WMT::RenderPipelineState pso = {}, std::optional<WMTScissorRect> src_rect = std::nullopt,
+      WMTOrigin dst_origin = {}, WMTSize resolve_size = {}
+  );
 
   RenderEncoderData *startRenderPass(
       uint8_t dsv_planar_flags, uint8_t dsv_readonly_flags, uint8_t render_target_count, uint64_t argument_buffer_size
@@ -832,6 +933,8 @@ public:
   InternalCommandLibrary &lib;
   EmulatedCommandContext emulated_cmd;
   ClearRenderTargetContext clear_rt_cmd;
+  ResolveTextureContext resolve_texture_cmd;
+  StretchBlitContext stretch_blit_cmd;
   DepthStencilBlitContext blit_depth_stencil_cmd;
   ClearUAV<ArgumentEncodingContext> clear_uav_cmd;
   MTLFXMVScaleContext mv_scale_cmd;
@@ -868,7 +971,7 @@ private:
   WMTSamplerInfo dummy_sampler_info_;
   WMT::Reference<WMT::Buffer> dummy_cbuffer_;
   void *dummy_cbuffer_host_;
-  WMTBufferInfo dummy_cbuffer_info_;
+  WMTBufferInfo dummy_cbuffer_info_ = {};
 
   EncoderData encoder_head = {EncoderType::Null, nullptr, ~0ull};
   EncoderData *encoder_last = &encoder_head;
@@ -876,6 +979,9 @@ private:
   unsigned encoder_count_ = 0;
   
   uint64_t encoder_id_ = kParityLane; // actually important to not start from 0
+  // First encoder id of the command buffer being encoded. Ids below it belong
+  // to command buffers whose fence bindings are already gone, so nothing can be
+  // emitted for them; see FenceSet::pruneBefore.
   std::array<WMT::Reference<WMT::Fence>, kParityLane> fence_pool_;
   FenceLocalityCheck fence_locality_;
 
@@ -920,6 +1026,9 @@ private:
 
   WMT::Device device_;
   CommandQueue& queue_;
+  bool persistent_residency_retired_ = false;
+  // Depth-write-always state for the depth resolve pass; created on first use.
+  WMT::Reference<WMT::DepthStencilState> depth_resolve_dss_;
 };
 
 template <>

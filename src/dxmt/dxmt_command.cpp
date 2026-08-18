@@ -1,3 +1,4 @@
+#include <cfloat>
 #include "dxmt_command.hpp"
 #include "Metal.hpp"
 #include "dxmt_context.hpp"
@@ -144,10 +145,12 @@ ClearRenderTargetContext::begin(Rc<Texture> texture, TextureViewKey view) {
   // enforce array render target for now
   view = texture->checkViewUseArray(view, true);
 
-  if (!pso_cache_.contains(format)) {
+  auto sample_count = texture->sampleCount();
+  uint64_t pso_key = (uint64_t(format) << 8) | (uint64_t(sample_count) & 0xffu);
+  if (!pso_cache_.contains(pso_key)) {
     WMTRenderPipelineInfo pipeline_info;
     WMT::InitializeRenderPipelineInfo(pipeline_info);
-    pipeline_info.raster_sample_count = texture->sampleCount();
+    pipeline_info.raster_sample_count = sample_count;
     pipeline_info.vertex_function = vs_clear_;
     if (dsv_flag) {
       pipeline_info.fragment_function = fs_clear_depth_;
@@ -169,10 +172,10 @@ ClearRenderTargetContext::begin(Rc<Texture> texture, TextureViewKey view) {
     if (pso == nullptr) {
       ERR("Failed to create ClearRenderTarget PSO of format ", format, ": ", err.description().getUTF8String());
     }
-    pso_cache_.emplace(format, std::move(pso));
+    pso_cache_.emplace(pso_key, std::move(pso));
   }
 
-  WMT::RenderPipelineState pso = pso_cache_.at(format);
+  WMT::RenderPipelineState pso = pso_cache_.at(pso_key);
 
   if (!pso)
     return;
@@ -585,6 +588,166 @@ TileBarrierContext::getPSO(TileBarrierPSOKey &key) {
   }
 
   return psos_.emplace(key, std::move(pso)).first->second;
+}
+
+
+ResolveTextureContext::ResolveTextureContext(
+    WMT::Device device, InternalCommandLibrary &lib, ArgumentEncodingContext &ctx
+) :
+    ctx_(ctx),
+    device_(device) {
+  auto library = lib.getLibrary();
+  vs_resolve_ = library.newFunction("vs_resolve_msaa");
+  fs_resolve_average_ = library.newFunction("fs_resolve_msaa_average");
+  fs_resolve_depth_ = library.newFunction("fs_resolve_msaa_depth");
+}
+
+WMT::RenderPipelineState
+ResolveTextureContext::getPSO(WMTPixelFormat format, ResolveTextureMode mode) {
+  PSOKey key = {format, mode};
+  auto cached = psos_.find(key);
+  if (cached != psos_.end())
+    return cached->second;
+
+  WMT::Function fs = {};
+  switch (mode) {
+  case ResolveTextureMode::Average:
+    fs = fs_resolve_average_;
+    break;
+  case ResolveTextureMode::DepthPoint:
+    fs = fs_resolve_depth_;
+    break;
+  }
+
+  WMTRenderPipelineInfo info;
+  WMT::InitializeRenderPipelineInfo(info);
+  info.vertex_function = vs_resolve_;
+  info.fragment_function = fs;
+  // The depth resolve writes a depth attachment and carries no colour target; the
+  // colour modes are the reverse.
+  if (mode == ResolveTextureMode::DepthPoint)
+    info.depth_pixel_format = format;
+  else
+    info.colors[0].pixel_format = format;
+  info.rasterization_enabled = true;
+  info.input_primitive_topology = WMTPrimitiveTopologyClassTriangle;
+
+  WMT::Reference<WMT::Error> error;
+  auto pso = device_.newRenderPipelineState(info, error);
+  if (!pso) {
+    WARN("Failed to create ResolveTexture PSO of format ", format, ": ",
+         error ? error.description().getUTF8String() : "unknown error");
+  }
+  auto [entry, _] = psos_.emplace(key, std::move(pso));
+  return entry->second;
+}
+
+void
+ResolveTextureContext::resolve(
+    Rc<Texture> src, TextureViewKey src_view, Rc<Texture> dst, TextureViewKey dst_view,
+    ResolveTextureMode mode, std::optional<WMTScissorRect> src_rect,
+    WMTOrigin dst_origin, WMTSize resolve_size
+) {
+  auto pso = getPSO(dst->pixelFormat(dst_view), mode);
+  if (!pso)
+    return;
+  ctx_.resolveTexture(
+      std::move(src), src_view, std::move(dst), dst_view, pso,
+      src_rect, dst_origin, resolve_size);
+}
+
+void
+ResolveTextureContext::resolveDepth(
+    Rc<Texture> src, TextureViewKey src_view, Rc<Texture> dst, TextureViewKey dst_view,
+    std::optional<WMTScissorRect> src_rect, WMTOrigin dst_origin, WMTSize resolve_size
+) {
+  auto pso = getPSO(dst->pixelFormat(dst_view), ResolveTextureMode::DepthPoint);
+  if (!pso)
+    return;
+  ctx_.resolveDepthTexture(
+      std::move(src), src_view, std::move(dst), dst_view, pso,
+      src_rect, dst_origin, resolve_size);
+}
+
+StretchBlitContext::StretchBlitContext(
+    WMT::Device device, InternalCommandLibrary &lib, ArgumentEncodingContext &ctx
+) :
+    ctx_(ctx),
+    device_(device) {
+  auto library = lib.getLibrary();
+  vs_blit_ = library.newFunction("vs_blit_quad");
+  fs_blit_ = library.newFunction("fs_blit_quad");
+}
+
+WMT::RenderPipelineState
+StretchBlitContext::getPSO(WMTPixelFormat dst_format, uint32_t sample_count) {
+  uint64_t key = (uint64_t(dst_format) << 8) | (uint64_t(sample_count) & 0xffu);
+  auto cached = psos_.find(key);
+  if (cached != psos_.end())
+    return cached->second;
+
+  WMTRenderPipelineInfo info;
+  WMT::InitializeRenderPipelineInfo(info);
+  info.vertex_function = vs_blit_;
+  info.fragment_function = fs_blit_;
+  info.colors[0].pixel_format = dst_format;
+  // Matches the render pass raster count (D3-O2 single -> multisample broadcast);
+  // 1 for the common single-sample destination, unchanged.
+  info.raster_sample_count = sample_count;
+  info.rasterization_enabled = true;
+  info.input_primitive_topology = WMTPrimitiveTopologyClassTriangle;
+
+  WMT::Reference<WMT::Error> error;
+  auto pso = device_.newRenderPipelineState(info, error);
+  if (!pso) {
+    WARN("Failed to create StretchBlit PSO of format ", dst_format, " samples ", sample_count, ": ",
+         error ? error.description().getUTF8String() : "unknown error");
+  }
+  auto [entry, _] = psos_.emplace(key, std::move(pso));
+  return entry->second;
+}
+
+WMT::SamplerState
+StretchBlitContext::getSampler(Filter filter) {
+  auto &slot = (filter == Filter::Linear) ? sampler_linear_ : sampler_point_;
+  if (slot)
+    return slot;
+  WMTSamplerInfo info{};
+  info.min_filter = (filter == Filter::Linear)
+                        ? WMTSamplerMinMagFilterLinear
+                        : WMTSamplerMinMagFilterNearest;
+  info.mag_filter = info.min_filter;
+  info.mip_filter = WMTSamplerMipFilterNotMipmapped;
+  info.r_address_mode = WMTSamplerAddressModeClampToEdge;
+  info.s_address_mode = WMTSamplerAddressModeClampToEdge;
+  info.t_address_mode = WMTSamplerAddressModeClampToEdge;
+  info.border_color = WMTSamplerBorderColorTransparentBlack;
+  info.compare_function = WMTCompareFunctionNever;
+  info.lod_min_clamp = 0.0f;
+  info.lod_max_clamp = FLT_MAX;
+  info.max_anisotroy = 1;
+  info.normalized_coords = true;
+  info.lod_average = false;
+  info.support_argument_buffers = false;
+  slot = device_.newSamplerState(info);
+  return slot;
+}
+
+void
+StretchBlitContext::blit(
+    Rc<Texture> src, TextureViewKey src_view, Rc<Texture> dst, TextureViewKey dst_view,
+    Filter filter, WMTOrigin src_origin, WMTSize src_size,
+    WMTOrigin dst_origin, WMTSize dst_size
+) {
+  auto pso = getPSO(dst->pixelFormat(dst_view), dst->sampleCount());
+  if (!pso)
+    return;
+  auto sampler = getSampler(filter);
+  if (!sampler)
+    return;
+  ctx_.stretchBlit(
+      std::move(src), src_view, std::move(dst), dst_view, pso, sampler,
+      src_origin, src_size, dst_origin, dst_size);
 }
 
 } // namespace dxmt

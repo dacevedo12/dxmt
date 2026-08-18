@@ -17,6 +17,8 @@
  */
 
 #include "dxmt_texture.hpp"
+#include "dxmt_format.hpp"
+#include "log/log.hpp"
 #include "dxmt_residency.hpp"
 #include "wsi_platform.hpp"
 #include <atomic>
@@ -43,26 +45,77 @@ TextureView::TextureView(TextureAllocation *allocation) :
     allocation(allocation),
     key(allocation->descriptor->fullView) {}
 
+static bool
+IsDefaultTextureSwizzle(WMTTextureSwizzleChannels swizzle) {
+  return swizzle.r == WMTTextureSwizzleRed && swizzle.g == WMTTextureSwizzleGreen &&
+         swizzle.b == WMTTextureSwizzleBlue && swizzle.a == WMTTextureSwizzleAlpha;
+}
+
 TextureView::TextureView(TextureAllocation *allocation, unsigned index, TextureViewDescriptor descriptor) :
     gpuResourceID(0),
     allocation(allocation),
     key(descriptor, index, allocation->descriptor->miplevelCount()) {
   auto parent = allocation->texture();
-  texture = parent.newTextureView(
-      descriptor.format, descriptor.type, descriptor.firstMiplevel, descriptor.miplevelCount,
-      descriptor.firstArraySlice, descriptor.arraySize,
-      {WMTTextureSwizzleRed, WMTTextureSwizzleGreen, WMTTextureSwizzleBlue, WMTTextureSwizzleAlpha}, gpuResourceID
+  auto parent_format = parent ? parent.pixelFormat() : WMTPixelFormatInvalid;
+  auto view_format = descriptor.format;
+  // Metal has no block-compressed sRGB view of a non-sRGB parent, so a shader
+  // read of one samples the parent and lets the sampler apply the transfer
+  // function. A view that covers the whole parent can be the parent itself.
+  bool compressed_srgb_srv =
+      !(descriptor.intendedUsage & WMTTextureUsageRenderTarget) &&
+      IsBlockCompressionFormat(descriptor.format) &&
+      Is_sRGBVariant(descriptor.format) &&
+      Forget_sRGB(descriptor.format) == parent_format;
+  bool full_parent_view =
+      compressed_srgb_srv &&
+      descriptor.type == allocation->descriptor->textureType() &&
+      descriptor.firstMiplevel == 0 &&
+      descriptor.miplevelCount == allocation->descriptor->miplevelCount() &&
+      descriptor.firstArraySlice == 0 &&
+      descriptor.arraySize == allocation->descriptor->arrayLength() &&
+      IsDefaultTextureSwizzle(descriptor.swizzle);
+
+  if (compressed_srgb_srv) {
+    view_format = parent_format;
+    if (full_parent_view) {
+      texture = parent;
+      gpuResourceID = allocation->gpuResourceID;
+      return;
+    }
+  }
+
+  auto view = parent.newTextureView(
+      view_format, descriptor.type, descriptor.firstMiplevel, descriptor.miplevelCount,
+      descriptor.firstArraySlice, descriptor.arraySize, descriptor.swizzle, gpuResourceID
   );
+  // newTextureView can drop the render-target bit. Where the view is a plain
+  // whole-resource alias of a parent that carries it, the parent renders what
+  // the view would have.
+  auto parent_usage = parent ? parent.usage() : WMTTextureUsageUnknown;
+  auto view_usage = view ? view.usage() : WMTTextureUsageUnknown;
+  if ((descriptor.intendedUsage & WMTTextureUsageRenderTarget) && view &&
+      !(view_usage & WMTTextureUsageRenderTarget) && parent &&
+      (parent_usage & WMTTextureUsageRenderTarget) &&
+      parent.pixelFormat() == view.pixelFormat() &&
+      descriptor.firstMiplevel == 0 && descriptor.firstArraySlice == 0) {
+    texture = parent;
+    gpuResourceID = allocation->gpuResourceID;
+    return;
+  }
+  texture = std::move(view);
+  if ((descriptor.intendedUsage & WMTTextureUsageRenderTarget) && !(view_usage & WMTTextureUsageRenderTarget))
+    WARN("texture view lost render target usage: view=", uint64_t(key), " format=", uint32_t(descriptor.format));
 }
 
 TextureAllocation::TextureAllocation(
     Texture *descriptor, WMT::Reference<WMT::Buffer> &&buffer, void *mapped_buffer, const WMTTextureInfo &info,
-    unsigned bytes_per_row, Flags<TextureAllocationFlag> flags
+    unsigned bytes_per_row, Flags<TextureAllocationFlag> flags, bool externally_owned_memory
 ) :
     descriptor(descriptor),
     mappedMemory(mapped_buffer),
     buffer_(std::move(buffer)),
-    flags_(flags) {
+    flags_(flags),
+    externally_owned_memory_(externally_owned_memory) {
   auto info_copy = info;
   obj_ = buffer_.newTexture(info_copy, 0, bytes_per_row);
 
@@ -90,9 +143,11 @@ TextureAllocation::TextureAllocation(
 
 void
 TextureAllocation::free(){
-#ifdef __i386__
-  wsi::aligned_free(mappedMemory);
-#endif
+  // Freed on every architecture, because wrapBuffer's caller allocates the
+  // host page itself and hands it over as owner of record. Where Metal owns
+  // the backing instead, mappedMemory is null and the free is a no-op.
+  if (!externally_owned_memory_)
+    wsi::aligned_free(mappedMemory);
   delete this;
 };
 
@@ -144,6 +199,7 @@ Texture::Texture(const WMTTextureInfo &descriptor, WMT::Device device) :
       .miplevelCount = info_.mipmap_level_count,
       .firstArraySlice = 0,
       .arraySize = arrayLength(),
+      .intendedUsage = info_.usage,
   });
   version_ = 1;
   fullView = TextureViewKey(viewDescriptors_[0], 0, info_.mipmap_level_count);
@@ -168,6 +224,7 @@ Texture::Texture(
       .miplevelCount = 1,
       .firstArraySlice = 0,
       .arraySize = 1,
+      .intendedUsage = info_.usage,
   });
   version_ = 1;
   fullView = TextureViewKey(viewDescriptors_[0], 0, info_.mipmap_level_count);
@@ -175,7 +232,10 @@ Texture::Texture(
 
 Rc<TextureAllocation>
 Texture::allocate(Flags<TextureAllocationFlag> flags) {
-  WMTResourceOptions options = WMTResourceHazardTrackingModeUntracked;
+  // Metal's default tracking, not Untracked. A render to texture followed by
+  // a sample from it in a later encoder needs a barrier that Untracked mode
+  // does not insert.
+  WMTResourceOptions options = (WMTResourceOptions)0;
   WMTTextureInfo info = info_; // copy
   info.mach_port = 0;
   if (flags.test(TextureAllocationFlag::CpuWriteCombined)) {
@@ -204,9 +264,44 @@ Texture::allocate(Flags<TextureAllocationFlag> flags) {
 }
 
 Rc<TextureAllocation>
+Texture::wrapBuffer(
+    WMT::Reference<WMT::Buffer> buffer, void *mapped, Flags<TextureAllocationFlag> flags
+) {
+  // Only valid for buffer-backed Textures (constructed with the
+  // bytes_per_image/bytes_per_row ctor): the bytes_per_row is what
+  // newTexture-on-buffer uses to lay out the texture view.
+  assert(bytes_per_image_ != 0);
+  // Mirror allocate()'s flag→options mapping so the WMTTextureInfo we
+  // pass to TextureAllocation matches the WMTResourceOptions the
+  // caller's newBuffer was already configured with. Untracked is not
+  // exposed here for the same reason as allocate(): d3d9's buffer-
+  // backed path samples after blit-encoder generateMipmaps /
+  // replaceRegion, which needs the Tracked default barrier.
+  WMTResourceOptions options = (WMTResourceOptions)0;
+  if (flags.test(TextureAllocationFlag::CpuWriteCombined))
+    options |= WMTResourceOptionCPUCacheModeWriteCombined;
+  if (flags.test(TextureAllocationFlag::CpuInvisible))
+    options |= WMTResourceStorageModePrivate;
+  if (flags.test(TextureAllocationFlag::GpuManaged))
+    options |= WMTResourceStorageModeManaged;
+  WMTTextureInfo info = info_;
+  info.mach_port = 0;
+  info.options = options;
+  // externally_owned_memory_ stays false (default): the allocation
+  // takes ownership of `mapped` and frees it unconditionally in the dtor.
+  // Pool-style donation back to the caller is unsafe so long as
+  // in-flight chunks may still retain this allocation via the chunk
+  // ref_tracker: that's precisely the lifetime gap this whole
+  // refactor closes. A future hook on TextureAllocation destruction
+  // (which fires after the last ref_tracker release) can re-introduce
+  // donation safely; doing it from MTLD3D9Texture's dtor cannot.
+  return new TextureAllocation(this, std::move(buffer), mapped, info, bytes_per_row_, flags);
+}
+
+Rc<TextureAllocation>
 Texture::import(mach_port_t mach_port) {
   Flags<TextureAllocationFlag> flags;
-  WMTTextureInfo info;
+  WMTTextureInfo info = {};
   info.mach_port = mach_port;
   auto texture = device_.newSharedTexture(info);
   // now allocation's info is populated
@@ -297,6 +392,38 @@ TextureViewKey Texture::checkViewUseFormat(TextureViewKey key, WMTPixelFormat fo
   if (unlikely(view.format != format)) {
     auto new_view_desc = view;
     new_view_desc.format = format;
+    return createView(new_view_desc);
+  }
+  return key;
+}
+
+TextureViewKey Texture::checkViewUseSwizzle(TextureViewKey key, WMTTextureSwizzleChannels swizzle) {
+  std::shared_lock<dxmt::shared_mutex> shared_lock(mutex_);
+  auto view = viewDescriptors_[key.index];
+  shared_lock = {};
+  if (unlikely(
+          view.swizzle.r != swizzle.r || view.swizzle.g != swizzle.g || view.swizzle.b != swizzle.b ||
+          view.swizzle.a != swizzle.a
+      )) {
+    auto new_view_desc = view;
+    new_view_desc.swizzle = swizzle;
+    // A swizzled view exists to be sampled; drop the render-target intent
+    // so TextureView's lost-RT workaround never substitutes the parent
+    // texture (which would silently discard the swizzle).
+    new_view_desc.intendedUsage = WMTTextureUsage(new_view_desc.intendedUsage & ~WMTTextureUsageRenderTarget);
+    return createView(new_view_desc);
+  }
+  return key;
+}
+
+TextureViewKey Texture::checkViewUseMipRange(TextureViewKey key, uint32_t firstMiplevel, uint32_t miplevelCount) {
+  std::shared_lock<dxmt::shared_mutex> shared_lock(mutex_);
+  auto view = viewDescriptors_[key.index];
+  shared_lock = {};
+  if (unlikely(view.firstMiplevel != firstMiplevel || view.miplevelCount != miplevelCount)) {
+    auto new_view_desc = view;
+    new_view_desc.firstMiplevel = firstMiplevel;
+    new_view_desc.miplevelCount = miplevelCount;
     return createView(new_view_desc);
   }
   return key;

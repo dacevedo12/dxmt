@@ -1,0 +1,14 @@
+LIBRARY D3D9.DLL
+EXPORTS
+    Direct3DCreate9 @16
+    Direct3DCreate9Ex @20
+    D3DPERF_BeginEvent @23
+    D3DPERF_EndEvent @24
+    D3DPERF_GetStatus @25
+    D3DPERF_QueryRepeatFrame @26
+    D3DPERF_SetMarker @27
+    D3DPERF_SetOptions @28
+    D3DPERF_SetRegion @29
+    DebugSetLevel @30
+    DebugSetMute @31
+    Direct3DShaderValidatorCreate9 @32

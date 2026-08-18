@@ -2,10 +2,15 @@
 #include "Metal.hpp"
 #include "thread.hpp"
 #include "airconv_public.h"
+#include <string>
 
 namespace dxmt {
 
 constexpr int kDXMTShaderCacheVersion = AIRCONV_VERSION;
+
+// Base directory every DXMT cache lives under, so the Metal shader cache and
+// this one cannot disagree about where that is.
+std::string GetDXMTShaderCacheDirectory();
 
 class ShaderCache {
 public:

@@ -34,6 +34,20 @@ Is_sRGBVariant(WMTPixelFormat format) {
   return Forget_sRGB(format) != format;
 }
 
+// The sRGB view a render target is written through must not carry the X-format
+// AlphaIsOne swizzle: a swizzled view is sample-only and drops the render-target
+// usage, so the attachment is discarded (an X8R8G8B8 target would render nothing
+// under D3DRS_SRGBWRITEENABLE). Only the colour channels need sRGB encoding; the
+// ignored X / alpha lane is written linearly, so the alpha-inclusive sRGB variant
+// is the correct write format. Returns the input unchanged when it has no sRGB
+// pair.
+inline WMTPixelFormat
+Recall_sRGB_ForRenderTarget(WMTPixelFormat format) {
+  WMTPixelFormat base = static_cast<WMTPixelFormat>(format & ~WMTPixelFormatAlphaIsOne);
+  WMTPixelFormat srgb = Recall_sRGB(base);
+  return srgb != base ? srgb : format;
+}
+
 bool IsBlockCompressionFormat(WMTPixelFormat format);
 
 uint32_t DepthStencilPlanarFlags(WMTPixelFormat format);

@@ -47,6 +47,17 @@ struct TextureViewDescriptor {
   uint32_t miplevelCount   : 4 = 1;
   uint32_t firstArraySlice : 12 = 0;
   uint32_t arraySize       : 12 = 1;
+  // What the view is for, rather than what Metal grants it. A swizzled or
+  // reinterpreted view can come back without the render-target bit, and the
+  // constructor needs the caller's intent to tell that case from a view that
+  // was never meant to be rendered into.
+  WMTTextureUsage intendedUsage : 8 = WMTTextureUsageUnknown;
+  WMTTextureSwizzleChannels swizzle = {
+      WMTTextureSwizzleRed,
+      WMTTextureSwizzleGreen,
+      WMTTextureSwizzleBlue,
+      WMTTextureSwizzleAlpha,
+  };
 };
 
 struct TextureViewKey {
@@ -139,6 +150,17 @@ public:
     return obj_;
   }
 
+  // Underlying linear MTLBuffer for buffer-backed allocations (the
+  // bytes_per_image / bytes_per_row Texture ctor produces these). The
+  // d3d9 path needs the buffer handle so its level-0 surface can keep
+  // a separate retain on it for the LockRect contract; Lock returns
+  // the buffer's mapped bytes as pBits and Unlock is a no-op (UMA).
+  // Returns a default-constructed (null) WMT::Buffer for non-buffer-
+  // backed allocations.
+  WMT::Buffer buffer() const {
+    return buffer_;
+  }
+
   Flags<TextureAllocationFlag>
   flags() const {
     return flags_;
@@ -153,7 +175,7 @@ public:
 private:
   TextureAllocation(
       Texture *descriptor, WMT::Reference<WMT::Buffer> &&buffer, void *mapped_buffer, const WMTTextureInfo &info,
-      unsigned bytes_per_row, Flags<TextureAllocationFlag> flags
+      unsigned bytes_per_row, Flags<TextureAllocationFlag> flags, bool externally_owned_memory = false
   );
   TextureAllocation(
       Texture *descriptor, WMT::Reference<WMT::Texture> &&texture, const WMTTextureInfo &textureDescriptor,
@@ -170,6 +192,16 @@ private:
   uint32_t version_ = 0;
   Flags<TextureAllocationFlag> flags_;
   small_vector<TextureViewRef, 4> cached_view_;
+  // Scaffolding for a future pool-donation hook. When true, the dtor
+  // skips wsi::aligned_free on mappedMemory because the caller has
+  // reclaimed the page (e.g. for re-vending through a device-level
+  // reuse pool). No call site sets this today; wrapBuffer always
+  // hands ownership to the allocation, which frees on drop. Donating
+  // safely needs the donation to fire AFTER the last ref_tracker
+  // release. Donating from a texture wrapper destructor is unsafe
+  // under the unified path because the ref_tracker may still hold
+  // views into the allocation at that point.
+  bool externally_owned_memory_ = false;
 };
 
 class Texture {
@@ -277,11 +309,31 @@ public:
   Rc<TextureAllocation> allocate(Flags<TextureAllocationFlag> flags);
   Rc<TextureAllocation> import(mach_port_t mach_port);
 
+  // Buffer-backed allocation that adopts a caller-supplied (buffer, mapped)
+  // pair instead of calling device_.newBuffer(). Only valid on a Texture
+  // built through the buffer-backed constructor, that is one given a
+  // bytes_per_image. The allocation owns both the buffer, whose reference is
+  // moved in, and the mapped page, freed through wsi::aligned_free on drop,
+  // and stays alive from chunk encode to GPU completion via the chunk
+  // ref_tracker. The caller allocates the pair itself because it may acquire
+  // from a pool rather than malloc.
+  Rc<TextureAllocation> wrapBuffer(
+      WMT::Reference<WMT::Buffer> buffer, void *mapped, Flags<TextureAllocationFlag> flags
+  );
+
   TextureView &view(TextureViewKey key);
   TextureView &view(TextureViewKey key, TextureAllocation *allocation);
 
   TextureViewKey checkViewUseArray(TextureViewKey key, bool isArray);
   TextureViewKey checkViewUseFormat(TextureViewKey key, WMTPixelFormat format);
+  // Derive a view that applies a per-channel sample swizzle (d3d9
+  // X-channel / luminance / depth-replicate formats). Returns `key`
+  // unchanged when the swizzle already matches. See checkViewUseFormat.
+  TextureViewKey checkViewUseSwizzle(TextureViewKey key, WMTTextureSwizzleChannels swizzle);
+  // Derive a view clamped to mips [firstMiplevel, firstMiplevel+count).
+  // d3d9 SetLOD(N) clamps sampling to mips N..(level_count-1). Returns
+  // `key` unchanged when the range already matches.
+  TextureViewKey checkViewUseMipRange(TextureViewKey key, uint32_t firstMiplevel, uint32_t miplevelCount);
 
   Rc<TextureAllocation> rename(Rc<TextureAllocation> &&newAllocation);
 
@@ -292,7 +344,7 @@ public:
 private:
   void prepareAllocationViews(TextureAllocation* allocation);
 
-  WMTTextureInfo info_;
+  WMTTextureInfo info_ = {};
   unsigned bytes_per_image_ = 0;
   unsigned bytes_per_row_ = 0;
 

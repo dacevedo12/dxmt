@@ -19,8 +19,7 @@ Presenter::Presenter(WMT::Device device, WMT::MetalLayer layer, InternalCommandL
   layer_props_.display_sync_enabled = false;
   layer_props_.framebuffer_only = false; // how strangely setting it true results in worse performance
   layer_props_.contents_scale = layer_props_.contents_scale * scale_factor;
-
-  WMTTextureInfo texture_info;
+  WMTTextureInfo texture_info = {};
   texture_info.type = WMTTextureType2D;
   texture_info.pixel_format = WMTPixelFormatRGBA32Float;
   texture_info.usage = WMTTextureUsageShaderRead;
@@ -50,7 +49,11 @@ Presenter::changeLayerProperties(
   if (should_invalidated)
     pso_valid.clear(); // defer changes
   else
-    layer_.setProps(layer_props_);
+    // A size-only change also defers to synchronizeLayerProperties: setting
+    // the props here would mutate the layer while the encode thread may be
+    // inside nextDrawable for an in-flight present; the deferred apply runs
+    // behind the present drain (see changeGammaRamp for the same shape).
+    props_dirty_ = true;
   return should_invalidated;
 }
 
@@ -92,13 +95,24 @@ Presenter::changeGammaRamp(const DXMTGammaRamp *gamma_ramp) {
       gamma_lut_rgba_[i * 4 + 2] = std::clamp(gamma_ramp->blue[i], 0.f, 1.f);
       gamma_lut_rgba_[i * 4 + 3] = 1.0f;
     }
-    gamma_lut_texture_.replaceRegion(
-          {0, 0, 0}, {DXMT_GAMMA_CP_COUNT, 1, 1}, 0, 0,
-          gamma_lut_rgba_.data(),
-          DXMT_GAMMA_CP_COUNT * sizeof(float) * 4,
-          0);
+    // Defer the texture upload to synchronizeLayerProperties. Writing the
+    // shared-storage LUT here (calling thread) races the encode thread / GPU
+    // sampling it for an in-flight present; torn gamma during animated
+    // fades. pso_valid.clear() already forces synchronizeLayerProperties to
+    // rebuild after frame_presented_.wait() has drained every in-flight
+    // present, so the upload rides that existing drain for free.
+    gamma_lut_dirty_ = true;
     pso_valid.clear();
   }
+}
+
+void
+Presenter::setDisplaySyncEnabled(bool enabled) {
+  if (layer_props_.display_sync_enabled == enabled)
+    return;
+
+  layer_props_.display_sync_enabled = enabled;
+  layer_.setProps(layer_props_);
 }
 
 Presenter::PresentState
@@ -121,9 +135,28 @@ Presenter::synchronizeLayerProperties() {
                                                    : nullptr;
   if (unlikely(!pso_valid.test_and_set())) {
     frame_presented_.wait(frame_requested_);
-    buildRenderPipelineState(final_colorspace == WMTColorSpaceHDR_PQ, is_hdr && hdr_metadata != nullptr, sample_count_ > 1, gamma_version_ != 0);
+    // Drained: no present is in flight, so the shared-storage gamma LUT can
+    // be uploaded without racing a GPU read (see changeGammaRamp).
+    if (gamma_lut_dirty_) {
+      gamma_lut_texture_.replaceRegion(
+          {0, 0, 0}, {DXMT_GAMMA_CP_COUNT, 1, 1}, 0, 0, gamma_lut_rgba_.data(),
+          DXMT_GAMMA_CP_COUNT * sizeof(float) * 4, 0
+      );
+      gamma_lut_dirty_ = false;
+    }
+    gamma_enabled_ = gamma_version_ != 0;
+    buildRenderPipelineState(final_colorspace == WMTColorSpaceHDR_PQ, is_hdr && hdr_metadata != nullptr, sample_count_ > 1, gamma_enabled_);
     layer_.setProps(layer_props_);
     layer_.setColorSpace(final_colorspace);
+    props_dirty_ = false;
+  } else if (unlikely(props_dirty_)) {
+    // Size-only layer change (changeLayerProperties): apply it behind the
+    // same present drain the invalidation path uses, so the layer is never
+    // mutated while the encode thread acquires a drawable. No PSO rebuild:
+    // the pipeline does not depend on the drawable size.
+    frame_presented_.wait(frame_requested_);
+    layer_.setProps(layer_props_);
+    props_dirty_ = false;
   }
 
   DXMTPresentMetadata metadata;
@@ -157,19 +190,30 @@ Presenter::encodeCommands(
     std::function<void(WMT::RenderCommandEncoder)> &&update_fences
 ) {
   auto drawable = layer_.nextDrawable();
+  auto drawable_tex = drawable.texture();
 
   WMTRenderPassInfo info;
   WMT::InitializeRenderPassInfo(info);
   info.colors[0].load_action = WMTLoadActionDontCare;
   info.colors[0].store_action = WMTStoreActionStore;
-  info.colors[0].texture = drawable.texture();
+  info.colors[0].texture = drawable_tex;
   auto encoder = cmdbuf.renderCommandEncoder(info);
   wait_fences(encoder);
   encoder.setFragmentTexture(backbuffer, 0);
-  encoder.setFragmentTexture(gamma_lut_texture_, 1);
+  // Only bind the gamma LUT when the live PSO variant samples it. Without a
+  // gamma ramp the fragment shader is compiled without the gamma path and
+  // never reads texture index 1, and the binding is then left unused, which
+  // the Metal debug layer flags when the encoder ends.
+  if (gamma_enabled_)
+    encoder.setFragmentTexture(gamma_lut_texture_, 1);
 
-  double width = layer_props_.drawable_width;
-  double height = layer_props_.drawable_height;
+  // Present target size is this frame's live drawable, not layer_props_. A
+  // client mutates layer_props_.drawable_* on the calling thread from its
+  // per-Present resize poll, so reading it here on the encode thread would
+  // be a cross-thread race. The drawable just acquired is the authoritative
+  // render-target extent, and it is what this frame actually renders into.
+  double width = (double)drawable_tex.width();
+  double height = (double)drawable_tex.height();
 
   encoder.setFragmentBytes(&metadata, sizeof(metadata), 0);
   if (backbuffer.width() == (uint64_t)width && backbuffer.height() == (uint64_t)height) {

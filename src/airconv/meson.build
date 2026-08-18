@@ -1,4 +1,6 @@
 airconv_src = files([
+ 'ffp_compile.cpp',
+ 'dxso_compile.cpp',
  'airconv_context.cpp',
  'air_type.cpp',
  'air_signature.cpp',

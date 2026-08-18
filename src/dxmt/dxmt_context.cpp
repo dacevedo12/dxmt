@@ -17,6 +17,7 @@
  */
 
 #include "dxmt_context.hpp"
+#include "util_env.hpp"
 #include "Metal.hpp"
 #include "dxmt_command_queue.hpp"
 #include "dxmt_deptrack.hpp"
@@ -33,6 +34,8 @@ ArgumentEncodingContext::ArgumentEncodingContext(CommandQueue &queue, WMT::Devic
     lib(lib),
     emulated_cmd(device, lib, *this),
     clear_rt_cmd(device, lib, *this),
+    resolve_texture_cmd(device, lib, *this),
+    stretch_blit_cmd(device, lib, *this),
     blit_depth_stencil_cmd(device, lib, *this),
     clear_uav_cmd(device, *this),
     mv_scale_cmd(device, lib, *this),
@@ -513,7 +516,9 @@ ArgumentEncodingContext::clearDepthStencil(
 
 void
 ArgumentEncodingContext::resolveTexture(
-    Rc<Texture> &&src, TextureViewKey src_view, Rc<Texture> &&dst, TextureViewKey dst_view
+    Rc<Texture> &&src, TextureViewKey src_view, Rc<Texture> &&dst, TextureViewKey dst_view,
+    WMT::RenderPipelineState pso, std::optional<WMTScissorRect> src_rect, WMTOrigin dst_origin,
+    WMTSize resolve_size
 ) {
   assert(!encoder_current);
   auto encoder_info = allocate<ResolveEncoderData>();
@@ -525,6 +530,10 @@ ArgumentEncodingContext::resolveTexture(
 
   encoder_info->src = access(src, src_view, ResourceAccess::Read);
   encoder_info->dst = access(dst, dst_view, ResourceAccess::Write);
+  encoder_info->pso = pso;
+  encoder_info->src_rect = src_rect;
+  encoder_info->dst_origin = dst_origin;
+  encoder_info->resolve_size = resolve_size;
 
   endPass();
 };
@@ -607,6 +616,22 @@ ArgumentEncodingContext::signalEvent(WMT::Reference<WMT::Event> &&event, uint64_
   encoder_info->type = EncoderType::SignalEvent;
   encoder_info->id = ~0ull;
   encoder_info->event = std::move(event);
+  encoder_info->value = value;
+
+  encoder_current = encoder_info;
+  endPass();
+}
+
+void
+ArgumentEncodingContext::signalEventByHandle(obj_handle_t event_handle, uint64_t value) {
+  assert(!encoder_current);
+  auto encoder_info = allocate<SignalEventData>();
+  encoder_info->type = EncoderType::SignalEvent;
+  encoder_info->id = ~0ull;
+  // Reference operator=(Class non_retained); retains, paired with the
+  // SignalEventData destructor's release. The retain runs on the encode
+  // thread so the calling-thread emit site dodges a wine_unix_call.
+  encoder_info->event = WMT::Event{event_handle};
   encoder_info->value = value;
 
   encoder_current = encoder_info;
@@ -762,7 +787,12 @@ ArgumentEncodingContext::bumpVisibilityResultOffset() {
   render_encoder->use_visibility_result = render_encoder->use_visibility_result || bool(active_visibility_query_count_);
 
   uint64_t offset;
-  if (vro_state_.tryGetNextWriteOffset(active_visibility_query_count_, offset)) {
+  // Ceiling on this draw's contribution to the counter: every sample in the
+  // render area. Rasterization cannot exceed it, so it is a safe roll trigger.
+  uint32_t sample_count = render_encoder->default_raster_sample_count ? render_encoder->default_raster_sample_count : 1;
+  uint64_t draw_sample_bound =
+      uint64_t(render_encoder->render_target_width) * render_encoder->render_target_height * sample_count;
+  if (vro_state_.tryGetNextWriteOffset(active_visibility_query_count_, draw_sample_bound, offset)) {
     auto &cmd = encodeRenderCommand<wmtcmd_render_setvisibilitymode>();
     cmd.type = WMTRenderCommandSetVisibilityMode;
     if (~offset == 0) {
@@ -850,6 +880,113 @@ ArgumentEncodingContext::resolveRenderPassBarrier() {
 }
 
 void
+ArgumentEncodingContext::resolveDepthTexture(
+    Rc<Texture> &&src, TextureViewKey src_view, Rc<Texture> &&dst, TextureViewKey dst_view,
+    WMT::RenderPipelineState pso, std::optional<WMTScissorRect> src_rect, WMTOrigin dst_origin, WMTSize resolve_size
+) {
+  assert(!encoder_current);
+  auto encoder_info = allocate<ResolveEncoderData>();
+  encoder_info->type = EncoderType::Resolve;
+  encoder_info->id = nextEncoderId();
+  encoder_info->fence_wait = {};
+  encoder_info->fence_update = {encoder_info->id};
+  encoder_current = encoder_info;
+
+  encoder_info->src = access(src, src_view, ResourceAccess::Read);
+  encoder_info->dst = access(dst, dst_view, ResourceAccess::Write);
+  encoder_info->pso = pso;
+  encoder_info->src_rect = src_rect;
+  encoder_info->dst_origin = dst_origin;
+  encoder_info->resolve_size = resolve_size;
+  encoder_info->is_depth = true;
+
+  endPass();
+};
+
+void
+ArgumentEncodingContext::stretchBlit(
+    Rc<Texture> &&src, TextureViewKey src_view, Rc<Texture> &&dst, TextureViewKey dst_view,
+    WMT::RenderPipelineState pso, WMT::SamplerState sampler,
+    WMTOrigin src_origin, WMTSize src_size,
+    WMTOrigin dst_origin, WMTSize dst_size
+) {
+  assert(!encoder_current);
+  // The src texture-view's level dimensions normalize the sample sub-
+  // rect into uv-space. dxmt::Texture::width/height(view_key) returns
+  // max(info_.width >> view.mip_start, 1); already guards against
+  // zero, so a divide-by-zero is impossible.
+  uint32_t src_view_w = src ? src->width(src_view) : 1;
+  uint32_t src_view_h = src ? src->height(src_view) : 1;
+
+  auto encoder_info = allocate<StretchBlitEncoderData>();
+  encoder_info->type = EncoderType::StretchBlit;
+  encoder_info->id = nextEncoderId();
+  encoder_info->fence_wait = {};
+  encoder_info->fence_update = {encoder_info->id};
+  encoder_current = encoder_info;
+
+  encoder_info->src = access(src, src_view, ResourceAccess::Read);
+  encoder_info->dst = access(dst, dst_view, ResourceAccess::Write);
+  encoder_info->pso = pso;
+  encoder_info->sampler = sampler;
+  encoder_info->src_uv_origin[0] = float(src_origin.x) / float(src_view_w);
+  encoder_info->src_uv_origin[1] = float(src_origin.y) / float(src_view_h);
+  encoder_info->src_uv_size[0] = float(src_size.width) / float(src_view_w);
+  encoder_info->src_uv_size[1] = float(src_size.height) / float(src_view_h);
+  encoder_info->dst_origin = dst_origin;
+  encoder_info->dst_size = dst_size;
+
+  endPass();
+}
+
+void
+ArgumentEncodingContext::copyTexture(
+    const Rc<Texture> &src, unsigned src_level, unsigned src_slice, WMTOrigin src_origin,
+    const Rc<Texture> &dst, unsigned dst_level, unsigned dst_slice, WMTOrigin dst_origin,
+    WMTSize size
+) {
+  assert(!encoder_current);
+  // Blit-encoder texture-to-texture copy in its own pass: a 1:1 sample-for-sample
+  // copy of one subresource region, matched sample count (single-sample or MSAA
+  // alike). The access(src, Read) + access(dst, Write) register the pass in the
+  // fence trackers, so a write-after-read against slot 0 (the swapchain rotation)
+  // or a read-after-write chain is ordered by the encoder scheduler; this is the
+  // same primitive EmitBlitOp_d9 emits for the d3d9 StretchRect Copy path.
+  startBlitPass();
+  auto src_tex = access<PipelineStage::Compute>(src, src_level, src_slice, ResourceAccess::Read);
+  auto dst_tex = access<PipelineStage::Compute>(dst, dst_level, dst_slice, ResourceAccess::Write);
+  auto &cmd = encodeBlitCommand<wmtcmd_blit_copy_from_texture_to_texture>();
+  cmd.type = WMTBlitCommandCopyFromTextureToTexture;
+  cmd.src = src_tex.handle;
+  cmd.src_slice = src_slice;
+  cmd.src_level = src_level;
+  cmd.src_origin = src_origin;
+  cmd.src_size = size;
+  cmd.dst = dst_tex.handle;
+  cmd.dst_slice = dst_slice;
+  cmd.dst_level = dst_level;
+  cmd.dst_origin = dst_origin;
+  endPass();
+}
+
+// Only the Metal3 backend enqueues this (its sole caller is the d3d9 StretchRect
+// scale path, whose StretchBlit encoder is itself compiled out under Metal4).
+void
+ArgumentEncodingContext::optimizeTextureForGPUAccess(const Rc<Texture> &texture, unsigned level, unsigned slice) {
+  assert(!encoder_current);
+  // Write access: the re-tile mutates the texture's layout, so it must register
+  // as the subresource's last writer for the following sample to wait on it.
+  startBlitPass();
+  auto tex = access<PipelineStage::Compute>(texture, level, slice, ResourceAccess::Write);
+  auto &cmd = encodeBlitCommand<wmtcmd_blit_optimize_contents>();
+  cmd.type = WMTBlitCommandOptimizeContentsForGPUAccess;
+  cmd.texture = tex.handle;
+  cmd.slice = slice;
+  cmd.level = level;
+  endPass();
+}
+
+void
 ArgumentEncodingContext::$$setEncodingContext(uint64_t seq_id, uint64_t frame_id) {
   current_buffer_chunk_ = 0;
   cpu_buffer_ = cpu_buffer_chunks_[current_buffer_chunk_].ptr;
@@ -896,12 +1033,25 @@ ArgumentEncodingContext::flushCommands(WMT::CommandBuffer cmdbuf, uint64_t seqId
 
   QueryReadbacks readbacks{};
 
-  if (auto count = vro_state_.reset()) {
+  uint64_t visibility_count = vro_state_.reset();
+  if (visibility_count) {
     readbacks.visibility = std::make_unique<VisibilityResultReadback>(
-        device_, seqId, count, pending_queries_
+        device_, seqId, visibility_count, pending_queries_
     );
   }
-  std::erase_if(pending_queries_, [=](auto &query) -> bool { return query->queryEndAt() == seqId; });
+  std::erase_if(pending_queries_, [&](auto &query) -> bool {
+    if (query->queryEndAt() != seqId)
+      return false;
+    // A query whose end chunk carried no visibility results gets no readback to
+    // resolve it (none was created above), yet it must still resolve or GetData
+    // spins forever. Hand it to the finish thread instead of stamping here:
+    // an encode-time stamp would be clobbered backward by the later
+    // finish-thread issue() of an earlier still-in-flight count>0 chunk. When
+    // count>0 the readback (which copied these queries) resolves it at finish.
+    if (!visibility_count)
+      readbacks.visibility_empty_ends.push_back(query);
+    return true;
+  });
 
   readbacks.timestamp = timestamp_state_.flush(cmdbuf);
 
@@ -1143,6 +1293,78 @@ ArgumentEncodingContext::flushCommands(WMT::CommandBuffer cmdbuf, uint64_t seqId
     }
     case EncoderType::Resolve: {
       auto data = static_cast<ResolveEncoderData *>(current);
+      if (data->is_depth) {
+        // Point resolve of a multisampled depth surface: a depth-only render pass
+        // whose fragment shader reads sample 0 of the source (bound as a fragment
+        // depth texture) and writes the destination depth attachment. The source
+        // is a multisampled depth-stencil surface, allocated with ShaderRead for
+        // exactly this sampled bind (CreateDepthStencilSurface). Only the depth
+        // aspect is resolved; a depth-stencil source's stencil is not carried,
+        // matching wined3d and DXVK, which resolve depth only.
+        auto src_texture = data->src.texture();
+        auto dst_texture = data->dst.texture();
+        if (!src_texture || !dst_texture) {
+          WARN("skipped a depth resolve with a missing attachment, encoder=", data->id);
+          data->~ResolveEncoderData();
+          break;
+        }
+        auto *dst_allocation = data->dst ? data->dst->allocation : nullptr;
+        auto *dst_descriptor = dst_allocation ? dst_allocation->descriptor : nullptr;
+
+        WMTRenderPassInfo info;
+        WMT::InitializeRenderPassInfo(info);
+        info.depth.texture = dst_texture;
+        info.depth.load_action = WMTLoadActionDontCare;
+        info.depth.store_action = WMTStoreActionStore;
+        if (dst_descriptor) {
+          info.render_target_width = dst_descriptor->width(data->dst->key);
+          info.render_target_height = dst_descriptor->height(data->dst->key);
+        }
+        info.render_target_array_length = 1;
+        info.default_raster_sample_count = 1;
+
+        // The depth resolve is a d3d9 (Metal 3) path; the Metal 4 render encoder
+        // sets depth-stencil state through the pipeline, not setDepthStencilState,
+        // and this branch never runs on the Metal 4 backend, so keep it out of it.
+        if (!depth_resolve_dss_) {
+          WMTDepthStencilInfo ds_info = {};
+          ds_info.depth_compare_function = WMTCompareFunctionAlways;
+          ds_info.depth_write_enabled = true;
+          depth_resolve_dss_ = device_.newDepthStencilState(ds_info);
+        }
+
+        auto encoder = cmdbuf.renderCommandEncoder(info);
+        encoder.setLabel(WMT::String::string("DepthResolvePass", WMTUTF8StringEncoding));
+        data->fence_wait.forEach([&](auto id) {
+          encoder.waitForFence(fence_pool_[id], WMTRenderStageFragment);
+        });
+        struct ResolveMetadata {
+          uint32_t src_origin[2];
+          uint32_t dst_origin[2];
+          uint32_t size[2];
+        } metadata = {};
+        metadata.src_origin[0] = data->src_rect ? data->src_rect->x : 0;
+        metadata.src_origin[1] = data->src_rect ? data->src_rect->y : 0;
+        metadata.dst_origin[0] = data->dst_origin.x;
+        metadata.dst_origin[1] = data->dst_origin.y;
+        metadata.size[0] = data->resolve_size.width ? data->resolve_size.width : info.render_target_width;
+        metadata.size[1] = data->resolve_size.height ? data->resolve_size.height : info.render_target_height;
+        encoder.setRenderPipelineState(data->pso);
+        encoder.setDepthStencilState(depth_resolve_dss_);
+        encoder.setFragmentTexture(src_texture, 0);
+        encoder.setFragmentBytes(&metadata, sizeof(metadata), 0);
+        encoder.setViewport(
+            {double(metadata.dst_origin[0]), double(metadata.dst_origin[1]), double(metadata.size[0]),
+             double(metadata.size[1]), 0.0, 1.0}
+        );
+        encoder.drawPrimitives(WMTPrimitiveTypeTriangle, 0, 3);
+        data->fence_update.forEach([&](auto id) {
+          encoder.updateFence(fence_pool_[id], WMTRenderStageFragment);
+        });
+        encoder.endEncoding();
+        data->~ResolveEncoderData();
+        break;
+      }
       {
         WMTRenderPassInfo info;
         WMT::InitializeRenderPassInfo(info);
@@ -1158,6 +1380,58 @@ ArgumentEncodingContext::flushCommands(WMT::CommandBuffer cmdbuf, uint64_t seqId
         encoder.endEncoding();
       }
       data->~ResolveEncoderData();
+      break;
+    }
+    case EncoderType::StretchBlit: {
+      auto data = static_cast<StretchBlitEncoderData *>(current);
+      // StretchBlit is d3d9's StretchRect render-pass path (setFragmentSamplerState
+      // et al. live on the Metal3 encoder only); the Metal4 backend never enqueues it.
+      {
+        auto *dst_allocation = data->dst ? data->dst->allocation : nullptr;
+        auto *dst_descriptor = dst_allocation ? dst_allocation->descriptor : nullptr;
+
+        WMTRenderPassInfo info;
+        WMT::InitializeRenderPassInfo(info);
+        info.colors[0].texture = data->dst.texture();
+        info.colors[0].load_action = WMTLoadActionLoad;
+        info.colors[0].store_action = WMTStoreActionStore;
+        if (dst_descriptor) {
+          info.render_target_width = dst_descriptor->width(data->dst->key);
+          info.render_target_height = dst_descriptor->height(data->dst->key);
+          info.render_target_array_length = 1;
+          // D3-O2: a single-sample -> multisample StretchRect broadcasts the
+          // sampled source into every sample, so the pass raster count follows
+          // the destination (1 for the common single-sample dst, unchanged).
+          info.default_raster_sample_count = dst_descriptor->sampleCount();
+        } else {
+          info.default_raster_sample_count = 1;
+        }
+
+        auto encoder = cmdbuf.renderCommandEncoder(info);
+        encoder.setLabel(WMT::String::string("StretchBlitPass", WMTUTF8StringEncoding));
+        data->fence_wait.forEach([&](auto id) { encoder.waitForFence(fence_pool_[id], WMTRenderStageFragment); });
+        if (data->pso && data->sampler) {
+          struct {
+            float src_uv_origin[2];
+            float src_uv_size[2];
+          } metadata{};
+          metadata.src_uv_origin[0] = data->src_uv_origin[0];
+          metadata.src_uv_origin[1] = data->src_uv_origin[1];
+          metadata.src_uv_size[0] = data->src_uv_size[0];
+          metadata.src_uv_size[1] = data->src_uv_size[1];
+          encoder.setRenderPipelineState(data->pso);
+          encoder.setFragmentTexture(data->src.texture(), 0);
+          encoder.setFragmentSamplerState(data->sampler, 0);
+          encoder.setFragmentBytes(&metadata, sizeof(metadata), 0);
+          encoder.setViewport({
+              double(data->dst_origin.x), double(data->dst_origin.y),
+              double(data->dst_size.width), double(data->dst_size.height), 0.0, 1.0});
+          encoder.drawPrimitives(WMTPrimitiveTypeTriangle, 0, 3);
+        }
+        data->fence_update.forEach([&](auto id) { encoder.updateFence(fence_pool_[id], WMTRenderStageFragment); });
+        encoder.endEncoding();
+      }
+      data->~StretchBlitEncoderData();
       break;
     }
     case EncoderType::SpatialUpscale: {
@@ -1272,6 +1546,22 @@ ArgumentEncodingContext::flushCommands(WMT::CommandBuffer cmdbuf, uint64_t seqId
   return readbacks;
 }
 
+// Diagnostic gate: keep every encoder pair in the order it was emitted.
+//
+// This routine reorders encoders outright whenever it finds no fence dependency
+// between them, and the dependency is decided purely by fence-set intersection.
+// So an access that never registered does not merely lose a barrier: it licenses
+// the consumer to be moved in front of its producer. That makes this switch the
+// one measurement that separates "the dependency algebra is missing an edge"
+// from "the algebra is right and the fault is elsewhere", because pinning the
+// order removes the entire degree of freedom rather than any single edge.
+// Diagnostic only, and slow by construction: it forfeits every pass merge.
+static bool
+EncoderReorderDisabled() {
+  static const bool disabled = env::getEnvVar("DXMT_DIAG_NO_ENCODER_REORDER") == "1";
+  return disabled;
+}
+
 DXMT_ENCODER_LIST_OP
 ArgumentEncodingContext::checkEncoderRelation(EncoderData *former, EncoderData *latter) {
 
@@ -1279,6 +1569,10 @@ ArgumentEncodingContext::checkEncoderRelation(EncoderData *former, EncoderData *
     return DXMT_ENCODER_LIST_OP_SWAP;
   if (latter->type == EncoderType::Null)
     return DXMT_ENCODER_LIST_OP_SWAP;
+  // After the Null folds: a Null encoder is a removed placeholder, not work
+  // whose order means anything.
+  if (EncoderReorderDisabled())
+    return DXMT_ENCODER_LIST_OP_SYNCHRONIZE;
   if (former->type == EncoderType::SignalEvent)
     return DXMT_ENCODER_LIST_OP_SYNCHRONIZE;
   if (latter->type == EncoderType::SignalEvent)
@@ -1301,19 +1595,28 @@ ArgumentEncodingContext::checkEncoderRelation(EncoderData *former, EncoderData *
         break;
 
       if (clear->clear_dsv) {
+        // Consume a plane only when the clear was actually applied to it. The
+        // load action is Load when the pass is built and moves to Clear only
+        // because an earlier fold already installed one, so a matched
+        // attachment that is not Load means this clear cannot be expressed in
+        // the pass descriptor. Retiring the bit anyway dropped the clear
+        // outright, and a dropped depth clear is invisible at the point it
+        // happens: the pass loads the previous contents, and whatever the app
+        // draws next is depth-tested against a stale buffer, so geometry simply
+        // fails to appear while every draw is still issued.
         if (auto depth_attachment = isClearDepthSignatureMatched(clear, render)) {
           if (depth_attachment->load_action == WMTLoadActionLoad) {
             depth_attachment->clear_depth = clear->depth_stencil.first;
             depth_attachment->load_action = WMTLoadActionClear;
+            clear->clear_dsv &= ~1;
           }
-          clear->clear_dsv &= ~1;
         }
         if (auto stencil_attachment = isClearStencilSignatureMatched(clear, render)) {
           if (stencil_attachment->load_action == WMTLoadActionLoad) {
             stencil_attachment->clear_stencil = clear->depth_stencil.second;
             stencil_attachment->load_action = WMTLoadActionClear;
+            clear->clear_dsv &= ~2;
           }
-          clear->clear_dsv &= ~2;
         }
         if (clear->clear_dsv == 0) {
           render->fence_update.merge(clear->fence_update);
@@ -1327,10 +1630,15 @@ ArgumentEncodingContext::checkEncoderRelation(EncoderData *former, EncoderData *
         }
       } else {
         if (auto attachment = isClearColorSignatureMatched(clear, render)) {
-          if (attachment->load_action == WMTLoadActionLoad) {
-            attachment->load_action = WMTLoadActionClear;
-            attachment->clear_color = clear->color;
-          }
+          // Same rule as the depth/stencil planes above: a matched attachment
+          // that is no longer Load already carries someone else's clear, so
+          // this one cannot be folded in. Leave it standing as its own encoder
+          // rather than destroying it, which costs one pass in a case that
+          // needs two clears before a single pass, and never loses one.
+          if (attachment->load_action != WMTLoadActionLoad)
+            break;
+          attachment->load_action = WMTLoadActionClear;
+          attachment->clear_color = clear->color;
           render->fence_update.merge(clear->fence_update);
           render->fence_wait.merge(clear->fence_wait);
           render->fence_wait.subtract(clear->fence_update);

@@ -10,7 +10,15 @@ public:
   void incRef();
   void decRef();
 
-  Rc<BufferAllocation> allocate(uint64_t coherent_seq_id);
+  // out_minted_fresh, when given, reports whether the FIFO had nothing retired
+  // to hand back and a new allocation had to be minted. Worth distinguishing
+  // because the two outcomes differ in CONTENT, not just in cost: a recycled
+  // allocation still holds the bytes it was last written with, while a fresh
+  // one comes up zeroed. Anything that reads such a buffer before its upload
+  // lands therefore renders last frame's data in the recycled case and nothing
+  // at all in the fresh case, so the fresh rate bounds how often that class of
+  // mistake can be visible.
+  Rc<BufferAllocation> allocate(uint64_t coherent_seq_id, bool *out_minted_fresh = nullptr);
   void updateImmediateName(uint64_t current_seq_id, Rc<BufferAllocation> &&allocation, uint32_t suballocation, bool owned_by_command_list);
   void recycle(uint64_t current_seq_id, Rc<BufferAllocation> &&allocation);
   uint32_t nextSuballocation();

@@ -39,6 +39,8 @@ public:
 
   void changeGammaRamp(const DXMTGammaRamp *gamma_ramp);
 
+  void setDisplaySyncEnabled(bool enabled);
+
   class PresentState {
   public:
     DXMTPresentMetadata metadata;
@@ -90,6 +92,22 @@ private:
   uint64_t gamma_version_ = 0;
   std::array<float, DXMT_GAMMA_CP_COUNT * 4> gamma_lut_rgba_;
   WMT::Reference<WMT::Texture> gamma_lut_texture_;
+  // Set by changeGammaRamp (calling thread) when gamma_lut_rgba_ holds new
+  // data; the actual gamma_lut_texture_ upload is deferred to
+  // synchronizeLayerProperties, which runs it after the present drain so the
+  // shared-storage texture is never written while the GPU samples it.
+  bool gamma_lut_dirty_ = false;
+  // Whether the live present PSO was built with the gamma function constant
+  // set; i.e. whether its fragment shader samples the gamma LUT at texture
+  // index 1. Set alongside the PSO rebuild in synchronizeLayerProperties and
+  // read in encodeCommands so the LUT is bound only when the shader uses it;
+  // shares the PSOs' calling-thread-build / encode-thread-read handoff.
+  bool gamma_enabled_ = false;
+  // Set by a size-only changeLayerProperties (calling thread) and consumed
+  // by synchronizeLayerProperties (also the calling thread, at Present):
+  // the layer props apply behind the present drain instead of racing the
+  // encode thread's drawable acquisition. Plain bool: no cross-thread use.
+  bool props_dirty_ = false;
   WMT::Reference<WMT::RenderPipelineState> present_blit_;
   WMT::Reference<WMT::RenderPipelineState> present_scale_;
   std::atomic_flag pso_valid = 0;
