@@ -832,9 +832,7 @@ MTLD3D9Device::~MTLD3D9Device() {
   // approaching the 32-bit address-space wall is visible without an external
   // profiler. The peak is stable, so teardown is a fine sampling point.
   if (d9DebugEnabled())
-    Logger::info(str::format(
-        "D3D9: peak buffer backing pool ", m_bufferBackingPoolPeak >> 10, " KiB"
-    ));
+    Logger::info(str::format("D3D9: peak buffer backing pool ", m_bufferBackingPoolPeak >> 10, " KiB"));
   // Restore the device window to its windowed style/rect so a fullscreen
   // game leaving does not strand a borderless, topmost window. No-op unless
   // a fullscreen window is currently held. unhook restores the focus window's
@@ -955,7 +953,6 @@ MTLD3D9Device::initTextureWithZero(dxmt::Texture *texture) {
     for (uint32_t level = 0; level < levels; ++level)
       initializer.initWithZero(texture, texture->current(), slice, level);
 }
-
 
 void
 MTLD3D9Device::commitCurrentChunkTimed() {
@@ -7588,8 +7585,7 @@ RtDsAttachmentsMatch(const MTLD3D9Device::D9PassAttachments &a, const MTLD3D9Dev
 
 inline void
 StartRenderPassForBatch_d9(
-    ArgumentEncodingContext &ctx, const MTLD3D9Device::BatchedDraw &bd,
-    const MTLD3D9Device::D9ResolvedDraw &res
+    ArgumentEncodingContext &ctx, const MTLD3D9Device::BatchedDraw &bd, const MTLD3D9Device::D9ResolvedDraw &res
 ) {
   uint8_t dsv_planar = 0;
   if (res.resolved_ds_dxmt) {
@@ -7659,8 +7655,8 @@ StartRenderPassForBatch_d9(
 
 inline void
 EmitCommonRenderSetup_d9(
-    ArgumentEncodingContext &ctx, const MTLD3D9Device::BatchedDraw &bd,
-    const MTLD3D9Device::D9ResolvedDraw &res, MTLD3D9Device::ChunkEmitState &s
+    ArgumentEncodingContext &ctx, const MTLD3D9Device::BatchedDraw &bd, const MTLD3D9Device::D9ResolvedDraw &res,
+    MTLD3D9Device::ChunkEmitState &s
 ) {
   // Per-draw POD state lives on bd.pod_snapshot now; Resolve already read the
   // same frozen snapshot pointer above to populate res.resolved_*, so reading
@@ -7854,7 +7850,8 @@ EmitCommonRenderSetup_d9(
   }
 
   // DSSO + stencil ref.
-  if (res.resolved_dsso && (s.dsso != res.resolved_dsso || s.stencil_ref != static_cast<int>(res.resolved_stencil_ref))) {
+  if (res.resolved_dsso &&
+      (s.dsso != res.resolved_dsso || s.stencil_ref != static_cast<int>(res.resolved_stencil_ref))) {
     auto &cmd = ctx.encodeRenderCommand<wmtcmd_render_setdsso>();
     cmd.type = WMTRenderCommandSetDSSO;
     cmd.dsso = res.resolved_dsso;
@@ -7976,8 +7973,7 @@ EmitCommonRenderSetup_d9(
 
 inline void
 EmitDrawCommand_d9(
-    ArgumentEncodingContext &ctx, const MTLD3D9Device::BatchedDraw &bd,
-    const MTLD3D9Device::D9ResolvedDraw &res
+    ArgumentEncodingContext &ctx, const MTLD3D9Device::BatchedDraw &bd, const MTLD3D9Device::D9ResolvedDraw &res
 ) {
   // "Instancing is ignored for non-indexed draws" is native (MSDN, wined3d
   // device.c and DXVK d3d9_device.cpp all yield instance_count = 1 for
@@ -8239,9 +8235,9 @@ private:
 
 bool
 MTLD3D9Device::PackDrawConstants(
-    BatchedDraw &bd, D9ResolvedDraw &res, ConstUploadCache &const_cache, const DrawShaderShape &shape, const uint32_t *ffp_texcoord_width,
-    uint32_t ffp_tcw_key, bool ds_bound, const void *vs_defs_key, const void *ps_defs_key, uint64_t chunk_seq,
-    uint64_t chunk_coherent_id
+    BatchedDraw &bd, D9ResolvedDraw &res, ConstUploadCache &const_cache, const DrawShaderShape &shape,
+    const uint32_t *ffp_texcoord_width, uint32_t ffp_tcw_key, bool ds_bound, const void *vs_defs_key,
+    const void *ps_defs_key, uint64_t chunk_seq, uint64_t chunk_coherent_id
 ) {
   const dxmt::D9EncodingState &pod = *bd.pod_snapshot;
   const DWORD *rs = pod.render_states->v;
@@ -8729,8 +8725,8 @@ MTLD3D9Device::PackDrawConstants(
 
 bool
 MTLD3D9Device::ResolveClusterState(
-    BatchedDraw &bd, D9ResolvedDraw &res, ResolveCache &resolve_cache, const D9EncodingRefs &refs, bool ffp_vs, bool ffp_ps,
-    uint32_t *ffp_texcoord_width
+    BatchedDraw &bd, D9ResolvedDraw &res, ResolveCache &resolve_cache, const D9EncodingRefs &refs, bool ffp_vs,
+    bool ffp_ps, uint32_t *ffp_texcoord_width
 ) {
   auto &cap = bd.cap;
   auto *vs = refs.vertex_shader.ptr();
@@ -9559,9 +9555,8 @@ MTLD3D9Device::ResolveClusterState(
   if (pso_key == resolve_cache.last_pso_key && resolve_cache.last_pso_task &&
       resolve_cache.last_pso_task->matchesKeyInputs(vs_fn, ps_fn, pso_info)) {
     task = resolve_cache.last_pso_task;
-  } else if (
-      auto it = m_psoCache.find(pso_key); it != m_psoCache.end() && it->second->matchesKeyInputs(vs_fn, ps_fn, pso_info)
-  ) {
+  } else if (auto it = m_psoCache.find(pso_key);
+             it != m_psoCache.end() && it->second->matchesKeyInputs(vs_fn, ps_fn, pso_info)) {
     task = it->second.get();
     resolve_cache.last_pso_key = pso_key;
     resolve_cache.last_pso_task = task;
@@ -9720,7 +9715,8 @@ MTLD3D9Device::ResolveClusterState(
       if (res.resolved_frag_texture_dxmt[stage].ptr() != rt_tex)
         continue;
       self_sampled = true;
-      TextureViewKey src_view = rt_tex->checkViewUseMipRange(TextureViewKey(res.resolved_frag_view[stage]), 0, rt_level);
+      TextureViewKey src_view =
+          rt_tex->checkViewUseMipRange(TextureViewKey(res.resolved_frag_view[stage]), 0, rt_level);
       if (obj_handle_t vh = rt_tex->view(src_view).texture.handle) {
         res.resolved_frag_view[stage] = static_cast<uint64_t>(src_view);
         res.resolved_frag_textures[stage] = vh;

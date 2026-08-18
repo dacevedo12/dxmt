@@ -635,6 +635,80 @@ jobs:
           name: clang-release-arm64-macos
           path: install
 
+  # Source gates over src/d3d9. They read the tree, so they need neither the
+  # toolchain nor a build, and run here rather than behind the cross build that
+  # would otherwise decide how long a formatting slip takes to surface. Globbed
+  # so a check added under tests/ci is gated on arrival.
+  lint-d3d9:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      # Pinned to the LLVM the tree is formatted with: releases disagree about
+      # the same file, so an unpinned one reports errors that are not there.
+      - name: Install clang-format
+        run: pip3 install "clang-format==21.1.*"
+
+      - name: Source gates
+        run: |
+          status=0
+          for check in tests/ci/test_*.py tests/d3d9/shader-oracle/corpus_lint.py; do
+            echo "== ${check}"
+            python3 "${check}" || status=1
+          done
+          exit "${status}"
+
+  # Builds the conformance suite without running it: the device tiers need a
+  # graphical session, which no hosted runner has. Compiling it is still worth a
+  # job, since it is what keeps Wine's modules and the vendored runner building.
+  build-d3d9-suite:
+    runs-on: macos-15
+    needs: [setup-wine, setup-llvm-darwin]
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          submodules: true
+
+      - name: Restore Wine Cache
+        uses: actions/cache/restore@v5
+        with:
+          key: wine-x86_64-${{ env.WINE_VERSION }}-macos
+          fail-on-cache-miss: true
+          path: ./toolchains/wine
+
+      - name: Install mingw-w64
+        run: brew install mingw-w64
+
+      - name: Restore LLVM Darwin Cache
+        uses: actions/cache/restore@v5
+        with:
+          key: llvm-darwin-${{ env.LLVM_VERSION }}-x86_64-macos
+          fail-on-cache-miss: true
+          path: ./toolchains/llvm-darwin
+
+      - name: Select Xcode Version
+        run: sudo xcode-select -s /Applications/Xcode_16.1.app
+
+      - name: Install Meson
+        run: pip3 install meson==1.10.0 --break-system-packages
+
+      # No exe wrapper is configured, so meson marks the device tiers skipped
+      # and nothing here launches Wine. The suite still builds, which is what
+      # keeps Wine's modules and the vendored runner compiling.
+      - name: Configure
+        run: |
+          meson setup build --cross-file build-win64.txt \
+            -Denable_tests=true -Dnative_llvm_path=toolchains/llvm-darwin \
+            -Dwine_install_path=toolchains/wine --buildtype release
+
+      - name: Build
+        run: meson compile -C build
+
+      # Needs neither Wine nor a GPU, so it gates every run.
+
   package:
     runs-on: macos-15
     needs: [build-gcc-release-x86_64-windows-cross, build-gcc-release-x86-windows-cross, build-clang-release-arm64ec-windows-cross]

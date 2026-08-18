@@ -118,15 +118,7 @@ shader_oracle_runner = executable('d3d9-shader-oracle-runner',
   ],
   install: false)
 
-# One test per corpus file. These need a live Metal device plus a wine
-# exe_wrapper to launch the PE, so they are NOT in the 'host' suite; on a
-# configuration without an exe_wrapper meson reports them as skipped. On a
-# device runner (wine as exe_wrapper, dxmt d3d9.dll on WINEDLLPATH) they run the
-# real oracle. See README.md for the standalone driver the maintainers use.
-foreach case : [
-  'dp2add', 'loop', 'lrp', 'mnxn', 'nrm', 'pow', 'rep', 'texdepth', 'texreg',
-]
-  test('d3d9-shader-oracle-' + case, shader_oracle_runner,
-    args: [ files('corpus' / (case + '.shader_test')) ],
-    suite: 'shader-oracle')
-endforeach
+# The corpus is gated by the suite's baseline diff (shader_oracle_spec.cpp), not
+# from here. The runner exits nonzero whenever any probe fails, which includes
+# an environmental one such as the optional DXC being absent, so its status
+# cannot separate "this layer regressed" from "this machine lacks a component".

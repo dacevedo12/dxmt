@@ -4,3 +4,8 @@
 [submodule "include/native/directx"]
 	path = include/native/directx
 	url = https://github.com/misyltoad/mingw-directx-headers
+[submodule "external/wine"]
+	path = external/wine
+	url = https://github.com/3Shain/wine.git
+	branch = v8.16
+	shallow = true

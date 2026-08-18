@@ -153,10 +153,8 @@ endif
 # environment. The oracle build never wants it: that drop is copied to a machine
 # with no source tree, where the copies beside the image are the only correct
 # answer.
-if not get_option('windows_oracle_only')
-  d3d9_unit_cpp_args += [
-    '-DDXMT_D3D9_ORACLE_CORPUS_DIR="'
-    + (meson.current_source_dir() / 'shader-oracle' / 'corpus')
-    + '"',
-  ]
-endif
+d3d9_unit_cpp_args += [
+  '-DDXMT_D3D9_ORACLE_CORPUS_DIR="'
+  + (meson.current_source_dir() / 'shader-oracle' / 'corpus')
+  + '"',
+]

@@ -6,6 +6,10 @@ option('wine_build_path', type : 'string')
 option('wine_install_path', type : 'string')
 option('wine_builtin_dll', type : 'boolean', value : true)
 option('enable_tests', type : 'boolean', value : false)
+# Wine's own d3d9 conformance modules are built from source, so the suite needs
+# the tree rather than the install. Defaults to the pinned submodule; point it
+# elsewhere to measure against a different Wine.
+option('wine_source_path', type : 'string', value : 'external/wine')
 option('enable_nvapi', type : 'boolean', value : false)
 option('enable_nvngx', type : 'boolean', value : false)
 option('enable_d3d12', type : 'boolean', value : false)

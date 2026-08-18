@@ -1,9 +1,11 @@
 build
+build-gamesir*
 .vscode
 .DS_Store
 wineprefix
 .cache
 wine
+!/external/wine
 .local
 .config
 toolchains

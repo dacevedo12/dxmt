@@ -1235,8 +1235,8 @@ private:
     uint64_t last_vbuf_table_offset = 0;
   };
   bool ResolveBatchedDrawForChunk(
-      BatchedDraw &bd, D9ResolvedDraw &res, uint64_t chunk_seq, uint64_t chunk_coherent_id, ConstUploadCache &const_cache,
-      ResolveCache &resolve_cache
+      BatchedDraw &bd, D9ResolvedDraw &res, uint64_t chunk_seq, uint64_t chunk_coherent_id,
+      ConstUploadCache &const_cache, ResolveCache &resolve_cache
   );
 
   // Resolve the cluster-stable half of a draw: the IA layout, the vertex and
@@ -1251,8 +1251,8 @@ private:
   // cache and the constant packer key on. Returns false when the draw cannot
   // be resolved.
   bool ResolveClusterState(
-      BatchedDraw &bd, D9ResolvedDraw &res, ResolveCache &resolve_cache, const D9EncodingRefs &refs, bool ffp_vs, bool ffp_ps,
-      uint32_t *ffp_texcoord_width
+      BatchedDraw &bd, D9ResolvedDraw &res, ResolveCache &resolve_cache, const D9EncodingRefs &refs, bool ffp_vs,
+      bool ffp_ps, uint32_t *ffp_texcoord_width
   );
 
   // What the draw's shader pair looks like to the constant packer: which
@@ -1278,9 +1278,9 @@ private:
   // consumes, so it reaches the rest of the draw only through bd. Returns false
   // when the ring cannot back the block, which fails the draw.
   bool PackDrawConstants(
-      BatchedDraw &bd, D9ResolvedDraw &res, ConstUploadCache &const_cache, const DrawShaderShape &shape, const uint32_t *ffp_texcoord_width,
-      uint32_t ffp_texcoord_width_key, bool ds_bound, const void *vs_defs_key, const void *ps_defs_key,
-      uint64_t chunk_seq, uint64_t chunk_coherent_id
+      BatchedDraw &bd, D9ResolvedDraw &res, ConstUploadCache &const_cache, const DrawShaderShape &shape,
+      const uint32_t *ffp_texcoord_width, uint32_t ffp_texcoord_width_key, bool ds_bound, const void *vs_defs_key,
+      const void *ps_defs_key, uint64_t chunk_seq, uint64_t chunk_coherent_id
   );
 
   // Refresh m_cachedSignaled from m_completionEvent and trim retired
